@@ -1,0 +1,85 @@
+{
+  "project_info": {
+    "project_number": "344965230552",
+    "firebase_url": "https://dating-app-967f3-default-rtdb.firebaseio.com",
+    "project_id": "dating-app-967f3",
+    "storage_bucket": "dating-app-967f3.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:344965230552:android:e5fcbe8c329c6506c8ccad",
+        "android_client_info": {
+          "package_name": "com.zipper.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:344965230552:android:823f59ddc3596fb3c8ccad",
+        "android_client_info": {
+          "package_name": "com.zipper.datingapp"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "344965230552-ph9nqq2c2r8omn035kui9gcmbdbu65fj.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.zipper.datingapp",
+            "certificate_hash": "b88065fa1a0415fdbcc11ac6ea2c8d85eabac376"
+          }
+        },
+        {
+          "client_id": "344965230552-qm5l5kekrsgkuatlq1si96vgdomqbbfi.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.zipper.datingapp",
+            "certificate_hash": "3fb7dbe08008ff21a71df29fbce7a93ef484092a"
+          }
+        },
+        {
+          "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

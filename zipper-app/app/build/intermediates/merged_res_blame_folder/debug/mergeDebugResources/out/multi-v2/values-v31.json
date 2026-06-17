@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.zipper.app-mergeDebugResources-108:/values-v31/values-v31.xml",
+            "map": [
+                {
+                    "source": "/Users/soumyaranjansingh/.gradle/caches/transforms-4/bac26cc7378fbe1d7e465b47b5195a48/transformed/core-splashscreen-1.0.1/res/values-v31/values-v31.xml",
+                    "from": {
+                        "startLines": "2,9",
+                        "startColumns": "4,4",
+                        "startOffsets": "55,473",
+                        "endLines": "8,13",
+                        "endColumns": "12,12",
+                        "endOffsets": "468,697"
+                    }
+                }
+            ]
+        }
+    ]
+}

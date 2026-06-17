@@ -52,6 +52,9 @@ android {
     }
 
     packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -93,7 +96,9 @@ dependencies {
     implementation(libs.firebase.messaging)
     implementation(libs.firebase.crashlytics)
     implementation(libs.firebase.analytics)
-    implementation(libs.play.services.auth)
+    implementation(libs.credentials)
+    implementation(libs.credentials.play.services.auth)
+    implementation(libs.googleid)
 
     // Agora
     implementation(libs.agora.rtc)
@@ -124,4 +129,10 @@ dependencies {
 
     // Accompanist
     implementation(libs.accompanist.permissions)
+
+    // Play Services Location
+    implementation(libs.play.services.location)
+
+    // ML Kit
+    implementation(libs.mlkit.face.detection)
 }

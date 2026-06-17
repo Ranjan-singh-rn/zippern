@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_tagline">జీవించు. కనెక్ట్ అవ్వు. వెలిగు.</string>
+    <string name="enter_mobile_number">మీ మొబైల్ నంబర్ నమోదు చేయండి</string>
+    <string name="get_otp">OTP పొందండి</string>
+    <string name="continue_with_google">Google తో కొనసాగండి</string>
+    <string name="continue_as_guest">అతిథిగా కొనసాగండి</string>
+    <string name="male">పురుషుడు</string>
+    <string name="female">స్త్రీ</string>
+    <string name="transgender">తృతీయ లింగం</string>
+    <string name="date_of_birth">పుట్టిన తేదీ</string>
+    <string name="city">నగరం</string>
+    <string name="ok">సరే</string>
+    <string name="cancel">రద్దు చేయి</string>
+    <string name="back">వెనక్కి</string>
+</resources>

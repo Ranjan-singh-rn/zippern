@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:ns1="http://schemas.android.com/tools">
+    <color name="splash_bg">#0D0D0D</color>
+    <string name="age_confirm">By continuing you confirm you\'re 18+</string>
+    <string name="age_error">You must be 18 or older to use Zipper</string>
+    <string name="app_name">Zipper</string>
+    <string name="app_tagline">Live. Connect. Shine.</string>
+    <string name="back">Back</string>
+    <string name="cancel">Cancel</string>
+    <string name="city">City</string>
+    <string name="com.google.firebase.crashlytics.mapping_file_id" ns1:ignore="UnusedResources,TypographyDashes" translatable="false">00000000000000000000000000000000</string>
+    <string name="continue_as_guest">Continue as Guest</string>
+    <string name="continue_with_google">Continue with Google</string>
+    <string name="date_of_birth">Date of Birth</string>
+    <string name="default_web_client_id" translatable="false">344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com</string>
+    <string name="detecting">Detecting…</string>
+    <string name="display_name">Display Name</string>
+    <string name="enter_mobile_number">Enter your mobile number</string>
+    <string name="error_generic">Something went wrong. Please try again.</string>
+    <string name="female">Female</string>
+    <string name="firebase_database_url" translatable="false">https://dating-app-967f3-default-rtdb.firebaseio.com</string>
+    <string name="gcm_defaultSenderId" translatable="false">344965230552</string>
+    <string name="gender">Gender</string>
+    <string name="get_otp">Get OTP</string>
+    <string name="google_api_key" translatable="false">AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY</string>
+    <string name="google_app_id" translatable="false">1:344965230552:android:e5fcbe8c329c6506c8ccad</string>
+    <string name="google_crash_reporting_api_key" translatable="false">AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY</string>
+    <string name="google_storage_bucket" translatable="false">dating-app-967f3.firebasestorage.app</string>
+    <string name="lets_go">Let\'s Go! ⚡</string>
+    <string name="male">Male</string>
+    <string name="ok">OK</string>
+    <string name="project_id" translatable="false">dating-app-967f3</string>
+    <string name="resend_otp">Resend OTP</string>
+    <string name="select_dob">Select date of birth</string>
+    <string name="set_up_profile">Set Up Profile</string>
+    <string name="tell_us_who_you_are">Tell us who you are</string>
+    <string name="terms_accept">I agree to the Terms &amp; Conditions</string>
+    <string name="transgender">Transgender</string>
+    <string name="verify_otp">Verify OTP</string>
+    <string name="what_to_call_you">What should we call you?</string>
+    <string name="your_city">Your city</string>
+    <style name="Theme.Zipper" parent="Theme.AppCompat.DayNight.NoActionBar"/>
+    <style name="Theme.Zipper.SplashScreen" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="postSplashScreenTheme">@style/Theme.Zipper</item>
+    </style>
+</resources>

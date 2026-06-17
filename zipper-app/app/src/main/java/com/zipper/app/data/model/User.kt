@@ -1,0 +1,37 @@
+package com.zipper.app.data.model
+
+data class User(
+    val uid: String = "",
+    val name: String = "",
+    val photoUrl: String = "",
+    val bio: String = "",
+    val gender: String = "",          // "male", "female", "transgender"
+    val age: Int = 0,
+    val dob: Long = 0L,               // DOB as epoch millis
+    val city: String = "",
+    val deviceId: String = "",
+    val hobbies: List<String> = emptyList(),
+    val languages: List<String> = emptyList(),
+    val isOnline: Boolean = false,
+    val isLive: Boolean = false,
+    val isInParty: Boolean = false,
+    val isHost: Boolean = false,
+    val diamonds: Long = 100,
+    val beans: Long = 0,
+    val level: Int = 1,
+    val wealthLevel: Int = 1,
+    val totalGemsSpent: Long = 0,
+    val equippedFrame: String = "",
+    val equippedEntrance: String = "",
+    val equippedChatStyle: String = "",
+    val callRateBeans: Int = 375,
+    val agencyId: String = "",
+    val hasRecharged: Boolean = false,
+    val isProfileComplete: Boolean = false,
+    val isFaceVerified: Boolean = false,
+    val facePhotoUrl: String = "",
+    val referralCode: String = "",
+    val fcmToken: String = "",
+    val createdAt: Long = System.currentTimeMillis(),
+    val lastSeen: Long = System.currentTimeMillis(),
+)

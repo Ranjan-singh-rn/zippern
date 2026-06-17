@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_tagline">வாழ்க. இணை. ஒளிர்.</string>
+    <string name="back">திரும்பு</string>
+    <string name="cancel">ரத்து செய்</string>
+    <string name="city">நகரம்</string>
+    <string name="continue_as_guest">விருந்தினராக தொடரவும்</string>
+    <string name="continue_with_google">Google உடன் தொடரவும்</string>
+    <string name="date_of_birth">பிறந்த தேதி</string>
+    <string name="enter_mobile_number">உங்கள் மொபைல் எண்ணை உள்ளிடவும்</string>
+    <string name="female">பெண்</string>
+    <string name="get_otp">OTP பெறுக</string>
+    <string name="male">ஆண்</string>
+    <string name="ok">சரி</string>
+    <string name="resend_otp">OTP மீண்டும் அனுப்பவும்</string>
+    <string name="set_up_profile">சுயவிவரத்தை அமைக்கவும்</string>
+    <string name="transgender">திருநங்கை</string>
+    <string name="verify_otp">OTP சரிபார்க்கவும்</string>
+</resources>

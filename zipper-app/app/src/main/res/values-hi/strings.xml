@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_tagline">जियो. जुड़ो. चमको.</string>
+    <string name="enter_mobile_number">अपना मोबाइल नंबर दर्ज करें</string>
+    <string name="get_otp">OTP प्राप्त करें</string>
+    <string name="continue_with_google">Google से जारी रखें</string>
+    <string name="continue_as_guest">अतिथि के रूप में जारी रखें</string>
+    <string name="verify_otp">OTP सत्यापित करें</string>
+    <string name="resend_otp">OTP पुनः भेजें</string>
+    <string name="terms_accept">मैं नियम और शर्तों से सहमत हूँ</string>
+    <string name="age_confirm">जारी रखने से आप पुष्टि करते हैं कि आपकी आयु 18+ है</string>
+    <string name="set_up_profile">प्रोफ़ाइल सेट करें</string>
+    <string name="tell_us_who_you_are">हमें बताएं आप कौन हैं</string>
+    <string name="display_name">प्रदर्शन नाम</string>
+    <string name="what_to_call_you">हम आपको क्या बुलाएं?</string>
+    <string name="gender">लिंग</string>
+    <string name="male">पुरुष</string>
+    <string name="female">महिला</string>
+    <string name="transgender">तृतीयलिंगी</string>
+    <string name="date_of_birth">जन्म तिथि</string>
+    <string name="select_dob">जन्म तिथि चुनें</string>
+    <string name="age_error">Zipper उपयोग करने के लिए आपकी आयु 18+ होनी चाहिए</string>
+    <string name="city">शहर</string>
+    <string name="your_city">आपका शहर</string>
+    <string name="detecting">पहचाना जा रहा है…</string>
+    <string name="lets_go">चलो शुरू करते हैं! ⚡</string>
+    <string name="ok">ठीक है</string>
+    <string name="cancel">रद्द करें</string>
+    <string name="back">वापस</string>
+    <string name="error_generic">कुछ गलत हो गया। कृपया पुनः प्रयास करें।</string>
+</resources>
