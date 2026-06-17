@@ -79,21 +79,23 @@ object CallSoundManager {
         toneGenerator = null
     }
 
-    /** System default incoming ringtone (looped on P+). */
+    /** System default incoming ringtone (looped on P+).
+     *  RingtoneManager.getRingtone() does ContentResolver/disk I/O — run it on an IO thread
+     *  to avoid StrictMode DiskReadViolation and main-thread jank (~400ms) on call arrival. */
     fun startIncomingRingtone(appContext: Context) {
-        synchronized(lock) {
-            stopIncomingRingtoneLocked()
-            val ctx = appContext.applicationContext
+        synchronized(lock) { stopIncomingRingtoneLocked() }
+        val ctx = appContext.applicationContext
+        Thread {
             val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE) ?: run {
                 Log.w(TAG, "No default ringtone URI")
-                return
+                return@Thread
             }
             val rt = try {
-                RingtoneManager.getRingtone(ctx, uri)
+                RingtoneManager.getRingtone(ctx, uri)   // disk I/O — safe on this thread
             } catch (e: Exception) {
                 Log.w(TAG, "getRingtone failed", e)
                 null
-            } ?: return
+            } ?: return@Thread
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 rt.isLooping = true
             }
@@ -104,14 +106,21 @@ object CallSoundManager {
                     .build()
             } catch (_: Exception) {
             }
-            ringtone = rt
+            synchronized(lock) {
+                if (ringtone != null) {
+                    // stopIncomingRingtone() was called while we were loading — discard
+                    try { rt.stop() } catch (_: Exception) {}
+                    return@Thread
+                }
+                ringtone = rt
+            }
             try {
                 rt.play()
             } catch (e: Exception) {
                 Log.w(TAG, "ringtone.play failed", e)
-                ringtone = null
+                synchronized(lock) { ringtone = null }
             }
-        }
+        }.also { it.name = "CallSoundManager-ringtone-load"; it.start() }
     }
 
     fun stopIncomingRingtone() {

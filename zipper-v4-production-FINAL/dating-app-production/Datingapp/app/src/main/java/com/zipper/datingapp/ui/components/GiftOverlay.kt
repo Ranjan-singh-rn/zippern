@@ -180,8 +180,8 @@ fun GiftOverlay(
     onComplete: () -> Unit
 ) {
     if (gift == null) return
-    val videoUrl = gift.videoUrl.trim()
-    val soundUrl = gift.soundUrl.trim()
+    val videoUrl = gift.videoUrl.orEmpty().trim()
+    val soundUrl = gift.soundUrl.orEmpty().trim()
 
     val primaryVideoUri = videoUrl.takeIf { it.isNotEmpty() }?.let(Uri::parse)
     val primaryAudioUri = if (primaryVideoUri == null) {
@@ -381,8 +381,8 @@ private fun GiftVideoOverlayContent(
     val enterOffsetPx = remember(density) { with(density) { 240.dp.toPx() } }
 
     val separateSound = remember(gift.id, gift.videoUrl, gift.soundUrl) {
-        val v = gift.videoUrl.trim()
-        val s = gift.soundUrl.trim()
+        val v = gift.videoUrl.orEmpty().trim()
+        val s = gift.soundUrl.orEmpty().trim()
         v.isNotEmpty() && s.isNotEmpty() && s != v
     }
 
@@ -515,7 +515,7 @@ private fun GiftVideoOverlayContent(
         player.playWhenReady = false
 
         if (separateSound && soundPlayer != null) {
-            soundPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(gift.soundUrl.trim())))
+            soundPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(gift.soundUrl.orEmpty().trim())))
             soundPlayer.prepare()
             soundPlayer.playWhenReady = false
 
@@ -538,7 +538,7 @@ private fun GiftVideoOverlayContent(
                 runCatching {
                     soundPlayer.stop()
                     soundPlayer.clearMediaItems()
-                    soundPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(gift.soundUrl.trim())))
+                    soundPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(gift.soundUrl.orEmpty().trim())))
                     soundPlayer.prepare()
                     var rw = 0L
                     while (rw < 4_000L &&
@@ -927,9 +927,9 @@ fun GiftAssetPreloader(gifts: List<Gift>) {
         delay(400)
         gifts.take(GiftPreloadMaxPerPass).forEachIndexed { index, gift ->
             if (index > 0) delay(GiftPreloadPauseMs)
-            cacheAssetToDisk(gift.videoUrl, cacheDir, "mp4")
+            cacheAssetToDisk(gift.videoUrl.orEmpty(), cacheDir, "mp4")
             delay(GiftPreloadPauseMs)
-            cacheAssetToDisk(gift.soundUrl, cacheDir, "mp3")
+            cacheAssetToDisk(gift.soundUrl.orEmpty(), cacheDir, "mp3")
             val thumb = gift.thumbnailUrl.trim()
             if (thumb.isNotEmpty()) {
                 delay(GiftPreloadPauseMs)

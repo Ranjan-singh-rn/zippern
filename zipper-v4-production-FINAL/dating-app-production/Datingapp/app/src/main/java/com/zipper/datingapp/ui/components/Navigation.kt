@@ -56,8 +56,8 @@ fun MainBottomNavigation(
             NavTab(R.string.nav_home,    Icons.Default.Home,                    0),
             NavTab(R.string.nav_live,    Icons.Default.Podcasts,                1),
             NavTab(R.string.nav_chats,   Icons.AutoMirrored.Filled.Chat,        2),
-            NavTab(R.string.nav_followed,Icons.Default.Favorite,                3),
-            NavTab(R.string.nav_profile, Icons.Default.Person,                  4),
+            NavTab(R.string.nav_games,   Icons.Default.SportsEsports,            3),
+            NavTab(R.string.nav_settings,Icons.Default.Settings,                4),
         )
 
         items.forEach { item ->
@@ -156,8 +156,8 @@ fun MainNavigationRail(
             NavTab(R.string.nav_home,     Icons.Default.Home,                 0),
             NavTab(R.string.nav_live,     Icons.Default.Podcasts,             1),
             NavTab(R.string.nav_chats,    Icons.AutoMirrored.Filled.Chat,     2),
-            NavTab(R.string.nav_followed, Icons.Default.Favorite,             3),
-            NavTab(R.string.nav_profile,  Icons.Default.Person,               4),
+            NavTab(R.string.nav_games,    Icons.Default.SportsEsports,        3),
+            NavTab(R.string.nav_settings, Icons.Default.Settings,             4),
         )
 
         items.forEach { item ->

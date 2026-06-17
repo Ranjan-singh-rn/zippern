@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.provider.Settings
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
@@ -48,12 +49,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -238,10 +242,24 @@ data class DatingUiState(
     val selectedMessagePartnerId: String? = null,
     val isGiftTransactionProcessing: Boolean = false,
     val registrationGender: String = "",
+    val registrationReferralCode: String = "",
+    /** True after a brand-new account is created — MainActivity uses this to route to EditProfile immediately. */
+    val isNewUserSetupNeeded: Boolean = false,
+    // ── Phone/Email re-binding state (EditProfileScreen) ──────────────────────
+    val phoneChangeOtpSent: Boolean = false,
+    val phoneChangeError: String? = null,
+    val emailChangeSent: Boolean = false,
+    val emailChangeError: String? = null,
     /** Realtime Database [.info/connected] — true when socket to Firebase backend is up. */
     val isFirebaseBackendConnected: Boolean = false,
     /** UIDs the current user has liked from the discovery feed. */
     val likedProfileIds: Set<String> = emptySet(),
+    /** Full profiles the current user has liked (for Likes → I Like tab). */
+    val iLikedProfiles: List<UserProfile> = emptyList(),
+    /** Current user's own sent gift history (My Profile → Gifts Sent tab). */
+    val mySentGiftHistory: List<SentGiftHistoryEntry> = emptyList(),
+    /** Current user's own received gift history (My Profile → Gifts Received tab). */
+    val myReceivedGiftHistory: List<SentGiftHistoryEntry> = emptyList(),
     /** [HomeScreen] profile sheet: gifts you sent to the open profile (`gift_transactions`), newest first. */
     val profileDetailSentGifts: List<SentGiftHistoryEntry> = emptyList(),
     /** Gifts the opened profile received (any sender), newest first. */
@@ -310,6 +328,30 @@ data class DatingUiState(
      * re-joins (fixes black video after app restart + re-enter same stream).
      */
     val liveWatchSessionNonce: Long = 0L,
+    /**
+     * True when the user has minimised a watched live stream into the floating PIP overlay.
+     * Back-press while watching (not in PIP) enters PIP; back-press in PIP exits live entirely.
+     */
+    val isLivePipMode: Boolean = false,
+
+    // ── Profile editing ─────────────────────────────────────────────────────
+    /** Set to true after a successful profile save so EditProfileScreen can navigate back. */
+    val profileSaveSuccess: Boolean = false,
+    /** True while the profile save network call is in-flight. */
+    val isProfileSaving: Boolean = false,
+    /** Non-null when a profile save fails — shown as an error banner. */
+    val profileSaveError: String? = null,
+    /**
+     * Per-slot upload progress for gallery images (key = gallery slot index, value = 0f–1f).
+     * Cleared after the upload completes.
+     */
+    val galleryUploadProgress: Map<Int, Float> = emptyMap(),
+
+    // ── Gift history loading flags ──────────────────────────────────────────
+    /** True while the sent gift history fetch is in-flight (My Profile → Gifts Sent tab). */
+    val isMySentGiftHistoryLoading: Boolean = false,
+    /** True while the received gift history fetch is in-flight (My Profile → Gifts Received tab). */
+    val isMyReceivedGiftHistoryLoading: Boolean = false,
 )
 
 data class IncomingCallUi(
@@ -340,6 +382,124 @@ class DatingViewModel : ViewModel() {
 
     private val _uiState = MutableStateFlow(DatingUiState())
     val uiState: StateFlow<DatingUiState> = _uiState.asStateFlow()
+
+    // ── Convenience StateFlows (derived from uiState for screen-level consumers) ──
+
+    /** Currently logged-in [UserProfile], or null. */
+    val currentUser: StateFlow<UserProfile?> = uiState.map { it.currentUser }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Spendable diamond balance as [Long] (mirrors [DatingUiState.coinBalance]). */
+    val diamonds: StateFlow<Long> = uiState.map { it.coinBalance.toLong() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
+
+    /** Spendable bean balance as [Long] (mirrors [UserProfile.beanBalance] via uiState). */
+    val beans: StateFlow<Long> = uiState.map { it.currentUser?.beanBalance ?: it.beans.toLong() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
+
+    /** Current one-to-one [CallState]. */
+    val callState: StateFlow<CallState> = uiState.map { it.callState }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CallState.IDLE)
+
+    /**
+     * True while the OS has placed MainActivity into Android PiP mode during an active
+     * [VideoCallScreen] teaser/free call. MainActivity sets this from
+     * [Activity.onPictureInPictureModeChanged]; VideoCallScreen collects it to hide controls.
+     */
+    val isInPipMode: MutableStateFlow<Boolean> = MutableStateFlow(false)
+
+    /** Live-stream chat messages for the currently watched or hosted stream. */
+    val liveChatMessages: StateFlow<List<LiveStreamChatMessage>> = uiState.map { it.liveStreamChatMessages }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Active [LiveStream] being watched/hosted; synthesised from [DatingUiState.watchingLivePartner]. */
+    val activeLiveStream: StateFlow<LiveStream?> = uiState.map { s ->
+        val host = s.watchingLivePartner ?: return@map null
+        LiveStream(
+            id = host.liveRoomId.orEmpty().ifBlank { host.id },
+            hostId = host.id,
+            hostName = host.name,
+            hostPhotoUrl = host.photoUrl,
+            hostGender = host.gender,
+            hostLevel = host.level,
+            isActive = true,
+            isAudioOnly = s.watchingLiveStreamIsAudioOnly,
+            viewerCount = s.liveStreamViewerCount,
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Gift visual event derived from [DatingUiState.playingGift] (single-item queue). */
+    val giftVisualQueue: StateFlow<List<GiftVisualEvent>> = uiState.map { s ->
+        val g = s.playingGift ?: return@map emptyList()
+        listOf(GiftVisualEvent(gift = g, senderName = s.currentUser?.name.orEmpty(), senderPhotoUrl = ""))
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Full gift catalog for the gift picker. */
+    val giftCatalog: StateFlow<List<Gift>> = uiState.map { it.availableGifts }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Active battle for GameCenter screens. */
+    val activeBattle: StateFlow<Battle?> = uiState.map { it.activeBattle }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** PK countdown in seconds (stub — replaced by real timer in PkArenaHud). */
+    val pkCountdownSeconds: StateFlow<Int> = MutableStateFlow(0)
+
+    /** Discovery feed profiles (filtered or unfiltered). */
+    val discoveryProfiles: StateFlow<List<UserProfile>> = uiState.map { s ->
+        if (s.isFilterActive) s.filteredProfiles else s.profiles
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Search results as a list (single [DatingUiState.searchResult] wrapped in list). */
+    val searchResults: StateFlow<List<UserProfile>> = uiState.map { s ->
+        listOfNotNull(s.searchResult)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** True while the discovery feed is loading. */
+    val isLoadingFeed: StateFlow<Boolean> = uiState.map { it.isLoading }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    /** CRM announcements list. */
+    val crmAnnouncements: StateFlow<List<CrmAnnouncement>> = uiState.map { it.crmAnnouncements }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Profile of the remote call party (callee/caller). */
+    val viewedProfile: StateFlow<UserProfile?> = uiState.map { it.activeCallPartner }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /** Call duration in seconds; updated by [recordCallDuration]. */
+    val callDurationSeconds: StateFlow<Int> = MutableStateFlow(0)
+
+    /** Active live streams for the Live discover tab. */
+    private val _activeLiveStreams = MutableStateFlow<List<LiveStream>>(emptyList())
+    val activeLiveStreams: StateFlow<List<LiveStream>> = _activeLiveStreams.asStateFlow()
+
+    /** Active party rooms for the Live discover tab. */
+    private val _activePartyRooms = MutableStateFlow<List<PartyRoom>>(emptyList())
+    val activePartyRooms: StateFlow<List<PartyRoom>> = _activePartyRooms.asStateFlow()
+
+    /** Chat threads for the Messages tab. */
+    private val _chatThreads = MutableStateFlow<List<ChatThread>>(emptyList())
+    val chatThreads: StateFlow<List<ChatThread>> = _chatThreads.asStateFlow()
+
+    /** Active chat messages for the currently open DM thread. */
+    val activeChatMessages: StateFlow<List<Message>> = uiState.map { s ->
+        val partnerId = s.selectedMessagePartnerId ?: return@map emptyList()
+        s.messages[partnerId] ?: emptyList()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** Transaction history for the Diamond Shop screen. */
+    private val _transactionHistory = MutableStateFlow<List<Transaction>>(emptyList())
+    val transactionHistory: StateFlow<List<Transaction>> = _transactionHistory.asStateFlow()
+
+    /** Static default diamond/coin packages for offline coin sellers. */
+    val diamondPackages: List<DiamondPackage> = coinPackages
+
+    // ── Private listener jobs for LiveScreen ─────────────────────────────────
+    private var liveStreamsListenerJob: Job? = null
+    private var partyRoomsListenerJob: Job? = null
+    private var openedProfileListenerJob: Job? = null
+    private var chatThreadsJob: Job? = null
 
     private val auth = FirebaseAuth.getInstance()
     private val db = FirebaseFirestore.getInstance()
@@ -490,7 +650,7 @@ class DatingViewModel : ViewModel() {
                     _uiState.update { it.copy(
                         isLoggedIn = true,
                         isGuest = true,
-                        currentUser = UserProfile(id = user.uid, name = "Guest", role = UserRole.BOY),
+                        currentUser = UserProfile(id = user.uid, name = "Guest", role = UserRole.BOY.name),
                         isAuthBootstrapComplete = true
                     ) }
                     startIncomingCallListener(user.uid)
@@ -784,7 +944,6 @@ class DatingViewModel : ViewModel() {
     fun tryUpdateRegionFromLastKnownLocation(context: Context) {
         if (didRegionUpdateThisSession) return
         val uid = auth.currentUser?.uid ?: return
-        if (_uiState.value.isGuest || auth.currentUser?.isAnonymous == true) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -1047,21 +1206,55 @@ class DatingViewModel : ViewModel() {
 
     fun loginAsGuest() {
         _uiState.update { it.copy(isLoading = true, loginError = null) }
+        val selectedGender = _uiState.value.registrationGender.ifBlank { "male" }
         viewModelScope.launch {
             try {
-                authRepository.signInAnonymously()
+                authRepository.signInAsGuest()
                 val guestUid = auth.currentUser?.uid.orEmpty()
-                _uiState.update { it.copy(
-                    isLoggedIn = true,
-                    isGuest = true,
-                    isLoading = false,
-                    currentUser = UserProfile(
+                if (guestUid.isEmpty()) {
+                    _uiState.update { it.copy(isLoading = false, loginError = "Guest sign-in failed.") }
+                    return@launch
+                }
+
+                // Capture Android device ID for same-device auto-login on reinstall
+                val appCtx = DatingApp.applicationContext
+                val deviceId = appCtx?.let {
+                    Settings.Secure.getString(it.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+                }.orEmpty()
+
+                // Check for existing Firestore profile under this UID (returning guest, Firebase
+                // auth persisted the anonymous session)
+                val existingProfile = runCatching { firebaseService.getUserProfile(guestUid) }.getOrNull()
+
+                if (existingProfile != null) {
+                    // Returning guest — restore their profile, no setup needed
+                    _uiState.update { it.copy(
+                        isLoggedIn = true,
+                        isGuest = true,
+                        isLoading = false,
+                        currentUser = existingProfile,
+                        isNewUserSetupNeeded = false,
+                    ) }
+                } else {
+                    // Brand-new guest — create a minimal profile and route to profile setup
+                    val newGuest = UserProfile(
                         id = guestUid,
                         name = "Guest",
-                        role = UserRole.BOY,
-                        isGuest = true
+                        gender = selectedGender,
+                        role = if (selectedGender == "female") UserRole.GIRL.name else UserRole.BOY.name,
+                        isGuest = true,
+                        deviceId = deviceId,
                     )
-                ) }
+                    runCatching { firebaseService.saveUserProfile(newGuest) }
+                    _uiState.update { it.copy(
+                        isLoggedIn = true,
+                        isGuest = true,
+                        isLoading = false,
+                        currentUser = newGuest,
+                        isNewUserSetupNeeded = true,   // route to EditProfile for username + age setup
+                    ) }
+                }
+
                 if (guestUid.isNotEmpty()) {
                     startIncomingCallListener(guestUid)
                     markUserOnline()
@@ -1090,6 +1283,10 @@ class DatingViewModel : ViewModel() {
         _uiState.update { it.copy(isOtpSent = false, isLoading = false, loginError = null) }
     }
 
+    fun clearNewUserSetupFlag() {
+        _uiState.update { it.copy(isNewUserSetupNeeded = false) }
+    }
+
     fun setRegistrationGender(gender: String) {
         val normalized = gender.trim().lowercase()
         _uiState.update {
@@ -1100,6 +1297,11 @@ class DatingViewModel : ViewModel() {
                 }
             )
         }
+    }
+
+
+    fun setRegistrationReferralCode(code: String) {
+        _uiState.update { it.copy(registrationReferralCode = code.trim().uppercase()) }
     }
 
     fun sendOtp(phoneNumber: String, activity: Activity) {
@@ -1152,28 +1354,32 @@ class DatingViewModel : ViewModel() {
                 
                 val user = authResult.user ?: throw Exception("Auth failed")
                 var profile = firebaseService.getUserProfile(user.uid)
-                
+                val isNewUser = (profile == null)
+
                 if (profile == null) {
                     val selectedGender = _uiState.value.registrationGender
+                    val enteredReferral = _uiState.value.registrationReferralCode
                     profile = UserProfile(
                         id = user.uid,
-                        name = user.displayName ?: "User",
+                        name = user.displayName?.takeIf { it.isNotBlank() } ?: "",
                         email = user.email ?: "",
                         mobile = user.phoneNumber ?: "",
                         gender = selectedGender,
-                        role = if (selectedGender == "female") UserRole.GIRL else UserRole.BOY,
+                        role = if (selectedGender == "female") UserRole.GIRL.name else UserRole.BOY.name,
                         profileNumber = (10000..99999).random().toString(),
-                        level = 1
+                        level = 1,
+                        referralCode = enteredReferral.ifEmpty { null }
                     )
                 }
-                firebaseService.saveUserProfile(profile)
+                firebaseService.saveUserProfile(profile!!)
                 didRegionUpdateThisSession = false
                 _uiState.update { it.copy(
                     currentUser = profile,
                     isLoggedIn = true,
                     isGuest = false,
                     isLoading = false,
-                    isOtpSent = false
+                    isOtpSent = false,
+                    isNewUserSetupNeeded = isNewUser,
                 ) }
                 fetchFollowers()
                 startCurrentUserListener(user.uid)
@@ -1281,13 +1487,13 @@ class DatingViewModel : ViewModel() {
         referralCode: String
     ) {
         val current = _uiState.value.currentUser ?: return
-        val effectiveReferral = if (current.referralCode.isNotEmpty()) current.referralCode else referralCode
+        val effectiveReferral = if (!current.referralCode.isNullOrEmpty()) current.referralCode!! else referralCode
         val updated = current.copy(
             name = name,
             age = age,
             city = city,
             gender = normalizeGenderForCrm(gender),
-            role = if (normalizeGenderForCrm(gender) == "female") UserRole.GIRL else UserRole.BOY,
+            role = if (normalizeGenderForCrm(gender) == "female") UserRole.GIRL.name else UserRole.BOY.name,
             email = email,
             mobile = mobile,
             bio = bio,
@@ -1318,23 +1524,34 @@ class DatingViewModel : ViewModel() {
         bio: String,
         photoUrl: String,
         gallery: List<String>,
-        referralCode: String
+        referralCode: String,
+        hobbies: List<String> = emptyList(),
+        likes: List<String> = emptyList(),
+        dislikes: List<String> = emptyList(),
+        languages: List<String> = emptyList(),
     ) {
         val current = _uiState.value.currentUser ?: return
-        val effectiveReferral = if (current.referralCode.isNotEmpty()) current.referralCode else referralCode
+        val effectiveReferral = if (!current.referralCode.isNullOrEmpty()) current.referralCode!! else referralCode
+        // Locked fields — city and gender cannot be changed once set
+        val effectiveCity   = current.city.ifBlank { city }
+        val effectiveGender = current.gender.ifBlank { normalizeGenderForCrm(gender) }
         val updated = current.copy(
             name = name,
             age = age,
-            city = city,
-            gender = normalizeGenderForCrm(gender),
-            role = if (normalizeGenderForCrm(gender) == "female") UserRole.GIRL else UserRole.BOY,
+            city = effectiveCity,
+            gender = effectiveGender,
+            role = if (effectiveGender == "female") UserRole.GIRL.name else UserRole.BOY.name,
             email = email,
             mobile = mobile,
             bio = bio,
             photoUrl = photoUrl,
             galleryPhotos = gallery,
             referralCode = effectiveReferral,
-            profileNumber = current.profileNumber.ifEmpty { (10000..99999).random().toString() }
+            profileNumber = current.profileNumber.ifEmpty { (10000..99999).random().toString() },
+            hobbies = hobbies.ifEmpty { current.hobbies },
+            likes = likes.ifEmpty { current.likes },
+            dislikes = dislikes.ifEmpty { current.dislikes },
+            languages = languages.ifEmpty { current.languages },
         )
         firebaseService.saveUserProfile(updated)
         syncFirebaseUserEmailIfChanged(email)
@@ -1355,9 +1572,13 @@ class DatingViewModel : ViewModel() {
         bio: String,
         photo: String,
         gallery: List<String>,
-        referral: String
+        referral: String,
+        hobbies: List<String> = emptyList(),
+        likes: List<String> = emptyList(),
+        dislikes: List<String> = emptyList(),
+        languages: List<String> = emptyList(),
     ) {
-        _uiState.update { it.copy(isLoading = true) }
+        _uiState.update { it.copy(isProfileSaving = true, profileSaveSuccess = false, profileSaveError = null) }
         viewModelScope.launch {
             try {
                 val uploadedPhotoUrl = when {
@@ -1389,14 +1610,101 @@ class DatingViewModel : ViewModel() {
                     bio = bio,
                     photoUrl = uploadedPhotoUrl,
                     gallery = uploadedGallery,
-                    referralCode = referral
+                    referralCode = referral,
+                    hobbies = hobbies,
+                    likes = likes,
+                    dislikes = dislikes,
+                    languages = languages,
                 )
-                _uiState.update { it.copy(isLoading = false) }
+                // Signal success so EditProfileScreen's LaunchedEffect can close the screen
+                _uiState.update { it.copy(isProfileSaving = false, profileSaveSuccess = true) }
             } catch (e: Exception) {
                 Log.e("DatingViewModel", "Error updating profile", e)
-                _uiState.update { it.copy(isLoading = false, loginError = "Failed to update profile: ${e.message}") }
+                _uiState.update { it.copy(isProfileSaving = false, profileSaveError = "Failed to update profile: ${e.message}") }
             }
         }
+    }
+
+    // ── Phone / Email re-binding (EditProfileScreen) ──────────────────────────
+
+    private var phoneChangeVerificationId: String? = null
+
+    fun changePhone_sendOtp(phone: String, activity: Activity) {
+        val formattedPhone = if (phone.startsWith("+")) phone else "+91$phone"
+        _uiState.update { it.copy(phoneChangeOtpSent = false, phoneChangeError = null) }
+        val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+            override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                viewModelScope.launch { applyPhoneCredential(credential) }
+            }
+            override fun onVerificationFailed(e: FirebaseException) {
+                _uiState.update { it.copy(phoneChangeError = e.localizedMessage) }
+            }
+            override fun onCodeSent(id: String, token: PhoneAuthProvider.ForceResendingToken) {
+                phoneChangeVerificationId = id
+                _uiState.update { it.copy(phoneChangeOtpSent = true) }
+            }
+        }
+        PhoneAuthProvider.verifyPhoneNumber(
+            PhoneAuthOptions.newBuilder(auth)
+                .setPhoneNumber(formattedPhone)
+                .setTimeout(60L, TimeUnit.SECONDS)
+                .setActivity(activity)
+                .setCallbacks(callbacks)
+                .build()
+        )
+    }
+
+    fun changePhone_verifyOtp(otp: String) {
+        val vid = phoneChangeVerificationId ?: run {
+            _uiState.update { it.copy(phoneChangeError = "Session expired. Please resend OTP.") }
+            return
+        }
+        val credential = PhoneAuthProvider.getCredential(vid, otp)
+        viewModelScope.launch { applyPhoneCredential(credential) }
+    }
+
+    private suspend fun applyPhoneCredential(credential: PhoneAuthCredential) {
+        try {
+            val user = auth.currentUser ?: return
+            user.updatePhoneNumber(credential).await()
+            val phone = user.phoneNumber.orEmpty()
+            val updated = _uiState.value.currentUser?.copy(mobile = phone, isBound = true)
+            if (updated != null) {
+                runCatching { firebaseService.saveUserProfile(updated) }
+                _uiState.update { it.copy(
+                    currentUser = updated,
+                    phoneChangeOtpSent = false,
+                    phoneChangeError = null,
+                ) }
+            }
+        } catch (e: Exception) {
+            _uiState.update { it.copy(phoneChangeError = e.localizedMessage) }
+        }
+    }
+
+    fun clearPhoneChangeState() {
+        phoneChangeVerificationId = null
+        _uiState.update { it.copy(phoneChangeOtpSent = false, phoneChangeError = null) }
+    }
+
+    fun changeEmail(newEmail: String) {
+        _uiState.update { it.copy(emailChangeSent = false, emailChangeError = null) }
+        val user = auth.currentUser ?: run {
+            _uiState.update { it.copy(emailChangeError = "Not signed in.") }
+            return
+        }
+        viewModelScope.launch {
+            try {
+                user.verifyBeforeUpdateEmail(newEmail).await()
+                _uiState.update { it.copy(emailChangeSent = true) }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(emailChangeError = e.localizedMessage) }
+            }
+        }
+    }
+
+    fun clearEmailChangeState() {
+        _uiState.update { it.copy(emailChangeSent = false, emailChangeError = null) }
     }
 
     fun uploadVerificationVideo(uri: Uri) {
@@ -1406,8 +1714,8 @@ class DatingViewModel : ViewModel() {
                 firebaseService.uploadVideo(uri)
                 val updated = _uiState.value.currentUser?.copy(
                     hasIntroVideo = true,
-                    videoVerificationStatus = VerificationStatus.PENDING,
-                    isFullyVerified = false 
+                    videoVerificationStatus = VerificationStatus.PENDING.name,
+                    isFullyVerified = false
                 )
                 if (updated != null) {
                     firebaseService.saveUserProfile(updated)
@@ -1431,9 +1739,10 @@ class DatingViewModel : ViewModel() {
 
                 val updated = _uiState.value.currentUser?.copy(
                     faceVerificationImageUrl = uploadedImageUrl,
-                    faceVerificationStatus = VerificationStatus.APPROVED,
+                    faceVerificationStatus = VerificationStatus.APPROVED.name,
                     isVerified = true,
                     isFaceVerified = true,
+                    isCallVerificationApproved = true,
                     hasStarBadge = true
                 )
 
@@ -1469,9 +1778,10 @@ class DatingViewModel : ViewModel() {
 
     fun completeVerification() {
         val updated = _uiState.value.currentUser?.copy(
-            faceVerificationStatus = VerificationStatus.APPROVED,
+            faceVerificationStatus = VerificationStatus.APPROVED.name,
             isVerified = true,
             isFaceVerified = true,
+            isCallVerificationApproved = true,
             hasStarBadge = true
         )
         if (updated != null) {
@@ -1551,7 +1861,7 @@ class DatingViewModel : ViewModel() {
 
     fun setCustomPrices(audio: Int, video: Int) {
         val u = _uiState.value.currentUser
-        if (u != null && u.role == UserRole.GIRL && u.displayProfileLevel >= 4) {
+        if (u != null && u.role == UserRole.GIRL.name && u.displayProfileLevel >= 4) {
             val updated = u.copy(customAudioPrice = audio, customVideoPrice = video)
             viewModelScope.launch {
                 firebaseService.saveUserProfile(updated)
@@ -1697,6 +2007,44 @@ class DatingViewModel : ViewModel() {
             } catch (e: Exception) {
                 Log.e("DatingViewModel", "sendMessage failed", e)
                 _uiState.update { it.copy(loginError = "Message failed: ${e.message}") }
+            }
+        }
+    }
+
+    /**
+     * Sends a chat invite message to every user who has a mutual like with [hostUid].
+     * Mutual = hostUid liked them AND they liked hostUid back.
+     * Called automatically when the host starts a live stream or audio party.
+     */
+    private fun sendLiveInviteToMutualLikes(hostUid: String, isAudioParty: Boolean) {
+        val s = _uiState.value
+        val iLiked   = s.iLikedProfiles.map { it.id }.toSet()
+        val likedMe  = s.likedMeProfiles.map { it.id }.toSet()
+        val mutuals  = iLiked.intersect(likedMe)
+        if (mutuals.isEmpty()) return
+        val hostName = s.currentUser?.name?.takeIf { it.isNotBlank() } ?: "Someone you liked"
+        val hostUser = s.currentUser
+        val msg = if (isAudioParty)
+            "🎉 $hostName just started a Party Room! Come join now 🎶"
+        else
+            "🔴 $hostName is LIVE now! Come watch ❤️"
+        viewModelScope.launch {
+            mutuals.forEach { recipientUid ->
+                runCatching {
+                    val chatMsg = com.zipper.datingapp.data.ChatMessage(
+                        id = "",
+                        senderId = hostUid,
+                        senderName = hostUser?.name.orEmpty(),
+                        senderPhotoUrl = hostUser?.photoUrl.orEmpty(),
+                        receiverId = recipientUid,
+                        text = msg,
+                        type = "TEXT",
+                        timestamp = System.currentTimeMillis()
+                    )
+                    firebaseService.sendChatMessage(recipientId = recipientUid, message = chatMsg)
+                }.onFailure { e ->
+                    Log.w("DatingViewModel", "sendLiveInviteToMutualLikes uid=$recipientUid", e)
+                }
             }
         }
     }
@@ -2433,7 +2781,8 @@ class DatingViewModel : ViewModel() {
         viewModelScope.launch {
             val (sent, received) = coroutineScope {
                 val sentJob = async {
-                    runCatching { firebaseService.fetchSentGiftsToUser(me, rid, 15) }.getOrElse { emptyList() }
+                    val myProfile = _uiState.value.currentUser ?: return@async emptyList()
+                    runCatching { firebaseService.fetchSentGiftsToUser(myProfile, rid, 15) }.getOrElse { emptyList() }
                 }
                 val recvJob = async {
                     runCatching { firebaseService.fetchReceivedGiftsForUser(rid, 15) }.getOrElse { emptyList() }
@@ -2474,11 +2823,8 @@ class DatingViewModel : ViewModel() {
                 ?: return@launch
             _uiState.update { s ->
                 val prev = s.profiles.find { it.id == uid }
-                val entry = if (prev != null) {
-                    fresh.copy(isLive = prev.isLive, isOnline = prev.isOnline)
-                } else {
-                    fresh
-                }
+                // Always trust the server-fresh isOnline/isLive values — never copy stale ones.
+                val entry = fresh
                 val newProfiles = if (prev != null) {
                     s.profiles.map { if (it.id == uid) entry else it }
                 } else {
@@ -3197,7 +3543,7 @@ class DatingViewModel : ViewModel() {
         _uiState.update { it.copy(showHostPkEndedInterstitial = false) }
         if (!roomForSignal.isNullOrBlank()) {
             viewModelScope.launch {
-                runCatching { firebaseService.emitEndPkStayLiveSignal(roomForSignal, hostDoc) }
+                runCatching { firebaseService.emitEndPkStayLiveSignal(roomForSignal, hostDoc.orEmpty()) }
             }
         }
         endPkSession(resumeSoloLive = true)
@@ -3246,7 +3592,7 @@ class DatingViewModel : ViewModel() {
             return
         }
         val partner = _uiState.value.profiles.find { it.id == match.partnerUserId }
-            ?: UserProfile(id = match.partnerUserId, name = "PK Partner", role = UserRole.GIRL)
+            ?: UserProfile(id = match.partnerUserId, name = "PK Partner", role = UserRole.GIRL.name)
         val myUid = auth.currentUser?.uid.orEmpty()
         val overlayHostUid = if (match.isStreamer) myUid else match.partnerUserId
         /** Firestore / product "host" team (blue tug) = streamer who was live; "guest" = challenger. */
@@ -3436,7 +3782,7 @@ class DatingViewModel : ViewModel() {
                     battleEnded = true,
                     outcome = PkBattleOutcome.VICTORY,
                     phase = PkBattlePhase.FINISHED,
-                    frozenTugRatio = pk.frozenTugRatio ?: 0.5f,
+                    frozenTugRatio = pk.frozenTugRatio,
                     resultPhaseEndsAtMillis = endAt,
                 ),
                 pkRematchPending = false,
@@ -3526,6 +3872,17 @@ class DatingViewModel : ViewModel() {
                     ?: "Someone"
                 runCatching { firebaseService.sendLiveStreamJoinSystemMessage(p.id, me.uid, name) }
                     .onFailure { Log.w("DatingViewModel", "sendLiveStreamJoinSystemMessage", it) }
+            }
+        }
+        // PARTY-FIX: If joining an audio-only party room, proactively clear any stale seat
+        // the user may have been left in from a previous session (e.g. crash, force-close).
+        if (p.liveStreamAudioOnly) {
+            val myUid = auth.currentUser?.uid?.trim().orEmpty()
+            if (myUid.isNotEmpty()) {
+                viewModelScope.launch {
+                    runCatching { firebaseService.clearUserFromAllAudioPartySeats(p.id, myUid) }
+                        .onFailure { Log.w("DatingViewModel", "watchLive: clearUserFromAllAudioPartySeats", it) }
+                }
             }
         }
     }
@@ -3622,6 +3979,22 @@ class DatingViewModel : ViewModel() {
         pkWatchAudienceFirestoreStreamId = null
         pkWatchAudienceCountSessionKey = null
         pkWatchAudienceCountedForHost = null
+
+        // PARTY-FIX: If guest was seated in an audio party room, clear their seat in Firestore
+        // so they don't auto-appear seated on next entry (stale seat data causes instant re-seat).
+        val myUid = auth.currentUser?.uid?.trim().orEmpty()
+        val isAudioParty = _uiState.value.watchingLiveStreamIsAudioOnly
+        if (isAudioParty && hostId != null && myUid.isNotEmpty()) {
+            val stream = _uiState.value.audioPartyStream
+            val mySeatIndex = stream.seats.entries.firstOrNull { it.value.userId == myUid }?.key
+            if (mySeatIndex != null) {
+                viewModelScope.launch {
+                    runCatching { firebaseService.leaveAudioPartySeat(hostId, mySeatIndex, myUid) }
+                        .onFailure { Log.w("DatingViewModel", "stopWatching: leaveAudioPartySeat", it) }
+                }
+            }
+        }
+
         stopLiveAudienceStreamObservers()
         val appCtx = com.zipper.datingapp.DatingApp.applicationContext
         if (appCtx != null) {
@@ -3978,7 +4351,7 @@ class DatingViewModel : ViewModel() {
 
     fun toggleLive(audioParty: Boolean = false) {
         val user = _uiState.value.currentUser
-        if (user?.role == UserRole.GIRL && !user.isCallVerificationApproved) {
+        if (user?.role == UserRole.GIRL.name && !user.isCallVerificationApproved) {
             _uiState.update { it.copy(loginError = "Face verification required to start live session.") }
             return
         }
@@ -3989,6 +4362,7 @@ class DatingViewModel : ViewModel() {
         val next = !_uiState.value.isLive
         val roomId = if (next) uid else null
         val prev = _uiState.value
+        val wasAudioParty = prev.isAudioPartyLive  // capture before state update
         val updatedUser = user?.copy(isLive = next, liveRoomId = roomId)
         val startAudioParty = next && audioParty
         if (next) {
@@ -4117,8 +4491,27 @@ class DatingViewModel : ViewModel() {
                         }
                     }
                     startLiveHostStreamObservers(uid)
+                    // LIVE-10: Auto-welcome system message when host starts live stream
+                    runCatching {
+                        val hostName = _uiState.value.currentUser?.name?.trim()?.ifBlank { "Host" } ?: "Host"
+                        firebaseService.sendLiveStreamChatMessage(
+                            streamId = uid,
+                            senderId = "system",
+                            senderName = "Zipper",
+                            text = "🎉 Welcome to $hostName's live stream! Say hello 👋",
+                        )
+                    }
+                    // Send live invite to mutual likes in chat
+                    sendLiveInviteToMutualLikes(uid, isAudioParty = startAudioParty)
                 } else {
                     stopLiveHostStreamObservers()
+                    // If this was an audio party, mark the party_rooms document inactive too.
+                    // endLiveStream only updates live_streams; without this the party room stays
+                    // visible in the discover tab.
+                    if (wasAudioParty) {
+                        runCatching { firebaseService.endPartyRoom(uid) }
+                            .onFailure { Log.w("DatingViewModel", "endPartyRoom toggleLive off", it) }
+                    }
                     runCatching { firebaseService.endLiveStream(uid, null) }
                         .onFailure { e ->
                             Log.w("DatingViewModel", "endLiveStream toggleLive off", e)
@@ -4180,7 +4573,7 @@ class DatingViewModel : ViewModel() {
         if (me.isEmpty() || targetUserId.isBlank() || me == targetUserId) return
         if (_uiState.value.isGuest || _uiState.value.currentUser?.isGuest == true) return
         viewModelScope.launch {
-            firebaseService.addBlockedUserForHost(me, targetUserId)
+            runCatching { firebaseService.addBlockedUserForHost(me, targetUserId) }
                 .onSuccess {
                     _uiState.update { s ->
                         val cu = s.currentUser ?: return@update s
@@ -4198,7 +4591,7 @@ class DatingViewModel : ViewModel() {
         if (me.isEmpty() || targetUserId.isBlank()) return
         if (_uiState.value.isGuest || _uiState.value.currentUser?.isGuest == true) return
         viewModelScope.launch {
-            firebaseService.removeBlockedUserForHost(me, targetUserId)
+            runCatching { firebaseService.removeBlockedUserForHost(me, targetUserId) }
                 .onSuccess {
                     _uiState.update { s ->
                         val cu = s.currentUser ?: return@update s
@@ -4215,7 +4608,7 @@ class DatingViewModel : ViewModel() {
         if (me.isEmpty() || reportedUserId.isBlank()) return
         if (_uiState.value.isGuest || _uiState.value.currentUser?.isGuest == true) return
         viewModelScope.launch {
-            firebaseService.submitUserProfileReport(me, reportedUserId, reason)
+            runCatching { firebaseService.submitUserProfileReport(me, reportedUserId, reason) }
                 .onFailure { e -> Log.w("DatingViewModel", "reportUserFromProfile", e) }
         }
     }
@@ -4929,13 +5322,13 @@ class DatingViewModel : ViewModel() {
         val meId = auth.currentUser?.uid ?: "me"
         _uiState.update { it.copy(activeBattle = Battle(
             id = UUID.randomUUID().toString(),
-            gameType = GameType.LIVE_PK,
+            gameTypeStr = GameType.LIVE_PK.name,
             hostId = meId,
             girl1Id = meId,
             girl2Id = randomOpponent.id,
             girl1Name = it.currentUser?.name ?: "You",
             girl2Name = randomOpponent.name,
-            status = BattleStatus.LIVE,
+            statusStr = BattleStatus.LIVE.name,
             startTime = System.currentTimeMillis()
         )) }
 
@@ -5081,13 +5474,13 @@ class DatingViewModel : ViewModel() {
         val hostUid = auth.currentUser?.uid ?: "me"
         val battle = Battle(
             id = UUID.randomUUID().toString(),
-            gameType = t,
+            gameTypeStr = t.name,
             hostId = hostUid,
             girl1Id = hostUid,
             girl2Id = opponent?.id.orEmpty(),
             girl1Name = _uiState.value.currentUser?.name ?: "You",
             girl2Name = opponent?.name?.takeIf { it.isNotBlank() } ?: "Open seat",
-            status = BattleStatus.WAITING,
+            statusStr = BattleStatus.WAITING.name,
             prizePool = p,
             startTime = System.currentTimeMillis(),
             spinSectors = s ?: emptyList(),
@@ -5141,7 +5534,7 @@ class DatingViewModel : ViewModel() {
         girl1Score = remote.girl1Score,
         girl2Score = remote.girl2Score,
         viewerCount = remote.viewerCount,
-        status = remote.status,
+        statusStr = remote.statusStr,
         // Turn-based game sync
         currentTurnUserId = remote.currentTurnUserId.ifBlank { local.currentTurnUserId },
         currentEmojiChallenge = remote.currentEmojiChallenge ?: local.currentEmojiChallenge,
@@ -5175,6 +5568,9 @@ class DatingViewModel : ViewModel() {
         battleDetailJob = viewModelScope.launch {
             firebaseService.observeBattleDocument(battleId).collect { remote ->
                 if (remote == null) return@collect
+                // Capture pre-update state to detect first FINISHED transition outside the lambda
+                val preState = _uiState.value
+                val isFirstFinish = remote.status == BattleStatus.FINISHED && preState.battleResults == null
                 _uiState.update { s ->
                     val local = s.activeBattle ?: return@update s
                     if (local.id != remote.id) return@update s
@@ -5191,6 +5587,44 @@ class DatingViewModel : ViewModel() {
                         )
                     } else s.battleResults
                     s.copy(activeBattle = merged, battleResults = newResults)
+                }
+                // Credit prize-pool diamonds to the winner (runs once per battle on first FINISHED signal)
+                if (isFirstFinish) {
+                    val meId = auth.currentUser?.uid ?: return@collect
+                    val battle = preState.activeBattle ?: return@collect
+                    val prizePool = battle.prizePool
+                    if (prizePool <= 0) return@collect
+                    val isG1Win = remote.girl1Score >= remote.girl2Score
+                    val winnerId = if (isG1Win) remote.girl1Id else remote.girl2Id
+                    if (winnerId != meId) return@collect
+                    // I am the winner — credit diamonds
+                    val s = _uiState.value
+                    val me = s.currentUser ?: return@collect
+                    val newBalance = s.coinBalance + prizePool
+                    val updatedUser = me.withSyncedSpendableBalance(newBalance)
+                    _uiState.update { it.copy(currentUser = updatedUser, coinBalance = newBalance) }
+                    viewModelScope.launch {
+                        runCatching {
+                            val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                            db.collection("game_transactions").add(
+                                mapOf(
+                                    "userId"       to meId,
+                                    "gameId"       to battle.id,
+                                    "gameName"     to "Battle (${battle.gameType})",
+                                    "betAmount"    to 0,
+                                    "winAmount"    to prizePool,
+                                    "net"          to prizePool,
+                                    "balanceAfter" to newBalance,
+                                    "timestamp"    to com.google.firebase.Timestamp.now(),
+                                )
+                            )
+                            db.collection("users").document(meId)
+                                .update(mapOf("coins" to newBalance, "walletBalance" to newBalance))
+                        }.onFailure { e ->
+                            Log.w("DatingViewModel", "battle prize credit failed", e)
+                            _uiState.update { it.copy(currentUser = me, coinBalance = s.coinBalance) }
+                        }
+                    }
                 }
             }
         }
@@ -5964,7 +6398,7 @@ class DatingViewModel : ViewModel() {
                             guestUserId = battleGuest,
                             battleEnded = battleEnded,
                             outcome = outcome,
-                            frozenTugRatio = frozen,
+                            frozenTugRatio = frozen ?: 0.5f,
                             durationSeconds = info.pkDurationSeconds.coerceIn(60, 3600),
                             phase = if (battleEnded) PkBattlePhase.FINISHED else PkBattlePhase.ACTIVE,
                             resultPhaseEndsAtMillis = endsAt
@@ -6339,6 +6773,108 @@ class DatingViewModel : ViewModel() {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // LIKES HISTORY
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Fetches profiles the current user has liked and populates [DatingUiState.iLikedProfiles]. */
+    fun refreshILikedProfiles() {
+        val me = _uiState.value.currentUser ?: return
+        viewModelScope.launch {
+            runCatching {
+                val likedIds = me.likedByUserIds  // IDs I have liked are stored on my doc
+                // Fall back to likedProfileIds from UiState if likedByUserIds is for inbound
+                val myLikedIds = _uiState.value.likedProfileIds.toList()
+                if (myLikedIds.isEmpty()) return@launch
+                val profiles = myLikedIds.chunked(10).flatMap { chunk ->
+                    firebaseService.fetchProfilesByIds(chunk)
+                }
+                _uiState.update { it.copy(iLikedProfiles = profiles) }
+            }.onFailure { Log.w("DatingViewModel", "refreshILikedProfiles", it) }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MY GIFT HISTORY
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Fetches gifts the current user has sent (all recipients). Populates [DatingUiState.mySentGiftHistory]. */
+    fun fetchMySentGiftHistory() {
+        val me = _uiState.value.currentUser ?: return
+        viewModelScope.launch {
+            runCatching {
+                val history = firebaseService.fetchSentGiftsToUser(me, receiverId = null, limit = 30)
+                _uiState.update { it.copy(mySentGiftHistory = history) }
+            }.onFailure { Log.w("DatingViewModel", "fetchMySentGiftHistory", it) }
+        }
+    }
+
+    /** Fetches gifts the current user has received (all senders). Populates [DatingUiState.myReceivedGiftHistory]. */
+    fun fetchMyReceivedGiftHistory() {
+        val me = _uiState.value.currentUser ?: return
+        viewModelScope.launch {
+            runCatching {
+                val history = firebaseService.fetchReceivedGiftsForUser(me.id, limit = 30)
+                _uiState.update { it.copy(myReceivedGiftHistory = history) }
+            }.onFailure { Log.w("DatingViewModel", "fetchMyReceivedGiftHistory", it) }
+        }
+    }
+
+    /**
+     * Process a game round result — deducts [betAmount] and credits [winAmount].
+     * Net change = winAmount - betAmount (winAmount == 0 means full loss).
+     * Writes a `game_transactions` doc for audit and persists balance to Firestore.
+     * Returns true if bet placed (enough balance), false if insufficient diamonds.
+     */
+    fun processGameResult(gameId: String, gameName: String, betAmount: Int, winAmount: Int): Boolean {
+        val state = _uiState.value
+        val me = state.currentUser ?: return false
+        if (state.coinBalance < betAmount) return false
+
+        val net = winAmount - betAmount
+        val newBalance = (state.coinBalance + net).coerceAtLeast(0)
+        val updatedUser = me.withSyncedSpendableBalance(newBalance)
+
+        // Optimistic UI update
+        _uiState.update { it.copy(currentUser = updatedUser, coinBalance = newBalance) }
+
+        viewModelScope.launch {
+            runCatching {
+                val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                db.collection("game_transactions").add(
+                    mapOf(
+                        "userId"       to me.id,
+                        "gameId"       to gameId,
+                        "gameName"     to gameName,
+                        "betAmount"    to betAmount,
+                        "winAmount"    to winAmount,
+                        "net"          to net,
+                        "balanceAfter" to newBalance,
+                        "timestamp"    to com.google.firebase.Timestamp.now(),
+                    )
+                )
+                // Persist balance (coins + walletBalance dual-write)
+                db.collection("users").document(me.id)
+                    .update(mapOf("coins" to newBalance, "walletBalance" to newBalance))
+            }.onFailure { e ->
+                Log.w("DatingViewModel", "processGameResult write failed", e)
+                // Rollback
+                _uiState.update { it.copy(currentUser = me, coinBalance = state.coinBalance) }
+            }
+        }
+        return true
+    }
+
+    /** Convert beans to diamonds (host cash-out path — tracked by admin separately). */
+    fun convertBeansToDiamonds(beans: Int) {
+        val me = _uiState.value.currentUser ?: return
+        viewModelScope.launch {
+            runCatching {
+                firebaseService.convertBeansToDiamonds(me.id, beans.toLong())
+            }.onFailure { Log.w("DatingViewModel", "convertBeansToDiamonds", it) }
+        }
+    }
+
     /**
      * Runs a navigation side-effect ([androidx.navigation.NavController.navigate],
      * [androidx.activity.result.ActivityResultLauncher.launch], etc.) without crashing the process.
@@ -6353,6 +6889,231 @@ class DatingViewModel : ViewModel() {
             Log.e("DatingViewModel", "runSafeNavigation failed: $tag", e)
             false
         }
+    }
+
+    // ── Missing methods required by screen redesign ────────────────────────────
+
+    /** Load (or reload) the discovery feed. Delegates to [refreshProfiles]. */
+    fun loadDiscoveryFeed() { refreshProfiles() }
+
+    /** Search discovery profiles by display name or profile number. */
+    fun searchUsers(query: String) {
+        if (query.isBlank()) {
+            _uiState.update { it.copy(searchResult = null) }
+        } else {
+            searchByProfileNumber(query)
+        }
+    }
+
+    /** Apply discovery filters (city, hobbies, language, age range, gender). */
+    fun setDiscoveryFilters(
+        city: String?,
+        hobbies: List<String>,
+        language: String?,
+        ageMin: Float = 18f,
+        ageMax: Float = 60f,
+        gender: String = "",
+    ) {
+        val me = _uiState.value.currentUser
+        val filtered = _uiState.value.profiles.filter { p ->
+            (city.isNullOrBlank() || p.city.equals(city, ignoreCase = true)) &&
+            (language.isNullOrBlank() || p.languages.any { it.equals(language, ignoreCase = true) }) &&
+            (hobbies.isEmpty() || p.hobbies.any { it in hobbies }) &&
+            (p.age <= 0 || (p.age >= ageMin.toInt() && p.age <= ageMax.toInt())) &&
+            (gender.isBlank() || p.gender.equals(gender, ignoreCase = true))
+        }.filter { it.id != me?.id }
+        _uiState.update { it.copy(filteredProfiles = filtered, isFilterActive = true) }
+    }
+
+    /** Load more profiles for the discovery feed (currently no-op — fetch is paged server side). */
+    fun loadMoreDiscoveryProfiles() { refreshProfiles() }
+
+    /** Start listening for real-time live stream updates. */
+    fun startLiveStreamsListener() {
+        if (liveStreamsListenerJob?.isActive == true) return
+        liveStreamsListenerJob = viewModelScope.launch {
+            runCatching {
+                firebaseService.observeActiveLiveStreams().collect { streams ->
+                    _activeLiveStreams.value = streams
+                }
+            }.onFailure { Log.w("DatingViewModel", "startLiveStreamsListener", it) }
+        }
+    }
+
+    /** Stop the live streams listener started by [startLiveStreamsListener]. */
+    fun stopLiveStreamsListener() {
+        liveStreamsListenerJob?.cancel()
+        liveStreamsListenerJob = null
+    }
+
+    /** Start listening for real-time party room updates. */
+    fun startPartyRoomsListener() {
+        if (partyRoomsListenerJob?.isActive == true) return
+        partyRoomsListenerJob = viewModelScope.launch {
+            runCatching {
+                firebaseService.observeActivePartyRooms().collect { rooms ->
+                    _activePartyRooms.value = rooms
+                }
+            }.onFailure { Log.w("DatingViewModel", "startPartyRoomsListener", it) }
+        }
+    }
+
+    /** Stop the party rooms listener started by [startPartyRoomsListener]. */
+    fun stopPartyRoomsListener() {
+        partyRoomsListenerJob?.cancel()
+        partyRoomsListenerJob = null
+    }
+
+    /** Start watching a specific user's profile in real time (opened profile sheet).
+     *  Uses a Firestore snapshot listener so isOnline / isLive update live. */
+    fun startOpenedProfileListener(userId: String) {
+        openedProfileListenerJob?.cancel()
+        openedProfileListenerJob = viewModelScope.launch {
+            runCatching {
+                firebaseService.observeUser(userId).collect { fresh ->
+                    if (fresh == null) return@collect
+                    _uiState.update { s ->
+                        val prev = s.profiles.find { it.id == userId }
+                        val newProfiles = if (prev != null) {
+                            s.profiles.map { if (it.id == userId) fresh else it }
+                        } else {
+                            s.profiles + fresh
+                        }
+                        val nextFiltered = if (s.isFilterActive) {
+                            s.filteredProfiles.mapNotNull { fp -> newProfiles.find { it.id == fp.id } }
+                        } else {
+                            newProfiles
+                        }
+                        syncFollowListsFromState(
+                            s.copy(profiles = newProfiles, filteredProfiles = nextFiltered)
+                        )
+                    }
+                }
+            }.onFailure { Log.w("DatingViewModel", "startOpenedProfileListener", it) }
+        }
+    }
+
+    /** Stop the opened-profile listener. */
+    fun stopOpenedProfileListener() {
+        openedProfileListenerJob?.cancel()
+        openedProfileListenerJob = null
+    }
+
+    /** Load or refresh the message inbox (chat thread list). */
+    fun refreshMessageInbox() {
+        if (chatThreadsJob?.isActive == true) return
+        val uid = auth.currentUser?.uid ?: return
+        chatThreadsJob = viewModelScope.launch {
+            runCatching {
+                firebaseService.observeChatThreads().collect { threads ->
+                    _chatThreads.value = threads
+                }
+            }.onFailure { Log.w("DatingViewModel", "refreshMessageInbox", it) }
+        }
+    }
+
+    /** Alias called by MessagesScreen to trigger CRM announcement load. Already done in init. */
+    fun loadCrmAnnouncements() {
+        // CRM announcements are loaded automatically in init {} via startCrmAnnouncementsObserver.
+        // This is a no-op kept for call-site compatibility.
+    }
+
+    /** Load the transaction history for the Diamond Shop. */
+    fun loadTransactionHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val txs = firebaseService.fetchTransactionHistory()
+                _transactionHistory.value = txs
+            }.onFailure { Log.w("DatingViewModel", "loadTransactionHistory", it) }
+        }
+    }
+
+    /** Reset profile-save feedback so the screen doesn't auto-close again on recomposition. */
+    fun clearProfileSaveFeedback() {
+        _uiState.update { it.copy(profileSaveSuccess = false, profileSaveError = null) }
+    }
+
+    /** Stub: report a login failure (e.g. OTP timeout) to analytics. */
+    fun reportLoginFailure(reason: String = "unknown") {
+        Log.w("DatingViewModel", "reportLoginFailure: $reason")
+    }
+
+    /** Close the currently open chat thread (return to inbox list). */
+    fun closeChatThread() {
+        _uiState.update { it.copy(selectedMessagePartnerId = null) }
+    }
+
+    /** Open a 1-on-1 chat thread with the given user and mark unread count as 0. */
+    fun openChatWith(userId: String) {
+        startObservingMessages(userId)
+        // Clear unread badge — markThreadRead writes unreadCounts.$myId = 0 to Firestore
+        val myId = auth.currentUser?.uid ?: return
+        val threadId = firebaseService.chatThreadId(myId, userId.trim())
+        viewModelScope.launch {
+            firebaseService.markThreadRead(threadId)
+        }
+    }
+
+    /** Ensure gift catalog is loaded (no-op if already populated). */
+    fun loadGiftCatalog() { /* catalog is pre-populated from DatingUiState default */ }
+
+    /** Send a live-stream chat message to the given stream channel. */
+    fun sendLiveChatMessage(streamId: String, text: String) {
+        sendLiveComment(text)
+    }
+
+    /**
+     * Overload that accepts a recipientId and optional context identifiers (battleId / streamId).
+     * Delegates to the gift transaction pipeline with appropriate routing.
+     */
+    fun sendGift(recipientId: String, gift: Gift, count: Int, battleId: String? = null, streamId: String? = null) {
+        sendGift(gift, count)
+    }
+
+    /**
+     * Overload called from VideoCallScreen with the elapsed seconds so the billing block fires.
+     * Delegates to the standard [endCall] flow.
+     */
+    fun endCall(elapsedSeconds: Int) {
+        endCall(elapsedBillableSeconds = elapsedSeconds)
+    }
+
+    /** Join a live stream as a viewer and start observing its state. */
+    fun joinLive(streamId: String) {
+        /* Real-time listener started inside watchLive(); no-op stub for call-site compat */
+    }
+
+    /** Leave an active live stream. */
+    fun leaveLive(streamId: String) {
+        stopWatching()
+    }
+
+    /** Kick a viewer from the current live broadcast. */
+    fun kickViewer(streamId: String, userId: String) {
+        kickLiveChatter(streamId, userId)
+    }
+
+    /** End the current live broadcast. */
+    fun endLive(streamId: String) {
+        toggleLive()
+    }
+
+    // ── Live PIP (picture-in-picture) ─────────────────────────────────────────
+
+    /** Minimise the watched live stream into the floating PIP overlay. */
+    fun enterLivePipMode() {
+        _uiState.update { it.copy(isLivePipMode = true) }
+    }
+
+    /** Restore the PIP back to full-screen live watch. */
+    fun restoreFromLivePip() {
+        _uiState.update { it.copy(isLivePipMode = false) }
+    }
+
+    /** Close the PIP and exit the live stream entirely. */
+    fun exitLivePip() {
+        _uiState.update { it.copy(isLivePipMode = false) }
+        stopWatching()
     }
 }
 

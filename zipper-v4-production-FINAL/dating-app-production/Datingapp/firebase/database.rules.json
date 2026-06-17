@@ -44,6 +44,12 @@
         ".read": true,
         ".write": true
       }
+    },
+    "live_chat": {
+      "$streamId": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
     }
   }
 }

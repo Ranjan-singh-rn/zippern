@@ -103,7 +103,9 @@ fun LoginScreen(
     onSendOtp: (String, Activity) -> Unit,
     onVerifyOtp: (String) -> Unit,
     onGoogleSignIn: (String) -> Unit,
+    onGoogleSignInFailure: (Throwable) -> Unit,
     onSelectGender: (String) -> Unit,
+    onSetReferralCode: (String) -> Unit,
     onGuestLogin: () -> Unit,
     onUseAnotherAccount: () -> Unit,
     onBackToOptions: () -> Unit
@@ -111,6 +113,7 @@ fun LoginScreen(
     var phoneNumber by remember { mutableStateOf("") }
     var otpCode by remember { mutableStateOf("") }
     var showPhoneInput by remember { mutableStateOf(false) }
+    var referralInput by remember { mutableStateOf(uiState.registrationReferralCode) }
 
     BackHandler(enabled = uiState.isOtpSent || showPhoneInput) {
         if (uiState.isOtpSent) {
@@ -133,9 +136,13 @@ fun LoginScreen(
             try {
                 val account = task.getResult(ApiException::class.java)
                 account.idToken?.let { onGoogleSignIn(it) }
+                    ?: onGoogleSignInFailure(IllegalStateException("Google sign-in did not return an ID token."))
             } catch (e: ApiException) {
                 Log.e("LoginScreen", "Google sign in failed status=${e.statusCode}", e)
+                onGoogleSignInFailure(e)
             }
+        } else {
+            onGoogleSignInFailure(IllegalStateException("Google sign-in was cancelled or could not start."))
         }
     }
 
@@ -303,7 +310,7 @@ fun LoginScreen(
                         if (uiState.registrationGender.isBlank()) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Gender selection is required to continue.",
+                                text = "Select your gender to continue.",
                                 color = TextMuted,
                                 style = MaterialTheme.typography.labelSmall,
                                 modifier = Modifier.fillMaxWidth()
@@ -311,10 +318,13 @@ fun LoginScreen(
                         }
                         Spacer(modifier = Modifier.height(20.dp))
 
+                        val genderSelected = uiState.registrationGender.isNotBlank()
+
                         // Phone button
                         GradientButton(
                             onClick = { showPhoneInput = true },
                             modifier = Modifier.fillMaxWidth(),
+                            enabled = genderSelected && !uiState.isLoading,
                         ) {
                             Icon(
                                 Icons.Default.Phone,
@@ -342,7 +352,7 @@ fun LoginScreen(
                             shape = buttonShape,
                             border = androidx.compose.foundation.BorderStroke(1.dp, OutlineDefault),
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary),
-                            enabled = uiState.registrationGender.isNotBlank()
+                            enabled = genderSelected && !uiState.isLoading,
                         ) {
                             Icon(Icons.Default.Email, contentDescription = null, modifier = Modifier.size(20.dp))
                             Spacer(Modifier.width(12.dp))
@@ -356,16 +366,18 @@ fun LoginScreen(
 
                             OutlinedTextField(
                                 value = phoneNumber,
-                                onValueChange = { if (it.length <= 15) phoneNumber = it },
-                                label = { Text("Phone Number") },
+                                onValueChange = { if (it.length <= 13) phoneNumber = it.filter { c -> c.isDigit() } },
+                                label = { Text("Mobile Number") },
+                                placeholder = { Text("10-digit number", color = TextMuted) },
                                 modifier = Modifier.fillMaxWidth(),
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 leadingIcon = {
-                                    Icon(
-                                        Icons.Default.Phone,
-                                        contentDescription = null,
-                                        tint = TextMuted,
-                                        modifier = Modifier.size(20.dp),
+                                    Text(
+                                        text = "+91",
+                                        color = TextSecondary,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 15.sp,
+                                        modifier = Modifier.padding(start = 12.dp),
                                     )
                                 },
                                 singleLine = true,
@@ -383,10 +395,35 @@ fun LoginScreen(
 
                             Spacer(modifier = Modifier.height(12.dp))
 
+                            // Referral code — phone login only (not shown for Google/Guest)
+                            OutlinedTextField(
+                                value = referralInput,
+                                onValueChange = { v ->
+                                    referralInput = v.uppercase().filter { it.isLetterOrDigit() }
+                                    onSetReferralCode(referralInput)
+                                },
+                                label = { Text("Referral Code (optional)") },
+                                placeholder = { Text("e.g. ABC123", color = TextMuted) },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = BrandPurple,
+                                    unfocusedBorderColor = OutlineDefault,
+                                    focusedLabelColor = BrandPurple,
+                                    unfocusedLabelColor = TextMuted,
+                                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                                    cursorColor = BrandPurple,
+                                ),
+                                shape = fieldShape,
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
                             GradientButton(
                                 onClick = { activity?.let { onSendOtp(phoneNumber, it) } },
                                 modifier = Modifier.fillMaxWidth(),
-                                enabled = phoneNumber.isNotEmpty() && !uiState.isLoading && uiState.registrationGender.isNotBlank(),
+                                enabled = phoneNumber.length >= 10 && !uiState.isLoading,
                             ) {
                                 Text("Get OTP", fontWeight = FontWeight.SemiBold, color = Color.White, fontSize = 15.sp)
                             }
@@ -419,8 +456,13 @@ fun LoginScreen(
                         TextButton(
                             onClick = onGuestLogin,
                             modifier = Modifier.fillMaxWidth(),
+                            enabled = genderSelected && !uiState.isLoading,
                         ) {
-                            Text("Explore as Guest", color = TextMuted, style = MaterialTheme.typography.labelLarge)
+                            Text(
+                                "Explore as Guest",
+                                color = if (genderSelected) TextMuted else TextMuted.copy(alpha = 0.4f),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
                         }
 
                     } else if (uiState.isOtpSent) {

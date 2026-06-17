@@ -60,7 +60,7 @@ fun ProfileCard(profile: UserProfile, modifier: Modifier = Modifier) {
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "${profile.name}, ${profile.age}",
+                        text = "${profile.name}, ${profile.currentAge}",
                         style = MaterialTheme.typography.headlineLarge,
                         color = Color.White,
                         fontWeight = FontWeight.Bold

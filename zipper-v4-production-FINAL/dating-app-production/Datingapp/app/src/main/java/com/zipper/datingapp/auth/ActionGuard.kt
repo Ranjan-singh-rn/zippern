@@ -1,13 +1,4 @@
 package com.zipper.datingapp.auth
 
-fun checkAccess(
-    isGuest: Boolean,
-    onBlocked: () -> Unit,
-    action: () -> Unit
-) {
-    if (isGuest) {
-        onBlocked()
-    } else {
-        action()
-    }
-}
+// checkAccess is defined in AuthRepository.kt (same package) as an inline fun.
+// This file is intentionally left minimal to avoid duplicate-symbol ambiguity.

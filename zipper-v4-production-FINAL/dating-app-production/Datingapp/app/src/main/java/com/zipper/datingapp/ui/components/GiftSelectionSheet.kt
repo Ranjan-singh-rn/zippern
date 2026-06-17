@@ -300,7 +300,7 @@ fun GiftSelectionSheet(
                         }
                     }
                     is LuckyGiftsOutcome.Failure -> {
-                        Toast.makeText(ctx, outcome.message, Toast.LENGTH_LONG).show()
+                        Toast.makeText(ctx, outcome.reason, Toast.LENGTH_LONG).show()
                     }
                 }
             } finally {

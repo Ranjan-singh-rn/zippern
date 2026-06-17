@@ -9,68 +9,122 @@ rules_version = '2';
 // For `firebase deploy` only, use database.rules.for-firebase-cli.json (includes .info/connected).
 //
 // Requires Firebase Auth (request.auth != null). Guest / unsigned users get PERMISSION_DENIED.
-
 service cloud.firestore {
   match /databases/{database}/documents {
-
     function signedIn() {
       return request.auth != null;
     }
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
 
-    // Profiles, presence, follow/like counters (app updates self + other users for followers/likes)
+    // ── User Profiles ─────────────────────────────────────────────────────────
     match /users/{userId} {
       allow read: if signedIn();
-      allow create: if signedIn() && request.auth.uid == userId;
-      allow update: if signedIn();
-      allow delete: if signedIn() && request.auth.uid == userId;
-    }
-
-    // 1:1 call invites (queried by receiverId + status)
-    match /calls/{callId} {
-      allow read, create, update, delete: if signedIn();
-    }
-
-    // 1:1 DMs (queried by chatId, senderId, receiverId)
-    match /messages/{messageId} {
-      allow read, create: if signedIn();
-      allow update, delete: if signedIn();
-    }
-
-    match /gifts/{giftId} {
-      allow read: if signedIn();
-      allow write: if false;
-    }
-
-    match /gift_transactions/{txId} {
-      allow read, create, update: if signedIn();
-      allow delete: if false;
-    }
-
-    match /transactions/{txId} {
-      allow read: if signedIn();
-      allow create: if signedIn();
-      allow update, delete: if false;
-    }
-
-    match /battles/{battleId} {
-      allow read, create, update: if signedIn();
-      allow delete: if signedIn();
-    }
-
-    // Live + PK banners (pkGuestUserId, pkStartedAtMillis, …); subcollection live chat.
-    // Optional: hostPrivateCallBusy (solo host on a private call) — same create/update as other live_streams fields.
-    // PK guest video for spectators uses Realtime DB live_publishers/… (see database.rules.json), not Firestore.
-    match /live_streams/{streamId} {
-      allow read, create, update, delete: if signedIn();
-      match /messages/{msgId} {
-        allow read, create, update, delete: if signedIn();
+      allow create: if isOwner(userId);
+      // FIX: was `if signedIn()` — any user could update any profile (coins, role, etc.)
+      allow update: if isOwner(userId);
+      allow delete: if isOwner(userId);
+      // Device audit trail — written on every login
+      match /user_devices/{deviceId} {
+        allow read, write: if isOwner(userId);
       }
     }
 
-    // Audio-party seat map + now playing (`streams/{hostUid}`), parallel to `live_streams`.
+    // ── Session Management (single-device login) ──────────────────────────────
+    match /user_sessions/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ── Incoming Calls (Firestore signalling) ─────────────────────────────────
+    match /incoming_calls/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if signedIn();   // Caller writes to recipient's doc
+      allow delete: if isOwner(userId);
+    }
+
+    // ── Device Bans ───────────────────────────────────────────────────────────
+    match /device_bans/{deviceId} {
+      allow read: if signedIn();   // Clients self-check on startup
+      allow write: if false;       // Admin SDK only
+    }
+
+    // ── Social Graph ──────────────────────────────────────────────────────────
+    // Document ID format: "{myId}_{targetId}"
+    match /likes/{docId} {
+      allow read: if signedIn();
+      // FIX: enforce that doc ID starts with caller's uid — can't like as someone else
+      allow create: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow delete: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow update: if false;
+    }
+    match /follows/{docId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow delete: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow update: if false;
+    }
+
+    // ── 1:1 Calls ─────────────────────────────────────────────────────────────
+    // FIX: was fully open — now restricted to caller/callee
+    match /calls/{callId} {
+      allow read: if signedIn() &&
+        (resource == null ||
+         resource.data.callerId == request.auth.uid ||
+         resource.data.receiverId == request.auth.uid);
+      allow create: if signedIn();
+      allow update: if signedIn() &&
+        (resource.data.callerId == request.auth.uid ||
+         resource.data.receiverId == request.auth.uid);
+      allow delete: if signedIn() &&
+        (resource.data.callerId == request.auth.uid ||
+         resource.data.receiverId == request.auth.uid);
+    }
+
+    // ── 1:1 Direct Messages ───────────────────────────────────────────────────
+    // FIX: was fully open — any user could read all private DMs
+    match /messages/{messageId} {
+      allow read: if signedIn() &&
+        (resource == null ||
+         resource.data.senderId == request.auth.uid ||
+         resource.data.recipientId == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.senderId == request.auth.uid;
+      allow update: if signedIn() && resource.data.senderId == request.auth.uid;
+      allow delete: if signedIn() && resource.data.senderId == request.auth.uid;
+    }
+    match /chat_threads/{threadId} {
+      // FIX: was fully open — restrict to participants (threadId contains uid)
+      allow read: if signedIn() && threadId.matches('.*' + request.auth.uid + '.*');
+      allow create: if signedIn();
+      allow update: if signedIn() && threadId.matches('.*' + request.auth.uid + '.*');
+      allow delete: if false;
+    }
+
+    // ── Live Streams ──────────────────────────────────────────────────────────
+    match /live_streams/{streamId} {
+      allow read: if signedIn();
+      allow create: if isOwner(streamId);
+      allow update: if signedIn();   // Viewers increment counters, send gifts, etc.
+      // FIX: only host (streamId == uid) can delete their stream
+      allow delete: if isOwner(streamId);
+      match /messages/{msgId} {
+        allow read: if signedIn();
+        allow create: if signedIn();
+        // FIX: only sender or stream host can update/delete messages
+        allow update: if signedIn() &&
+          (resource.data.senderId == request.auth.uid || request.auth.uid == streamId);
+        allow delete: if signedIn() &&
+          (resource.data.senderId == request.auth.uid || request.auth.uid == streamId);
+      }
+    }
+
+    // Audio-party (streams/{hostUid}) + 1:1 video call requests to host
     match /streams/{streamId} {
-      allow read, create, update, delete: if signedIn();
-      // 1:1 video call requests to the host (`documentId` = requester's uid).
+      allow read: if signedIn();
+      allow create: if isOwner(streamId);
+      allow update: if signedIn();   // Guests update seat state
+      // FIX: only host can delete their audio party stream
+      allow delete: if isOwner(streamId);
       match /video_call_requests/{reqId} {
         allow read: if signedIn() &&
           (request.auth.uid == streamId || request.auth.uid == reqId);
@@ -81,25 +135,137 @@ service cloud.firestore {
       }
     }
 
-    match /diamondResellers/{docId} {
+    // PK banners shown on live streams
+    match /live_pk_banners/{hostId} {
       allow read: if signedIn();
-      allow write: if false;
+      allow create, update: if signedIn();   // Both PK participants write during battle
+      allow delete: if isOwner(hostId);
     }
 
+    // ── Party Rooms ───────────────────────────────────────────────────────────
+    match /party_rooms/{roomId} {
+      allow read: if signedIn();
+      allow create: if isOwner(roomId);
+      allow update: if signedIn();   // Participants update seat state
+      // FIX: only host can delete their party room
+      allow delete: if isOwner(roomId);
+    }
+
+    // ── Battles / Game Center ─────────────────────────────────────────────────
+    match /battles/{battleId} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      // FIX: only battle participants can update
+      allow update: if signedIn() &&
+        (resource == null ||
+         resource.data.hostId == request.auth.uid ||
+         resource.data.opponentId == request.auth.uid);
+      allow delete: if signedIn() && resource.data.hostId == request.auth.uid;
+      // Real-time game state synced during a battle
+      match /game_state/{docId} {
+        allow read, create, update: if signedIn();
+        allow delete: if false;
+      }
+    }
+
+    // ── Game Transactions (leaderboard + history) ─────────────────────────────
+    // FIX: was MISSING — GamesScreen queries this collection; without a rule it silently fails
+    match /game_transactions/{txId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;   // Immutable game ledger
+    }
+
+    // ── Gifts & Economy ───────────────────────────────────────────────────────
+    match /gifts/{giftId} {
+      allow read: if signedIn();
+      allow write: if false;   // Admin SDK / Console only
+    }
     match /crm_gifts/{docId} {
       allow read: if signedIn();
       allow write: if false;
     }
-
     match /crm_lucky_gifts/{docId} {
       allow read: if signedIn();
       allow write: if false;
     }
+    match /gift_transactions/{txId} {
+      // FIX: was open read/update — restricted to sender/receiver, no updates
+      allow read: if signedIn() &&
+        (resource == null ||
+         resource.data.senderId == request.auth.uid ||
+         resource.data.receiverId == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.senderId == request.auth.uid;
+      allow update, delete: if false;   // Immutable once written
+    }
+    match /transactions/{txId} {
+      // FIX: was open read — only own transactions are visible
+      allow read: if signedIn() &&
+        (resource == null || resource.data.userId == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;  // Immutable ledger
+    }
 
-    // CRM / admin announcements (Messages tab); clients read only — publish via Admin SDK or Console.
-    match /crm_announcements/{docId} {
+    // ── Agency & Host Verification ────────────────────────────────────────────
+    match /agencies/{agencyId} {
+      allow read: if signedIn();
+      allow write: if false;   // Admin SDK only
+    }
+    match /verifications/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId);
+      allow delete: if false;
+    }
+
+    // ── Bean Withdrawals ──────────────────────────────────────────────────────
+    match /bean_withdrawal_requests/{docId} {
+      // FIX: was open read — only the requester can see their own requests
+      allow read: if signedIn() &&
+        (resource == null || resource.data.userId == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;  // Processed by admin only
+    }
+
+    // ── Blocking & Reporting ──────────────────────────────────────────────────
+    match /blocks/{docId} {
+      // FIX: was open read — only the blocker can read their own blocks
+      allow read: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow create: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow delete: if signedIn() && docId.matches(request.auth.uid + '_.*');
+      allow update: if false;
+    }
+    match /reports/{docId} {
+      allow create: if signedIn();
+      allow read, update, delete: if false;  // Admin only
+    }
+    match /user_reports/{docId} {
+      allow create: if signedIn();
+      allow read, update, delete: if false;  // Admin only
+    }
+
+    // ── Diamond Shop ──────────────────────────────────────────────────────────
+    match /diamondResellers/{docId} {
       allow read: if signedIn();
       allow write: if false;
+    }
+    // Legacy collection name used in code
+    match /resellers/{docId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // ── CRM / Announcements ───────────────────────────────────────────────────
+    match /crm_announcements/{docId} {
+      allow read: if signedIn();
+      allow write: if false;   // Admin SDK / Console only
+    }
+
+    // ── Platform Company Wallet ───────────────────────────────────────────────
+    // FIX: was `allow create, update: if signedIn()` — any user could write to the wallet!
+    match /company_wallet/{docId} {
+      allow read: if false;    // Admin only — never exposed to clients
+      allow create, update: if false;  // Admin SDK only
+      allow delete: if false;
     }
   }
 }

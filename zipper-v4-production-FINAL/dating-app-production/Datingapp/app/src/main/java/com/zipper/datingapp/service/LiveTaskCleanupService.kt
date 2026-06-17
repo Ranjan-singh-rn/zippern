@@ -86,7 +86,7 @@ private object LiveBroadcastCleanup {
                 runCatching { firebaseService.endLiveStream(uid, streamDoc) }
                     .onFailure { e ->
                         Log.w(TAG, "endLiveStream onTaskRemoved", e)
-                        runCatching { firebaseService.clearLiveStreamPkBanner(uid) }
+                        runCatching { firebaseService.clearLiveStreamPkBannerIfDocumentExists(uid) }
                     }
             }.onFailure { e ->
                 Log.w(TAG, "endGhostSoloLiveIfNeeded", e)

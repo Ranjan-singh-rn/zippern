@@ -67,10 +67,10 @@ fun CreateBattleScreen(
     // Mystery Box State
     val mysteryBoxes = remember {
         mutableStateListOf(
-            MysteryBoxContent(0, MysteryRewardType.DIAMONDS, 100),
-            MysteryBoxContent(1, MysteryRewardType.BEANS, 50),
-            MysteryBoxContent(2, MysteryRewardType.DIAMONDS, 5000), // 1% item
-            MysteryBoxContent(3, MysteryRewardType.BEANS, 2000)   // 2% item
+            MysteryBoxContent(0, MysteryRewardType.DIAMONDS.name, 100),
+            MysteryBoxContent(1, MysteryRewardType.BEANS.name, 50),
+            MysteryBoxContent(2, MysteryRewardType.DIAMONDS.name, 5000), // 1% item
+            MysteryBoxContent(3, MysteryRewardType.BEANS.name, 2000)   // 2% item
         )
     }
 
@@ -294,13 +294,13 @@ fun MysteryCustomizationPanel(
                             Row(modifier = Modifier.weight(1.5f)) {
                                 FilterChip(
                                     selected = box.rewardType == MysteryRewardType.DIAMONDS,
-                                    onClick = { onBoxUpdate(index, box.copy(rewardType = MysteryRewardType.DIAMONDS)) },
+                                    onClick = { onBoxUpdate(index, box.copy(rewardTypeStr = MysteryRewardType.DIAMONDS.name)) },
                                     label = { Text("💎", fontSize = 10.sp) },
                                     modifier = Modifier.padding(end = 4.dp)
                                 )
                                 FilterChip(
                                     selected = box.rewardType == MysteryRewardType.BEANS,
-                                    onClick = { onBoxUpdate(index, box.copy(rewardType = MysteryRewardType.BEANS)) },
+                                    onClick = { onBoxUpdate(index, box.copy(rewardTypeStr = MysteryRewardType.BEANS.name)) },
                                     label = { Text("🫘", fontSize = 10.sp) }
                                 )
                             }

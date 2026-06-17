@@ -76,9 +76,16 @@ android {
 
     packaging {
         jniLibs {
-            // Uncompressed / legacy-aligned native libs — reduces WebRTC `.so` load failures on some OEM APK installs.
-            useLegacyPackaging = true
+            // All .so files are 16KB ELF-aligned (verified), so legacy packaging is not needed.
+            // Removing useLegacyPackaging = true silences the Android 15 16KB page-size popup
+            // and enables direct memory-mapping of libs from the APK (smaller RAM footprint).
+            useLegacyPackaging = false
         }
+    }
+
+    // Prevent TFLite model files from being compressed in the APK (required for memory-mapped inference).
+    androidResources {
+        noCompress += "tflite"
     }
 
     lint {
@@ -208,6 +215,10 @@ dependencies {
     // ML Kit Face Detection
     implementation(libs.mlkit.face.detection)
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+
+    // TensorFlow Lite — gender classification model for Phase 4 verification
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     
     // Graphics path
     implementation(libs.graphics.path)

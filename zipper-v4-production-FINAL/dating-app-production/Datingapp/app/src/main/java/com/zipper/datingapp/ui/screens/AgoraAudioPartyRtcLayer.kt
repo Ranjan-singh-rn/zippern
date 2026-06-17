@@ -80,7 +80,7 @@ fun AgoraAudioPartyRtcLayer(
 
     LaunchedEffect(channelId, firebaseUid, joinAsBroadcaster, micPermissionGranted, token) {
         if (channelId.isBlank() || firebaseUid.isBlank()) return@LaunchedEffect
-        val t = token ?: return@LaunchedEffect
+        val t = token ?: ""  // "" = no-auth / test mode; replace with signed token in production
         val publish = joinAsBroadcaster && micPermissionGranted
         manager.leaveChannel()
         delay(220)

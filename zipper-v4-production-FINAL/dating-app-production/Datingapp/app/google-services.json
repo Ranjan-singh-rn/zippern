@@ -23,6 +23,14 @@
           }
         },
         {
+          "client_id": "344965230552-qm5l5kekrsgkuatlq1si96vgdomqbbfi.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.zipper.datingapp",
+            "certificate_hash": "3fb7dbe08008ff21a71df29fbce7a93ef484092a"
+          }
+        },
+        {
           "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
           "client_type": 3
         }

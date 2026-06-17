@@ -4,15 +4,7 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
 
-/** Outcome of [com.zipper.datingapp.ui.DatingViewModel.processLuckyGifts]. */
-sealed class LuckyGiftsOutcome {
-    data class Success(
-        val diamondsWon: Int,
-        /** Matches `gift_transactions` id from `processLuckyGifts` (for live gift message dedup). */
-        val transactionId: String? = null,
-    ) : LuckyGiftsOutcome()
-    data class Failure(val message: String) : LuckyGiftsOutcome()
-}
+// LuckyGiftsOutcome is defined in Models.kt — do not duplicate here.
 
 /** Callable `processLuckyGifts` is deployed in `us-central1` — match region explicitly. */
 fun zipperFirebaseFunctions(): FirebaseFunctions =

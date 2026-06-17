@@ -12,9 +12,12 @@ import io.agora.rtc2.IRtcEngineEventHandler
 import io.agora.rtc2.RtcEngine
 import io.agora.rtc2.RtcEngineConfig
 import io.agora.rtc2.video.VideoCanvas
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * Thin wrapper around Agora RTC for Zipper live: solo host/audience, PK (multi-publisher channel), 1:1.
@@ -81,6 +84,33 @@ class AgoraManager(context: Context) {
             }
         }
 
+    /**
+     * Pre-initialise the Agora engine on an IO thread before the call screen shows.
+     * Call this from a coroutine (e.g. lifecycleScope.launch(Dispatchers.IO)) so
+     * RtcEngine.create() — which loads native libs and opens SQLite — never runs on Main.
+     */
+    suspend fun initEngineAsync() = withContext(Dispatchers.IO) {
+        ensureEngine()
+    }
+
+    private fun clearAgoraCorruptedCache() {
+        // Agora stores a SQLite state DB in filesDir/agorasdk/. If this DB has a schema
+        // mismatch (e.g. after SDK upgrade or crash) the "no such column: key" error fires
+        // on every init and onJoinChannelSuccess is never delivered. Wipe it so the SDK
+        // recreates a clean DB on next create().
+        try {
+            val agoraDir = File(appContext.filesDir, "agorasdk")
+            if (agoraDir.exists()) {
+                agoraDir.listFiles()
+                    ?.filter { it.name.endsWith(".db") || it.name.endsWith(".db-wal") || it.name.endsWith(".db-shm") }
+                    ?.forEach { it.delete() }
+                Log.d(TAG, "clearAgoraCorruptedCache: cleaned ${agoraDir.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "clearAgoraCorruptedCache failed", e)
+        }
+    }
+
     private fun ensureEngine(): RtcEngine? {
         if (destroyed) return null
         engine?.let {
@@ -91,6 +121,10 @@ class AgoraManager(context: Context) {
             Log.w(TAG, "AGORA_APP_ID empty — engine not created")
             return null
         }
+        // Clear any corrupted Agora SQLite state before creating the engine.
+        // This fixes the "no such column: key in android_metadata" error which
+        // prevents onJoinChannelSuccess from ever being delivered.
+        clearAgoraCorruptedCache()
         return try {
             val cfg =
                 RtcEngineConfig().apply {
@@ -98,7 +132,17 @@ class AgoraManager(context: Context) {
                     mAppId = appId
                     mEventHandler = eventHandler
                 }
-            RtcEngine.create(cfg).also { engine = it }
+            RtcEngine.create(cfg).also { rtc ->
+                engine = rtc
+                // Disable Agora's face-detection extension — it queries CameraMetadata
+                // face scores/rects on every frame and logs a warning when Android's
+                // STATISTICS_FACE_DETECT_MODE is not enabled (our case). This causes
+                // ~20-30 log lines/sec and wastes CPU on every camera frame.
+                runCatching {
+                    rtc.enableExtension("agora_video_filters_face_capture", "face_capture", false)
+                    rtc.enableExtension("agora_video_filters_face_detection", "face_detection", false)
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "RtcEngine.create failed", e)
             null
@@ -385,17 +429,18 @@ class AgoraManager(context: Context) {
         channelId: String,
         uid: Int,
         token: String?,
+        subscribeAudio: Boolean = true,
     ): Int {
         val rtc = ensureEngine() ?: return -1
         rtc.enableVideo()
-        rtc.enableAudio()
+        if (subscribeAudio) rtc.enableAudio()
         val options =
             ChannelMediaOptions().apply {
                 channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
                 clientRoleType = Constants.CLIENT_ROLE_AUDIENCE
                 publishMicrophoneTrack = false
                 publishCameraTrack = false
-                autoSubscribeAudio = true
+                autoSubscribeAudio = subscribeAudio
                 autoSubscribeVideo = true
                 startPreview = false
             }

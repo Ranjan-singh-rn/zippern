@@ -87,6 +87,22 @@ fun ProfileScreen(
     onOpenInboxForGifts: () -> Unit = {},
     /** Unblock a user id from Profile → Blocked users. */
     onUnblockUser: (String) -> Unit = {},
+    /** Load the current user's sent and received gift history. */
+    onLoadMyGiftHistory: () -> Unit = {},
+    /** Show My Profile full-screen sheet. */
+    onShowMyProfile: () -> Unit = {},
+    /** Navigate to Likes → I Like tab. */
+    onShowLikesILike: () -> Unit = {},
+    /** Navigate to Likes → Like Me tab. */
+    onShowLikesLikeMe: () -> Unit = {},
+    /** Open Blocked Users screen. */
+    onShowBlockedUsers: () -> Unit = {},
+    /** Refresh like counts (i-like and like-me). */
+    onRefreshLikeCounts: () -> Unit = {},
+    /** Open Feedback & Support screen. */
+    onFeedbackClick: () -> Unit = {},
+    /** Open My Bag (cosmetics) screen. */
+    onMyBagClick: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val user = uiState.currentUser ?: return
@@ -97,6 +113,8 @@ fun ProfileScreen(
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showBlockedUsersSheet by remember { mutableStateOf(false) }
+    var showLevelInfoDialog by remember { mutableStateOf(false) }
+    var showStreamingHistoryDialog by remember { mutableStateOf(false) }
 
     fun resolveBlockedDisplayName(uid: String): String {
         val u = uid.trim()
@@ -145,7 +163,8 @@ fun ProfileScreen(
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomStart)
-                        .padding(start = 20.dp, bottom = 50.dp),
+                        .padding(start = 20.dp, bottom = 50.dp)
+                        .clickable { onShowMyProfile() },
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     // Profile Avatar with Ring/Frame (online dot = Firestore [UserProfile.isOnline])
@@ -338,7 +357,7 @@ fun ProfileScreen(
                     // the card disappears immediately on local state update, without waiting for
                     // the Firestore listener to re-fire.
                     if (!user.hasBlueTick && !user.isVerified && !user.isFaceVerified &&
-                        user.faceVerificationStatus != VerificationStatus.APPROVED
+                        user.faceVerificationStatus != VerificationStatus.APPROVED.name
                     ) {
                         Surface(
                             modifier = Modifier
@@ -356,7 +375,7 @@ fun ProfileScreen(
                                 Spacer(Modifier.width(12.dp))
                                 Column {
                                     Text(
-                                        text = if (user.faceVerificationStatus == VerificationStatus.PENDING) "Verification Pending" else "Get Your Star Badge",
+                                        text = if (user.faceVerificationStatus == VerificationStatus.PENDING.name) "Verification Pending" else "Get Your Star Badge",
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 14.sp,
                                         color = MaterialTheme.colorScheme.onSurface,
@@ -375,13 +394,13 @@ fun ProfileScreen(
                     }
 
                     // Level Progress info for Girls
-                    if (user.role == UserRole.GIRL) {
+                    if (user.role == UserRole.GIRL.name) {
                         LevelProgressCard(user)
                         Spacer(modifier = Modifier.height(16.dp))
                     }
 
                     // Custom Call Price Section for Level 4+ Girls
-                    if (user.role == UserRole.GIRL && user.displayProfileLevel >= 4) {
+                    if (user.role == UserRole.GIRL.name && user.displayProfileLevel >= 4) {
                         CustomCallPriceSection(user = user, onSetCustomPrice = onSetCustomPrice)
                         Spacer(modifier = Modifier.height(16.dp))
                     }
@@ -391,12 +410,18 @@ fun ProfileScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("${user.iLikeCount}", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.clickable { onShowLikesILike() }
+                        ) {
+                            Text("${uiState.iLikedProfiles.size}", fontSize = 20.sp, fontWeight = FontWeight.Bold)
                             Text("I Like", fontSize = 14.sp, color = TextSecondary)
                         }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("${user.likeMeCount}", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.clickable { onShowLikesLikeMe() }
+                        ) {
+                            Text("${uiState.likedMeProfiles.size}", fontSize = 20.sp, fontWeight = FontWeight.Bold)
                             Text("Like Me", fontSize = 14.sp, color = TextSecondary)
                         }
                     }
@@ -473,7 +498,7 @@ fun ProfileScreen(
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // SPECIAL FEATURE: Convert Diamonds for Girls
-                    if (user.role == UserRole.GIRL) {
+                    if (user.role == UserRole.GIRL.name) {
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -508,25 +533,21 @@ fun ProfileScreen(
                             onClick = { showBlockedUsersSheet = true }
                         )
                     }
-                    ProfileMenuRow(
-                        Icons.Default.SportsEsports,
-                        stringResource(R.string.profile_game_center),
-                        stringResource(R.string.profile_play_win),
-                        onClick = onGameCenterClick
-                    )
                     // Added: Custom Call Price Setting for Level 4+ Girls
-                    if (user.role == UserRole.GIRL && user.displayProfileLevel >= 4) {
+                    if (user.role == UserRole.GIRL.name && user.displayProfileLevel >= 4) {
                         ProfileMenuRow(Icons.Default.Call, "Call Prices", "Set per min", onClick = onSetCustomPrice)
                     }
 
                     ProfileMenuRow(Icons.Default.CardGiftcard, "My Rewards", "New!", onClick = onRewardsClick)
+                    ProfileMenuRow(Icons.Default.ShoppingBag, "My Bag", "Frames & effects", onClick = onMyBagClick)
                     ProfileMenuRow(Icons.Default.Language, "Language", uiState.selectedLanguage.label, onClick = { showLanguageDialog = true })
-                    ProfileMenuRow(Icons.Default.Stars, "My Level", "Lv.${user.level}")
-                    ProfileMenuRow(Icons.Default.History, "Streaming History", "${user.totalLiveMinutes / 60}h streamed")
+                    ProfileMenuRow(Icons.Default.Stars, "My Level", "Lv.${user.level}", onClick = { showLevelInfoDialog = true })
+                    ProfileMenuRow(Icons.Default.History, "Streaming History", "${user.totalLiveMinutes / 60}h streamed", onClick = { showStreamingHistoryDialog = true })
+                    ProfileMenuRow(Icons.Default.HeadsetMic, "Feedback & Support", "Report issues", onClick = onFeedbackClick)
                     ProfileMenuRow(Icons.Default.Settings, stringResource(R.string.profile_settings), "", onClick = { showSettings = true })
 
                     // DISPLAY REFERRAL CODE AT THE BOTTOM
-                    if (user.referralCode.isNotEmpty()) {
+                    if (!user.referralCode.isNullOrEmpty()) {
                         Spacer(modifier = Modifier.height(24.dp))
                         Surface(
                             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f),
@@ -675,15 +696,6 @@ fun ProfileScreen(
                 )
 
                 SettingsItem(
-                    icon = Icons.Default.Language,
-                    title = stringResource(R.string.profile_app_language),
-                    onClick = {
-                        showSettings = false
-                        showLanguageDialog = true
-                    }
-                )
-
-                SettingsItem(
                     icon = Icons.Default.OpenInNew,
                     title = stringResource(R.string.profile_update_app),
                     onClick = {
@@ -779,11 +791,39 @@ fun ProfileScreen(
     if (showConvertDialog) {
         ConvertDiamondsDialog(
             diamondBalance = uiState.coinBalance,
-            onConvert = { 
+            onConvert = {
                 onConvertDiamonds(it)
                 showConvertDialog = false
             },
             onDismiss = { showConvertDialog = false }
+        )
+    }
+
+    if (showLevelInfoDialog) {
+        AlertDialog(
+            onDismissRequest = { showLevelInfoDialog = false },
+            title = { Text("My Level") },
+            text = {
+                Column {
+                    Text("Current Level: ${user.level}", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Keep spending diamonds to level up and unlock exclusive features!")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showLevelInfoDialog = false }) { Text("OK") } }
+        )
+    }
+
+    if (showStreamingHistoryDialog) {
+        AlertDialog(
+            onDismissRequest = { showStreamingHistoryDialog = false },
+            title = { Text("Streaming History") },
+            text = {
+                Column {
+                    Text("Total streamed: ${user.totalLiveMinutes / 60}h ${user.totalLiveMinutes % 60}m", fontWeight = FontWeight.Bold)
+                }
+            },
+            confirmButton = { TextButton(onClick = { showStreamingHistoryDialog = false }) { Text("Close") } }
         )
     }
 }
@@ -961,7 +1001,7 @@ fun RewardsDialog(points: Int, canClaim: Boolean, onClaim: () -> Unit, onDismiss
 @Composable
 fun LevelProgressCard(user: UserProfile) {
     val totalMinutes = user.totalLiveMinutes + user.totalStreamingMinutes
-    val diamonds = maxOf(user.diamondsEarned, user.gems)
+    val diamonds = maxOf(user.diamondsEarned, user.gems.toLong())
     val currentLv = computeHostLevel(totalMinutes, diamonds)
     val nextLv = (currentLv + 1).coerceAtMost(99)
     val tierName = levelTierName(currentLv)

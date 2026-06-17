@@ -22,10 +22,17 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import coil.compose.AsyncImage
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -57,7 +64,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.zipper.datingapp.auth.checkAccess
+import com.zipper.datingapp.security.BanManager
+import com.zipper.datingapp.security.DeviceTracker
+import com.zipper.datingapp.ui.screens.DeviceBanScreen
 import com.zipper.datingapp.ui.DatingViewModel
+import com.zipper.datingapp.ui.components.GlobalLivePip
 import com.zipper.datingapp.ui.components.FuturisticConfirmCloseDialog
 import com.zipper.datingapp.ui.components.GiftAssetPreloader
 import com.zipper.datingapp.ui.components.GiftOverlay
@@ -127,6 +138,17 @@ private fun runtimeOnboardingPermissionArray(): Array<String> {
 
 class MainActivity : AppCompatActivity() {
     private val viewModel: DatingViewModel by viewModels()
+
+    /**
+     * Lock the app's font scale to 1.0 regardless of the system accessibility setting.
+     * Without this, increasing "Font size" in Android Settings stretches every `sp` value
+     * in Compose and breaks the UI on every screen size.
+     */
+    override fun attachBaseContext(newBase: Context) {
+        val config = android.content.res.Configuration(newBase.resources.configuration)
+        config.fontScale = 1f
+        super.attachBaseContext(newBase.createConfigurationContext(config))
+    }
 
     /**
      * Holds the latest notification-tap intent so the Compose UI can react to it.
@@ -211,6 +233,7 @@ class MainActivity : AppCompatActivity() {
             !s.isAuthBootstrapComplete && !s.splashHoldTimedOut
         }
         super.onCreate(savedInstanceState)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
         // Prevent OS-level screenshots and screen recording; keep display awake while the app is in use (incl. embedded video calls).
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
@@ -246,6 +269,50 @@ class MainActivity : AppCompatActivity() {
                     viewModel.applyStoredLanguageCode(code)
                     AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(code))
                 }
+
+                // ── Device ban check — runs once at app start ────────────────
+                var deviceBanInfo by remember { mutableStateOf<com.zipper.datingapp.security.DeviceBanInfo?>(null) }
+                LaunchedEffect(Unit) {
+                    val ban = DeviceTracker.checkDeviceBan(this@MainActivity)
+                    if (ban != null) deviceBanInfo = ban
+                }
+                if (deviceBanInfo != null) {
+                    DeviceBanScreen(banInfo = deviceBanInfo!!)
+                    return@DatingAppTheme
+                }
+
+                // ── Single-device session — register on login, kick on duplicate ──
+                var activeSessionId by remember { mutableStateOf<String?>(null) }
+                LaunchedEffect(uiState.isLoggedIn, uiState.currentUser?.id) {
+                    val uid = uiState.currentUser?.id ?: return@LaunchedEffect
+                    if (!uiState.isLoggedIn) return@LaunchedEffect
+                    try {
+                        // Register this login; any prior device gets signed out automatically
+                        val sessionId = DeviceTracker.registerNewSession(this@MainActivity, uid)
+                        activeSessionId = sessionId
+                        // Listen: if another device logs in, sign this one out
+                        DeviceTracker.startSessionListener(uid, sessionId) {
+                            viewModel.logout(this@MainActivity)
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.w("MainActivity", "Session registration failed (non-fatal): ${e.message}")
+                    }
+                }
+
+                // ── Login suspension check — show remaining time if suspended ──
+                LaunchedEffect(uiState.isLoggedIn, uiState.currentUser?.id) {
+                    val uid = uiState.currentUser?.id ?: return@LaunchedEffect
+                    if (!uiState.isLoggedIn) return@LaunchedEffect
+                    val suspension = BanManager.checkLoginSuspension(uid)
+                    if (suspension != null) {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "Account suspended: ${suspension.remainingHours}h ${suspension.remainingMinutes}m remaining",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                        viewModel.logout(this@MainActivity)
+                    }
+                }
                 LaunchedEffect(
                     uiState.isLoggedIn,
                     uiState.isAuthBootstrapComplete,
@@ -260,6 +327,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 var showFaceVerification by remember { mutableStateOf(false) }
                 var showEditProfile by remember { mutableStateOf(false) }
+                // Auto-open EditProfile the first time a brand-new user logs in (so they can set name/DOB/photo)
+                LaunchedEffect(uiState.isNewUserSetupNeeded) {
+                    if (uiState.isNewUserSetupNeeded && uiState.currentUser != null) {
+                        showEditProfile = true
+                        viewModel.clearNewUserSetupFlag()
+                    }
+                }
                 var showCreateBattle by remember { mutableStateOf(false) }
                 var showGameCenter by remember { mutableStateOf(false) }
                 var showDiamondShop by remember { mutableStateOf(false) }
@@ -272,13 +346,6 @@ class MainActivity : AppCompatActivity() {
                 val snackbarHostState = remember { SnackbarHostState() }
                 
                 val context = LocalContext.current
-                LaunchedEffect(uiState.followActionError) {
-                    val err = uiState.followActionError
-                    if (!err.isNullOrBlank()) {
-                        Toast.makeText(context, err, Toast.LENGTH_LONG).show()
-                        viewModel.clearFollowActionError()
-                    }
-                }
                 LaunchedEffect(uiState.liveGiftMessage) {
                     val msg = uiState.liveGiftMessage
                     if (!msg.isNullOrBlank()) {
@@ -613,7 +680,7 @@ class MainActivity : AppCompatActivity() {
                         val u = uiState.currentUser
                         val alreadyVerified =
                             u?.isFaceVerified == true ||
-                                u?.faceVerificationStatus == VerificationStatus.APPROVED ||
+                                u?.faceVerificationStatus == VerificationStatus.APPROVED.name ||
                                 u?.isVerified == true ||
                                 u?.hasBlueTick == true
                         if (alreadyVerified) {
@@ -774,7 +841,9 @@ class MainActivity : AppCompatActivity() {
                             onSendOtp = { phone, activity -> viewModel.sendOtp(phone, activity) },
                             onVerifyOtp = { code -> viewModel.verifyOtp(code) },
                             onGoogleSignIn = { token -> viewModel.signInWithGoogle(token) },
+                            onGoogleSignInFailure = { error -> viewModel.reportLoginFailure(error.message ?: "unknown") },
                             onSelectGender = { gender -> viewModel.setRegistrationGender(gender) },
+                            onSetReferralCode = { code -> viewModel.setRegistrationReferralCode(code) },
                             onGuestLogin = { viewModel.loginAsGuest() },
                             onUseAnotherAccount = { viewModel.useAnotherAccount(this@MainActivity) },
                             onBackToOptions = { viewModel.resetOtpStatus() }
@@ -840,21 +909,33 @@ class MainActivity : AppCompatActivity() {
                     } else if (showEditProfile && uiState.currentUser != null) {
                         EditProfileScreen(
                             user = uiState.currentUser!!,
-                            onSave = { name, age, city, gender, email, mobile, bio, photo, gallery, referral ->
+                            uiState = uiState,
+                            onSave = { name, age, city, gender, email, mobile, bio, photo, gallery, referral, mimeTypes, hobbies, likes, dislikes, languages ->
                                 checkAccess(
                                     isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
                                     onBlocked = { showLoginRequiredSheet = true },
                                     action = {
                                         viewModel.updateProfileWithUploads(
-                                            name, age, city, gender, email, mobile, bio, photo, gallery, referral
+                                            name, age, city, gender, email, mobile, bio,
+                                            photo, gallery, referral,
+                                            hobbies = hobbies,
+                                            likes = likes,
+                                            dislikes = dislikes,
+                                            languages = languages,
                                         )
-                                        showEditProfile = false
                                     }
                                 )
                             },
+                            onSaveDone = { showEditProfile = false },
                             onUploadVideo = { viewModel.uploadVerificationVideo(it) },
                             onSelectFrame = { viewModel.selectFrame(it) },
-                            onBack = { showEditProfile = false }
+                            onBack = { showEditProfile = false },
+                            onClearSaveFeedback = { viewModel.clearProfileSaveFeedback() },
+                            onSendPhoneChangeOtp = { phone, activity -> viewModel.changePhone_sendOtp(phone, activity) },
+                            onVerifyPhoneChangeOtp = { otp -> viewModel.changePhone_verifyOtp(otp) },
+                            onClearPhoneChangeState = { viewModel.clearPhoneChangeState() },
+                            onChangeEmail = { email -> viewModel.changeEmail(email) },
+                            onClearEmailChangeState = { viewModel.clearEmailChangeState() },
                         )
                     } else if (showCreateBattle) {
                         CreateBattleScreen(
@@ -867,31 +948,13 @@ class MainActivity : AppCompatActivity() {
                             }
                         )
                     } else if (uiState.activeBattle != null) {
-                        // Game Center battles use LiveBattleScreen only (not LiveWatcher PK layout); mutually exclusive with activeBattle == null branches below.
-                        LiveBattleScreen(
-                            uiState = uiState,
-                            onEndBattle = { viewModel.leaveBattle() },
-                            onVote = { team -> viewModel.castVote(team) },
-                            onSupport = { team, gift, count ->
-                                checkAccess(
-                                    isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                    onBlocked = { showLoginRequiredSheet = true },
-                                    action = { viewModel.supportGirl(team, gift, count) }
-                                )
-                            },
-                            onStartSpin = { viewModel.startSpin() },
-                            onSpinComplete = { viewModel.completeSpin() },
-                            onOpenBox = { index -> viewModel.openMysteryBox(index) },
-                            onEmojiGameTurn = { emoji -> viewModel.setEmojiChallenge(emoji) },
-                            onSolveEmoji = { answer -> viewModel.solveEmojiChallenge(answer) },
-                            onClearGiftAnimation = { viewModel.clearPlayingGift() },
-                            onTopUpCoins = { showDiamondShop = true },
-                            onProcessLuckyGifts = { rid, price, qty ->
-                                viewModel.processLuckyGifts(rid, price, qty)
-                            },
-                            onLuckyGiftVisual = { g, rid, qty, tx ->
-                                viewModel.publishLuckyGiftVisual(g, rid, qty, tx)
-                            },
+                        // Game Center battles use PkBattleScreen only (not LiveWatcher PK layout); mutually exclusive with activeBattle == null branches below.
+                        val battle = uiState.activeBattle!!
+                        PkBattleScreen(
+                            viewModel = viewModel,
+                            battleId = battle.id,
+                            myStreamId = uiState.currentUser?.liveRoomId.orEmpty(),
+                            onBattleEnd = { viewModel.leaveBattle() },
                         )
                     } else if (showGameCenter) {
                         BattleLobbyScreen(
@@ -908,166 +971,17 @@ class MainActivity : AppCompatActivity() {
                             uiState.activeCallPartner != null &&
                             !(uiState.isLive && (uiState.isPkSearching || !uiState.pkRoomId.isNullOrBlank()))
                     ) {
-                        val hostProf = uiState.callOverlayHostProfile
-                        val streamerSide = uiState.webRtcCallIsStreamer
-                        val overlayHostName = when {
-                            !hostProf?.name.isNullOrBlank() -> hostProf!!.name
-                            streamerSide -> uiState.currentUser?.name.orEmpty()
-                            else -> uiState.activeCallPartner!!.name
-                        }.ifBlank { uiState.activeCallPartner!!.name }
-                        val overlayHostPhoto = hostProf?.photoUrl?.takeIf { it.isNotBlank() }
-                            ?: (if (streamerSide) uiState.currentUser?.photoUrl else null)?.takeIf { !it.isNullOrBlank() }
-                            ?: uiState.activeCallPartner!!.photoUrl
-                        val overlayFollowers = hostProf?.followerIds?.size ?: uiState.watchingLiveHostFollowerCount
-                        val webrtcLiveRoomId = uiState.webRtcSessionRoomId?.trim().orEmpty()
-                        val liveModHostUid = hostProf?.id?.trim().orEmpty().ifBlank {
-                            if (streamerSide) uiState.currentUser?.id.orEmpty() else uiState.activeCallPartner!!.id
-                        }
-                        val liveModMyUid = uiState.currentUser?.id.orEmpty()
-                        val pkGenderFor: (String) -> String = { uid ->
-                            val u = uid.trim()
-                            when {
-                                u.isEmpty() -> ""
-                                u == uiState.currentUser?.id -> uiState.currentUser?.gender.orEmpty()
-                                u == uiState.activeCallPartner?.id -> uiState.activeCallPartner?.gender.orEmpty()
-                                else -> uiState.profiles.find { it.id == u }?.gender
-                                    ?: uiState.filteredProfiles.find { it.id == u }?.gender
-                                    ?: ""
-                            }
-                        }
-                        val pkHudHostGender =
-                            uiState.pkBattleSession?.hostUserId?.let(pkGenderFor).orEmpty()
-                        val pkHudGuestGender =
-                            uiState.pkBattleSession?.guestUserId?.let(pkGenderFor).orEmpty()
-                        // Teaser calls use the same [VideoCallScreen] chrome as paid private 1:1; `isFreeTeaserCall` only affects video surfaces and top trackers inside the screen.
+                        val callPartner = uiState.activeCallPartner!!
                         VideoCallScreen(
-                            partner = uiState.activeCallPartner!!,
-                            isVideoButton = uiState.isVideoCallActive,
-                            callState = uiState.callState,
-                            callStatus = uiState.callStatus,
-                            isIncomingCall = uiState.isIncomingCall,
-                            onAcceptCall = { viewModel.acceptCall() },
-                            onToggleMic = { enabled ->
-                                WebRTCManager.activeManager()?.setAudioEnabled(enabled)
-                            },
-                            onToggleCamera = { enabled ->
-                                WebRTCManager.activeManager()?.setVideoEnabled(enabled)
-                            },
-                            isPkSearching = uiState.isPkSearching,
-                            pkStatusText = uiState.pkStatusText,
-                            pkRetryAvailable = uiState.pkRetryAvailable,
-                            onStartPk = { d -> viewModel.startRandomPk(d) },
-                            onInviteFollowerPk = {
-                                Toast.makeText(
-                                    context,
-                                    context.getString(R.string.pk_invite_follower_toast),
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            },
-                            onRetryPk = { d -> viewModel.startRandomPk(d) },
-                            onCancelPk = { viewModel.cancelRandomPk() },
-                            pkBattleSession = uiState.pkBattleSession,
-                            pkHudHostGender = pkHudHostGender,
-                            pkHudGuestGender = pkHudGuestGender,
-                            onPkBattleTimerFinished = { viewModel.markPkBattleTimerFinished() },
-                            pkRematchPending = uiState.pkRematchPending,
-                            onPkRematchChallenge = { viewModel.challengePkRematch() },
-                            pkHudShowRematchForHost = uiState.webRtcCallIsStreamer,
-                            onEndCall = { elapsed -> viewModel.endCall(elapsedBillableSeconds = elapsed) },
-                            isFreeTeaserCall = uiState.isFreeTeaserCall,
-                            onFreeTeaserExpired = {
-                                runCatching { WebRTCManager.activeManager()?.onDestroy() }
-                                viewModel.endCall()
-                                showTeaserPaywall = true
-                            },
-                            showWebrtcLiveOverlay = !uiState.webRtcSessionRoomId.isNullOrBlank(),
-                            webrtcOverlayShowBroadcastMetrics = uiState.webRtcShowLiveAudienceChrome,
-                            liveChatMessages = uiState.liveStreamChatMessages,
-                            liveChatSenderPhotoLookup = { uid ->
-                                uiState.profiles.find { it.id == uid }?.photoUrl?.takeIf { it.isNotBlank() }
-                                    ?: uiState.filteredProfiles.find { it.id == uid }?.photoUrl?.takeIf { it.isNotBlank() }
-                            },
-                            onLiveChatGiftRowClick = null,
-                            liveViewerCount = uiState.liveStreamViewerCount,
-                            pkHostViewerCount = uiState.pkHostViewerCount,
-                            pkGuestViewerCount = uiState.pkGuestViewerCount,
-                            pkHostViewerUserIds = uiState.pkHostViewerUserIds,
-                            pkGuestViewerUserIds = uiState.pkGuestViewerUserIds,
-                            liveAudienceViewerUserIds = uiState.liveAudienceViewerUserIds,
-                            overlayHostDisplayName = overlayHostName,
-                            overlayHostAvatarUrl = overlayHostPhoto,
-                            overlayHostFollowerCount = overlayFollowers,
-                            onSendLiveChat = { viewModel.sendLiveComment(it) },
-                            availableGifts = uiState.availableGifts,
-                            coinBalance = uiState.coinBalance,
-                            isGiftTransactionProcessing = uiState.isGiftTransactionProcessing,
-                            onSendGift = { gift, count -> viewModel.sendGift(gift, count) },
-                            onSendGiftToPkBattler = { uid, gift, count ->
-                                viewModel.sendGiftToLiveBattler(uid, gift, count)
-                            },
-                            onTopUpCoins = { showDiamondShop = true },
-                            onProcessLuckyGifts = { rid, price, qty ->
-                                viewModel.processLuckyGifts(rid, price, qty)
-                            },
-                            onLuckyGiftVisual = { g, rid, qty, tx ->
-                                viewModel.publishLuckyGiftVisual(g, rid, qty, tx)
-                            },
-                            diamondShopUiState = uiState,
-                            onBuyDiamonds = { viewModel.buyCoins(it) },
-                            liveStreamDocIdForModeration = webrtcLiveRoomId.takeIf { it.isNotEmpty() },
-                            streamHostUserIdForModeration = liveModHostUid.takeIf { it.isNotEmpty() },
-                            currentUserIdForModeration = liveModMyUid.takeIf { it.isNotEmpty() },
-                            onKickLiveChatter = webrtcLiveRoomId.takeIf { it.isNotEmpty() }?.let { rid ->
-                                { tid: String -> viewModel.kickLiveChatter(rid, tid) }
-                            },
-                            onBlockLiveChatter = run {
-                                val rid = webrtcLiveRoomId
-                                val host = liveModHostUid
-                                if (rid.isEmpty() || host.isEmpty()) null
-                                else {
-                                    { tid: String -> viewModel.blockLiveChatter(rid, host, tid) }
-                                }
-                            },
-                            onFollowLiveChatter = run {
-                                if (!streamerSide || webrtcLiveRoomId.isEmpty()) null
-                                else { tid: String, hint: String ->
-                                    checkAccess(
-                                        isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                        onBlocked = { showLoginRequiredSheet = true },
-                                        action = { viewModel.followLiveChatterFromHostMenu(tid, hint) }
-                                    )
-                                }
-                            },
-                            onLikeLiveChatter = run {
-                                if (!streamerSide || webrtcLiveRoomId.isEmpty()) null
-                                else { tid: String, _: String ->
-                                    checkAccess(
-                                        isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                        onBlocked = { showLoginRequiredSheet = true },
-                                        action = { viewModel.likeLiveChatterFromHostMenu(tid) }
-                                    )
-                                }
-                            },
-                            isCallDiamondPayer = streamerSide,
-                            onOpenLiveViewerProfile = { p ->
-                                viewModel.requestOpenProfileSheet(p.id, p)
-                            },
-                            onFollowLiveViewer = { p ->
-                                checkAccess(
-                                    isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                    onBlocked = { showLoginRequiredSheet = true },
-                                    action = { viewModel.toggleFollowProfile(p) }
-                                )
-                            },
-                            onPkSpectatorLikeHost = {
-                                uiState.activeCallPartner?.let { host ->
-                                    checkAccess(
-                                        isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                        onBlocked = { showLoginRequiredSheet = true },
-                                        action = { viewModel.likeProfile(host) }
-                                    )
-                                }
-                            },
+                            viewModel = viewModel,
+                            callId = uiState.webRtcSessionRoomId.orEmpty(),
+                            calleeId = callPartner.id,
+                            calleeName = callPartner.name,
+                            calleePhotoUrl = callPartner.photoUrl,
+                            isVideoCall = uiState.isVideoCallActive,
+                            rtcEngine = null,
+                            remoteAgoraUid = 0,
+                            onCallEnded = { elapsedSeconds -> viewModel.endCall(elapsedSeconds) },
                         )
                     } else {
                         DatingAppApp(
@@ -1161,36 +1075,189 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (showTeaserPaywall) {
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .zIndex(2500f)
+                        ModalBottomSheet(
+                            onDismissRequest = { showTeaserPaywall = false },
+                            containerColor = androidx.compose.material3.MaterialTheme.colorScheme.surface,
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
                         ) {
-                            TeaserRechargeBottomSheet(
-                                uiState = uiState,
-                                onDismiss = { showTeaserPaywall = false },
-                                onOpenFullShop = {
-                                    showTeaserPaywall = false
-                                    showDiamondShop = true
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .navigationBarsPadding()
+                                    .padding(horizontal = 24.dp, vertical = 20.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Text("💎", fontSize = 48.sp)
+                                Text(
+                                    "You're running low on diamonds!",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    textAlign = TextAlign.Center
+                                )
+                                Text(
+                                    "Recharge your diamonds to keep enjoying calls and gifts.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                                    textAlign = TextAlign.Center
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("Your balance", style = MaterialTheme.typography.bodyMedium)
+                                        Text(
+                                            "💎 ${uiState.coinBalance}",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
-                            )
+                                Spacer(Modifier.height(4.dp))
+                                Button(
+                                    onClick = {
+                                        showTeaserPaywall = false
+                                        showDiamondShop = true
+                                    },
+                                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color(0xFF9C27B0)
+                                    ),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("Get Diamonds", fontWeight = FontWeight.Bold)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        showTeaserPaywall = false
+                                        viewModel.endCall()
+                                    },
+                                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("End Call")
+                                }
+                                Spacer(Modifier.height(4.dp))
+                            }
                         }
                     }
 
-                    uiState.incomingCall?.let { incoming ->
-                        val callerPhoto = incoming.callerPhotoUrl.ifBlank {
-                            uiState.profiles.firstOrNull { it.id == incoming.callerId }?.photoUrl.orEmpty()
-                        }
-                        PremiumAppIncomingCallOverlay(
-                            callerName = incoming.callerName,
-                            callerPhotoUrl = callerPhoto,
-                            isVideoCall = incoming.isVideoCall,
-                            onAccept = { viewModel.acceptIncomingCall() },
-                            onDecline = { incomingDeclineConfirm = true },
+                    // In-app incoming call overlay (shown over any screen)
+                    val incoming = uiState.incomingCall
+                    if (incoming != null) {
+                        Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .zIndex(2000f)
-                        )
+                                .background(Color.Black.copy(alpha = 0.75f))
+                                .zIndex(3000f),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.85f)
+                                    .clip(RoundedCornerShape(24.dp))
+                                    .background(
+                                        Brush.verticalGradient(
+                                            listOf(Color(0xFF1A1A2E), Color(0xFF16213E))
+                                        )
+                                    )
+                                    .padding(vertical = 32.dp, horizontal = 24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                // Avatar
+                                Box(
+                                    modifier = Modifier
+                                        .size(96.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF2A2A3E)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (incoming.callerPhotoUrl.isNotBlank()) {
+                                        AsyncImage(
+                                            model = incoming.callerPhotoUrl,
+                                            contentDescription = incoming.callerName,
+                                            modifier = Modifier.fillMaxSize().clip(CircleShape),
+                                        )
+                                    } else {
+                                        Text(
+                                            incoming.callerName.take(1).uppercase(),
+                                            fontSize = 38.sp,
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(16.dp))
+                                Text(
+                                    incoming.callerName,
+                                    color = Color.White,
+                                    fontSize = 22.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                Text(
+                                    if (incoming.isVideoCall) "Incoming Video Call" else "Incoming Audio Call",
+                                    color = Color.White.copy(alpha = 0.65f),
+                                    fontSize = 14.sp,
+                                )
+                                Spacer(Modifier.height(32.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceEvenly,
+                                ) {
+                                    // Decline
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(64.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFFE53935))
+                                                .clickable { incomingDeclineConfirm = true },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Decline",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(28.dp),
+                                            )
+                                        }
+                                        Spacer(Modifier.height(8.dp))
+                                        Text("Decline", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                                    }
+                                    // Accept
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(64.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(0xFF43A047))
+                                                .clickable { viewModel.acceptIncomingCall() },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Call,
+                                                contentDescription = "Accept",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(28.dp),
+                                            )
+                                        }
+                                        Spacer(Modifier.height(8.dp))
+                                        Text("Accept", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (incomingDeclineConfirm && uiState.incomingCall != null) {
@@ -1387,6 +1454,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ── Picture-in-Picture (VideoCallScreen teaser/free calls) ─────────────────
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        enterPipIfVideoCallActive()
+    }
+
+    private fun enterPipIfVideoCallActive() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val state = viewModel.uiState.value
+        if (state.callState != com.zipper.datingapp.data.CallState.ACTIVE || !state.isVideoCallActive) return
+        try {
+            val params = android.app.PictureInPictureParams.Builder()
+                .setAspectRatio(android.util.Rational(9, 16))
+                .build()
+            enterPictureInPictureMode(params)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "enterPictureInPictureMode failed", e)
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: android.content.res.Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        viewModel.isInPipMode.value = isInPictureInPictureMode
+    }
+    // ───────────────────────────────────────────────────────────────────────────
+
     /**
      * Called when the activity is already running (singleTop) and a new notification intent
      * arrives. Funnels the intent into [notifIntentState] for the Compose UI to act on.
@@ -1504,6 +1600,127 @@ fun DatingAppApp(
     onPersistLanguage: (AppLanguage) -> Unit
 ) {
     val appContext = LocalContext.current
+
+    // ── Profile-routed screens ────────────────────────────────────────────────
+    var showMyProfile       by remember { mutableStateOf(false) }
+    var showLikesScreen     by remember { mutableStateOf(false) }
+    var likesInitialTab     by remember { mutableStateOf(0) }
+    var showDiamondHistory  by remember { mutableStateOf(false) }
+    var showBeansCenter     by remember { mutableStateOf(false) }
+    var showCallHistory     by remember { mutableStateOf(false) }
+    var showBlockedUsers    by remember { mutableStateOf(false) }
+    var showFeedbackScreen  by remember { mutableStateOf(false) }
+    var showMyBagScreen     by remember { mutableStateOf(false) }
+
+    // Full-screen overlays driven by ProfileScreen callbacks
+    if (showMyProfile) {
+        MyProfileScreen(
+            uiState = uiState,
+            onBack = { showMyProfile = false },
+            onEditProfile = { showMyProfile = false; onEditProfile() },
+            onEnterOwnLive = { showMyProfile = false; viewModel.setTab(1) },
+            onEnterOwnParty = { showMyProfile = false; viewModel.setTab(1) }
+        )
+        return
+    }
+    if (showLikesScreen) {
+        LikesScreen(
+            uiState = uiState,
+            initialTab = likesInitialTab,
+            onBack = { showLikesScreen = false },
+            onProfileClick = { profile ->
+                showLikesScreen = false
+                // Prefetch from server NOW so the feed list has up-to-date isLive before the
+                // profile sheet opens — ensures the PIP window appears instantly without
+                // waiting for startOpenedProfileListener to fire.
+                viewModel.prefetchOpenedProfileFromServer(profile.id)
+                viewModel.startOpenedProfileListener(profile.id)
+                viewModel.requestOpenProfileSheet(profile.id, profile)
+                viewModel.setTab(0)
+            }
+        )
+        return
+    }
+    if (showDiamondHistory) {
+        DiamondHistoryScreen(
+            viewModel = viewModel,
+            onBack = { showDiamondHistory = false },
+            onBuyDiamonds = { showDiamondHistory = false; onDiamondShopClick() },
+        )
+        return
+    }
+    if (showBeansCenter) {
+        BeansCenterScreen(
+            viewModel = viewModel,
+            uiState = uiState,
+            onBack = { showBeansCenter = false },
+            onConvertBeans = { beans -> viewModel.convertBeansToDiamonds(beans) }
+        )
+        return
+    }
+    if (showCallHistory) {
+        CallHistoryScreen(
+            viewModel = viewModel,
+            onBack = { showCallHistory = false },
+            onRecall = { userId -> viewModel.initiateCall(true, userId) }
+        )
+        return
+    }
+    if (showBlockedUsers) {
+        BlockedUsersScreen(
+            uiState = uiState,
+            onBack = { showBlockedUsers = false },
+            onUnblock = { uid -> viewModel.unblockUserFromProfile(uid) }
+        )
+        return
+    }
+    if (showFeedbackScreen) {
+        FeedbackScreen(
+            viewModel = viewModel,
+            onBack = { showFeedbackScreen = false },
+        )
+        return
+    }
+    if (showMyBagScreen) {
+        MyBagScreen(
+            onBack = { showMyBagScreen = false },
+        )
+        return
+    }
+    if (uiState.openProfileSheetForUserId != null) {
+        val profileUserId = uiState.openProfileSheetForUserId!!
+        val profileToShow = uiState.profiles.find { it.id == profileUserId }
+            ?: uiState.openProfileSheetHintProfile
+        LaunchedEffect(profileUserId) {
+            viewModel.prefetchOpenedProfileFromServer(profileUserId)
+            viewModel.startOpenedProfileListener(profileUserId)
+        }
+        if (profileToShow != null) {
+            UserProfileScreen(
+                profile = profileToShow,
+                uiState = uiState,
+                viewModel = viewModel,
+                onBack = {
+                    viewModel.clearOpenProfileSheetRequest()
+                    viewModel.stopOpenedProfileListener()
+                },
+                onStartChat = {
+                    viewModel.clearOpenProfileSheetRequest()
+                    viewModel.setTab(2)
+                },
+                onStartCall = { isVideo ->
+                    viewModel.clearOpenProfileSheetRequest()
+                    viewModel.initiateCall(isVideo, profileUserId)
+                },
+                onJoinLive = {
+                    viewModel.clearOpenProfileSheetRequest()
+                    viewModel.watchLiveByHostId(profileUserId)
+                }
+            )
+            return
+        }
+    }
+
     LaunchedEffect(uiState.selectedTab, uiState.watchingLivePartner?.id, uiState.isLive) {
         if (uiState.selectedTab == 1 &&
             uiState.watchingLivePartner != null &&
@@ -1512,18 +1729,38 @@ fun DatingAppApp(
             delay(420)
             WebRTCManager.activeManager()?.refreshVideoSinkAttachments("live_tab_reselected")
         }
+        // Refresh like counts whenever Settings tab (4) is opened so the counts match LikesScreen
+        if (uiState.selectedTab == 4) {
+            viewModel.refreshILikedProfiles()
+            viewModel.refreshLikedMeProfiles()
+        }
     }
-    BackHandler(enabled = uiState.watchingLivePartner != null) {
-        viewModel.stopWatching()
+    // Back from live audience: minimize to PIP instead of stopping
+    BackHandler(enabled = uiState.watchingLivePartner != null && !uiState.isLivePipMode) {
+        viewModel.enterLivePipMode()
+    }
+    // Back while PIP is active: close PIP (exits live)
+    BackHandler(enabled = uiState.isLivePipMode) {
+        viewModel.exitLivePip()
+    }
+    BackHandler(enabled = uiState.openProfileSheetForUserId != null) {
+        viewModel.clearOpenProfileSheetRequest()
+        viewModel.stopOpenedProfileListener()
     }
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val widthClass = maxWidth.toWindowWidthClass()
         val isCompact = widthClass == AppWindowWidthClass.Compact
+        val chatThreads by viewModel.chatThreads.collectAsStateWithLifecycle()
+        val totalUnreadMessages = remember(chatThreads) {
+            val myUid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+            chatThreads.sumOf { thread -> thread.unreadCounts[myUid] ?: 0 }
+        }
         val hideForPkAudience =
             uiState.watchingPkActive || uiState.watchingPkLingerSession != null
         val hideForPkHostOrBattler =
             uiState.pkBattleSession != null && uiState.webRtcShowLiveAudienceChrome
-        val hideNavChrome = uiState.watchingLivePartner != null ||
+        // Nav chrome hidden when watching live full-screen, but VISIBLE when in PIP mode
+        val hideNavChrome = (uiState.watchingLivePartner != null && !uiState.isLivePipMode) ||
             uiState.isLive ||
             hideForPkAudience ||
             hideForPkHostOrBattler
@@ -1537,7 +1774,7 @@ fun DatingAppApp(
                     MainBottomNavigation(
                         selectedTab = uiState.selectedTab,
                         onTabSelected = { viewModel.setTab(it) },
-                        unreadCount = 0
+                        unreadCount = totalUnreadMessages
                     )
                 } else {
                     Spacer(Modifier.height(0.dp))
@@ -1553,7 +1790,7 @@ fun DatingAppApp(
                     MainNavigationRail(
                         selectedTab = uiState.selectedTab,
                         onTabSelected = { viewModel.setTab(it) },
-                        unreadCount = 0,
+                        unreadCount = totalUnreadMessages,
                     )
                     VerticalDivider(
                         modifier = Modifier.fillMaxHeight(),
@@ -1564,317 +1801,142 @@ fun DatingAppApp(
                 Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                 when (uiState.selectedTab) {
                     0 -> HomeScreen(
-                        uiState = uiState,
-                        isGuestPreview = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                        onGuestRestricted = onRequestLoginRequired,
-                        onConsumedOpenProfileRequest = { viewModel.clearOpenProfileSheetRequest() },
-                        onProfileSheetTargetChanged = { userId ->
-                            if (userId != null) {
-                                viewModel.loadProfileGiftHistory(userId)
-                                viewModel.prefetchOpenedProfileFromServer(userId)
-                            } else {
-                                viewModel.clearProfileGiftHistory()
-                            }
-                        },
-                        onReset = { viewModel.refreshProfiles() },
-                        onVideoCall = { partner ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = {
-                                    if (uiState.currentUser?.isCallVerificationApproved == true) {
-                                        viewModel.initiateCall(true, partner.id)
-                                    } else {
-                                        onRequireFaceVerification { viewModel.initiateCall(true, partner.id) }
-                                    }
-                                }
-                            )
-                        },
-                        onMessage = { 
-                            viewModel.startObservingMessages(it.id)
-                            viewModel.setTab(2)
-                        },
-                        onWatchLive = { 
-                            viewModel.watchLive(it)
-                            viewModel.setTab(1)
-                        },
-                        onFollow = { viewModel.toggleFollowProfile(it) },
-                        onLike = { viewModel.likeProfile(it) },
-                        onApplyFilter = { age, level, city, cost -> viewModel.applyPaidFilters(age, level, city, cost) },
-                        onClearFilter = { viewModel.clearFilters() },
-                        onSearch = { viewModel.searchByProfileNumber(it) },
-                        onGiftToProfile = { profile, gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendPrivateGiftToUser(profile.id, gift, count) }
-                            )
-                        },
-                        onTopUpCoins = onDiamondShopClick,
-                        onProcessLuckyGifts = { rid, price, qty ->
-                            viewModel.processLuckyGifts(rid, price, qty)
-                        },
-                        onLuckyGiftVisual = { g, rid, qty, tx ->
-                            viewModel.publishLuckyGiftVisual(g, rid, qty, tx)
-                        },
-                        onArmMarketingFreeCallHook = { viewModel.armMarketingFreeCallHook() },
-                        onBlockProfile = { p -> viewModel.blockUserFromProfile(p.id) },
-                        onReportProfile = { p, reason -> viewModel.reportUserFromProfile(p.id, reason) },
+                        viewModel = viewModel,
+                        onProfileClick = { userId -> viewModel.requestOpenProfileSheet(userId) },
+                        onNotificationClick = { viewModel.setTab(2) },
                     )
-                    1 -> LiveScreen(
-                        uiState = uiState,
-                        isGuestPreview = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                        onGuestRestricted = onRequestLoginRequired,
-                        onToggleLive = onToggleLive,
-                        onAudioPartySeatCountChange = { viewModel.setAudioPartySeatCount(it) },
-                        onAudioPartyClaimSeat = { host, seat -> viewModel.claimAudioPartySeat(host, seat) },
-                        onAudioPartyLeaveSeat = { host, seat -> viewModel.leaveAudioPartySeat(host, seat) },
-                        onAudioPartyHostSeatAction = { host, action -> viewModel.hostAudioPartySeatAction(host, action) },
-                        onAudioPartySetMyMic = { host, on -> viewModel.setMyAudioPartySeatPublishing(host, on) },
-                        onAudioPartyMergeNowPlaying = { t, a -> viewModel.mergeAudioPartyNowPlayingForHost(t, a) },
-                        onAudioPartySendEmoji = { viewModel.sendAudioPartyStageEmoji(it) },
-                        onAudioPartyRoomBackgroundChange = { viewModel.setAudioPartyRoomBackground(it) },
-                        onRecordStreamingMinutes = { viewModel.recordLiveStreamingMinutes(it) },
-                        onSendGift = { gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGift(gift, count) }
+                    1 -> when {
+                        // ── Host: audio party room ───────────────────────────────────────
+                        uiState.isLive && uiState.isAudioPartyLive -> {
+                            val me = uiState.currentUser
+                            AudioPartyStageLayout(
+                                seatCount = uiState.audioPartySeatCount,
+                                stream = uiState.audioPartyStream,
+                                hostUserId = me?.id.orEmpty(),
+                                myUserId = me?.id.orEmpty(),
+                                isHost = true,
+                                title = "Party Room",
+                                subtitle = me?.name.orEmpty(),
+                                hostDisplayName = me?.name.orEmpty(),
+                                hostPhotoUrl = me?.photoUrl.orEmpty(),
+                                hostProfileNumber = me?.profileNumber.orEmpty(),
+                                hostBeans = me?.beans ?: 0,
+                                hostHasBlueTick = me?.hasBlueTick ?: false,
+                                showSeatCountControls = true,
+                                onSeatCountSelected = { viewModel.setAudioPartySeatCount(it) },
+                                onClaimSeat = { seatIdx ->
+                                    viewModel.claimAudioPartySeat(me?.id.orEmpty(), seatIdx)
+                                },
+                                onLeaveSeat = { seatIdx ->
+                                    viewModel.leaveAudioPartySeat(me?.id.orEmpty(), seatIdx)
+                                },
+                                onHostSeatAction = { action ->
+                                    viewModel.hostAudioPartySeatAction(me?.id.orEmpty(), action)
+                                },
+                                onToggleMySeatMic = { /* no-op: host always unmuted */ },
+                                onMergeNowPlaying = { t, a ->
+                                    viewModel.mergeAudioPartyNowPlayingForHost(t, a)
+                                },
+                                onSendStageEmoji = { viewModel.sendAudioPartyStageEmoji(it) },
+                                showTopQuickEmojis = true,
+                                onEndParty = { viewModel.toggleLive() },
                             )
-                        },
-                        onSendPkBattlerGift = { uid, gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGiftToLiveBattler(uid, gift, count) }
+                            // Wire Agora audio — host joins as broadcaster
+                            AgoraAudioPartyRtcLayer(
+                                channelId = uiState.currentRoomId.orEmpty(),
+                                firebaseUid = me?.id.orEmpty(),
+                                joinAsBroadcaster = true,
+                                micPermissionGranted = true,
+                                token = null,
+                                signalHostStreamReady = false,
+                                onEngineReady = {},
                             )
-                        },
-                        onWatchLive = { viewModel.watchLive(it) },
-                        onFollow = { viewModel.toggleFollowProfile(it) },
-                        onStopWatching = { viewModel.stopWatching() },
-                        onGoBattleMode = { viewModel.startBattle() },
-                        onCall = {
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.initiateCall(true, it.id) }
+                        }
+                        // ── Host: solo video live ────────────────────────────────────────
+                        uiState.isLive -> {
+                            LiveBroadcastScreen(
+                                viewModel = viewModel,
+                                streamId = uiState.currentRoomId.orEmpty(),
+                                rtcEngine = null,
+                                onEndLive = { onToggleLive(false) },
+                                onStartPk = { /* PK initiated from within LiveBroadcastScreen */ },
+                                onOpenGames = onShowGameCenter,
                             )
-                        },
-                        onMessage = { 
-                            viewModel.startObservingMessages(it.id)
-                            viewModel.setTab(2)
-                        },
-                        onSendDmWhileWatching = { profile, text ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendMessage(profile.id, text) }
+                        }
+                        // ── Audience: audio party room ───────────────────────────────────
+                        uiState.watchingLivePartner != null && uiState.watchingLiveStreamIsAudioOnly && !uiState.isLivePipMode -> {
+                            val partner = uiState.watchingLivePartner!!
+                            val myId = uiState.currentUser?.id.orEmpty()
+                            AudioPartyStageLayout(
+                                seatCount = uiState.watchingLiveAudioPartySeatCount,
+                                stream = uiState.audioPartyStream,
+                                hostUserId = partner.id,
+                                myUserId = myId,
+                                isHost = false,
+                                title = partner.name,
+                                subtitle = "",
+                                hostDisplayName = partner.name,
+                                hostPhotoUrl = partner.photoUrl,
+                                hostProfileNumber = partner.profileNumber,
+                                hostBeans = partner.beans,
+                                hostHasBlueTick = partner.hasBlueTick,
+                                showSeatCountControls = false,
+                                onSeatCountSelected = {},
+                                onClaimSeat = { seatIdx ->
+                                    viewModel.claimAudioPartySeat(partner.id, seatIdx)
+                                },
+                                onLeaveSeat = { seatIdx ->
+                                    viewModel.leaveAudioPartySeat(partner.id, seatIdx)
+                                },
+                                onToggleMySeatMic = { publishing ->
+                                    viewModel.setMyAudioPartySeatPublishing(partner.id, publishing)
+                                },
+                                onLeave = { viewModel.stopWatching() },
                             )
-                        },
-                        onBuyDiamonds = { viewModel.buyCoins(it) },
-                        onUploadIntroVideo = { viewModel.uploadVerificationVideo(it) },
-                        onSendComment = { viewModel.sendLiveComment(it) },
-                        onClearGiftAnimation = { viewModel.clearPlayingGift() },
-                        onTopUpCoins = { onDiamondShopClick() },
-                        onStartPk = { d -> viewModel.startRandomPk(d) },
-                        onInviteFollowerPk = {
-                            Toast.makeText(
-                                appContext,
-                                appContext.getString(R.string.pk_invite_follower_toast),
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        },
-                        onRetryPk = { d -> viewModel.startRandomPk(d) },
-                        onCancelPk = { viewModel.cancelRandomPk() },
-                        onPkBattleTimerFinished = { viewModel.markPkBattleTimerFinished() },
-                        onPkRematchChallenge = { viewModel.challengePkRematch() },
-                        onPkFindAnotherOpponent = {
-                            viewModel.startRandomPk(uiState.pkBattleSession?.durationSeconds ?: 300)
-                        },
-                        onPkOpponentPeerDisconnected = {
-                            viewModel.handlePkOpponentPeerDisconnectedFromComposeHost()
-                        },
-                        onHostStreamReady = { viewModel.ensureLivePublishedToFirestore() },
-                        onLikeLive = { viewModel.likeLiveStream(it) },
-                        onKickLiveChatter = { streamDocId, targetUserId ->
-                            viewModel.kickLiveChatter(streamDocId, targetUserId)
-                        },
-                        onBlockLiveChatter = { streamDocId, hostUid, targetUserId ->
-                            viewModel.blockLiveChatter(streamDocId, hostUid, targetUserId)
-                        },
-                        onFollowLiveChatter = { tid, hint ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.followLiveChatterFromHostMenu(tid, hint) }
+                            // Wire Agora audio — audience joins as listener
+                            AgoraAudioPartyRtcLayer(
+                                channelId = partner.id,
+                                firebaseUid = myId,
+                                joinAsBroadcaster = false,
+                                micPermissionGranted = false,
+                                token = null,
+                                signalHostStreamReady = false,
+                                onEngineReady = {},
                             )
-                        },
-                        onLikeLiveChatter = { tid, _ ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.likeLiveChatterFromHostMenu(tid) }
+                        }
+                        // ── Audience: full-screen live viewer ────────────────────────────
+                        uiState.watchingLivePartner != null && !uiState.isLivePipMode -> {
+                            val partner = uiState.watchingLivePartner!!
+                            LiveViewerScreen(
+                                viewModel = viewModel,
+                                streamId = partner.id,
+                                hostUid = 0,   // 0 = subscribe to first publisher in channel
+                                rtcEngine = null,
+                                onLeave = { viewModel.enterLivePipMode() },
                             )
-                        },
-                        onRefreshLiveDiscover = { viewModel.refreshLiveDiscoverFromServer() },
-                        onClearLiveDiscoverNotice = { viewModel.clearLiveDiscoverNotice() },
-                        onPrivateGiftToChatter = { profile, gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendPrivateGiftToUser(profile.id, gift, count) }
-                            )
-                        },
-                        onOpenUserProfile = { profile ->
-                            viewModel.setTab(0)
-                            viewModel.requestOpenProfileSheet(profile.id, profile)
-                        },
-                        onStartDmObservationForPartner = { viewModel.startObservingMessages(it.id) },
-                        onClearDmThreadFocus = { viewModel.clearMessageThreadFocus() },
-                        onChatSendMessage = { userId, text ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendMessage(userId, text) }
-                            )
-                        },
-                        onChatSendImageMessage = { userId, imageUri ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendImageMessage(userId, imageUri) }
-                            )
-                        },
-                        onChatConsumeImageUploadError = { viewModel.clearImageUploadError() },
-                        onChatSendGiftMessage = { userId, gift ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGiftMessage(userId, gift) }
-                            )
-                        },
-                        onChatSendGift = { gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGift(gift, count) }
-                            )
-                        },
-                        onChatStartCall = { isVideo, receiverId ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.initiateCall(isVideo, receiverId) }
-                            )
-                        },
-                        onLiveProfileGiftTargetChanged = { userId ->
-                            if (userId != null) {
-                                viewModel.loadProfileGiftHistory(userId)
-                                viewModel.prefetchOpenedProfileFromServer(userId)
-                            } else {
-                                viewModel.clearProfileGiftHistory()
-                            }
-                        },
-                        onLikeProfile = { viewModel.likeProfile(it) },
-                        onGiftToProfile = { profile, gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendPrivateGiftToUser(profile.id, gift, count) }
-                            )
-                        },
-                        onConfirmPkWatchPerspective = { hostId, key, forHost ->
-                            viewModel.confirmPkWatchAudiencePerspective(hostId, key, forHost)
-                        },
-                        onSwipeToAdjacentLive = { step -> viewModel.switchWatchingLiveInFeed(step) },
-                        onClearLiveSwipeNoOthersNotice = { viewModel.clearLiveSwipeNoOthersNotice() },
-                        onBlockUserFromProfile = { p -> viewModel.blockUserFromProfile(p.id) },
-                        onReportUserFromProfile = { p, reason ->
-                            viewModel.reportUserFromProfile(p.id, reason)
-                        },
-                        onProcessLuckyGifts = { rid, price, qty ->
-                            viewModel.processLuckyGifts(rid, price, qty)
-                        },
-                        onLuckyGiftVisual = { g, rid, qty, tx ->
-                            viewModel.publishLuckyGiftVisual(g, rid, qty, tx)
-                        },
-                        onGetAgoraToken = { ch, publisher ->
-                            viewModel.getAgoraToken(ch, publisher)
-                        },
-                        onSetLiveDiscoverSurface = { viewModel.setLiveDiscoverSurface(it) },
-                        onSetLiveDiscoverLiveFilter = { viewModel.setLiveDiscoverLiveFilter(it) },
-                        onRequestAudioPartyVideoCallWithHost = { hostId ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.requestVideoCallWithAudioPartyHost(hostId) }
-                            )
-                        },
-                        onHostRespondAudioPartyVideoCall = { fromUserId, accept ->
-                            viewModel.hostRespondAudioPartyVideoCall(fromUserId, accept)
-                        },
+                        }
+                        // ── Default: live discovery grid ─────────────────────────────────
+                        else -> LiveScreen(
+                            viewModel = viewModel,
+                            onJoinLive = { streamId -> viewModel.watchLive(com.zipper.datingapp.data.UserProfile(id = streamId)) },
+                            onJoinParty = { roomId -> viewModel.watchLive(com.zipper.datingapp.data.UserProfile(id = roomId)) },
+                            onGoLive = { onToggleLive(false) },
+                            onGoParty = { onToggleLive(true) },
+                        )
+                    }
+                    2 -> {
+                    // Refresh the inbox thread list whenever the Messages tab becomes active
+                    // (guards against the race where scheduleGlobalInboxPrefetch ran at login
+                    // before the user had any messages, leaving the list blank until first reply).
+                    LaunchedEffect(Unit) { viewModel.refreshMessageInbox() }
+                    MessagesScreen(
+                        viewModel = viewModel,
+                        onOpenProfile = { userId -> viewModel.requestOpenProfileSheet(userId) },
                     )
-                    2 -> MessagesScreen(
-                        uiState = uiState,
-                        isGuestPreview = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                        onGuestRestricted = onRequestLoginRequired,
-                        onSendMessage = { userId, text ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendMessage(userId, text) }
-                            )
-                        },
-                        onSendImageMessage = { userId, imageUri ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendImageMessage(userId, imageUri) }
-                            )
-                        },
-                        onConsumeImageUploadError = { viewModel.clearImageUploadError() },
-                        onSendGiftMessage = { userId, gift ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGiftMessage(userId, gift) }
-                            )
-                        },
-                        onSendGift = { gift, count ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.sendGift(gift, count) }
-                            )
-                        },
-                        onTopUpCoins = { onDiamondShopClick() },
-                        onStartCall = { isVideo, receiverId ->
-                            checkAccess(
-                                isGuest = uiState.currentUser?.isGuest == true || uiState.isGuest,
-                                onBlocked = onRequestLoginRequired,
-                                action = { viewModel.initiateCall(isVideo, receiverId) }
-                            )
-                        },
-                        onSelectPartner = { userId -> viewModel.startObservingMessages(userId) },
-                        onClearMessageThreadFocus = { viewModel.clearMessageThreadFocus() },
-                        onProcessLuckyGifts = { rid, price, qty ->
-                            viewModel.processLuckyGifts(rid, price, qty)
-                        },
-                        onLuckyGiftVisual = { g, rid, qty, tx ->
-                            viewModel.publishLuckyGiftVisual(g, rid, qty, tx)
-                        },
-                    )
-                    3 -> FollowedScreen(
-                        uiState = uiState,
-                        onWatchLive = {
-                            viewModel.watchLive(it)
-                            viewModel.setTab(1)
-                        },
-                        onOpenProfile = { profile ->
-                            viewModel.setTab(0)
-                            viewModel.requestOpenProfileSheet(profile.id, profile)
-                        },
-                        onRefreshLikedMeList = { viewModel.refreshLikedMeProfiles() }
+                    } // end tab 2 block
+                    3 -> GamesScreen(
+                        viewModel = viewModel,
+                        onBack = { viewModel.setTab(0) },
                     )
                     4 -> ProfileScreen(
                         uiState = uiState,
@@ -1882,10 +1944,10 @@ fun DatingAppApp(
                         onLogout = { viewModel.logout(appContext) },
                         onDeleteAccount = { viewModel.deleteAccount() },
                         onThemeToggle = onCycleTheme,
-                        onBeansCenterClick = { viewModel.setTab(1) /* Placeholder or dedicated beans logic */ },
-                        onBrowseForVideoCalls = { viewModel.setTab(0) },
+                        onBeansCenterClick = { showBeansCenter = true },
+                        onBrowseForVideoCalls = { showCallHistory = true },
                         onOpenInboxForGifts = { viewModel.setTab(2) },
-                        onDiamondShopClick = onDiamondShopClick,
+                        onDiamondShopClick = { showDiamondHistory = true },
                         onRewardsClick = { viewModel.showRewards() },
                         onClaimReward = { viewModel.claimDailyReward() },
                         onDismissRewards = { viewModel.toggleRewardsDialog(false) },
@@ -1894,12 +1956,40 @@ fun DatingAppApp(
                             onPersistLanguage(lang)
                         },
                         onConvertDiamonds = { viewModel.convertDiamondsToBeans(it) },
-                        onVerifyProfile = { 
-                            onRequireFaceVerification {}
-                        },
+                        onVerifyProfile = { onRequireFaceVerification {} },
                         onGameCenterClick = onShowGameCenter,
                         onSetCustomPrice = onShowCustomPrice,
                         onUnblockUser = { viewModel.unblockUserFromProfile(it) },
+                        onLoadMyGiftHistory = {
+                            viewModel.fetchMySentGiftHistory()
+                            viewModel.fetchMyReceivedGiftHistory()
+                        },
+                        onShowMyProfile = {
+                            viewModel.refreshILikedProfiles()
+                            viewModel.refreshLikedMeProfiles()
+                            viewModel.fetchMySentGiftHistory()
+                            viewModel.fetchMyReceivedGiftHistory()
+                            showMyProfile = true
+                        },
+                        onShowLikesILike = {
+                            likesInitialTab = 0
+                            showLikesScreen = true
+                            viewModel.refreshILikedProfiles()
+                            viewModel.refreshLikedMeProfiles()
+                        },
+                        onShowLikesLikeMe = {
+                            likesInitialTab = 1
+                            showLikesScreen = true
+                            viewModel.refreshILikedProfiles()
+                            viewModel.refreshLikedMeProfiles()
+                        },
+                        onShowBlockedUsers = { showBlockedUsers = true },
+                        onRefreshLikeCounts = {
+                            viewModel.refreshILikedProfiles()
+                            viewModel.refreshLikedMeProfiles()
+                        },
+                        onFeedbackClick = { showFeedbackScreen = true },
+                        onMyBagClick    = { showMyBagScreen = true },
                     )
                 }
 
@@ -1924,6 +2014,19 @@ fun DatingAppApp(
             }       // Row
         }           // Scaffold content lambda
         }           // CompositionLocalProvider
+
+        // ── Global floating live PIP ──────────────────────────────────────────
+        // Shown when user minimises a live stream — floats over every screen in the app.
+        val pipPartner = uiState.watchingLivePartner
+        if (uiState.isLivePipMode && pipPartner != null) {
+            GlobalLivePip(
+                partner = pipPartner,
+                viewerFirebaseUid = uiState.currentUser?.id.orEmpty(),
+                onGetAgoraToken = { ch, pub -> viewModel.getAgoraToken(ch, pub) },
+                onRestore = { viewModel.restoreFromLivePip() },
+                onClose   = { viewModel.exitLivePip() }
+            )
+        }
     }               // BoxWithConstraints
 }
 

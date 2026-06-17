@@ -1,5 +1,8 @@
 package com.zipper.datingapp.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -13,16 +16,23 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.runtime.mutableStateListOf
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.StopCircle
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -95,6 +105,10 @@ fun AudioPartyStageLayout(
     onSendStageEmoji: (String) -> Unit = {},
     /** When false, quick emoji row is omitted (Itzo room uses docked icon bar). */
     showTopQuickEmojis: Boolean = false,
+    /** Host only: called when the host taps "End Party". No-op for audience. */
+    onEndParty: () -> Unit = {},
+    /** Audience only: called when the guest taps the ✕ leave button. No-op for host. */
+    onLeave: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val capacity = normalizeAudioPartyStageSeatCount(
@@ -106,6 +120,30 @@ fun AudioPartyStageLayout(
     val guestRange = remember(capacity, stream.seatCount, seatCount) {
         AudioPartyStreamState(seatCount = capacity).guestSeatIndexRange()
     }
+    // ── Viewer join messages ──────────────────────────────────────────────────
+    val joinMessages = remember { mutableStateListOf<String>() }
+    // Track previous seat snapshot to detect new occupants
+    val prevSeatSnapshot = remember { mutableMapOf<Int, String>() }
+
+    LaunchedEffect(stream.seats) {
+        for ((idx, seat) in stream.seats) {
+            val prevUserId = prevSeatSnapshot[idx].orEmpty()
+            val newUserId = seat.userId.trim()
+            if (newUserId.isNotBlank() && newUserId != prevUserId) {
+                val name = seat.displayName.ifBlank { "Someone" }
+                joinMessages.add("👋 $name joined the party")
+            }
+            prevSeatSnapshot[idx] = newUserId
+        }
+    }
+    // Auto-expire messages after 6 seconds
+    LaunchedEffect(joinMessages.size) {
+        if (joinMessages.isNotEmpty()) {
+            delay(6_000L)
+            if (joinMessages.isNotEmpty()) joinMessages.removeAt(0)
+        }
+    }
+
     var hostMenuSeat by remember { mutableIntStateOf(0) }
     var showHostMenu by remember { mutableStateOf(false) }
     var hostMenuCustomPrice by remember { mutableStateOf("") }
@@ -334,6 +372,30 @@ fun AudioPartyStageLayout(
             .padding(horizontal = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        // ✕ Leave button — shown for audience members only (host has "End Party" below)
+        if (!isHost) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 4.dp)
+            ) {
+                IconButton(
+                    onClick = onLeave,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .size(38.dp)
+                        .background(Color.Black.copy(alpha = 0.38f), CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Leave Party",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+        }
+
         if (title.isNotBlank()) {
             Text(
                 text = title,
@@ -537,6 +599,76 @@ fun AudioPartyStageLayout(
                         selectedBorderColor = Color.Transparent,
                     ),
                 )
+            }
+        }
+
+        // ── End Party button (host only) ──────────────────────────────────────
+        if (isHost) {
+            var showEndConfirm by remember { mutableStateOf(false) }
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = { showEndConfirm = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935)),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Icon(
+                    Icons.Default.StopCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("End Party", fontWeight = FontWeight.SemiBold)
+            }
+            if (showEndConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showEndConfirm = false },
+                    title = { Text("End Party?") },
+                    text = { Text("This will close the room for all participants.") },
+                    confirmButton = {
+                        Button(
+                            onClick = { showEndConfirm = false; onEndParty() },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935)),
+                        ) { Text("End Party") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showEndConfirm = false }) { Text("Cancel") }
+                    },
+                )
+            }
+        }
+
+        // ── Viewer join message feed ──────────────────────────────────────────
+        AnimatedVisibility(
+            visible = joinMessages.isNotEmpty(),
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 100.dp)
+                    .padding(vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                joinMessages.forEach { msg ->
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                Color.Black.copy(alpha = 0.45f),
+                                RoundedCornerShape(20.dp),
+                            )
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            text = msg,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
             }
         }
 

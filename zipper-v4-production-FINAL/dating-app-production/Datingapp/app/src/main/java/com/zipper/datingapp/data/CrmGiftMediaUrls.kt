@@ -98,6 +98,9 @@ fun DocumentSnapshot.crmThumbnailRaw(): String? = firstNonBlank(
  */
 suspend fun DocumentSnapshot.toResolvedCrmGift(): Gift? {
     val name = getString("name") ?: return null
+    // Safety guard: if CRM sets status="inactive" without toggling active=false, honour it.
+    val statusField = getString("status")?.trim()?.lowercase()
+    if (statusField != null && statusField == "inactive") return null
     val videoUrl = resolveFirebaseStorageUrl(crmVideoRaw())
     val soundUrl = resolveFirebaseStorageUrl(crmAudioRaw())
     val thumbnailUrl = resolveFirebaseStorageUrl(crmThumbnailRaw())

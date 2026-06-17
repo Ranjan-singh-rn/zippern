@@ -88,6 +88,7 @@ import com.zipper.datingapp.data.PkBattleSessionState
 import com.zipper.datingapp.data.PK_POST_RESULT_LINGER_MS
 import com.zipper.datingapp.data.UserProfile
 import com.zipper.datingapp.economy.VirtualEconomyMath
+import com.zipper.datingapp.service.CallFirebaseMessagingService
 import com.zipper.datingapp.service.FirebaseService
 import com.zipper.datingapp.service.LiveEconomyGiftResult
 import com.zipper.datingapp.data.Gift
@@ -286,6 +287,10 @@ class LiveStreamActivity : ComponentActivity() {
     private var callElapsedTickJob: Job? = null
     private val walletDiamondBalance = MutableStateFlow(0)
     private val callDiamondRatePerMinute = MutableStateFlow(VirtualEconomyMath.DEFAULT_CALL_VIDEO_DIAMONDS_PER_MIN)
+    /** Chamet-style real-time billing: charges one minute immediately on connect, then every 60 s. */
+    private var realtimeBillingJob: Job? = null
+    /** Set to true once [startRealtimeCallBilling] runs so [endRegularCallAndReturn] skips the legacy bulk charge. */
+    private var realtimeBillingRan = false
     private val callStatusForUi = MutableStateFlow(CallStatus.CONNECTING)
     private val showGiftPickerSheet = MutableStateFlow(false)
     /** PK session: audience / battlers pick host vs guest before sending (gifts drive PK score). */
@@ -371,6 +376,12 @@ class LiveStreamActivity : ComponentActivity() {
             "CALL_CHAT_UI",
             "surface=LiveStreamActivity room=${roomId!!} isPk=$isPkSession isVideoCall=$isVideoCall isStreamer=$isStreamer version=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE})"
         )
+
+        // Dismiss the incoming call notification (ID 2001) the moment the call activity opens,
+        // whether the user tapped Accept in-app or from the notification action.
+        androidx.core.app.NotificationManagerCompat.from(this)
+            .cancel(CallFirebaseMessagingService.NOTIF_INCOMING_CALL)
+
         bindPrivateCallForProcessTeardown(roomId!!, isPkSession)
 
         liveStreamBinding = ActivityLiveStreamBinding.inflate(layoutInflater)
@@ -723,17 +734,6 @@ class LiveStreamActivity : ComponentActivity() {
                                         }
                                     }
                                 } else null,
-                                onFollowLiveChatter = if (isStreamer && streamDocMod != null && modHostUid != null) {
-                                    { tid, _ ->
-                                        val host = modHostUid!!
-                                        lifecycleScope.launch {
-                                            runCatching { firebaseService.toggleFollowRelationship(host, tid.trim()) }
-                                                .onFailure { e ->
-                                                    android.util.Log.w("LiveStreamActivity", "follow from overlay", e)
-                                                }
-                                        }
-                                    }
-                                } else null,
                                 onLikeLiveChatter = if (isStreamer && streamDocMod != null) {
                                     { tid, _ ->
                                         val liker = FirebaseAuth.getInstance().currentUser?.uid
@@ -889,18 +889,7 @@ class LiveStreamActivity : ComponentActivity() {
                                         ).show()
                                     }
                                 },
-                                onFollowViewer = { p ->
-                                    val me = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
-                                    if (me.isNotEmpty() && p.id.isNotBlank()) {
-                                        lifecycleScope.launch {
-                                            runCatching {
-                                                firebaseService.toggleFollowRelationship(me, p.id.trim())
-                                            }.onFailure { e ->
-                                                android.util.Log.w("LiveStreamActivity", "follow PK viewer sheet", e)
-                                            }
-                                        }
-                                    }
-                                },
+                                onFollowViewer = { },
                             )
                         }
                         if (showPkGift && pkSessionSnap != null) {
@@ -970,10 +959,32 @@ class LiveStreamActivity : ComponentActivity() {
                 val profile by liveHostProfile.collectAsStateWithLifecycle()
                 val viewers by liveViewerCount.collectAsStateWithLifecycle()
                 val elapsedTop by callElapsedSeconds.collectAsStateWithLifecycle()
+                val walletTop by walletDiamondBalance.collectAsStateWithLifecycle()
+                val rateTop by callDiamondRatePerMinute.collectAsStateWithLifecycle()
                 val displayName = profile?.name?.takeIf { it.isNotBlank() } ?: overlayPeerName
                 val avatar = profile?.photoUrl?.takeIf { it.isNotBlank() } ?: overlayPeerPhoto
-                val followers = profile?.followerIds?.size ?: 0
+                val followers = (profile?.likeMeCount ?: 0L).toInt()
                 val itzoStandardVideoCall = !isPkSession && isVideoCall
+                val currentUidForLike = remember {
+                    com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+                }
+                // Like state — seeded from PARTNER's profile (not liveHostProfile, which can be the
+                // caller's own doc when isStreamer=true). Updated from the Firestore return value
+                // after every tap so UI and database always agree.
+                var partnerIsLiked by remember { mutableStateOf(false) }
+                // One-time read: fetch partner's likedByUserIds to show correct heart on call open.
+                LaunchedEffect(overlayPeerId, currentUidForLike) {
+                    if (!itzoStandardVideoCall) return@LaunchedEffect
+                    if (overlayPeerId.isBlank() || currentUidForLike.isBlank()) return@LaunchedEffect
+                    runCatching {
+                        firebaseService.getUserProfile(overlayPeerId.trim())
+                    }.onSuccess { partnerProfile ->
+                        partnerIsLiked = partnerProfile?.likedByUserIds
+                            ?.contains(currentUidForLike) == true
+                    }.onFailure { e ->
+                        android.util.Log.w("LiveStreamActivity", "like init read failed", e)
+                    }
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -984,7 +995,7 @@ class LiveStreamActivity : ComponentActivity() {
                     WebRtcOverlayTopBar(
                         displayName = displayName,
                         avatarUrl = avatar,
-                        followerCount = followers,
+                        likeCount = followers,
                         viewerCount = viewers,
                         showBroadcastMetrics = isPkSession,
                         sessionElapsedSeconds = elapsedTop,
@@ -995,6 +1006,29 @@ class LiveStreamActivity : ComponentActivity() {
                         } else {
                             null
                         },
+                        // Like button: optimistic flip → Firestore write → confirmed state from return value.
+                        onLikePartner = if (itzoStandardVideoCall && overlayPeerId.isNotBlank() && currentUidForLike.isNotBlank()) {
+                            {
+                                val before = partnerIsLiked
+                                partnerIsLiked = !before          // optimistic flip
+                                lifecycleScope.launch {
+                                    firebaseService.toggleDiscoveryProfileLike(
+                                        currentUidForLike,
+                                        overlayPeerId.trim(),
+                                    ).onSuccess { nowLiked ->
+                                        partnerIsLiked = nowLiked // truth from Firestore
+                                        android.util.Log.d("LiveStreamActivity", "like partner nowLiked=$nowLiked")
+                                    }.onFailure { e ->
+                                        partnerIsLiked = before   // revert on error
+                                        android.util.Log.w("LiveStreamActivity", "like partner failed", e)
+                                    }
+                                }
+                            }
+                        } else null,
+                        partnerIsLiked = partnerIsLiked,
+                        // Show live diamond balance chip on payer side only
+                        payerDiamondBalance = if (itzoStandardVideoCall && isStreamer) walletTop else -1,
+                        payerDiamondRatePerMinute = if (itzoStandardVideoCall && isStreamer) rateTop else 0,
                     )
                 }
             }
@@ -1034,7 +1068,7 @@ class LiveStreamActivity : ComponentActivity() {
                         floatingLiveChatOverlay = false,
                         transparentDockPanel = true,
                         itzoStandardCallDock = !isPkSession && isVideoCall,
-                        bottomSheetComposer = true,
+                        bottomSheetComposer = false,
                         // Bottom overlay resized for video (~45% screen); chat fills the band above controls.
                         audiencePanelFillHeight = isVideoCall,
                         isMicOn = isMicOn,
@@ -1097,17 +1131,6 @@ class LiveStreamActivity : ComponentActivity() {
                                     }.onFailure { e ->
                                         android.util.Log.w("LiveStreamActivity", "block from overlay", e)
                                     }
-                                }
-                            }
-                        } else null,
-                        onFollowLiveChatter = if (isStreamer && streamDocMod != null && modHostUid != null) {
-                            { tid, _ ->
-                                val host = modHostUid!!
-                                lifecycleScope.launch {
-                                    runCatching { firebaseService.toggleFollowRelationship(host, tid.trim()) }
-                                        .onFailure { e ->
-                                            android.util.Log.w("LiveStreamActivity", "follow from overlay", e)
-                                        }
                                 }
                             }
                         } else null,
@@ -1826,13 +1849,91 @@ class LiveStreamActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Chamet-style real-time billing for the payer (outgoing caller / `isStreamer = true`).
+     *
+     * Behaviour:
+     *  1. Charges **1 minute immediately** when the call connects.
+     *  2. Charges **1 more minute every 60 s** while the call is alive.
+     *  3. After each charge [walletDiamondBalance] is updated so the UI reflects the deduction live.
+     *  4. If the remaining balance is **less than the rate**, the call is auto-ended.
+     *
+     * The post-call bulk charge in [endRegularCallAndReturn] is skipped when this job ran
+     * (flag [realtimeBillingRan]) to avoid double-charging.
+     */
+    private fun startRealtimeCallBilling() {
+        if (!isStreamer || isPkSession || overlayPeerId.isBlank()) return
+        val myUid = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
+        if (myUid.isBlank()) return
+        realtimeBillingJob?.cancel()
+        realtimeBillingRan = true
+        realtimeBillingJob = lifecycleScope.launch {
+            // ── Minute 1: charge immediately when call connects ──────────────────
+            val rate = callDiamondRatePerMinute.value
+            if (rate <= 0) return@launch
+
+            val firstResult = runCatching {
+                firebaseService.chargeOneCallMinute(myUid, overlayPeerId, rate)
+            }.getOrElse { Result.failure(it) }
+
+            firstResult.onSuccess { newBal ->
+                // newBal == -1 → sentinel: balance was already below rate, call should never
+                // have connected. End immediately.
+                // newBal >= 0  → charge succeeded; call continues for the full 60 s.
+                // DO NOT check (newBal < rate) here — that would end the call the moment
+                // the first minute is deducted, which is the bug (e.g. 2000 bal - 1500 = 500,
+                // 500 < 1500 → wrong early termination).
+                if (newBal == -1) {
+                    showInsufficientToast()
+                    endRegularCallAndReturn()
+                    return@launch
+                }
+                walletDiamondBalance.value = newBal
+            }
+
+            // ── Subsequent minutes: charge every 59 s ────────────────────────────
+            // Chamet model: minute N is paid up-front. After 59 s we try to charge
+            // minute N+1. If the balance is insufficient the call ends at ~59 s per
+            // paid minute (2 000 diamonds → ~59 s; 3 000 → ~1 m 59 s, etc.).
+            while (isActive) {
+                delay(59_000L)
+                if (!isActive) break
+                val currentRate = callDiamondRatePerMinute.value
+                if (currentRate <= 0) continue
+                val chargeResult = runCatching {
+                    firebaseService.chargeOneCallMinute(myUid, overlayPeerId, currentRate)
+                }.getOrElse { Result.failure(it) }
+                chargeResult.onSuccess { newBal ->
+                    if (newBal == -1) {
+                        // Ran out of diamonds for the next minute → end call
+                        showInsufficientToast()
+                        endRegularCallAndReturn()
+                        return@launch
+                    }
+                    walletDiamondBalance.value = newBal
+                }
+                // On network failure we don't end the call — let the next tick retry
+            }
+        }
+    }
+
+    private fun showInsufficientToast() {
+        runOnUiThread {
+            android.widget.Toast.makeText(
+                this@LiveStreamActivity,
+                getString(R.string.call_ended_insufficient_diamonds),
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     private fun observeSelfWalletAndPartnerRate() {
         val myUid = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
         if (myUid.isNotEmpty()) {
             lifecycleScope.launch {
                 firebaseService.observeUserProfile(myUid).collect { p ->
                     p?.let {
-                        walletDiamondBalance.value = it.coins
+                        walletDiamondBalance.value = it.diamondBalance.toInt()
                         if (isPkSession) livePkSelfProfileHud.value = it
                     }
                 }
@@ -2036,7 +2137,7 @@ class LiveStreamActivity : ComponentActivity() {
                         myUid,
                         com.google.firebase.firestore.Source.SERVER,
                     )?.let { p ->
-                        walletDiamondBalance.value = p.coins
+                        walletDiamondBalance.value = p.diamondBalance.toInt()
                     }
                 }
             }
@@ -2311,18 +2412,29 @@ class LiveStreamActivity : ComponentActivity() {
         val fbUid = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
         if (fbUid.isEmpty()) return
         val uid = am.agoraUidFromFirebaseUid(fbUid)
-        val token = withContext(Dispatchers.IO) { fetchAgoraTokenForPrivateCall(channel) }
+
+        // Pre-init engine + fetch token in parallel on IO — keeps Main thread free,
+        // avoids the 473ms StrictMode DiskReadViolation from RtcEngine.create().
+        val token = withContext(Dispatchers.IO) {
+            am.initEngineAsync()                        // loads native libs + clears bad SQLite
+            fetchAgoraTokenForPrivateCall(channel)      // Firebase HTTPS callable
+        }
+
         if (token == null) {
+            android.util.Log.e("LiveStreamActivity", "performAgoraJoin: token fetch failed for channel=$channel")
             withContext(Dispatchers.Main) {
                 if (!teardownHandled) setCallUiState(CallUIState.CallFailed)
             }
             return
         }
+
         withContext(Dispatchers.Main) {
             if (teardownHandled) return@withContext
             applyAgoraVideoBindings()
             val code = am.joinOneToOneVideo(channel, uid, token)
+            android.util.Log.d("AgoraManager", "joinOneToOneVideo channel=$channel uid=$uid code=$code")
             if (code != 0) {
+                android.util.Log.e("LiveStreamActivity", "joinOneToOneVideo failed code=$code — showing CallFailed")
                 setCallUiState(CallUIState.CallFailed)
             }
         }
@@ -2333,7 +2445,11 @@ class LiveStreamActivity : ComponentActivity() {
         if (agoraStreamerJoinRequested) return
         agoraStreamerJoinRequested = true
         val ch = roomId?.trim().orEmpty()
-        if (ch.isEmpty()) return
+        if (ch.isEmpty()) {
+            android.util.Log.e("LiveStreamActivity", "joinAgoraPrivateVideoAfterAcceptIfNeeded: blank roomId, aborting join")
+            return
+        }
+        android.util.Log.d("AgoraManager", "joinAgoraPrivateVideoAfterAcceptIfNeeded: joining channel=$ch as streamer")
         lifecycleScope.launch { performAgoraJoin(ch) }
     }
 
@@ -2366,6 +2482,7 @@ class LiveStreamActivity : ComponentActivity() {
             preferLoudSpeaker = isPkSession || isVideoCall,
         )
         isSpeakerOnFlow.value = isPkSession || isVideoCall
+        @Suppress("DEPRECATION")
         android.util.Log.d(
             "WebRTC_SIGNAL",
             "AudioManager routing: speakerOn=${audioManager.isSpeakerphoneOn} isPk=$isPkSession isVideo=$isVideoCall"
@@ -2659,6 +2776,8 @@ class LiveStreamActivity : ComponentActivity() {
             } else {
                 oneOnOneCallReachedConnected = true
                 startCallElapsedTicker()
+                // Chamet-style: charge first minute now, then every 60 s (payer only)
+                startRealtimeCallBilling()
             }
         }
 
@@ -3159,19 +3278,30 @@ class LiveStreamActivity : ComponentActivity() {
         callSessionRemoteEndJob?.cancel()
         callSessionRemoteEndJob = null
         teardownHandled = true
+        // Stop per-minute billing job immediately so no extra charge fires during teardown
+        realtimeBillingJob?.cancel()
+        realtimeBillingJob = null
         playingGiftOverlay.value = null
-        val needCharge = !isPkSession && oneOnOneCallReachedConnected && isStreamer
-        val uidCharge = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
+
+        // If Chamet-style per-minute billing already ran, skip the legacy bulk post-call charge
+        // to avoid double-billing. Legacy path is only used as fallback if billing never started
+        // (e.g. very old code path or PK session guard bypassed).
+        val needLegacyCharge = !isPkSession && oneOnOneCallReachedConnected && isStreamer &&
+            !realtimeBillingRan
+        val uidCharge  = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
         val peerCharge = overlayPeerId.trim()
         val elapsedCharge = callElapsedSeconds.value
         val rateCharge = callDiamondRatePerMinute.value
-        if (needCharge && uidCharge.isNotEmpty() && peerCharge.isNotEmpty() && elapsedCharge > 0 && rateCharge > 0) {
+        if (needLegacyCharge && uidCharge.isNotEmpty() && peerCharge.isNotEmpty() &&
+            elapsedCharge > 0 && rateCharge > 0) {
             lifecycleScope.launch {
                 withContext(Dispatchers.IO) {
                     runCatching {
-                        firebaseService.chargeCallDiamondSession(uidCharge, peerCharge, elapsedCharge, rateCharge)
+                        firebaseService.chargeCallDiamondSessionWithAgentSplit(
+                            uidCharge, peerCharge, elapsedCharge, rateCharge
+                        )
                     }.onFailure { e ->
-                        android.util.Log.w("LiveStreamActivity", "chargeCallDiamondSession", e)
+                        android.util.Log.w("LiveStreamActivity", "legacyChargeCallDiamond", e)
                     }
                 }
                 finishEndRegularCallSequence()
@@ -3207,7 +3337,50 @@ class LiveStreamActivity : ComponentActivity() {
         finish()
     }
 
-    @Suppress("DEPRECATION")
+    // ── Picture-in-Picture ──────────────────────────────────────────────────────
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        enterPipIfActive()
+    }
+
+    private fun enterPipIfActive() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+        // Only enter PiP if there is an active media stream (not on confirmation dialog or idle)
+        if (!isStreamer && !isPkSession && !oneOnOneCallReachedConnected) return
+        try {
+            val params = android.app.PictureInPictureParams.Builder()
+                .setAspectRatio(android.util.Rational(9, 16))
+                .build()
+            enterPictureInPictureMode(params)
+        } catch (e: Exception) {
+            android.util.Log.w("LiveStreamActivity", "enterPictureInPictureMode failed", e)
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: android.content.res.Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        // Hide all Compose overlays (chat, controls, buttons) when in PiP; restore when returning.
+        val overlayVisibility = if (isInPictureInPictureMode) View.GONE else View.VISIBLE
+        runOnUiThread {
+            if (isPkSession) {
+                // PK layout: audience panel + arena HUD + gift overlay
+                liveStreamBinding.composePkAudience.visibility = overlayVisibility
+                liveStreamBinding.composePkArenaHud.visibility = overlayVisibility
+            } else {
+                // Standard 1:1 layout: top and bottom Compose bands
+                liveStreamBinding.composeOverlayTop.visibility = overlayVisibility
+                liveStreamBinding.composeOverlayBottom.visibility = overlayVisibility
+            }
+            // Gift overlay is always hidden in PiP
+            liveStreamBinding.composeGiftOverlay.visibility = overlayVisibility
+        }
+    }
+    // ───────────────────────────────────────────────────────────────────────────
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         confirmUserCloseThen {
             if (isPkSession) endPkAndReturn() else endRegularCallAndReturn()
@@ -3220,6 +3393,7 @@ class LiveStreamActivity : ComponentActivity() {
             val hostUid = FirebaseAuth.getInstance().currentUser?.uid?.trim().orEmpty()
             val streamDoc = roomId?.trim().orEmpty().takeIf { it.isNotEmpty() }
             if (hostUid.isNotEmpty()) {
+                @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
                 GlobalScope.launch(Dispatchers.IO + NonCancellable) {
                     runCatching { firebaseService.endLiveStream(hostUid, streamDoc) }
                         .onFailure { e ->
@@ -3330,6 +3504,7 @@ class LiveStreamActivity : ComponentActivity() {
         fun firePrivateCallSignalingTeardownIfBound(firebaseService: FirebaseService) {
             val rid = privateCallRoomIdForProcessTeardown ?: return
             privateCallRoomIdForProcessTeardown = null
+            @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
             GlobalScope.launch(Dispatchers.IO + NonCancellable) {
                 try {
                     firebaseService.setCallSessionStatus(rid, "ENDED")

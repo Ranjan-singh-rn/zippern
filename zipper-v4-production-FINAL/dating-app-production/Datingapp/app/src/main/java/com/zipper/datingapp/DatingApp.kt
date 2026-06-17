@@ -13,6 +13,9 @@ import coil.ImageLoader
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreSettings
+import com.google.firebase.firestore.PersistentCacheSettings
 import com.zipper.datingapp.BuildConfig
 import com.zipper.datingapp.webrtc.IceConfigRepository
 import kotlinx.coroutines.CoroutineScope
@@ -81,6 +84,18 @@ class DatingApp : Application() {
         }
         super.onCreate()
         DatingApp.applicationContext = applicationContext
+
+        // Enable Firestore disk persistence — data is served from cache instantly on subsequent
+        // app starts and updated from the network in the background. Without this, every launch
+        // fetches all profiles / messages / live-streams fresh from the network (slow cold start).
+        try {
+            FirebaseFirestore.getInstance().firestoreSettings =
+                FirebaseFirestoreSettings.Builder()
+                    .setLocalCacheSettings(PersistentCacheSettings.newBuilder().build())
+                    .build()
+        } catch (e: Exception) {
+            Log.w("DatingApp", "Firestore persistence init failed", e)
+        }
         // Production crash reports; disable in debug to keep the Crashlytics dashboard clean during development.
         runCatching {
             FirebaseCrashlytics.getInstance().isCrashlyticsCollectionEnabled = !BuildConfig.DEBUG

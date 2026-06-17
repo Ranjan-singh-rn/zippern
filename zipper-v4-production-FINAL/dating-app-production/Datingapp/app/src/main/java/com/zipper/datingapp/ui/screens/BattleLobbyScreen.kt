@@ -40,7 +40,7 @@ fun BattleLobbyScreen(
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
-    val isGirl = uiState.currentUser?.role == UserRole.GIRL
+    val isGirl = uiState.currentUser?.role == UserRole.GIRL.name
     val gameTypeFilters = listOf("All") + GameType.entries.map { it.label }
     var selectedFilter by remember { mutableStateOf("All") }
     val widthClass = LocalWindowWidthClass.current
@@ -60,6 +60,7 @@ fun BattleLobbyScreen(
                     BattleStatus.WAITING       -> 1
                     BattleStatus.STARTING_SOON -> 2
                     BattleStatus.FINISHED      -> 3
+                    else                       -> 4
                 }
             }
         )
@@ -197,6 +198,7 @@ fun ImprovedBattleCard(battle: Battle, onClick: () -> Unit) {
                             BattleStatus.WAITING -> Color(0xFF22C55E)
                             BattleStatus.STARTING_SOON -> Color(0xFFFBBF24)
                             BattleStatus.FINISHED -> Color.Gray
+                            else -> Color.Gray
                         },
                         shape = RoundedCornerShape(8.dp)
                     ) {

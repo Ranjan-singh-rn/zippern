@@ -50,6 +50,8 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.CardGiftcard
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.FlipCameraAndroid
 import androidx.compose.material.icons.filled.FlipCameraIos
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -129,6 +131,7 @@ import com.zipper.datingapp.R
 import com.zipper.datingapp.data.Gift
 import com.zipper.datingapp.data.GiftCatalog
 import com.zipper.datingapp.data.LiveStreamChatMessage
+import com.zipper.datingapp.data.isLiveSystemMessage
 import com.zipper.datingapp.webrtc.WebRTCManager
 import java.util.Locale
 import kotlin.math.abs
@@ -1430,10 +1433,10 @@ private fun formatCallDurationClock(totalSeconds: Int): String {
 fun WebRtcOverlayTopBar(
     displayName: String,
     avatarUrl: String,
-    followerCount: Int,
+    likeCount: Int,
     viewerCount: Int,
     modifier: Modifier = Modifier,
-    /** Private 1:1 calls set false to hide follower/viewer lines (no “live audience” chrome). */
+    /** Private 1:1 calls set false to hide like/viewer lines (no “live audience” chrome). */
     showBroadcastMetrics: Boolean = true,
     /** When false with [showBroadcastMetrics], hides only the live viewer count (e.g. PK battle). */
     showLiveViewerCount: Boolean = true,
@@ -1448,61 +1451,114 @@ fun WebRtcOverlayTopBar(
     itzoVideoCallBar: Boolean = false,
     /** When [itzoVideoCallBar] is true, second-leading action (e.g. [android.app.Activity.moveTaskToBack]). */
     onMinimizeCall: (() -> Unit)? = null,
+    /**
+     * Payer's live coin balance shown in the top-right chip during [itzoVideoCallBar].
+     * Pass -1 (default) to hide the chip (non-payer / receiver side).
+     */
+    payerDiamondBalance: Int = -1,
+    /** Rate chip label: "💎 rate/min". Pass 0 to hide the rate part. */
+    payerDiamondRatePerMinute: Int = 0,
+    /** Like / heart button next to the partner name in [itzoVideoCallBar]. Null hides it. */
+    onLikePartner: (() -> Unit)? = null,
+    /** Whether the current user already liked this partner (fills the heart icon). */
+    partnerIsLiked: Boolean = false,
 ) {
     if (itzoVideoCallBar && onLeaveStream != null) {
-        Surface(
-            modifier = modifier.fillMaxWidth(),
-            color = Color.Transparent,
-            shadowElevation = 0.dp,
+        // ── Chamet-style 1:1 call top bar ────────────────────────────────────────
+        // Layout: [avatar] [name + timer column] [❤ like] [💎 balance chip]
+        // No back button, no chevron/minimize button.
+        Row(
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            // Partner avatar
+            Surface(
+                modifier = Modifier.size(44.dp),
+                shape = CircleShape,
+                color = Color.White.copy(alpha = 0.18f),
+                border = BorderStroke(1.5.dp, Color.White.copy(alpha = 0.35f)),
             ) {
-                IconButton(
-                    onClick = onLeaveStream,
-                    modifier = Modifier.size(44.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = stringResource(R.string.profile_sheet_back_cd),
-                        tint = Color.White,
+                if (avatarUrl.isNotBlank()) {
+                    AsyncImage(
+                        model = avatarUrl,
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize().clip(CircleShape),
+                        contentScale = ContentScale.Crop,
                     )
                 }
-                if (onMinimizeCall != null) {
-                    IconButton(
-                        onClick = onMinimizeCall,
-                        modifier = Modifier.size(44.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.KeyboardArrowDown,
-                            contentDescription = stringResource(R.string.call_minimize_cd),
-                            tint = Color.White,
-                        )
-                    }
-                } else {
-                    Spacer(Modifier.size(44.dp))
-                }
-                val title = displayName.ifBlank { stringResource(R.string.call_overlay_title) }
-                val timerSuffix =
-                    if (sessionElapsedSeconds >= 0) {
-                        " · ${formatCallDurationClock(sessionElapsedSeconds)}"
-                    } else {
-                        ""
-                    }
+            }
+            // Name + elapsed timer — cap at 12 chars so the row never gets squashed
+            val itzoCallDisplayName = displayName.ifBlank { stringResource(R.string.call_overlay_title) }
+                .let { if (it.length > 12) it.take(12).trimEnd() + "…" else it }
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = title + timerSuffix,
-                    modifier = Modifier.weight(1f),
+                    text = itzoCallDisplayName,
                     color = Color.White,
-                    fontSize = 16.sp,
+                    fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
                 )
-                Spacer(Modifier.width(88.dp))
+                if (sessionElapsedSeconds >= 0) {
+                    Text(
+                        text = formatCallDurationClock(sessionElapsedSeconds),
+                        color = Color(0xFF4ADE80),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+            // Like / heart button
+            if (onLikePartner != null) {
+                IconButton(
+                    onClick = onLikePartner,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            if (partnerIsLiked) Color(0x44FF6B9D) else Color.White.copy(alpha = 0.15f),
+                            CircleShape,
+                        ),
+                ) {
+                    Icon(
+                        imageVector = if (partnerIsLiked) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                        contentDescription = "Like",
+                        tint = Color(0xFFFF6B9D),
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+            // Diamond balance chip — payer side only
+            if (payerDiamondBalance >= 0) {
+                Surface(
+                    shape = RoundedCornerShape(50),
+                    color = Color(0xFF1A1A2E).copy(alpha = 0.88f),
+                    border = BorderStroke(1.dp, Color(0xFFFFC400).copy(alpha = 0.6f)),
+                    modifier = Modifier.widthIn(min = 76.dp),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "💎 $payerDiamondBalance",
+                            color = Color(0xFFFFC400),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                        )
+                        if (payerDiamondRatePerMinute > 0) {
+                            Text(
+                                text = "$payerDiamondRatePerMinute/min",
+                                color = Color.White.copy(alpha = 0.7f),
+                                fontSize = 10.sp,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
             }
         }
         return
@@ -1566,7 +1622,7 @@ fun WebRtcOverlayTopBar(
                 }
                 if (showBroadcastMetrics) {
                     Text(
-                        stringResource(R.string.live_followers_count, followerCount),
+                        stringResource(R.string.live_followers_count, likeCount),
                         color = Color.White.copy(alpha = 0.72f),
                         fontSize = 10.sp
                     )
@@ -1635,8 +1691,6 @@ fun WebRtcOverlayBottomChat(
     currentUserIdForModeration: String? = null,
     onKickLiveChatter: ((targetUserId: String) -> Unit)? = null,
     onBlockLiveChatter: ((targetUserId: String) -> Unit)? = null,
-    /** Host: follow chatter (toggle); args are user id and chat display name hint. */
-    onFollowLiveChatter: ((targetUserId: String, senderDisplayName: String) -> Unit)? = null,
     /** Host: discovery-style like on chatter profile; toggles if already liked. */
     onLikeLiveChatter: ((targetUserId: String, senderDisplayName: String) -> Unit)? = null,
     /** Resolve sender profile photo for gift rows (live chat list may omit photo on the message doc). */
@@ -1794,6 +1848,367 @@ fun WebRtcOverlayBottomChat(
                 showComplianceBanner = showComplianceBanner,
                 skipNavigationBarsInset = skipNavigationBarsInset,
             )
+        } else if (itzoDock) {
+            // ─── Chamet-style 1:1 video call dock ──────────────────────────────────────
+            // Three-section layout (bottom-anchored):
+            //   1. Scrollable message list (grows to fill available height)
+            //   2. Control button row: [mic][speaker][gift][flip][💎]  [🔴 end call]
+            //   3. Inline WhatsApp-style composer: [Say something…] [Send ▶]
+            val itzoDockListState = rememberLazyListState()
+            val itzoDockMsgKey = messages.lastOrNull()?.let { m -> "${m.id}_${m.timestamp}" }.orEmpty()
+            val itzoDockScope = rememberCoroutineScope()
+            LaunchedEffect(itzoDockMsgKey, messages.size) {
+                if (messages.isNotEmpty()) {
+                    itzoDockScope.launch {
+                        itzoDockListState.animateScrollToItem(messages.size - 1)
+                    }
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight()
+                    .then(if (!skipNavigationBarsInset) Modifier.navigationBarsPadding() else Modifier)
+                    .imePadding(),
+            ) {
+                // ── 1a. Compliance / safety banner — always visible above messages ────────
+                // Stays pinned at the top of the chat area; messages scroll beneath it.
+                if (showComplianceBanner) {
+                    LiveStreamComplianceBanner(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        variant = LiveStreamComplianceBannerVariant.Floating,
+                    )
+                }
+
+                // ── 1b. Messages ─────────────────────────────────────────────────────────
+                // Dark-background bubbles ensure text is readable over any video brightness.
+                LazyColumn(
+                    state = itzoDockListState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(horizontal = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.Bottom),
+                    contentPadding = PaddingValues(vertical = 6.dp),
+                ) {
+                    if (messages.isEmpty()) {
+                        item {
+                            Text(
+                                text = stringResource(R.string.call_overlay_chat_empty),
+                                color = Color.White.copy(alpha = 0.45f),
+                                fontSize = 13.sp,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
+                    items(
+                        items = messages,
+                        key = { m -> m.id.ifBlank { "${m.timestamp}_${m.senderId}" } },
+                    ) { m ->
+                        when {
+                            m.isLiveSystemMessage() -> {
+                                // Billing / system alert: amber pill, full-width, always on dark bg
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 3.dp)
+                                        .background(Color(0xCC1A1200), RoundedCornerShape(10.dp))
+                                        .border(1.dp, Color(0xFFFBBF24).copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = m.text,
+                                        color = Color(0xFFFFE082),
+                                        fontSize = 12.sp,
+                                        fontStyle = FontStyle.Italic,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                }
+                            }
+                            m.type == "gift" -> {
+                                LiveStreamGiftChatRow(
+                                    message = m,
+                                    senderPhotoUrl = senderPhotoLookup(m.senderId),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp),
+                                    onClick = onGiftRowClick?.let { { it(m) } },
+                                )
+                            }
+                            else -> {
+                                // Chat bubbles with solid dark backgrounds — readable on any video.
+                                // Self  → right-aligned, deep purple
+                                // Other → left-aligned, near-black charcoal
+                                val isSelf = !currentUserIdForModeration.isNullOrBlank() &&
+                                    m.senderId == currentUserIdForModeration
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = if (isSelf) Arrangement.End else Arrangement.Start,
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(
+                                            topStart    = if (isSelf) 18.dp else 4.dp,
+                                            topEnd      = if (isSelf) 4.dp  else 18.dp,
+                                            bottomStart = 18.dp,
+                                            bottomEnd   = 18.dp,
+                                        ),
+                                        // Both sides use fully-opaque dark colours so white text is
+                                        // always legible regardless of the video frame behind them.
+                                        color = if (isSelf)
+                                            Color(0xEE6A1B9A)   // deep purple, ~93 % opaque
+                                        else
+                                            Color(0xEE1C1C2E),  // dark charcoal-navy, ~93 % opaque
+                                        modifier = Modifier.widthIn(max = 260.dp),
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(
+                                                horizontal = 12.dp,
+                                                vertical = 7.dp,
+                                            ),
+                                        ) {
+                                            if (!isSelf && m.senderName.isNotBlank()) {
+                                                Text(
+                                                    text = m.senderName,
+                                                    color = Color(0xFFCE93D8),
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                )
+                                            }
+                                            Text(
+                                                text = m.text,
+                                                color = Color.White,
+                                                fontSize = 14.sp,
+                                                lineHeight = 19.sp,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── 2. Control buttons row ────────────────────────────────────────────────
+                val ctrlSize = 48.dp
+                val ctrlIcSz = 22.dp
+                val ctrlGhost = Color(0x66FFFFFF)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                ) {
+                    // Mic
+                    if (onToggleMic != null) {
+                        IconButton(
+                            onClick = { onToggleMic(!isMicOn) },
+                            modifier = Modifier
+                                .size(ctrlSize)
+                                .background(
+                                    if (isMicOn) ctrlGhost else Color.Red.copy(alpha = 0.82f),
+                                    CircleShape,
+                                ),
+                        ) {
+                            Icon(
+                                imageVector = if (isMicOn) Icons.Default.Mic else Icons.Default.MicOff,
+                                contentDescription = if (isMicOn) "Mute" else "Unmute",
+                                tint = Color.White,
+                                modifier = Modifier.size(ctrlIcSz),
+                            )
+                        }
+                    }
+                    // Speaker / earpiece
+                    if (onToggleSpeaker != null) {
+                        IconButton(
+                            onClick = { onToggleSpeaker(!isSpeakerOn) },
+                            modifier = Modifier
+                                .size(ctrlSize)
+                                .background(
+                                    if (isSpeakerOn) Color(0xFF4ADE80).copy(alpha = 0.72f) else ctrlGhost,
+                                    CircleShape,
+                                ),
+                        ) {
+                            Icon(
+                                imageVector = if (isSpeakerOn)
+                                    Icons.AutoMirrored.Filled.VolumeUp
+                                else
+                                    Icons.AutoMirrored.Filled.VolumeOff,
+                                contentDescription = if (isSpeakerOn) "Switch to earpiece" else "Switch to loudspeaker",
+                                tint = Color.White,
+                                modifier = Modifier.size(ctrlIcSz),
+                            )
+                        }
+                    }
+                    // Gift
+                    if (onOpenGiftSheet != null) {
+                        IconButton(
+                            onClick = { if (!giftActionInProgress) onOpenGiftSheet() },
+                            enabled = !giftActionInProgress,
+                            modifier = Modifier
+                                .size(ctrlSize)
+                                .background(
+                                    brush = Brush.linearGradient(
+                                        listOf(Color(0xFFFFD54F), Color(0xFFFF6B9D), Color(0xFFFF9100)),
+                                    ),
+                                    shape = CircleShape,
+                                ),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CardGiftcard,
+                                contentDescription = stringResource(R.string.live_send_gift_action),
+                                tint = Color.White,
+                                modifier = Modifier.size(ctrlIcSz),
+                            )
+                        }
+                    }
+                    // Flip camera
+                    if (onFlipCamera != null) {
+                        IconButton(
+                            onClick = onFlipCamera,
+                            enabled = flipCameraEnabled,
+                            modifier = Modifier
+                                .size(ctrlSize)
+                                .background(
+                                    if (flipCameraEnabled) ctrlGhost else ctrlGhost.copy(alpha = 0.38f),
+                                    CircleShape,
+                                ),
+                        ) {
+                            Icon(
+                                imageVector = if (isFrontCamera)
+                                    Icons.Default.FlipCameraAndroid
+                                else
+                                    Icons.Default.FlipCameraIos,
+                                contentDescription = stringResource(R.string.call_flip_camera),
+                                tint = Color.White.copy(alpha = if (flipCameraEnabled) 1f else 0.4f),
+                                modifier = Modifier.size(ctrlIcSz),
+                            )
+                        }
+                    }
+                    // Diamond shop
+                    if (onOpenDiamondShop != null) {
+                        IconButton(
+                            onClick = onOpenDiamondShop,
+                            modifier = Modifier
+                                .size(ctrlSize)
+                                .background(
+                                    brush = Brush.linearGradient(
+                                        listOf(Color(0xFF42A5F5), Color(0xFF1565C0)),
+                                    ),
+                                    shape = CircleShape,
+                                ),
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_diamond),
+                                contentDescription = stringResource(R.string.call_diamond_shop_cd),
+                                tint = Color.White,
+                                modifier = Modifier.size(ctrlIcSz),
+                            )
+                        }
+                    }
+                    // Big red end-call button — most prominent element in the row
+                    if (onEndCall != null) {
+                        IconButton(
+                            onClick = onEndCall,
+                            modifier = Modifier
+                                .size(64.dp)
+                                .shadow(8.dp, CircleShape)
+                                .clip(CircleShape)
+                                .background(ItzoUiTokens.CallDecline),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CallEnd,
+                                contentDescription = endCallLabel,
+                                tint = Color.White,
+                                modifier = Modifier.size(30.dp),
+                            )
+                        }
+                    }
+                }
+
+                // ── 3. Inline WhatsApp-style composer ────────────────────────────────────
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    val composerInteraction = remember { MutableInteractionSource() }
+                    BasicTextField(
+                        value = draft,
+                        onValueChange = { draft = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(46.dp)
+                            .background(Color.White.copy(alpha = 0.15f), RoundedCornerShape(23.dp))
+                            .border(1.dp, Color.White.copy(alpha = 0.32f), RoundedCornerShape(23.dp)),
+                        singleLine = true,
+                        textStyle = TextStyle(
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            lineHeight = 20.sp,
+                        ),
+                        interactionSource = composerInteraction,
+                        cursorBrush = SolidColor(Color.White),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                        keyboardActions = KeyboardActions(
+                            onSend = {
+                                val t = draft.trim()
+                                if (t.isNotEmpty()) {
+                                    onSendMessage(t)
+                                    draft = ""
+                                }
+                            },
+                        ),
+                        decorationBox = { innerTextField ->
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 16.dp),
+                                contentAlignment = Alignment.CenterStart,
+                            ) {
+                                if (draft.isEmpty()) {
+                                    Text(
+                                        text = stringResource(R.string.live_chat_hint),
+                                        color = Color.White.copy(alpha = 0.45f),
+                                        fontSize = 15.sp,
+                                    )
+                                }
+                                innerTextField()
+                            }
+                        },
+                    )
+                    // Send button — pink circle
+                    IconButton(
+                        onClick = {
+                            val t = draft.trim()
+                            if (t.isNotEmpty()) {
+                                onSendMessage(t)
+                                draft = ""
+                            }
+                        },
+                        modifier = Modifier
+                            .size(46.dp)
+                            .background(Color(0xFFE91E63), CircleShape),
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = stringResource(R.string.live_send),
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+            }
         } else {
             val glassStagingMaxH = liveChatStagingViewportMaxHeight()
             /** 1:1 video + end call: stretch message stack so [weight] steals slack instead of squishing the composer. */
@@ -2936,15 +3351,6 @@ fun WebRtcOverlayBottomChat(
                         enabled = onBlockLiveChatter != null
                     ) {
                         Text(stringResource(R.string.live_action_block))
-                    }
-                    TextButton(
-                        onClick = {
-                            onFollowLiveChatter?.invoke(target.senderId, target.senderName)
-                            moderationTarget = null
-                        },
-                        enabled = onFollowLiveChatter != null
-                    ) {
-                        Text(stringResource(R.string.live_action_follow_profile))
                     }
                     TextButton(
                         onClick = {

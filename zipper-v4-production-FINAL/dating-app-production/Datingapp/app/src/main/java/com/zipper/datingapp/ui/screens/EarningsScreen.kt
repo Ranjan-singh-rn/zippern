@@ -2,18 +2,13 @@ package com.zipper.datingapp.ui.screens
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountBalanceWallet
-import androidx.compose.material.icons.filled.Call
-import androidx.compose.material.icons.filled.CardGiftcard
-import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.zipper.datingapp.ui.DatingUiState
@@ -61,83 +56,35 @@ fun EarningsScreen(uiState: DatingUiState) {
                     color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
                 Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = { /* Handle withdrawal */ },
-                    modifier = Modifier.fillMaxWidth()
+                // Withdrawal is handled through Bean Center (beans → INR payout)
+                OutlinedButton(
+                    onClick = { /* TODO: navigate to BeanCenterScreen */ },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = false,
                 ) {
                     Icon(Icons.Default.AccountBalanceWallet, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Withdraw to Bank")
+                    Text("Withdraw via Bean Center")
                 }
             }
         }
         
         Spacer(modifier = Modifier.height(32.dp))
-        
-        Text(
-            text = "Breakdown",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold
-        )
-        
-        Spacer(modifier = Modifier.height(16.dp))
-        
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            EarningStatItem(
-                icon = Icons.Default.LiveTv,
-                label = "Live",
-                amount = "₹${String.format(Locale.getDefault(), "%.2f", uiState.totalEarnings * 0.4)}",
-                color = Color(0xFF4ADE80)
-            )
-            EarningStatItem(
-                icon = Icons.Default.Call,
-                label = "Calls",
-                amount = "₹${String.format(Locale.getDefault(), "%.2f", uiState.totalEarnings * 0.3)}",
-                color = Color(0xFF4FC3F7)
-            )
-            EarningStatItem(
-                icon = Icons.Default.CardGiftcard,
-                label = "Gifts",
-                amount = "₹${String.format(Locale.getDefault(), "%.2f", uiState.totalEarnings * 0.3)}",
-                color = Color(0xFFFBBF24)
-            )
-        }
-        
-        Spacer(modifier = Modifier.height(32.dp))
-        
+
         Text(
             text = "Platform Policy",
             style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold
+            fontWeight = FontWeight.Bold,
         )
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "You keep 70% of all coins earned. Platform fee is 30%.",
+            text = "Gifts: You receive 50% of every gift's value as beans.\n" +
+                "Calls: You earn 30–50% of call charges as beans (varies by caller and callee gender).\n" +
+                "Payouts: 1,00,000 beans = ₹1,000 paid to your account.",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         }
     }
 }
 
-@Composable
-fun EarningStatItem(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    label: String,
-    amount: String,
-    color: Color
-) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Surface(
-            shape = CircleShape,
-            color = color.copy(alpha = 0.2f),
-            modifier = Modifier.size(56.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(icon, contentDescription = null, tint = color)
-            }
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(text = label, style = MaterialTheme.typography.labelMedium)
-        Text(text = amount, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
-    }
-}

@@ -46,7 +46,9 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.zipper.datingapp.ml.GenderClassifier
 import com.zipper.datingapp.ui.DatingUiState
+import kotlinx.coroutines.tasks.await
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
@@ -54,8 +56,24 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
-/** Aligned with live preview smile gate in [processFaceFrame]. */
-private const val SMILE_PROBABILITY_THRESHOLD = 0.6f
+/**
+ * Minimum smile probability to trigger verification (lowered from 0.6 → 0.45 for faster detection).
+ * Aligned with the gate in [captureImageWithMediaImageValidation].
+ */
+private const val SMILE_PROBABILITY_THRESHOLD = 0.45f
+
+/**
+ * Maximum eye-open probability for BOTH eyes to count as a deliberate blink.
+ * Acts as an alternative trigger when the user cannot produce a clear smile.
+ */
+private const val BLINK_PROBABILITY_THRESHOLD = 0.30f
+
+/**
+ * Minimum gender-classifier confidence to enforce a gender mismatch rejection.
+ * Below this value the check is skipped rather than blocking the user.
+ * Set to 0f to disable gender checking entirely (e.g. while the model is absent).
+ */
+private const val GENDER_CONFIDENCE_THRESHOLD = 0.70f
 
 @Composable
 fun FaceVerificationScreen(
@@ -82,16 +100,21 @@ fun FaceVerificationScreen(
     val analysisHolder = remember { object { @Volatile var analysis: ImageAnalysis? = null } }
 
     var isCapturing by remember { mutableStateOf(false) }
-    var smileHint by remember { mutableStateOf("Smile to verify") }
+    var smileHint by remember { mutableStateOf("Smile (or blink) to verify") }
 
     val detector = remember {
         FaceDetection.getClient(
             FaceDetectorOptions.Builder()
+                // Enables smilingProbability AND eyeOpenProbability for blink detection
                 .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
                 .build()
         )
     }
+
+    // Gender classifier — gracefully absent when model file is not yet in assets/
+    val genderClassifier = remember(context) { GenderClassifier(context) }
+    val declaredGender = uiState.currentUser?.genderText.orEmpty()
 
     Box(
         modifier = Modifier
@@ -127,7 +150,7 @@ fun FaceVerificationScreen(
             )
 
             Text(
-                text = "Align your face and smile. Verification triggers automatically when your smile is detected.",
+                text = "Align your face, then smile or blink deliberately. Verification triggers automatically.",
                 style = MaterialTheme.typography.bodyLarge,
                 color = Color.White.copy(alpha = 0.7f),
                 textAlign = TextAlign.Center,
@@ -166,7 +189,7 @@ fun FaceVerificationScreen(
             Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4ADE80), modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Reference: ${uiState.currentUser?.name}'s profile photos", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
+                Text("Reference: ${uiState.currentUser?.name?.takeIf { it.isNotBlank() } ?: "your"} profile photos", color = Color.White.copy(alpha = 0.5f), fontSize = 11.sp)
             }
         }
     }
@@ -198,13 +221,15 @@ fun FaceVerificationScreen(
                                             cameraExecutor = cameraExecutor,
                                             detector = detector,
                                             mainExecutor = mainExecutor,
+                                            genderClassifier = genderClassifier,
+                                            declaredGender = declaredGender,
                                             onReadyForUpload = { uri, _ ->
                                                 try {
                                                     onVerify(uri) {
                                                         mainExecutor.execute {
                                                             captureInProgress.set(false)
                                                             isCapturing = false
-                                                            smileHint = "Smile to verify"
+                                                            smileHint = "Smile or blink to verify"
                                                         }
                                                     }
                                                 } catch (e: Exception) {
@@ -220,7 +245,7 @@ fun FaceVerificationScreen(
                                                 mainExecutor.execute {
                                                     captureInProgress.set(false)
                                                     isCapturing = false
-                                                    smileHint = "Smile to verify"
+                                                    smileHint = "Smile or blink to verify"
                                                 }
                                             },
                                             onError = {
@@ -244,7 +269,7 @@ fun FaceVerificationScreen(
                         },
                         onNoSmile = {
                             mainExecutor.execute {
-                                if (!captureInProgress.get()) smileHint = "Smile to verify"
+                                if (!captureInProgress.get()) smileHint = "Smile or blink to verify"
                             }
                         }
                     )
@@ -267,9 +292,25 @@ fun FaceVerificationScreen(
             analysisHolder.analysis = null
             runCatching { cameraProviderFuture.get().unbindAll() }
             runCatching { detector.close() }
+            runCatching { genderClassifier.close() }
             runCatching { cameraExecutor.shutdown() }
         }
     }
+}
+
+/**
+ * Returns true when [this] face meets the verification trigger condition:
+ *  • Big smile  : [Face.smilingProbability] > [SMILE_PROBABILITY_THRESHOLD], OR
+ *  • Blink      : both [Face.leftEyeOpenProbability] AND [Face.rightEyeOpenProbability]
+ *                 are below [BLINK_PROBABILITY_THRESHOLD] (deliberate eyes-closed gesture).
+ */
+private fun Face.isVerificationReady(): Boolean {
+    val smile      = smilingProbability       ?: 0f
+    val leftOpen   = leftEyeOpenProbability   ?: 1f
+    val rightOpen  = rightEyeOpenProbability  ?: 1f
+    val hasBigSmile = smile > SMILE_PROBABILITY_THRESHOLD
+    val hasBlink    = leftOpen < BLINK_PROBABILITY_THRESHOLD && rightOpen < BLINK_PROBABILITY_THRESHOLD
+    return hasBigSmile || hasBlink
 }
 
 private fun processFaceFrame(
@@ -297,14 +338,15 @@ private fun processFaceFrame(
                         mainExecutor.execute {
                             Toast.makeText(
                                 context,
-                                "No face detected, try again",
+                                "No face detected — move closer and face the camera",
                                 Toast.LENGTH_SHORT
                             ).show()
                         }
                     }
                     onNoSmile()
                 }
-                faces.any { (it.smilingProbability ?: 0f) > SMILE_PROBABILITY_THRESHOLD } -> onSmileDetected()
+                // Trigger on smile (≥ 0.45) OR deliberate blink (both eyes < 0.30)
+                faces.any { it.isVerificationReady() } -> onSmileDetected()
                 else -> onNoSmile()
             }
         }
@@ -390,9 +432,28 @@ private fun logAndToastNoFace(context: Context, bitmapForMetrics: Bitmap?, tagRe
 }
 
 /**
+ * Crops [bitmap] to the face [boundingBox], clamping to image boundaries.
+ * Used to extract the face region for gender classification.
+ */
+private fun cropFaceBitmap(bitmap: Bitmap, boundingBox: android.graphics.Rect): Bitmap {
+    val left   = boundingBox.left.coerceAtLeast(0)
+    val top    = boundingBox.top.coerceAtLeast(0)
+    val right  = boundingBox.right.coerceAtMost(bitmap.width)
+    val bottom = boundingBox.bottom.coerceAtMost(bitmap.height)
+    val w = (right - left).coerceAtLeast(1)
+    val h = (bottom - top).coerceAtLeast(1)
+    return Bitmap.createBitmap(bitmap, left, top, w, h)
+}
+
+/**
  * Disk capture only: CameraX writes [photoFile] with EXIF; we read orientation via [ExifInterface],
- * apply [Matrix] in [bitmapFromJpegFileForMlKit], then [InputImage.fromBitmap] — only [onReadyForUpload]
- * when ML Kit reports [faces.isNotEmpty].
+ * apply [Matrix] in [bitmapFromJpegFileForMlKit], then [InputImage.fromBitmap].
+ *
+ * Phase 4 additions:
+ *  • [genderClassifier] — when non-null and model is loaded, runs gender inference on the face
+ *    crop; if predicted gender differs from [declaredGender] with ≥ [GENDER_CONFIDENCE_THRESHOLD]
+ *    confidence the capture is rejected.
+ *  • Smile OR blink condition: mirrors [Face.isVerificationReady] used in the live preview.
  */
 private fun captureImageWithMediaImageValidation(
     context: Context,
@@ -400,6 +461,8 @@ private fun captureImageWithMediaImageValidation(
     cameraExecutor: Executor,
     detector: com.google.mlkit.vision.face.FaceDetector,
     mainExecutor: Executor,
+    genderClassifier: GenderClassifier? = null,
+    declaredGender: String = "",
     onReadyForUpload: (Uri, File) -> Unit,
     onInvalidFace: () -> Unit,
     onError: () -> Unit
@@ -421,9 +484,7 @@ private fun captureImageWithMediaImageValidation(
                     val inputImage = inputImageFromCapturedFile(photoFile)
                     detector.process(inputImage)
                         .addOnSuccessListener { faces: List<Face> ->
-                            val hasSmile = faces.any {
-                                (it.smilingProbability ?: 0f) > SMILE_PROBABILITY_THRESHOLD
-                            }
+                            val readyFace = faces.firstOrNull { it.isVerificationReady() }
                             when {
                                 faces.isEmpty() -> {
                                     Log.w("FaceVerification", "ML Kit: faces.isEmpty() after EXIF+Matrix upright decode")
@@ -435,21 +496,58 @@ private fun captureImageWithMediaImageValidation(
                                         onInvalidFace()
                                     }
                                 }
-                                !hasSmile -> {
-                                    Log.w("FaceVerification", "Instant verify: face(s) present but smile below threshold")
+                                readyFace == null -> {
+                                    Log.w("FaceVerification", "Instant verify: face present but smile/blink threshold not met")
                                     mainExecutor.execute {
                                         Toast.makeText(
                                             context,
-                                            "Smile clearly for the camera, then try again.",
+                                            "Smile clearly or blink fully, then try again.",
                                             Toast.LENGTH_LONG
                                         ).show()
                                         onInvalidFace()
                                     }
                                 }
                                 else -> {
+                                    // ── Gender check (Phase 4) ──────────────────────────────────
+                                    val classifier = genderClassifier
+                                    if (classifier != null && classifier.isAvailable &&
+                                        declaredGender.isNotBlank() &&
+                                        GENDER_CONFIDENCE_THRESHOLD > 0f
+                                    ) {
+                                        val faceBitmap = runCatching {
+                                            val fullBmp = bitmapFromJpegFileForMlKit(photoFile, 0)
+                                            cropFaceBitmap(fullBmp, readyFace.boundingBox)
+                                        }.getOrNull()
+
+                                        val genderResult = faceBitmap?.let {
+                                            runCatching { classifier.classify(it) }.getOrNull()
+                                        }
+
+                                        if (genderResult != null &&
+                                            genderResult.confidence >= GENDER_CONFIDENCE_THRESHOLD &&
+                                            genderResult.predictedGender != declaredGender
+                                        ) {
+                                            Log.w(
+                                                "FaceVerification",
+                                                "Gender mismatch: declared=$declaredGender " +
+                                                "detected=${genderResult.predictedGender} " +
+                                                "conf=${"%.0f".format(genderResult.confidence * 100)}%"
+                                            )
+                                            mainExecutor.execute {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Gender mismatch detected. Please verify using your own face.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                                onInvalidFace()
+                                            }
+                                            return@addOnSuccessListener
+                                        }
+                                    }
+                                    // ─────────────────────────────────────────────────────────────
                                     Log.d(
                                         "FaceVerification",
-                                        "Instant verify: faces=${faces.size} smile OK — upload + Firestore approval"
+                                        "Instant verify: faces=${faces.size} trigger=OK gender=OK → upload"
                                     )
                                     mainExecutor.execute { onReadyForUpload(uri, photoFile) }
                                 }
@@ -492,4 +590,148 @@ private fun captureImageWithMediaImageValidation(
             }
         }
     )
+}
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * HOST FACE DEDUPLICATION
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Prevents a person from creating two host accounts.
+ *
+ * HOW IT WORKS:
+ * 1. On host verification submission, ML Kit extracts face landmark positions
+ * 2. These positions are normalized into a pseudo-embedding vector (List<Float>)
+ * 3. The vector is stored in Firestore: host_face_embeddings/{uid}
+ * 4. Before approving a new host, compare against ALL existing host embeddings
+ * 5. If cosine similarity > DUPLICATE_THRESHOLD → reject as duplicate face
+ *
+ * LIMITATIONS:
+ * - ML Kit doesn't produce true embeddings (unlike FaceNet/ArcFace)
+ * - We use landmark positions as a proxy — effective against casual duplication
+ * - A proper implementation would use TFLite FaceNet model for real embeddings
+ * - For production, move this comparison to a Cloud Function using a real model
+ *
+ * THRESHOLD: 0.92 cosine similarity → very conservative (few false positives)
+ */
+object HostFaceDeduplicate {
+
+    private const val DUPLICATE_THRESHOLD = 0.92f
+    private val db get() = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+
+    /**
+     * Extract a pseudo-embedding from ML Kit face landmarks.
+     * Returns a normalized vector of landmark x,y positions (relative coordinates).
+     */
+    fun extractPseudoEmbedding(face: com.google.mlkit.vision.face.Face): List<Float> {
+        val landmarks: List<Int> = listOf(
+            com.google.mlkit.vision.face.FaceLandmark.LEFT_EYE,
+            com.google.mlkit.vision.face.FaceLandmark.RIGHT_EYE,
+            com.google.mlkit.vision.face.FaceLandmark.NOSE_BASE,
+            com.google.mlkit.vision.face.FaceLandmark.LEFT_CHEEK,
+            com.google.mlkit.vision.face.FaceLandmark.RIGHT_CHEEK,
+            com.google.mlkit.vision.face.FaceLandmark.MOUTH_LEFT,
+            com.google.mlkit.vision.face.FaceLandmark.MOUTH_RIGHT,
+            com.google.mlkit.vision.face.FaceLandmark.MOUTH_BOTTOM,
+        )
+
+        val positions = mutableListOf<Float>()
+        val boundingBox = face.boundingBox
+        val faceWidth = boundingBox.width().toFloat().coerceAtLeast(1f)
+        val faceHeight = boundingBox.height().toFloat().coerceAtLeast(1f)
+
+        for (landmarkType in landmarks) {
+            val landmark = face.getLandmark(landmarkType)
+            if (landmark != null) {
+                // Normalize to [0,1] relative to face bounding box
+                positions.add((landmark.position.x - boundingBox.left) / faceWidth)
+                positions.add((landmark.position.y - boundingBox.top) / faceHeight)
+            } else {
+                positions.add(0f)
+                positions.add(0f)
+            }
+        }
+
+        return normalizeVector(positions)
+    }
+
+    /**
+     * L2-normalize a vector (for cosine similarity).
+     */
+    private fun normalizeVector(v: List<Float>): List<Float> {
+        val magnitude = Math.sqrt(v.sumOf { (it * it).toDouble() }).toFloat()
+        return if (magnitude < 0.0001f) v else v.map { it / magnitude }
+    }
+
+    /**
+     * Cosine similarity between two normalized vectors.
+     * Range: -1 to 1. Higher = more similar. 1 = identical.
+     */
+    fun cosineSimilarity(a: List<Float>, b: List<Float>): Float {
+        if (a.size != b.size) return 0f
+        return a.zip(b).sumOf { (x, y) -> (x * y).toDouble() }.toFloat()
+    }
+
+    /**
+     * Save face embedding to Firestore for future comparison.
+     * Call this after host verification is approved.
+     */
+    suspend fun saveHostEmbedding(uid: String, embedding: List<Float>) {
+        db.collection("host_face_embeddings")
+            .document(uid)
+            .set(
+                mapOf(
+                    "uid" to uid,
+                    "embedding" to embedding,
+                    "savedAt" to System.currentTimeMillis(),
+                ),
+            )
+            .await()
+    }
+
+    /**
+     * Check if this face already exists as a verified host.
+     * @return DuplicateFaceResult
+     */
+    suspend fun checkForDuplicateFace(
+        newEmbedding: List<Float>,
+        excludeUid: String,
+    ): DuplicateFaceResult {
+        return try {
+            val docs = db.collection("host_face_embeddings").get().await()
+            var highestSimilarity = 0f
+            var matchedUid: String? = null
+
+            for (doc in docs.documents) {
+                val existingUid = doc.getString("uid") ?: continue
+                if (existingUid == excludeUid) continue // skip self
+
+                @Suppress("UNCHECKED_CAST")
+                val rawList = doc.get("embedding") as? List<*> ?: continue
+                val existingEmbedding = rawList.mapNotNull { (it as? Number)?.toFloat() }
+
+                if (existingEmbedding.size == newEmbedding.size) {
+                    val similarity = cosineSimilarity(newEmbedding, existingEmbedding)
+                    if (similarity > highestSimilarity) {
+                        highestSimilarity = similarity
+                        matchedUid = existingUid
+                    }
+                }
+            }
+
+            if (highestSimilarity >= DUPLICATE_THRESHOLD) {
+                DuplicateFaceResult.Duplicate(matchedUid = matchedUid!!, similarity = highestSimilarity)
+            } else {
+                DuplicateFaceResult.Unique(highestSimilarity = highestSimilarity)
+            }
+        } catch (e: Exception) {
+            DuplicateFaceResult.Error(e.message ?: "Unknown error")
+        }
+    }
+}
+
+sealed class DuplicateFaceResult {
+    data class Duplicate(val matchedUid: String, val similarity: Float) : DuplicateFaceResult()
+    data class Unique(val highestSimilarity: Float) : DuplicateFaceResult()
+    data class Error(val message: String) : DuplicateFaceResult()
 }
