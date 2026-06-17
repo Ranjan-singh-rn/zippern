@@ -1,8 +1,0 @@
-{
-  "name": "zipper-firebase-scripts",
-  "private": true,
-  "description": "One-off admin scripts (migrations). Not part of the Android app build.",
-  "dependencies": {
-    "firebase-admin": "^12.7.0"
-  }
-}
