@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-    <!-- Default: no cleartext; scope exceptions here if a backend truly requires HTTP. -->
-    <base-config cleartextTrafficPermitted="false" />
-</network-security-config>

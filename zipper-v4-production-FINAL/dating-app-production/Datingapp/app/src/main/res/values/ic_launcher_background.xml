@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- White matches the logo's outer border so the launcher shape mask blends cleanly. -->
-    <color name="ic_launcher_background">#FFFFFF</color>
-</resources>

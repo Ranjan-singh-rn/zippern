@@ -1,0 +1,4 @@
+-keep class com.zipper.app.data.** { *; }
+-keep class io.agora.** { *; }
+-keep class com.google.firebase.** { *; }
+-dontwarn io.agora.**
