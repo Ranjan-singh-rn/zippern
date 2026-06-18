@@ -39,6 +39,7 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.android.gms.location.LocationServices
+import com.google.firebase.auth.FirebaseAuth
 import com.zipper.app.ui.theme.*
 import com.zipper.app.ui.theme.ZipperSuccess
 import com.zipper.app.ui.theme.ZipperError
@@ -52,11 +53,15 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ProfileSetupScreen(
     onNavigateToFaceVerification: (gender: String) -> Unit,
+    onNavigateToLogin: () -> Unit = {},
     viewModel: AuthViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    // Detect if this is a guest/anonymous login — referral code not shown for guests
+    val isGuestUser = remember { FirebaseAuth.getInstance().currentUser?.isAnonymous ?: true }
 
     var name by remember { mutableStateOf("") }
     var gender by remember { mutableStateOf("") }
@@ -67,6 +72,7 @@ fun ProfileSetupScreen(
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     var showDatePicker by remember { mutableStateOf(false) }
     var referralCode by remember { mutableStateOf("") }
+    var showNotAHostDialog by remember { mutableStateOf(false) }
 
     // Device ID
     @SuppressLint("HardwareIds")
@@ -202,8 +208,8 @@ fun ProfileSetupScreen(
         ((System.currentTimeMillis() - it) / (365.25 * 24 * 60 * 60 * 1000)).toInt()
     } ?: 0
 
-    val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank() &&
-        (referralCode.isBlank() || uiState.referralValid)  // if code entered, it must be verified
+    // Referral code validity is handled in the onClick dialog flow, not by disabling the button
+    val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank()
 
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
 
@@ -415,63 +421,66 @@ fun ProfileSetupScreen(
                 }
             }
 
-            Spacer(Modifier.height(20.dp))
+            // Referral code section — only shown for non-guest users
+            if (!isGuestUser) {
+                Spacer(Modifier.height(20.dp))
 
-            // Referral Code (optional — for hosts joining via agency)
-            ProfileLabel("Referral Code (Optional — for hosts only)")
-            Spacer(Modifier.height(6.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedTextField(
-                    value = referralCode,
-                    onValueChange = { referralCode = it.uppercase() },
-                    placeholder = { Text("Enter agency code", color = MaterialTheme.colorScheme.onBackground.copy(0.3f)) },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = when {
-                            uiState.referralValid -> ZipperSuccess
-                            uiState.referralError != null -> ZipperError
-                            else -> ZipperPink
-                        },
-                        unfocusedBorderColor = when {
-                            uiState.referralValid -> ZipperSuccess
-                            uiState.referralError != null -> ZipperError
-                            else -> MaterialTheme.colorScheme.onBackground.copy(0.12f)
-                        },
-                        focusedTextColor = MaterialTheme.colorScheme.onBackground,
-                        unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
-                        cursorColor = ZipperPink,
-                        focusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
-                        unfocusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
-                    ),
-                    modifier = Modifier.weight(1f),
-                )
-                if (uiState.referralCheckLoading) {
-                    CircularProgressIndicator(color = ZipperPink, modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                } else if (referralCode.length >= 6) {
-                    Box(
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Brush.linearGradient(listOf(ZipperPink, ZipperPurple)))
-                            .clickable { viewModel.verifyReferralCode(referralCode) },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text("✓", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                // Referral Code (optional — for hosts joining via agency)
+                ProfileLabel("Referral Code (Optional — for hosts only)")
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = referralCode,
+                        onValueChange = { referralCode = it.uppercase() },
+                        placeholder = { Text("Enter agency code", color = MaterialTheme.colorScheme.onBackground.copy(0.3f)) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = when {
+                                uiState.referralValid -> ZipperSuccess
+                                uiState.referralError != null -> ZipperError
+                                else -> ZipperPink
+                            },
+                            unfocusedBorderColor = when {
+                                uiState.referralValid -> ZipperSuccess
+                                uiState.referralError != null -> ZipperError
+                                else -> MaterialTheme.colorScheme.onBackground.copy(0.12f)
+                            },
+                            focusedTextColor = MaterialTheme.colorScheme.onBackground,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
+                            cursorColor = ZipperPink,
+                            focusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                            unfocusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                        ),
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (uiState.referralCheckLoading) {
+                        CircularProgressIndicator(color = ZipperPink, modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    } else if (referralCode.length >= 6) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Brush.linearGradient(listOf(ZipperPink, ZipperPurple)))
+                                .clickable { viewModel.verifyReferralCode(referralCode) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("✓", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
-            }
-            if (uiState.referralError != null) {
-                Spacer(Modifier.height(4.dp))
-                Text(uiState.referralError!!, color = ZipperError, fontSize = 12.sp)
-            }
-            if (uiState.referralValid) {
-                Spacer(Modifier.height(4.dp))
-                Text("✓ Valid referral code — you'll be registered as a host", color = ZipperSuccess, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                if (uiState.referralError != null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(uiState.referralError!!, color = ZipperError, fontSize = 12.sp)
+                }
+                if (uiState.referralValid) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("✓ Valid referral code — you'll be registered as a host", color = ZipperSuccess, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
             }
 
             Spacer(Modifier.height(36.dp))
@@ -489,15 +498,20 @@ fun ProfileSetupScreen(
                             Brush.horizontalGradient(listOf(MaterialTheme.colorScheme.onBackground.copy(0.1f), MaterialTheme.colorScheme.onBackground.copy(0.1f))),
                     )
                     .clickable(enabled = canProceed && !uiState.isLoading) {
-                        viewModel.saveProfile(
-                            name = name,
-                            gender = gender,
-                            dob = dob ?: 0L,
-                            age = ageFromDob,
-                            city = city,
-                            deviceId = deviceId,
-                            photoUri = photoUri,
-                        )
+                        if (!isGuestUser && referralCode.isNotBlank() && !uiState.referralValid) {
+                            // Code was entered but didn't verify as host — show dialog
+                            showNotAHostDialog = true
+                        } else {
+                            viewModel.saveProfile(
+                                name = name.trim(),
+                                gender = gender,
+                                dob = dob!!,
+                                age = ageFromDob,
+                                city = city.trim(),
+                                deviceId = deviceId,
+                                photoUri = photoUri,
+                            )
+                        }
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -523,6 +537,54 @@ fun ProfileSetupScreen(
                 action = { TextButton(onClick = { viewModel.clearError() }) { Text("OK") } },
                 containerColor = MaterialTheme.colorScheme.surface,
             ) { Text(err, color = MaterialTheme.colorScheme.onSurface) }
+        }
+
+        // "Not a host" dialog — shown when referral code entered but verification failed
+        if (showNotAHostDialog) {
+            AlertDialog(
+                onDismissRequest = { showNotAHostDialog = false },
+                title = { Text("Not Registered as Host", fontWeight = FontWeight.Bold) },
+                text = {
+                    Text(
+                        "The referral code you entered does not match any host record for your account. " +
+                            "Would you like to continue as a regular user instead?",
+                        color = MaterialTheme.colorScheme.onSurface.copy(0.8f),
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            val currentDob = dob ?: return@TextButton
+                            showNotAHostDialog = false
+                            // Clear the referral code and proceed as normal user
+                            viewModel.saveProfile(
+                                name = name.trim(),
+                                gender = gender,
+                                dob = currentDob,
+                                age = ageFromDob,
+                                city = city.trim(),
+                                deviceId = deviceId,
+                                photoUri = photoUri,
+                            )
+                        }
+                    ) {
+                        Text("Yes, Continue as User", color = ZipperPink, fontWeight = FontWeight.SemiBold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            showNotAHostDialog = false
+                            viewModel.signOut()
+                            onNavigateToLogin()
+                        }
+                    ) {
+                        Text("No, Go Back", color = MaterialTheme.colorScheme.onSurface.copy(0.6f))
+                    }
+                },
+                containerColor = MaterialTheme.colorScheme.surface,
+                titleContentColor = MaterialTheme.colorScheme.onSurface,
+            )
         }
     }
 }

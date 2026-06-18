@@ -26,6 +26,7 @@ data class AuthUiState(
     val otpAutoFilled: String? = null,
     val faceVerificationAttempts: Int = 0,
     val navigateToFaceVerification: Boolean = false,
+    val navigateToLogin: Boolean = false,
     val accountDeleted: Boolean = false,
     val referralCheckLoading: Boolean = false,
     val referralError: String? = null,
@@ -203,10 +204,18 @@ class AuthViewModel @Inject constructor(
 
     // ── Consume navigation events ─────────────────────────────────────────────
 
+    fun signOut() {
+        viewModelScope.launch {
+            repo.signOut()
+            _uiState.update { it.copy(navigateToMain = false, navigateToOtp = false, navigateToProfileSetup = false) }
+        }
+    }
+
     fun onNavigatedToOtp()          = _uiState.update { it.copy(navigateToOtp = false) }
     fun onNavigatedToProfileSetup() = _uiState.update { it.copy(navigateToProfileSetup = false) }
     fun onNavigatedToMain()         = _uiState.update { it.copy(navigateToMain = false) }
     fun onNavigatedToFaceVerification() = _uiState.update { it.copy(navigateToFaceVerification = false) }
+    fun onNavigatedToLogin()        = _uiState.update { it.copy(navigateToLogin = false) }
     fun onAccountDeleted()          = _uiState.update { it.copy(accountDeleted = false) }
     fun clearError()                = _uiState.update { it.copy(error = null) }
     fun isLoggedIn()                = repo.isLoggedIn()

@@ -95,6 +95,11 @@ fun ZipperNavGraph(
                         popUpTo(0) { inclusive = true }
                     }
                 },
+                onNavigateToLogin = {
+                    navController.navigate(Screen.Login.route) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                },
             )
         }
 
