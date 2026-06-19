@@ -24,6 +24,7 @@ data class User(
     val equippedFrame: String = "",
     val equippedEntrance: String = "",
     val equippedChatStyle: String = "",
+    val totalGiftsReceived: Long = 0,
     val callRateBeans: Int = 375,
     val agencyId: String = "",
     val hasRecharged: Boolean = false,
