@@ -249,7 +249,8 @@ class AuthRepository @Inject constructor(
             val emailMatch = applicantEmail.isNotBlank() && currentEmail.isNotBlank() &&
                 applicantEmail.equals(currentEmail, ignoreCase = true)
 
-            if (!phoneMatch && !emailMatch) return ReferralResult.AccountMismatch
+            // BOTH phone AND email must match
+            if (!phoneMatch || !emailMatch) return ReferralResult.AccountMismatch
 
             // Valid — return host data
             ReferralResult.Valid(
