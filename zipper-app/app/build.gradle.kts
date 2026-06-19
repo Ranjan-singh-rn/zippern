@@ -135,4 +135,8 @@ dependencies {
 
     // ML Kit
     implementation(libs.mlkit.face.detection)
+
+    // Firebase ML Model Downloader + TFLite
+    implementation(libs.firebase.ml.modeldownloader)
+    implementation(libs.tensorflow.lite)
 }

@@ -20,6 +20,8 @@ accompanistPermissions = "0.36.0"
 credentials = "1.2.2"
 googleid = "1.1.1"
 mlkitFace = "16.1.7"
+firebaseModelDownloader = "24.2.3"
+tensorflowLite = "2.14.0"
 
 [libraries]
 # Compose
@@ -90,6 +92,8 @@ accompanist-permissions = { group = "com.google.accompanist", name = "accompanis
 
 # ML Kit
 mlkit-face-detection = { group = "com.google.mlkit", name = "face-detection", version.ref = "mlkitFace" }
+firebase-ml-modeldownloader = { group = "com.google.firebase", name = "firebase-ml-modeldownloader-ktx", version.ref = "firebaseModelDownloader" }
+tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 
 # Play Services
 play-services-location = { group = "com.google.android.gms", name = "play-services-location", version = "21.3.0" }

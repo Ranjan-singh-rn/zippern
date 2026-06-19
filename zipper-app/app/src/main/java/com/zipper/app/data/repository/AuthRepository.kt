@@ -191,6 +191,25 @@ class AuthRepository @Inject constructor(
         }
     }
 
+    /** Full cleanup: deletes Firestore doc, Storage files, and Auth account */
+    suspend fun clearAllUserData(): AuthResult {
+        val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not logged in")
+        return try {
+            // Delete Firestore doc
+            firestore.collection("users").document(uid).delete().await()
+            // Best-effort delete Storage files (ignore errors if they don't exist)
+            try { storage.reference.child("profile_photos/$uid.jpg").delete().await() } catch (_: Exception) {}
+            try { storage.reference.child("face_verifications/$uid.jpg").delete().await() } catch (_: Exception) {}
+            // Delete Auth account last
+            auth.currentUser?.delete()?.await()
+            AuthResult.Success
+        } catch (e: Exception) {
+            // Even if Firestore delete failed, try to delete auth account
+            try { auth.currentUser?.delete()?.await() } catch (_: Exception) {}
+            AuthResult.Error(e.message ?: "Cleanup failed")
+        }
+    }
+
     // Upload verification selfie to Firebase Storage, mark isFaceVerified = true
     suspend fun saveFaceVerification(photoUri: Uri): AuthResult {
         val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not logged in")

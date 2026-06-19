@@ -165,15 +165,7 @@ fun ProfileSetupScreen(
                                 val addresses = withContext(Dispatchers.IO) {
                                     geocoder.getFromLocation(location.latitude, location.longitude, 1)
                                 }
-                                val detectedCity = addresses?.firstOrNull()?.let { addr ->
-                                    // Build candidate list; reject anything containing "Division" or "Zone"
-                                    val candidates = listOfNotNull(
-                                        addr.subAdminArea,
-                                        addr.locality,
-                                        addr.adminArea,
-                                    ).filter { it.isNotBlank() && !it.contains("Division", ignoreCase = true) && !it.contains("Zone", ignoreCase = true) }
-                                    candidates.firstOrNull() ?: addr.adminArea ?: ""
-                                } ?: ""
+                                val detectedCity = addresses?.firstOrNull()?.let { extractCity(it) } ?: ""
                                 city = detectedCity
                             } catch (e: Exception) {
                                 // keep manual input
@@ -211,7 +203,12 @@ fun ProfileSetupScreen(
     // Referral code validity is handled in the onClick dialog flow, not by disabling the button
     val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank()
 
-    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .imePadding(),
+    ) {
 
         // Background glow orbs
         Box(
@@ -233,9 +230,10 @@ fun ProfileSetupScreen(
 
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp),
+                .padding(horizontal = 28.dp)
+                .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Spacer(Modifier.height(56.dp))
@@ -628,4 +626,39 @@ private fun ProfileField(
             ),
         )
     }
+}
+
+private fun extractCity(addr: android.location.Address): String {
+    val adminSuffixes = listOf(
+        "division", "district", "zone", "taluk", "tehsil",
+        "mandal", "block", "sub-district", "municipal corporation", "nagar nigam"
+    )
+
+    fun String.isAdminJargon() = adminSuffixes.any { this.contains(it, ignoreCase = true) }
+    fun String?.clean() = this?.trim()?.takeIf { it.isNotBlank() && !it.isAdminJargon() }
+
+    // Priority 1: locality (Android field for city/town)
+    addr.locality.clean()?.let { return it }
+
+    // Priority 2: subAdminArea (district) filtered for admin jargon
+    addr.subAdminArea.clean()?.let { return it }
+
+    // Priority 3: Parse from full address line — city is typically before State
+    val line = addr.getAddressLine(0)
+    if (!line.isNullOrBlank()) {
+        val state = addr.adminArea ?: ""
+        val country = addr.countryName ?: ""
+        val parts = line.split(",").map { it.trim() }
+        val candidate = parts.firstOrNull { part ->
+            part.isNotBlank() &&
+            !part.any { it.isDigit() } &&
+            !part.contains(state, ignoreCase = true) &&
+            !part.contains(country, ignoreCase = true) &&
+            !part.isAdminJargon()
+        }
+        candidate?.let { return it }
+    }
+
+    // Priority 4: adminArea (state) as last resort
+    return addr.adminArea ?: ""
 }

@@ -146,7 +146,7 @@ class AuthViewModel @Inject constructor(
                 is AuthResult.Error -> {
                     val attempts = _uiState.value.faceVerificationAttempts + 1
                     if (attempts >= 3) {
-                        repo.deleteCurrentUser()
+                        repo.clearAllUserData()
                         _uiState.update { it.copy(isLoading = false, accountDeleted = true, faceVerificationAttempts = attempts) }
                     } else {
                         _uiState.update { it.copy(isLoading = false, error = result.message, faceVerificationAttempts = attempts) }
@@ -162,11 +162,16 @@ class AuthViewModel @Inject constructor(
         if (attempts >= 3) {
             _uiState.update { it.copy(isLoading = true) }
             viewModelScope.launch {
-                repo.deleteCurrentUser()
+                repo.clearAllUserData()
                 _uiState.update { it.copy(isLoading = false, accountDeleted = true, faceVerificationAttempts = attempts) }
             }
         } else {
-            _uiState.update { it.copy(faceVerificationAttempts = attempts, error = "No face detected. ${3 - attempts} attempt(s) remaining.") }
+            _uiState.update {
+                it.copy(
+                    faceVerificationAttempts = attempts,
+                    error = "Face check failed. ${3 - attempts} attempt(s) remaining.",
+                )
+            }
         }
     }
 
