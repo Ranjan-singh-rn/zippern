@@ -31,6 +31,7 @@ data class AuthUiState(
     val referralCheckLoading: Boolean = false,
     val referralError: String? = null,
     val referralValid: Boolean = false,
+    val referralNotFound: Boolean = false,       // code typed but doesn't exist → treat as user
     // Stored from ReferralResult.Valid — used to activate host application on profile save
     val referralAgencyId: String = "",
     val referralCallRate: Int = 375,
@@ -175,32 +176,33 @@ class AuthViewModel @Inject constructor(
         }
     }
 
-    fun verifyReferralCode(code: String) {
+    fun verifyReferralCode(code: String, overridePhone: String = "", overrideEmail: String = "") {
         if (code.isBlank()) {
-            _uiState.update { it.copy(referralValid = false, referralError = null) }
+            _uiState.update { it.copy(referralValid = false, referralError = null, referralNotFound = false) }
             return
         }
-        _uiState.update { it.copy(referralCheckLoading = true, referralError = null) }
+        _uiState.update { it.copy(referralCheckLoading = true, referralError = null, referralNotFound = false) }
         viewModelScope.launch {
-            when (val result = repo.verifyReferralCode(code)) {
+            when (val result = repo.verifyReferralCode(code, overridePhone, overrideEmail)) {
                 is com.zipper.app.data.repository.ReferralResult.Valid -> {
-                    _uiState.update {
-                        it.copy(
-                            referralCheckLoading = false,
-                            referralValid = true,
-                            referralError = null,
-                            referralAgencyId = result.agencyId,
-                            referralCallRate = result.callRate,
-                            referralApplicationId = result.applicationId,
-                        )
-                    }
+                    _uiState.update { it.copy(
+                        referralCheckLoading = false,
+                        referralValid = true,
+                        referralNotFound = false,
+                        referralError = null,
+                        referralAgencyId = result.agencyId,
+                        referralCallRate = result.callRate,
+                        referralApplicationId = result.applicationId,
+                    ) }
                 }
-                is com.zipper.app.data.repository.ReferralResult.NotFound ->
-                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "Invalid referral code") }
+                is com.zipper.app.data.repository.ReferralResult.NotFound -> {
+                    // Code doesn't exist — silently treat person as regular user, don't block
+                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralNotFound = true, referralError = null) }
+                }
                 is com.zipper.app.data.repository.ReferralResult.AlreadyUsed ->
                     _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "This code has already been used") }
                 is com.zipper.app.data.repository.ReferralResult.AccountMismatch ->
-                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "This code is not registered for your account") }
+                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "Details don't match the agency record for this code") }
                 is com.zipper.app.data.repository.ReferralResult.Error ->
                     _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = result.message) }
             }

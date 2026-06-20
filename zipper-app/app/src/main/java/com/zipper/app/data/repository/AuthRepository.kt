@@ -226,7 +226,11 @@ class AuthRepository @Inject constructor(
     }
 
     // Verify referral code — checks if code exists AND matches user's phone/email
-    suspend fun verifyReferralCode(code: String): ReferralResult {
+    suspend fun verifyReferralCode(
+        code: String,
+        overridePhone: String = "",   // phone entered in form (for Google-login users)
+        overrideEmail: String = "",   // email entered in form (for phone-login users)
+    ): ReferralResult {
         return try {
             val snap = firestore.collection("hostApplications")
                 .whereEqualTo("referralCode", code.trim().uppercase())
@@ -241,26 +245,20 @@ class AuthRepository @Inject constructor(
 
             val applicantPhone = doc.getString("applicantPhone") ?: ""
             val applicantEmail = doc.getString("applicantEmail") ?: ""
-            val currentPhone = auth.currentUser?.phoneNumber ?: ""
-            val currentEmail = auth.currentUser?.email ?: ""
 
-            val phoneAvailable = applicantPhone.isNotBlank() && currentPhone.isNotBlank()
-            val emailAvailable = applicantEmail.isNotBlank() && currentEmail.isNotBlank()
+            // Combine Firebase Auth data with any form-provided values
+            val currentPhone = (auth.currentUser?.phoneNumber?.takeIf { it.isNotBlank() } ?: overridePhone).replace(" ", "")
+            val currentEmail = (auth.currentUser?.email?.takeIf { it.isNotBlank() } ?: overrideEmail).trim()
 
-            // No common identifier to validate against
-            if (!phoneAvailable && !emailAvailable) return ReferralResult.AccountMismatch
-
-            val phoneMatch = phoneAvailable &&
-                applicantPhone.replace(" ", "") == currentPhone.replace(" ", "")
-            val emailMatch = emailAvailable &&
+            // Both phone AND email must match (we now always have both because
+            // the missing one is collected in the profile setup form)
+            val phoneMatch = applicantPhone.isNotBlank() && currentPhone.isNotBlank() &&
+                applicantPhone.replace(" ", "") == currentPhone
+            val emailMatch = applicantEmail.isNotBlank() && currentEmail.isNotBlank() &&
                 applicantEmail.equals(currentEmail, ignoreCase = true)
 
-            // Every available field must match (phone-only login checks phone only,
-            // Google-only login checks email only, linked account checks both)
-            if (phoneAvailable && !phoneMatch) return ReferralResult.AccountMismatch
-            if (emailAvailable && !emailMatch) return ReferralResult.AccountMismatch
+            if (!phoneMatch || !emailMatch) return ReferralResult.AccountMismatch
 
-            // Valid — return host data
             ReferralResult.Valid(
                 agencyId = doc.getString("agencyId") ?: "",
                 callRate = doc.getLong("callRate")?.toInt() ?: 375,

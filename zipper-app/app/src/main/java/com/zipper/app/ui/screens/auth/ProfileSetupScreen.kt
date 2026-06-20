@@ -40,9 +40,12 @@ import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import com.google.android.gms.location.LocationServices
 import com.google.firebase.auth.FirebaseAuth
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import com.zipper.app.ui.theme.*
 import com.zipper.app.ui.theme.ZipperSuccess
 import com.zipper.app.ui.theme.ZipperError
+import com.zipper.app.ui.theme.ZipperWarning
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +65,15 @@ fun ProfileSetupScreen(
 
     // Detect if this is a guest/anonymous login — referral code not shown for guests
     val isGuestUser = remember { FirebaseAuth.getInstance().currentUser?.isAnonymous ?: true }
+    val hasPhone = remember { FirebaseAuth.getInstance().currentUser?.phoneNumber?.isNotBlank() == true }
+    val hasEmail = remember { FirebaseAuth.getInstance().currentUser?.email?.isNotBlank() == true }
+
+    // Fields to collect the missing contact info (shown only when referral code is entered)
+    var extraEmail by remember { mutableStateOf("") }   // for phone-login users (no email in Auth)
+    var extraPhone by remember { mutableStateOf("") }   // for Google-login users (no phone in Auth)
+
+    val needsEmail = !isGuestUser && !hasEmail   // phone-login user needs to provide email for host check
+    val needsPhone = !isGuestUser && !hasPhone   // Google-login user needs to provide phone for host check
 
     var name by remember { mutableStateOf("") }
     var gender by remember { mutableStateOf("") }
@@ -200,8 +212,14 @@ fun ProfileSetupScreen(
         ((System.currentTimeMillis() - it) / (365.25 * 24 * 60 * 60 * 1000)).toInt()
     } ?: 0
 
+    // Verify button is enabled when code >= 6 chars AND missing fields are filled
+    val verifyEnabled = referralCode.length >= 6 &&
+        (!needsEmail || extraEmail.isNotBlank()) &&
+        (!needsPhone || extraPhone.length == 10)
+
     // Referral code validity is handled in the onClick dialog flow, not by disabling the button
-    val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank()
+    val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank() &&
+        (isGuestUser || referralCode.isBlank() || uiState.referralValid || uiState.referralNotFound)
 
     Box(
         modifier = Modifier
@@ -458,13 +476,13 @@ fun ProfileSetupScreen(
                     )
                     if (uiState.referralCheckLoading) {
                         CircularProgressIndicator(color = ZipperPink, modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
-                    } else if (referralCode.length >= 6) {
+                    } else if (verifyEnabled) {
                         Box(
                             modifier = Modifier
                                 .size(48.dp)
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(Brush.linearGradient(listOf(ZipperPink, ZipperPurple)))
-                                .clickable { viewModel.verifyReferralCode(referralCode) },
+                                .clickable { viewModel.verifyReferralCode(referralCode, overridePhone = "+91$extraPhone", overrideEmail = extraEmail) },
                             contentAlignment = Alignment.Center,
                         ) {
                             Text("✓", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -478,6 +496,64 @@ fun ProfileSetupScreen(
                 if (uiState.referralValid) {
                     Spacer(Modifier.height(4.dp))
                     Text("✓ Valid referral code — you'll be registered as a host", color = ZipperSuccess, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+                if (uiState.referralNotFound) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "⚠ Code not recognized — you'll join as a regular user",
+                        color = ZipperWarning,
+                        fontSize = 12.sp,
+                    )
+                }
+
+                // Show missing contact fields only when a referral code has been entered
+                if (referralCode.isNotBlank()) {
+                    if (needsEmail) {
+                        Spacer(Modifier.height(12.dp))
+                        ProfileLabel("Your Email (for host verification)")
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = extraEmail,
+                            onValueChange = { extraEmail = it.trim() },
+                            placeholder = { Text("your@email.com", color = MaterialTheme.colorScheme.onBackground.copy(0.3f)) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ZipperPink,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.onBackground.copy(0.12f),
+                                focusedTextColor = MaterialTheme.colorScheme.onBackground,
+                                unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
+                                cursorColor = ZipperPink,
+                                focusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                                unfocusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    if (needsPhone) {
+                        Spacer(Modifier.height(12.dp))
+                        ProfileLabel("Your Phone Number (for host verification)")
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = extraPhone,
+                            onValueChange = { v -> if (v.length <= 10 && v.all(Char::isDigit)) extraPhone = v },
+                            placeholder = { Text("10-digit mobile number", color = MaterialTheme.colorScheme.onBackground.copy(0.3f)) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ZipperPink,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.onBackground.copy(0.12f),
+                                focusedTextColor = MaterialTheme.colorScheme.onBackground,
+                                unfocusedTextColor = MaterialTheme.colorScheme.onBackground,
+                                cursorColor = ZipperPink,
+                                focusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                                unfocusedContainerColor = MaterialTheme.colorScheme.onBackground.copy(0.06f),
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
 
@@ -496,8 +572,7 @@ fun ProfileSetupScreen(
                             Brush.horizontalGradient(listOf(MaterialTheme.colorScheme.onBackground.copy(0.1f), MaterialTheme.colorScheme.onBackground.copy(0.1f))),
                     )
                     .clickable(enabled = canProceed && !uiState.isLoading) {
-                        if (!isGuestUser && referralCode.isNotBlank() && !uiState.referralValid) {
-                            // Code was entered but didn't verify as host — show dialog
+                        if (!isGuestUser && referralCode.isNotBlank() && !uiState.referralValid && !uiState.referralNotFound && uiState.referralError != null) {
                             showNotAHostDialog = true
                         } else {
                             viewModel.saveProfile(
