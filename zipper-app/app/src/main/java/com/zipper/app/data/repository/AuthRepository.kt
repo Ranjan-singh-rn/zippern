@@ -244,13 +244,21 @@ class AuthRepository @Inject constructor(
             val currentPhone = auth.currentUser?.phoneNumber ?: ""
             val currentEmail = auth.currentUser?.email ?: ""
 
-            val phoneMatch = applicantPhone.isNotBlank() && currentPhone.isNotBlank() &&
+            val phoneAvailable = applicantPhone.isNotBlank() && currentPhone.isNotBlank()
+            val emailAvailable = applicantEmail.isNotBlank() && currentEmail.isNotBlank()
+
+            // No common identifier to validate against
+            if (!phoneAvailable && !emailAvailable) return ReferralResult.AccountMismatch
+
+            val phoneMatch = phoneAvailable &&
                 applicantPhone.replace(" ", "") == currentPhone.replace(" ", "")
-            val emailMatch = applicantEmail.isNotBlank() && currentEmail.isNotBlank() &&
+            val emailMatch = emailAvailable &&
                 applicantEmail.equals(currentEmail, ignoreCase = true)
 
-            // BOTH phone AND email must match
-            if (!phoneMatch || !emailMatch) return ReferralResult.AccountMismatch
+            // Every available field must match (phone-only login checks phone only,
+            // Google-only login checks email only, linked account checks both)
+            if (phoneAvailable && !phoneMatch) return ReferralResult.AccountMismatch
+            if (emailAvailable && !emailMatch) return ReferralResult.AccountMismatch
 
             // Valid — return host data
             ReferralResult.Valid(
