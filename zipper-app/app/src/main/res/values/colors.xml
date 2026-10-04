@@ -1,4 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="splash_bg">#0D0D0D</color>
+    <!--
+        The two XML colours the app has, and both of them are the same one on
+        purpose: Ink.i950 from ui/theme/Color.kt, which is ZipperColors.bgBase.
+
+        A cold start hands the screen over three times — splash window, then the
+        Activity window, then the first Compose frame. splash_bg was #0D0D0D and
+        the window was AppCompat's default, so those handovers were three
+        slightly different darks in a row and read as a flicker. Keeping all
+        three on one value makes the launch look like nothing happened, which is
+        what a launch should look like.
+
+        If Ink.i950 ever changes in Color.kt, change it here too — the resource
+        system cannot see a Kotlin constant, so this is a copy that has to be
+        kept by hand.
+    -->
+    <color name="splash_bg">#FF070812</color>
+    <color name="window_bg">#FF070812</color>
 </resources>

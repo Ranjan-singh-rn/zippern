@@ -1,0 +1,13 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.zipper.app",
+      "sha256_cert_fingerprints": [
+        "48:78:A3:5F:A2:B4:D8:A0:A6:BC:AB:84:F2:2B:66:31:23:85:FE:02:52:36:03:EA:23:D3:E1:90:FC:19:48:AF",
+        "DB:31:A0:36:E1:BF:84:1E:F2:84:95:AC:B0:CD:5F:0D:56:A8:C3:D2:A0:55:57:FB:F9:C4:03:DA:0D:F2:FB:D4"
+      ]
+    }
+  }
+]

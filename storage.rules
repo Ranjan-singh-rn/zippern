@@ -1,0 +1,443 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ══════════════════════════════════════════════════════════════
+    // HELPERS
+    // ══════════════════════════════════════════════════════════════
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // CRM users sign in with real personal emails (Gmail etc.) — NOT @zippern.crm.
+    // Storage rules can't query Firestore, so we can't verify the crmUsers doc here.
+    // isCrmUser = any authenticated user (CRM enforces role-based access at the app layer).
+    // TODO: switch to a Firebase custom claim (e.g. token.crm == true) once Cloud
+    //       Functions set that claim in createCrmUser — then re-sign-in is needed.
+    function isCrmUser() {
+      return request.auth != null;
+    }
+
+    // App users = signed-in users of the mobile app (same check for now — same auth pool)
+    function isAppUser() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function isVideo() {
+      return request.resource.contentType.matches('video/.*');
+    }
+
+    function isImageOrVideo() {
+      return isImage() || isVideo();
+    }
+
+    function isDocument() {
+      return request.resource.contentType in [
+        'application/pdf',
+        'image/jpeg',
+        'image/png',
+        'image/jpg'
+      ];
+    }
+
+    function maxSize(mb) {
+      return request.resource.size <= mb * 1024 * 1024;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST VERIFICATION CAPTURES
+    // /hostVerification/{uid}/capture.jpg
+    //
+    // A photograph of the host's face, taken live in the app. Biometric data
+    // under the DPDP Act: the host writes it, only they can read it back, and
+    // review happens through the CRM against a signed URL the backend mints —
+    // not by granting staff blanket read access to a bucket of faces.
+    //
+    // Capped hard at 4MB. A liveness capture is a single JPEG; anything larger
+    // is either a mistake or someone using the path as free storage.
+    // ══════════════════════════════════════════════════════════════
+    match /hostVerification/{uid}/{fileName} {
+      allow read:  if isOwner(uid);
+      allow write: if isOwner(uid) && isImage() && maxSize(4);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // APPEAL EVIDENCE
+    // /appealEvidence/{uid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    //
+    // Screenshots somebody attaches when they say a ban or a report decision
+    // was wrong. Written by an account that is BANNED — which is the point:
+    // `isBanned` gates the product, not the session, and a wrongly banned
+    // person with no way to show what actually happened is the case this whole
+    // path exists for.
+    //
+    // `isCrmUser()` on read because the reviewer has to open them, and unlike a
+    // face capture these are not biometric data: they are screenshots of chats
+    // and rooms, so they do not need the signed-URL treatment
+    // `hostVerification` gets. Nobody but the uploader and staff can read them.
+    match /appealEvidence/{uid}/{fileName} {
+      allow read:  if isOwner(uid) || isCrmUser();
+      allow write: if isOwner(uid) && isImage() && maxSize(5);
+      // Kept. An appeal decided on evidence that was later deleted cannot be
+      // reviewed again, and an appeal is exactly the thing that gets reviewed
+      // again.
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // USER PROFILE MEDIA
+    // /profileMedia/{uid}/avatar.jpg
+    // /profileMedia/{uid}/cover.jpg
+    // ══════════════════════════════════════════════════════════════
+    // Also gallery_{ts}_{n}.{ext} — the profile gallery holds short videos too.
+    match /profileMedia/{uid}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if (isOwner(uid) || isCrmUser())
+                   && ((isImage() && maxSize(5)) || (isVideo() && maxSize(50)));
+      allow delete: if isOwner(uid) || isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PUBLIC AGENCY SELF-SIGNUP KYC UPLOADS (no auth required)
+    // /kyc/agencies/signup/{fileName}
+    // read: must be public so unauthenticated uploader can call getDownloadURL
+    //       after upload completes (Storage rules apply to getDownloadURL too).
+    //       Filenames include timestamps — not guessable by outsiders.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/agencies/signup/{fileName} {
+      allow read:  if true;
+      allow write: if isDocument() && maxSize(10);  // public — no auth needed
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // STAFF REGISTERING AN AGENCY ON SOMEONE'S BEHALF
+    // /kyc/agencies/temp/{fileName}
+    //
+    // Three upload paths in the CRM had NO rule matching them at all, so every
+    // one failed with storage/unauthorized. They are three segments deep
+    // (kyc / <something> / file) and the only KYC rules that existed were the
+    // four-segment /kyc/{agencyId}/{hostUid}/{fileName} and the public signup
+    // path — neither of which a three-segment path can match. A Storage rule
+    // matches an EXACT depth unless it uses {name=**}.
+    //
+    // 'temp' because the documents are uploaded before the agency record
+    // exists, so there is no id to file them under yet. Staff only: this is
+    // /agencies/register, which already refuses anyone who is not a superadmin
+    // or app_admin.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/agencies/temp/{fileName} {
+      allow read:   if isCrmUser();
+      allow write:  if isCrmUser() && isDocument() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // A PARENT AGENCY CREATING A SUB-AGENCY
+    // /kyc/sub-agencies/{fileName}
+    //
+    // Written from the agency's own dashboard, before the sub-agency record
+    // exists — same reason as 'temp' above. The uploader is the signed-in
+    // parent agency, not staff.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/sub-agencies/{fileName} {
+      allow read:   if isCrmUser();
+      allow write:  if isCrmUser() && isDocument() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // AN AGENCY SUBMITTING ITS OWN KYC AFTER APPROVAL
+    // /kyc/{agencyId}/applications/{fileName}  and  /kyc/{agencyId}/{ts}/{f}
+    //
+    // Both are four segments and already match the host rule below, which is
+    // why they work. Left documented here so the next person reading this file
+    // does not conclude they are missing too.
+    // ══════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST / AGENCY KYC DOCUMENTS
+    // /kyc/{agencyId}/{hostUid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/{agencyId}/{hostUid}/{fileName} {
+      // Finance + admin + the agency that owns this host can read
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser()
+                   && isDocument()
+                   && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PAYOUT SCREENSHOTS (agency submits proof to finance)
+    // /payoutScreenshots/{reportId}/{agencyId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /payoutScreenshots/{reportId}/{agencyId}/{fileName} {
+      // Agency owner uploads their screenshot
+      allow read:  if isCrmUser()
+                   || (isAppUser() && request.auth.uid == agencyId);
+      allow write: if (isAppUser() && request.auth.uid == agencyId
+                       && isImage()
+                       && maxSize(10))
+                   || isCrmUser();
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PUBLIC SELLER SELF-SIGNUP ID PROOF UPLOADS (no auth required)
+    // /sellerDocs/signup/{fileName}
+    // read: must be public for same reason as agency signup above
+    // ══════════════════════════════════════════════════════════════
+    match /sellerDocs/signup/{fileName} {
+      allow read:  if true;
+      allow write: if isDocument() && maxSize(10);  // public — no auth needed
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CRM ADMIN SELLER DOC UPLOADS (superadmin creating sellers via CRM)
+    // /sellerDocs/crm/{fileName}
+    // Seller doc isn't created yet when uploading, so sellerId isn't known.
+    // ══════════════════════════════════════════════════════════════
+    match /sellerDocs/crm/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser() && isDocument() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER PAYMENT PROOFS (CRM admin uploads when loading initial coins)
+    // /sellerPaymentProofs/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /sellerPaymentProofs/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser() && isDocument() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // COIN SELLER DOCS (ID proof, payment QR codes)
+    // /sellerDocs/{sellerId}/{fileName}
+    // /sellerQr/{sellerId}/qr.png
+    // ══════════════════════════════════════════════════════════════
+    match /sellerDocs/{sellerId}/{fileName} {
+      allow read:  if isCrmUser()
+                   || isOwner(sellerId);
+      allow write: if (isOwner(sellerId) || isCrmUser())
+                   && isDocument()
+                   && maxSize(10);
+      allow delete: if isOwner(sellerId) || isCrmUser();
+    }
+
+    match /sellerQr/{sellerId}/{fileName} {
+      allow read:  if isSignedIn();   // buyers scan QR code
+      allow write: if isOwner(sellerId)
+                   && isImage()
+                   && maxSize(2);
+      allow delete: if isOwner(sellerId) || isCrmUser();
+    }
+
+    // Recharge proof (buyer/seller uploads payment screenshot)
+    // /rechargeScreenshots/{reqId}/{fileName}
+    match /rechargeScreenshots/{reqId}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isAppUser()
+                   && isImage()
+                   && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // COIN PURCHASE PROOFS (seller pays Zippern to top up coin inventory)
+    // /coinPurchaseProofs/{sellerUid}/{fileName}
+    // Seller is authenticated in the seller app when they submit.
+    // ══════════════════════════════════════════════════════════════
+    match /coinPurchaseProofs/{sellerUid}/{fileName} {
+      allow read:  if isCrmUser() || isOwner(sellerUid);
+      allow write: if isOwner(sellerUid)
+                   && isImage()
+                   && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER COIN PURCHASE REQUEST PROOFS (CRM seller dashboard)
+    // /coinPurchases/{sellerId}/{fileName}
+    // Uploaded by the seller's CRM agent (isCrmUser) from seller-dashboard.
+    // ══════════════════════════════════════════════════════════════
+    match /coinPurchases/{sellerId}/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser() && isImage() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER SEND-DIAMONDS PAYMENT PROOFS (CRM seller dashboard)
+    // /recharges/{sellerId}/{fileName}
+    // Uploaded by the seller's CRM agent from seller-dashboard.
+    // ══════════════════════════════════════════════════════════════
+    match /recharges/{sellerId}/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser() && isImage() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DYNAMIC CONTENT ASSETS (tech team manages)
+    // /contentAssets/gifts/thumbnails/{file}
+    // /contentAssets/gifts/lottie/{file}
+    // /contentAssets/levels/badges/{file}
+    // /contentAssets/levels/entries/{file}
+    // /contentAssets/levels/levelup/{file}
+    // /contentAssets/profileCards/{file}
+    // /contentAssets/banners/{file}
+    // Uses {allPaths=**} to allow any depth under contentAssets/
+    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
+    // APP BUILDS — the APKs the in-app updater installs
+    // /appBuilds/{channel}/{fileName}
+    //
+    // `channel` is `debug` or `release`, and the split is not organisational.
+    // A debug APK is signed with the debug keystore and a release APK with
+    // zipper-release.jks; Android refuses an update signed with a different key
+    // (INSTALL_FAILED_UPDATE_INCOMPATIBLE), and both share the applicationId
+    // com.zipper.app. Serving the wrong one fails at the final step, after a
+    // 130 MB download, with an OS error the person cannot act on.
+    //
+    // ── READ IS PUBLIC, AND HAS TO BE ────────────────────────────────────────
+    //
+    // The download runs through Android's `DownloadManager`, an OS service that
+    // carries none of the app's Firebase credentials — so an authenticated read
+    // is not available to it at any price. A `?alt=media&token=` download URL
+    // bypasses these rules anyway, which is the mechanism the publish script
+    // uses; this clause makes the SDK path agree with it rather than leaving a
+    // rule that says something the system does not enforce.
+    //
+    // Nothing is given away by it. This is the application binary, handed to
+    // anybody who installs the app, and the updater verifies a SHA-256 recorded
+    // in `appConfig/androidUpdate` before installing — so a substituted file is
+    // caught by the hash, not by the ACL.
+    //
+    // ── WRITE IS NOBODY ──────────────────────────────────────────────────────
+    //
+    // `if false` is the whole rule. `backend/scripts/publish_apk.py` uploads
+    // through the Admin SDK, which bypasses security rules by design, so there
+    // is no client — staff included — that has any business putting an
+    // executable here. A CRM account able to upload an APK is a CRM account
+    // able to ship code to every phone on the platform.
+    // `{path=**}` rather than `{channel}/{fileName}`: the layout is
+    // `appBuilds/{channel}/{abi}/{file}` since the APK was split per
+    // architecture, and a two-segment pattern silently stops matching a
+    // three-segment path — which would leave the objects governed by the
+    // catch-all deny at the bottom of this file and every download 403ing.
+    match /appBuilds/{path=**} {
+      allow read:   if true;
+      allow write:  if false;
+      allow delete: if false;
+    }
+
+    match /contentAssets/{allPaths=**} {
+      allow read:  if isSignedIn();
+      // Images, Lottie JSON, and video. Video is here because an entrance is a
+      // video now: the image-sequence Lotties these replaced were 22 MB of
+      // base64 frames, and the H.264 re-encode of the same clip is under 2 MB.
+      // Refusing the small one while admitting the enormous one would have been
+      // exactly backwards.
+      allow write: if isCrmUser()
+                   && (isImage()
+                       || isVideo()
+                       || request.resource.contentType == 'application/json'
+                       || request.resource.contentType == 'text/plain')
+                   && maxSize(30);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // MONEY EVIDENCE — proof attached to a payment
+    // /evidence/{kind}/{fileName}
+    //
+    // A payment screenshot, a bank slip, an invoice. The CRM used to ask for a
+    // URL and nothing else, which meant whoever was filling the form had to get
+    // the file onto some public host first — in practice a Drive link that only
+    // opens while its owner is signed in, so the "evidence" behind a payout was
+    // a link that shows an auditor a login page.
+    //
+    // Staff only, in both directions. These carry bank references and account
+    // holders' names, so an app user must not be able to read them, and only
+    // somebody with a CRM account can write one.
+    //
+    // No delete, for anyone. Evidence that can be removed is not evidence — a
+    // correction is a new upload beside the old one, which is why UploadField
+    // prefixes every file name with a timestamp rather than overwriting.
+    // ══════════════════════════════════════════════════════════════
+    match /evidence/{kind}/{fileName} {
+      allow read:   if isCrmUser();
+      allow write:  if isCrmUser()
+                    && (isImage() || request.resource.contentType == 'application/pdf')
+                    && maxSize(10);
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CRM PROFILE PHOTOS — a staff or partner account's own picture
+    // /crmProfilePhotos/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /crmProfilePhotos/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isCrmUser() && isImage() && maxSize(5);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // FEEDBACK ATTACHMENTS (users upload images of issues)
+    // /feedbackAttachments/{ticketId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /feedbackAttachments/{ticketId}/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isAppUser()
+                   && isImageOrVideo()
+                   && maxSize(50);   // allow video clips (other-phone recordings)
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // LIVE ROOM / CALL THUMBNAILS
+    // /roomThumbs/{roomId}/thumb.jpg
+    // ══════════════════════════════════════════════════════════════
+    match /roomThumbs/{roomId}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isAppUser()
+                   && isImage()
+                   && maxSize(2);
+      allow delete: if isAppUser() || isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST PROFILE PHOTOS (uploaded by agency when inviting a host)
+    // /hostPhotos/{agencyId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /hostPhotos/{agencyId}/{fileName} {
+      allow read:  if isCrmUser();
+      allow write: if isCrmUser() && isImage() && maxSize(10);
+      allow delete: if isCrmUser();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DENY EVERYTHING ELSE
+    // ══════════════════════════════════════════════════════════════
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

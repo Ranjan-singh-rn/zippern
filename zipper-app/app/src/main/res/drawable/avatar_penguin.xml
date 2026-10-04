@@ -1,0 +1,27 @@
+<!-- Default avatar · penguin. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Aqua/400 -->
+    <path
+        android:fillColor="#FF5CE1E6"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Body -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,54m-28,0a28,28 0 1,0 56,0a28,28 0 1,0 -56,0" />
+    <!-- Face and belly -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M48,60m-19,0a19,19 0 1,0 38,0a19,19 0 1,0 -38,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M41,46m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M55,46m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Beak -->
+    <path
+        android:fillColor="#FFFFB627"
+        android:pathData="M40,52L56,52L48,60Z" />
+</vector>

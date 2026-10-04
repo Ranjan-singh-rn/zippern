@@ -1,0 +1,18 @@
+{
+  "projects": {
+    "default": "zipper-83816"
+  },
+  "targets": {
+    "zipper-83816": {
+      "hosting": {
+        "production": [
+          "zipperlive"
+        ],
+        "applinks": [
+          "zipper-83816"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

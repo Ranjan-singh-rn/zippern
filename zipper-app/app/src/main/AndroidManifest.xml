@@ -13,8 +13,27 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!--
+      In-app updates (OTA). See UpdateRepository and ApkInstaller.
+
+      Declaring it is necessary and never sufficient: since Android 8 the user
+      also has to turn on "install unknown apps" for this app specifically, which
+      is why ApkInstaller checks canRequestPackageInstalls() and sends them to
+      ACTION_MANAGE_UNKNOWN_APP_SOURCES before spending a single byte.
+
+      GOOGLE PLAY FORBIDS AN APP UPDATING ITSELF OUTSIDE PLAY. This permission
+      and everything behind it exist for the hand-shared team builds only. The
+      whole feature is behind BuildConfig.OTA_ENABLED so a Play build can switch
+      it off without a code change — but the permission is still declared in the
+      merged manifest, so a Play submission needs this line removed (or moved to
+      a flavour-specific manifest) as well as the flag flipped.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Features -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -33,17 +52,86 @@
         android:theme="@style/Theme.Zipper"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
-        android:extractNativeLibs="false">
+        android:extractNativeLibs="false"
+        android:enableOnBackInvokedCallback="true"
+        android:localeConfig="@xml/locales_config">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.Zipper.SplashScreen"
             android:windowSoftInputMode="adjustResize"
-            android:screenOrientation="portrait">
+            android:screenOrientation="portrait"
+            android:supportsPictureInPicture="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Firebase Phone Auth reCAPTCHA redirect -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="com.zipper.app" />
+            </intent-filter>
+
+            <!--
+              Firebase email sign-in link — the return leg of "Add your email".
+
+              WHY AN APP LINK AND NOT THE CUSTOM SCHEME ABOVE
+              A sign-in link is mailed, so it is opened by a mail client, and it
+              has to survive being forwarded, previewed and scanned by whatever
+              is between us and the inbox. Those all require a real https URL,
+              and Firebase will only mint the link on a domain it has authorised
+              — so the custom scheme that carries the reCAPTCHA return cannot
+              carry this one.
+
+              WHAT MATCHES
+              /__/auth/ is Firebase's own reserved path, where the action handler
+              lives. /secure-account is our continueUrl and MUST stay in step
+              with AuthRepository.EMAIL_LINK_RETURN_PATH; a manifest cannot read
+              a Kotlin constant, so the two are held together by comments at both
+              ends and nothing else.
+
+              Both are scoped by path on purpose, but NOT for the reason first
+              written here. The CRM is not on this host: .firebaserc maps the
+              hosting target "production" to the site `zipperlive`, so the SPA
+              is served from zipperlive.web.app. `zipper-83816.firebaseapp.com`
+              is the Firebase AUTH domain, and that is the real hazard:
+              /__/auth/ is Firebase's whole reserved namespace on it and also
+              contains /__/auth/handler — the OAuth return used by Google
+              sign-in in the CRM and by phone-auth reCAPTCHA in this very app.
+              An autoVerify'd filter over the namespace would have this app
+              intercepting its own reCAPTCHA callback.
+
+              /__/auth/links is the exact path Firebase documents for the
+              email-link return, and it is the only part of the namespace that
+              belongs to us.
+
+              autoVerify NEEDS /.well-known/assetlinks.json ON THAT DOMAIN,
+              listing this package and its release SHA-256. Firebase Hosting
+              serves that file for apps registered in the project with a
+              fingerprint. Until it does, Android 12+ silently opens the browser
+              instead and the flow never comes back to the app — which looks
+              exactly like "nothing happened when I tapped the email".
+              MainActivity.consumeEmailLink is what receives it.
+            -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="zipper-83816.firebaseapp.com"
+                    android:pathPrefix="/__/auth/links" />
+                <data
+                    android:scheme="https"
+                    android:host="zipper-83816.firebaseapp.com"
+                    android:pathPrefix="/secure-account" />
             </intent-filter>
         </activity>
 
@@ -56,10 +144,47 @@
             </intent-filter>
         </service>
 
-        <!-- FCM default channel -->
+        <!--
+          FileProvider — the ONLY one in this project, added for OTA installs.
+
+          WHY IT IS NEEDED AT ALL
+          A `file://` URI in an intent has thrown FileUriExposedException since
+          Android 7. The system package installer is a different process, so it
+          cannot read our APK from a path; it needs a `content://` URI plus
+          FLAG_GRANT_READ_URI_PERMISSION, and that is what a FileProvider mints.
+
+          WHY THE PATHS ARE AS NARROW AS THEY ARE
+          `xml/file_paths.xml` grants exactly one directory — the app-scoped
+          external downloads folder the OTA APK lands in. A provider's paths are
+          the size of the hole it opens: every file under a declared root becomes
+          reachable by any app we hand a URI to, and a broader root (or worse,
+          `<external-path path="." />`) would put the user's whole shared storage
+          behind a component that only ever needs to serve one APK.
+
+          grantUriPermissions="true" with no <grant-uri-permission> children means
+          access is only ever what an individual intent's FLAG_GRANT_READ_URI_PERMISSION
+          confers, for as long as that activity lives. exported MUST be false: an
+          exported FileProvider is readable by every app on the device without any
+          grant at all.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- FCM default channel.
+             Only ever used for "notification" messages the app does not handle
+             itself — i.e. a Firebase console campaign. Pointing it at
+             zipper_calls made any such campaign ring with the full ringtone and
+             the call vibration pattern, as though somebody were calling. -->
         <meta-data
             android:name="com.google.firebase.messaging.default_notification_channel_id"
-            android:value="zipper_calls" />
+            android:value="zipper_messages" />
 
     </application>
 </manifest>

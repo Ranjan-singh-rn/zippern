@@ -1,0 +1,25 @@
+<!-- 8A.4 — an immediate alert. Internal only. One condition per email, with the
+     threshold that fired it stated, so a reader can tell "this is unusual" from
+     "the threshold is set too low". -->
+<div style="background:{{ tone_bg }};border:1px solid {{ tone_border }};
+            border-radius:8px;padding:14px 16px;margin:0 0 18px">
+  <div style="font-size:12px;letter-spacing:.6px;text-transform:uppercase;
+              color:{{ tone_text }};font-weight:600">{{ severity }} · {{ spec }}</div>
+  <div style="margin:6px 0 0;line-height:1.6;color:#18181b">{{ headline }}</div>
+</div>
+
+{{{ facts }}}
+
+{{{ detail }}}
+
+<p style="margin:18px 0 0;line-height:1.6">
+  <strong>What to do.</strong> {{ action }}
+</p>
+
+<p style="color:#71717a;font-size:12px;margin:18px 0 0;line-height:1.6">
+  Threshold: {{ threshold }}. Set by <code>{{ threshold_setting }}</code> — an
+  owner changes it with an environment variable, not a code change.
+  <br>
+  Repeat suppression: {{ suppression }}. While this condition stays true you
+  will not be emailed about it again inside that window (8A.1.4).
+</p>

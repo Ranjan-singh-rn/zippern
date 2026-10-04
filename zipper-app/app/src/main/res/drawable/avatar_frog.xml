@@ -1,0 +1,31 @@
+<!-- Default avatar · frog. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Mint/500 -->
+    <path
+        android:fillColor="#FF16C77E"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Eye bumps -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M33,32m-13,0a13,13 0 1,0 26,0a13,13 0 1,0 -26,0M63,32m-13,0a13,13 0 1,0 26,0a13,13 0 1,0 -26,0" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,56m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M33,32m-7,0a7,7 0 1,0 14,0a7,7 0 1,0 -14,0M63,32m-7,0a7,7 0 1,0 14,0a7,7 0 1,0 -14,0" />
+    <!-- Pupils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M33,32m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0M63,32m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0" />
+    <!-- Wide grin -->
+    <path
+        android:fillColor="#FFA8F0CE"
+        android:pathData="M32,60h32a16,10 0 0,1 -32,0z" />
+</vector>

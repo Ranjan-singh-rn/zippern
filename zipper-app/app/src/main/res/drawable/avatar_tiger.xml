@@ -1,0 +1,36 @@
+<!-- Default avatar · tiger. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Amber/500 -->
+    <path
+        android:fillColor="#FFFFA726"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M24,30m-11,0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0M72,30m-11,0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,52m-27,0a27,27 0 1,0 54,0a27,27 0 1,0 -54,0" />
+    <!-- Forehead stripes, punched back out in the disc colour. Slanted, not
+         upright: two vertical bars at this size read as hair clips. -->
+    <path
+        android:fillColor="#FFFFA726"
+        android:pathData="M39,30L43,29L46,42L42,43ZM57,30L53,29L50,42L54,43Z" />
+    <!-- Cheeks -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M38,62m-11,0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0M58,62m-11,0a11,11 0 1,0 22,0a11,11 0 1,0 -22,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M37,46m-4.5,0a4.5,4.5 0 1,0 9,0a4.5,4.5 0 1,0 -9,0M59,46m-4.5,0a4.5,4.5 0 1,0 9,0a4.5,4.5 0 1,0 -9,0" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FFFF6FA8"
+        android:pathData="M42,56h12L48,64Z" />
+</vector>

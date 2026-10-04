@@ -1,43 +1,26 @@
 package com.zipper.app.ui.screens.auth
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.*
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.sp
-import com.zipper.app.ui.theme.ZipperPink
+import com.zipper.app.ui.components.TopBar
+import com.zipper.app.ui.components.ZipperScreen
+import com.zipper.app.ui.theme.Space
+import com.zipper.app.ui.theme.ZipperTheme
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TermsScreen(onBack: () -> Unit) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Terms & Conditions", color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onSurface)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
-            )
-        },
-        containerColor = MaterialTheme.colorScheme.background,
-    ) { padding ->
+    val c = ZipperTheme.colors
+    ZipperScreen(topBar = { TopBar("Terms & Conditions", onBack = onBack) }) { _ ->
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 16.dp),
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = Space.lg, vertical = Space.md),
+            verticalArrangement = Arrangement.spacedBy(Space.xxl),
         ) {
             TermsSection(
                 title = "1. Acceptance of Terms",
@@ -100,33 +83,17 @@ fun TermsScreen(onBack: () -> Unit) {
                 body = "For any questions about these Terms, please contact us through the feedback section in the App settings.",
             )
 
-            Spacer(Modifier.height(32.dp))
-            Text(
-                "Last updated: June 2026",
-                color = MaterialTheme.colorScheme.onBackground.copy(0.35f),
-                fontSize = 12.sp,
-                modifier = Modifier.align(Alignment.CenterHorizontally),
-            )
-            Spacer(Modifier.height(32.dp))
+            Text("Last updated: June 2026", style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().align(Alignment.CenterHorizontally))
+            Spacer(Modifier.navigationBarsPadding())
         }
     }
 }
 
 @Composable
 private fun TermsSection(title: String, body: String) {
-    Column(modifier = Modifier.padding(bottom = 24.dp)) {
-        Text(
-            text = title,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = ZipperPink,
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
-        Text(
-            text = body,
-            fontSize = 14.sp,
-            color = MaterialTheme.colorScheme.onBackground.copy(0.75f),
-            lineHeight = 22.sp,
-        )
+    val c = ZipperTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
+        Text(title, style = ZipperTheme.type.labelL, color = c.textPrimary)
+        Text(body, style = ZipperTheme.type.bodyM.copy(lineHeight = 22.sp), color = c.textSecondary)
     }
 }

@@ -1,0 +1,31 @@
+<!-- Default avatar · owl. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Aqua/500 -->
+    <path
+        android:fillColor="#FF22C8D6"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ear tufts -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M26,30L30,10L44,24ZM70,30L66,10L52,24Z" />
+    <!-- Body -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,54m-27,0a27,27 0 1,0 54,0a27,27 0 1,0 -54,0" />
+    <!-- Eye discs -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M38,48m-10,0a10,10 0 1,0 20,0a10,10 0 1,0 -20,0M58,48m-10,0a10,10 0 1,0 20,0a10,10 0 1,0 -20,0" />
+    <!-- Pupils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M38,48m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M58,48m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Beak -->
+    <path
+        android:fillColor="#FFFFB627"
+        android:pathData="M48,58L42,67L54,67Z" />
+</vector>

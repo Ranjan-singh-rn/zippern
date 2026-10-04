@@ -1,9 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Zipper" parent="Theme.AppCompat.DayNight.NoActionBar" />
+
+    <!--
+        The window theme, and the other half of "the app is dark everywhere".
+
+        This used to inherit Theme.AppCompat.DayNight.NoActionBar. On a phone set
+        to light mode that resolves to AppCompat's LIGHT theme, so the window
+        underneath Compose was white while the Compose tree was drawing a
+        near-black UI. That mismatch is visible in four places, all of them
+        reported as "light mode looks odd":
+
+          • the cold-start flash — the window is painted before the first Compose
+            frame exists, so every launch flashed white between the splash icon
+            and the app;
+          • android:windowBackground shows through anywhere Compose has not
+            painted yet, which includes the moment a new Activity or a
+            Dialog/ModalBottomSheet window is being laid out;
+          • isLightTheme=true switches the platform's own widgets — text-selection
+            handles, the autofill and share sheets, the reCAPTCHA WebView chrome
+            Firebase phone auth opens — to their light variants, which arrive
+            light-on-light over the app's dark UI;
+          • windowLightStatusBar / windowLightNavigationBar default to true under a
+            light theme, i.e. dark system icons, which vanish against a bar that
+            is transparent over Ink.i950.
+
+        Theme.AppCompat.NoActionBar (no "DayNight") is permanently dark, so all
+        four of those follow from the parent alone and do not need overriding
+        attribute by attribute — which also keeps this file free of anything
+        newer than minSdk 26.
+
+        Do NOT add a res/values-night/ copy of this. A night variant only exists
+        to differ from the day one, and there is no day one any more; adding it
+        back is how the system setting leaks in again. If light mode is ever
+        built, this parent and the `darkTheme` argument in ui/theme/Theme.kt have
+        to change in the same commit.
+    -->
+    <style name="Theme.Zipper" parent="Theme.AppCompat.NoActionBar">
+        <!--
+            Pinned to the app's own base surface rather than left at AppCompat's
+            dark default (#303030, a mid grey). Compose paints ZipperColors.bgBase
+            over the top, so any pixel of window still showing is a visible seam
+            between two different darks — most noticeably on the launch flash and
+            while the keyboard resizes the window.
+        -->
+        <item name="android:windowBackground">@color/window_bg</item>
+    </style>
+
     <style name="Theme.Zipper.SplashScreen" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/splash_bg</item>
         <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
         <item name="postSplashScreenTheme">@style/Theme.Zipper</item>
     </style>
+
 </resources>

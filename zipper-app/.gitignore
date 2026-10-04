@@ -1,0 +1,9 @@
+
+
+# ── Release signing ──────────────────────────────────────────────────────────
+# The app's identity for its entire life. Committed once, it is a key anybody
+# who clones the repo can publish an update with — and it cannot be rotated,
+# because Google Play binds the app to the certificate it was first signed
+# with. Kept out of git and backed up somewhere that is not this laptop.
+*.jks
+*.keystore

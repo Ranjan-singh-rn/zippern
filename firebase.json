@@ -1,0 +1,116 @@
+{
+  "firestore": {
+    "database": "(default)",
+    "location": "asia-south1",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "storage": [
+    {
+      "bucket": "zipper-83816.firebasestorage.app",
+      "rules": "storage.rules"
+    }
+  ],
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "//": "TypeScript is compiled on every deploy. Without this, `firebase deploy --only functions` uploads whatever happens to be in functions/lib and a source change silently does not ship.",
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run build"
+      ],
+      "//2": "The entrance artwork folders are inputs to the one-off upload scripts, not something any function reads at runtime. Without these lines every deploy packed 111 MB of entrance art (102 MB of it image-sequence Lottie JSON) into the function bundle and uploaded it again.",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local",
+        "entry-lotties",
+        "entry-video",
+        "entry-thumbnails",
+        "scripts"
+      ]
+    }
+  ],
+  "hosting": [
+    {
+      "//": "The Android App Links site — the project's DEFAULT hosting site, which is also the Firebase Auth domain (zipper-83816.firebaseapp.com). It serves one file that matters: /.well-known/assetlinks.json.",
+      "//2": "It has to be THIS host. Firebase generates the email-binding link on the auth domain, and Android verifies an App Link against assetlinks.json on the host in the link. Until this target existed the host answered 'Site Not Found', so the link opened a browser and the binding never came back to the app.",
+      "//3": "IGNORE IS SPELLED OUT, and that is the whole point. Firebase Hosting's DEFAULT ignore list contains '**/.*', which matches every dotted path — including .well-known. Inheriting it would silently drop the one file this target exists to publish, deploy successfully, and leave a 404 with nothing in the log to explain it.",
+      "target": "applinks",
+      "public": "hosting/applinks",
+      "ignore": ["firebase.json", "**/node_modules/**", "README.md"],
+      "headers": [
+        {
+          "//": "Android will not accept the file without this content type. Firebase infers it from the extension here, but the file has no extension in the URL path people test with, so it is stated rather than assumed.",
+          "source": "/.well-known/assetlinks.json",
+          "headers": [{ "key": "Content-Type", "value": "application/json" }]
+        }
+      ]
+    },
+    {
+      "target": "production",
+      "public": "zipper-crm/out",
+      "ignore": [
+        "firebase.json",
+        "**/.*",
+        "**/node_modules/**"
+      ],
+      "rewrites": [
+        {
+          "//": "Python API on Cloud Run, served from the same origin so there is no CORS.",
+          "//2": "Must come first \u2014 anything under /api/ goes to the backend, not the SPA.",
+          "source": "/api/**",
+          "run": {
+            "serviceId": "zipper-api",
+            "region": "asia-south1"
+          }
+        },
+        {
+          "/": "next.config.js sets trailingSlash: true, so the real path is /agencies/<id>/salary/ \u2014 a pattern ending at 'salary' never matched and fell through to /agencies/**, serving the agency detail page under the salary URL.",
+          "source": "/agencies/*/salary{,/**}",
+          "destination": "/agencies/_/salary/index.html"
+        },
+        {
+          "source": "/agencies/**",
+          "destination": "/agencies/_/index.html"
+        },
+        {
+          "source": "/sellers/**",
+          "destination": "/sellers/_/index.html"
+        },
+        {
+          "source": "/approvals/**",
+          "destination": "/approvals/_/index.html"
+        },
+        {
+          "source": "/users/**",
+          "destination": "/users/_/index.html"
+        },
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    }
+  ],
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "functions": {
+      "port": 5001
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "storage": {
+      "port": 9199
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4000
+    }
+  }
+}

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Lottie Debug</title>
+<style>
+  body { background: #0f172a; color: #e2e8f0; font-family: monospace; padding: 20px; }
+  h1 { color: #f472b6; margin-bottom: 4px; }
+  h2 { color: #94a3b8; font-size: 15px; margin: 32px 0 12px; border-top: 1px solid #1e293b; padding-top: 20px; }
+  p.sub { color: #64748b; font-size: 12px; margin: 0 0 16px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 20px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; width: 220px; }
+  .card.single { width: 320px; }
+  .card h3 { margin: 0 0 4px; color: #94a3b8; font-size: 13px; }
+  .card .meta { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+  .anim { background: #0f172a; border-radius: 8px; }
+  .status { font-size: 11px; margin-top: 8px; color: #64748b; word-break: break-all; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  .playing { color: #f472b6; }
+  .loading { color: #94a3b8; font-style: italic; font-size: 13px; margin: 12px 0; }
+  .url-display { font-size: 9px; color: #475569; margin-top: 4px; word-break: break-all; }
+  a.back { color: #f472b6; font-size: 12px; text-decoration: none; display: inline-block; margin-bottom: 16px; }
+  a.back:hover { text-decoration: underline; }
+  .cors-warn { background: #451a03; border: 1px solid #f97316; border-radius: 8px; padding: 12px 16px; font-size: 12px; color: #fed7aa; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js"></script>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const PROJECT_ID = 'zipper-83816';
+const API_KEY    = 'AIzaSyDi6O6K-ddR8VWdHHz7qmKYhvyVyC_QlZw';
+
+// ── Single source of truth: load Lottie from a URL ───────────────────────────
+// Works for both same-origin URLs (/lottie/entrances/en_bike.json) and
+// Firebase Storage URLs (after CORS is configured on the bucket).
+function playLottie(src, containerId, statusId, large) {
+  const container = document.getElementById(containerId);
+  const statusEl  = document.getElementById(statusId);
+  if (!container) return;
+
+  const sz = large ? 288 : 192;
+  container.style.width  = sz + 'px';
+  container.style.height = sz + 'px';
+
+  const setStatus = (msg, cls) => {
+    if (statusEl) { statusEl.textContent = msg; statusEl.className = 'status ' + (cls || ''); }
+  };
+
+  const t0 = Date.now();
+  setStatus('Fetching…');
+
+  fetch(src)
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(data => {
+      const fetchMs = Date.now() - t0;
+
+      const anim = lottie.loadAnimation({
+        container,
+        renderer: 'svg',   // svg handles more Lottie features than canvas
+        loop: true,
+        autoplay: true,
+        animationData: data,
+      });
+
+      // data_ready can fire synchronously when animationData is provided,
+      // so check isLoaded immediately AND listen for the event.
+      function startPolling() {
+        setStatus('Loaded in ' + fetchMs + 'ms', 'ok');
+        setInterval(() => {
+          const f       = anim.currentFrame.toFixed(0);
+          const playing = anim.isLoaded && !anim.isPaused;
+          setStatus(
+            (playing ? '▶ ' : '⏸ ') + 'frame ' + f + '/' + anim.totalFrames + ' (' + fetchMs + 'ms)',
+            playing ? 'playing' : 'ok'
+          );
+        }, 300);
+      }
+
+      if (anim.isLoaded) {
+        startPolling();
+      } else {
+        anim.addEventListener('data_ready', startPolling);
+      }
+      anim.addEventListener('data_failed', () => setStatus('✗ data_failed', 'err'));
+    })
+    .catch(err => {
+      const isCors = err.message === 'Failed to fetch';
+      setStatus(isCors ? '✗ CORS blocked' : '✗ ' + err.message, 'err');
+      console.error(src + ':', err);
+    });
+}
+
+function renderCard(gridId, id, label, src, meta, large) {
+  const grid = document.getElementById(gridId);
+  if (!grid) return;
+  const card   = document.createElement('div');
+  card.className = 'card' + (large ? ' single' : '');
+  const animId   = 'anim_'   + id;
+  const statusId = 'status_' + id;
+  card.innerHTML =
+    '<h3>' + label + '</h3>' +
+    (meta ? '<div class="meta">' + meta + '</div>' : '') +
+    '<div class="anim" id="' + animId + '"></div>' +
+    '<div class="status" id="' + statusId + '">Waiting…</div>' +
+    '<div class="url-display">' + src + '</div>';
+  grid.appendChild(card);
+  playLottie(src, animId, statusId, large);
+}
+
+// ── Single-preview mode: ?url=<encoded storage url> ──────────────────────────
+const params    = new URLSearchParams(window.location.search);
+const singleUrl = params.get('url');
+
+if (singleUrl) {
+  document.write(
+    '<a class="back" href="/lottie-test.html">← Back to all animations</a>' +
+    '<h1>🎬 Lottie Preview</h1>' +
+    '<div class="grid" id="single-grid"></div>'
+  );
+  const label = decodeURIComponent(singleUrl).split('/').pop().split('?')[0];
+  renderCard('single-grid', 'preview', label, singleUrl, null, true);
+
+} else {
+  // ── Full debug mode ───────────────────────────────────────────────────────
+  document.write(
+    '<h1>🎬 Lottie Animation Debug</h1>' +
+    '<p class="sub">CRM and Android app share the same Firebase Storage URL — one source of truth.</p>' +
+    '<div class="cors-warn" id="cors-warn" style="display:none">⚠️ <strong>Firebase Storage CORS not configured</strong> — all Storage URL previews will fail with "Failed to fetch". Fix once in <a href="https://console.cloud.google.com" target="_blank" style="color:#fb923c">Google Cloud Shell</a>:<br><code style="background:#1c0a00;padding:4px 8px;border-radius:4px;display:inline-block;margin-top:6px">echo \'[{"origin":["*"],"method":["GET"],"maxAgeSeconds":3600}]\' > cors.json && gsutil cors set cors.json gs://zipper-83816.firebasestorage.app</code></div>' +
+
+    '<h2>🎁 Gift Animations</h2>' +
+    '<p class="sub">Created in Content Management or Gift Economy. Both CRM preview and Android app use the same Storage URL.</p>' +
+    '<div class="loading" id="gifts-loading">⏳ Loading gifts from Firestore…</div>' +
+    '<div class="grid" id="gifts-grid"></div>' +
+
+    '<h2>🚀 Entrance Animations — Dynamic</h2>' +
+    '<p class="sub">Created in Content Management → Bag Items (category: entrance). Upload a Lottie .json to get a Storage URL.</p>' +
+    '<div class="loading" id="entrances-loading">⏳ Loading entrances from Firestore…</div>' +
+    '<div class="grid" id="entrances-grid"></div>' +
+
+    ''
+  );
+
+  // Load gifts from Firestore — use renderCard (same path as entrances, no bugs)
+  fetch('https://firestore.googleapis.com/v1/projects/' + PROJECT_ID +
+        '/databases/(default)/documents/gifts?key=' + API_KEY + '&pageSize=100')
+    .then(r => { if (!r.ok) throw new Error('Firestore HTTP ' + r.status); return r.json(); })
+    .then(data => {
+      document.getElementById('gifts-loading').style.display = 'none';
+      const docs = (data.documents || [])
+        .map(d => {
+          const f      = d.fields || {};
+          const name   = (f.name        || {}).stringValue || d.name.split('/').pop();
+          const lotUrl = (f.lottieAsset || {}).stringValue || '';
+          const emoji  = (f.emoji       || {}).stringValue || '🎁';
+          return { name, lotUrl, emoji };
+        })
+        .filter(g => g.lotUrl && g.lotUrl.startsWith('http'));
+
+      if (docs.length === 0) {
+        const el = document.getElementById('gifts-loading');
+        el.style.display = 'block';
+        el.textContent = 'ℹ️ No gift Lottie URLs yet. Upload a .json in CRM → Content Management → Gifts.';
+        return;
+      }
+
+      docs.forEach((g, i) => renderCard('gifts-grid', 'gift_' + i, g.name, g.lotUrl, g.emoji, false));
+    })
+    .catch(err => {
+      document.getElementById('gifts-loading').textContent = '✗ Firestore error: ' + err.message;
+    });
+
+  // Dynamic entrances — loaded from Firestore bagItems (category === 'entrance')
+  // Uses animationUrl (Firebase Storage) when set; shows CORS warning if not configured.
+  fetch('https://firestore.googleapis.com/v1/projects/' + PROJECT_ID +
+        '/databases/(default)/documents/bagItems?key=' + API_KEY + '&pageSize=200')
+    .then(r => { if (!r.ok) throw new Error('Firestore HTTP ' + r.status); return r.json(); })
+    .then(data => {
+      const entrances = (data.documents || [])
+        .map(d => {
+          const f = d.fields || {};
+          return {
+            id: d.name.split('/').pop(),
+            name:           (f.name           || {}).stringValue || '',
+            category:       (f.category       || {}).stringValue || '',
+            animationUrl:   (f.animationUrl   || {}).stringValue || '',
+            animationAsset: (f.animationAsset || {}).stringValue || '',
+            isActive:       (f.isActive       || {}).booleanValue !== false,
+          };
+        })
+        .filter(e => e.category === 'entrance' && e.isActive);
+
+      document.getElementById('entrances-loading').style.display = 'none';
+
+      if (entrances.length === 0) {
+        document.getElementById('entrances-loading').style.display = 'block';
+        document.getElementById('entrances-loading').textContent =
+          'ℹ️ No entrance bag items in Firestore yet. Add one in Content Management → Bag Items (category: entrance) and upload a Lottie .json.';
+        return;
+      }
+
+      let corsFailed = false;
+      entrances.forEach((e, i) => {
+        if (e.animationUrl) {
+          // Storage URL — works after CORS is configured on the bucket
+          renderCard('entrances-grid', 'dyn_' + i, e.name, e.animationUrl, null, false);
+          // Detect CORS failure and show warning once
+          // (renderCard's playLottie already shows per-card error; this adds the banner)
+          fetch(e.animationUrl).catch(err => {
+            if (!corsFailed && err.message === 'Failed to fetch') {
+              corsFailed = true;
+              const warn = document.getElementById('cors-warn');
+              if (warn) warn.style.display = 'block';
+            }
+          });
+        } else {
+          // No Storage URL yet — show placeholder, don't try to load missing files
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.innerHTML = '<h3>' + e.name + '</h3><div class="status err">No Storage URL — upload .json in Content Management → Entrances</div>';
+          document.getElementById('entrances-grid').appendChild(card);
+        }
+      });
+    })
+    .catch(err => {
+      document.getElementById('entrances-loading').textContent = '✗ Firestore error: ' + err.message;
+    });
+
+}
+</script>
+</body>
+</html>

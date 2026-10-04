@@ -1,0 +1,23 @@
+<!-- 8A.2.12 / 8A.4.4 — a card above the owner-set amount is waiting on a
+     signature. To: all three owners. Nobody else. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  A money card above your alert threshold is waiting for a signature. It is
+  above the line you set, so all three of you are being told about it rather
+  than only whoever happens to open the board.
+</p>
+
+{{{ facts }}}
+
+<p style="margin:18px 0 0;line-height:1.6">
+  <strong>What happens next.</strong> Nothing moves until one of you signs it.
+  Whoever verified it cannot sign it, and none of you can sign a card you raised
+  yourselves (5.5.3) — so this needs an owner who is not
+  {{ raised_by }}.
+</p>
+
+<p style="color:#71717a;font-size:12px;margin:18px 0 0;line-height:1.6">
+  Threshold: {{ threshold }}. Set by <code>ALERT_LARGE_AMOUNT_INR</code>.
+  <br>
+  Repeat suppression: {{ suppression }} — you get one email per card, not one
+  per hour that it sits there. Ageing is chased separately (8A.4.7).
+</p>

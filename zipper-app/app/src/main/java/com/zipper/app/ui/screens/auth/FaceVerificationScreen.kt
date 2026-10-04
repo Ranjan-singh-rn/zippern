@@ -1,10 +1,8 @@
 package com.zipper.app.ui.screens.auth
 
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Color
-import android.graphics.Matrix
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -13,25 +11,35 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.outlined.CameraAlt
+import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.isGranted
+import com.google.accompanist.permissions.rememberPermissionState
+import com.google.accompanist.permissions.shouldShowRationale
 import com.google.firebase.ml.modeldownloader.CustomModelDownloadConditions
 import com.google.firebase.ml.modeldownloader.DownloadType
 import com.google.firebase.ml.modeldownloader.FirebaseModelDownloader
@@ -39,12 +47,27 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
-import com.zipper.app.ui.theme.*
+import com.zipper.app.ui.components.*
+import com.zipper.app.ui.screens.profile.GlassCard
+import com.zipper.app.ui.theme.Radius
+import com.zipper.app.ui.theme.Space
+import com.zipper.app.ui.theme.ZipperTheme
 import kotlinx.coroutines.tasks.await
 import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
+
+/*
+ * Host identity check — liveness (look · blink · smile) on the front camera,
+ * then an auto-capture that is matched against the profile photo server-side.
+ *
+ *   TopBar "Verify your identity". Instruction glass card with the three
+ *   steps (done = mint check, current = brand disc, upcoming = raised disc).
+ *   Circular 240 preview inside a brand-gradient ring that pulses. Capture
+ *   gradient CTA, retry Secondary button on error, attempt counter caption,
+ *   DPDP biometric note.
+ */
 
 // ─── Liveness step state machine ────────────────────────────────────────────
 private enum class LivenessStep(val instruction: String, val emoji: String) {
@@ -55,6 +78,9 @@ private enum class LivenessStep(val instruction: String, val emoji: String) {
     PROCESSING("Verifying…", "⏳"),
 }
 
+private const val DPDP_NOTE = "Your face image is biometric data. It is used only to confirm you are the person in your profile photo and is reviewed by Zipper staff."
+
+@OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun FaceVerificationScreen(
     declaredGender: String,
@@ -64,6 +90,78 @@ fun FaceVerificationScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val c = ZipperTheme.colors
+
+    // ── Camera permission gate ────────────────────────────────────────────────
+    val cameraPermission = rememberPermissionState(android.Manifest.permission.CAMERA)
+
+    // Request as soon as the screen opens — user sees the dialog immediately
+    LaunchedEffect(Unit) {
+        if (!cameraPermission.status.isGranted) {
+            cameraPermission.launchPermissionRequest()
+        }
+    }
+
+    /*
+     * THE WAY OUT.
+     *
+     * This screen is now reached automatically the moment somebody redeems a
+     * referral code, and it is also the only screen in the app that cannot
+     * function without a hardware permission. Without an exit, a host who
+     * declines the camera — or taps it by mistake, or has no light — is held on
+     * a rationale card with one button that reopens a dialog they have already
+     * said no to. They would have to kill the app, and they would land back
+     * here on the next launch.
+     *
+     * So the capture is skippable, and skipping is honest about its price: the
+     * badge stays pending, `isVerifiedHost` stays false, and everything it
+     * gates stays shut until they come back through Me → Verify your face.
+     * Nothing is lost by leaving — beans still accrue, they are simply held.
+     */
+    if (!cameraPermission.status.isGranted) {
+        // Rationale / settings nudge while waiting for the user to grant
+        ZipperScreen(
+            topBar = {
+                TopBar(
+                    "Verify your identity",
+                    actions = {
+                        TextButton(onClick = onNavigateToMain) {
+                            Text("Later", style = ZipperTheme.type.labelM, color = c.textSecondary)
+                        }
+                    },
+                )
+            },
+        ) { _ ->
+            Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
+                if (cameraPermission.status.shouldShowRationale) {
+                    // User denied once — show request button again
+                    EmptyState(
+                        Icons.Outlined.CameraAlt, "Allow camera access",
+                        "Zipper needs the camera for a quick liveness check. Your selfie is only used for verification.",
+                        actionLabel = "Allow camera", onAction = { cameraPermission.launchPermissionRequest() },
+                    )
+                } else {
+                    // Permanently denied — send to Settings
+                    EmptyState(
+                        Icons.Outlined.CameraAlt, "Camera is turned off",
+                        "Turn on camera access for Zipper in Settings to continue with verification.",
+                        actionLabel = "Open Settings",
+                        onAction = {
+                            val intent = android.content.Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.fromParts("package", context.packageName, null)
+                            )
+                            context.startActivity(intent)
+                        },
+                    )
+                }
+                Text(DPDP_NOTE, style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = Space.x3l))
+            }
+        }
+        return   // Don't render the camera UI until permission is granted
+    }
+
+    // Permission granted — proceed with the camera
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
@@ -170,7 +268,7 @@ fun FaceVerificationScreen(
                     }
 
                     // All checks passed — save & proceed
-                    viewModel.saveFaceVerification(uri)
+                    viewModel.submitHostCapture(uri)
                 }
 
                 override fun onError(exc: ImageCaptureException) {
@@ -188,182 +286,157 @@ fun FaceVerificationScreen(
         animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
         label = "scale",
     )
-    val borderColor = when (step) {
-        LivenessStep.LOOK       -> ZipperPurple
-        LivenessStep.BLINK      -> ZipperPink
-        LivenessStep.SMILE      -> ZipperGold
-        LivenessStep.CAPTURE,
-        LivenessStep.PROCESSING -> ZipperSuccess
-    }
+    val busy = step == LivenessStep.CAPTURE || step == LivenessStep.PROCESSING || uiState.isLoading
+    val ringBrush = if (busy) Brush.sweepGradient(listOf(c.statusSuccess, c.statusSuccess.copy(0.3f), c.statusSuccess))
+                    else Brush.sweepGradient(listOf(c.brandGradientFrom, c.brandGradientTo, c.brandGradientFrom))
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
-    ) {
-        // Background glow
-        Box(Modifier.size(260.dp).offset((-60).dp, (-40).dp)
-            .blur(100.dp).background(ZipperPurple.copy(0.18f), CircleShape))
-        Box(Modifier.size(200.dp).align(Alignment.BottomEnd).offset(60.dp, 60.dp)
-            .blur(80.dp).background(ZipperPink.copy(0.15f), CircleShape))
-
-        Column(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 28.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Spacer(Modifier.height(52.dp))
-
-            Text(
-                "Identity Check",
-                fontSize = 24.sp, fontWeight = FontWeight.ExtraBold,
-                color = MaterialTheme.colorScheme.onBackground,
+    ZipperScreen(
+        topBar = {
+            TopBar(
+                "Verify your identity",
+                // The same exit as the permission gate above. A host who cannot
+                // do this right now leaves with their status intact and pending,
+                // rather than force-quitting the app.
+                actions = {
+                    TextButton(onClick = onNavigateToMain) {
+                        Text("Later", style = ZipperTheme.type.labelM, color = c.textSecondary)
+                    }
+                },
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Quick liveness check to keep Zipper safe",
-                color = MaterialTheme.colorScheme.onBackground.copy(0.5f),
-                fontSize = 13.sp, textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(8.dp))
-
-            // Attempt counter
-            Text(
-                "Attempts remaining: $attemptsLeft / 3",
-                color = if (attemptsLeft <= 1) ZipperError
-                        else MaterialTheme.colorScheme.onBackground.copy(0.35f),
-                fontSize = 12.sp,
-            )
-
-            Spacer(Modifier.height(24.dp))
-
-            // Step indicator chips
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                LivenessStep.entries.take(3).forEach { s ->
-                    val active  = s == step || step.ordinal > s.ordinal
-                    val current = s == step
-                    Box(
-                        modifier = Modifier
-                            .height(4.dp)
-                            .width(if (current) 32.dp else 20.dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(if (active) borderColor else MaterialTheme.colorScheme.onBackground.copy(0.15f)),
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(20.dp))
-
-            // Camera oval
-            Box(
-                modifier = Modifier.size(260.dp),
-                contentAlignment = Alignment.Center,
+        },
+    ) { _ ->
+        Box(Modifier.fillMaxSize()) {
+            AmbientGlows()
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = Space.lg, vertical = Space.md),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(Space.xl),
             ) {
-                Box(
-                    modifier = Modifier
-                        .size((260 * pulseScale).dp)
-                        .border(
-                            3.dp,
-                            Brush.sweepGradient(listOf(borderColor, borderColor.copy(0.3f), borderColor)),
-                            CircleShape,
-                        ),
-                )
-                Box(
-                    modifier = Modifier.size(240.dp).clip(CircleShape)
-                        .background(MaterialTheme.colorScheme.surface),
-                ) {
-                    val previewView = remember { PreviewView(context) }
-                    AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-
-                    LaunchedEffect(Unit) {
-                        val providerFuture = ProcessCameraProvider.getInstance(context)
-                        providerFuture.addListener({
-                            val provider = providerFuture.get()
-                            val preview = Preview.Builder().build()
-                                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-                            val imgCapture = ImageCapture.Builder()
-                                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                                .build()
-                            imageCaptureUseCase = imgCapture
-
-                            val imgAnalysis = ImageAnalysis.Builder()
-                                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                                .build()
-                            imgAnalysis.setAnalyzer(cameraExecutor) { proxy ->
-                                val mediaImg = proxy.image
-                                if (mediaImg != null && step != LivenessStep.CAPTURE && step != LivenessStep.PROCESSING) {
-                                    val inputImg = InputImage.fromMediaImage(mediaImg, proxy.imageInfo.rotationDegrees)
-                                    detector.process(inputImg)
-                                        .addOnSuccessListener { faces ->
-                                            faces.firstOrNull()?.let { processFrame(it) }
-                                        }
-                                        .addOnCompleteListener { proxy.close() }
-                                } else {
-                                    proxy.close()
-                                }
+                // Instruction card — three short steps
+                GlassCard {
+                    Text("Quick liveness check", style = ZipperTheme.type.headingS, color = c.textPrimary)
+                    LivenessStep.entries.take(3).forEachIndexed { i, s ->
+                        val done = step.ordinal > s.ordinal
+                        val current = s == step
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
+                            Box(
+                                Modifier.size(24.dp).then(
+                                    when {
+                                        done -> Modifier.background(c.tintSuccessSubtle, CircleShape).border(1.dp, c.statusSuccess, CircleShape)
+                                        current -> Modifier.background(Brush.horizontalGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), CircleShape)
+                                        else -> Modifier.background(c.bgRaised, CircleShape).border(1.dp, c.borderSubtle, CircleShape)
+                                    }
+                                ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                // `textOnBrand` rather than `Color.White`: the
+                                // number is only white because the CURRENT step's
+                                // disc is filled with the brand gradient. Saying
+                                // that in the token keeps the pair together — the
+                                // fill above and this foreground are one decision.
+                                if (done) Icon(Icons.Default.Check, null, tint = c.statusSuccess, modifier = Modifier.size(14.dp))
+                                else Text("${i + 1}", style = ZipperTheme.type.overline, color = if (current) c.textOnBrand else c.textMuted)
                             }
-                            imageAnalysisUseCase = imgAnalysis
-
-                            try {
-                                provider.unbindAll()
-                                provider.bindToLifecycle(
-                                    lifecycleOwner,
-                                    CameraSelector.DEFAULT_FRONT_CAMERA,
-                                    preview, imgCapture, imgAnalysis,
-                                )
-                            } catch (_: Exception) { }
-                        }, mainExecutor)
+                            Text(
+                                when (s) { LivenessStep.LOOK -> "Look straight at the camera"; LivenessStep.BLINK -> "Blink slowly"; else -> "Smile" },
+                                style = if (current) ZipperTheme.type.labelM else ZipperTheme.type.bodyM,
+                                color = if (current) c.textPrimary else c.textSecondary,
+                            )
+                        }
                     }
                 }
 
-                // Processing overlay
-                if (step == LivenessStep.PROCESSING || uiState.isLoading) {
-                    Box(
-                        modifier = Modifier.size(240.dp).clip(CircleShape)
-                            .background(androidx.compose.ui.graphics.Color(0x88000000)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator(color = ZipperPink, modifier = Modifier.size(40.dp))
+                // Camera ring
+                Box(Modifier.size(260.dp), contentAlignment = Alignment.Center) {
+                    Box(Modifier.size((260 * pulseScale).dp).border(3.dp, ringBrush, CircleShape))
+                    Box(Modifier.size(240.dp).clip(CircleShape).background(c.bgElevated)) {
+                        val previewView = remember { PreviewView(context) }
+                        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+
+                        LaunchedEffect(Unit) {
+                            val providerFuture = ProcessCameraProvider.getInstance(context)
+                            providerFuture.addListener({
+                                val provider = providerFuture.get()
+                                val preview = Preview.Builder().build()
+                                    .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+
+                                val imgCapture = ImageCapture.Builder()
+                                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                                    .build()
+                                imageCaptureUseCase = imgCapture
+
+                                val imgAnalysis = ImageAnalysis.Builder()
+                                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                    .build()
+                                imgAnalysis.setAnalyzer(cameraExecutor) { proxy ->
+                                    val mediaImg = proxy.image
+                                    if (mediaImg != null && step != LivenessStep.CAPTURE && step != LivenessStep.PROCESSING) {
+                                        val inputImg = InputImage.fromMediaImage(mediaImg, proxy.imageInfo.rotationDegrees)
+                                        detector.process(inputImg)
+                                            .addOnSuccessListener { faces ->
+                                                faces.firstOrNull()?.let { processFrame(it) }
+                                            }
+                                            .addOnCompleteListener { proxy.close() }
+                                    } else {
+                                        proxy.close()
+                                    }
+                                }
+                                imageAnalysisUseCase = imgAnalysis
+
+                                try {
+                                    provider.unbindAll()
+                                    provider.bindToLifecycle(
+                                        lifecycleOwner,
+                                        CameraSelector.DEFAULT_FRONT_CAMERA,
+                                        preview, imgCapture, imgAnalysis,
+                                    )
+                                } catch (_: Exception) { }
+                            }, mainExecutor)
+                        }
+                    }
+
+                    // Processing overlay
+                    if (step == LivenessStep.PROCESSING || uiState.isLoading) {
+                        Box(Modifier.size(240.dp).clip(CircleShape).background(c.scrimStrong), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = c.brandPrimary, strokeWidth = 3.dp, modifier = Modifier.size(40.dp))
+                        }
                     }
                 }
-            }
 
-            Spacer(Modifier.height(24.dp))
-
-            // Instruction card
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(borderColor.copy(0.1f))
-                    .padding(horizontal = 20.dp, vertical = 14.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(step.emoji, fontSize = 28.sp)
-                    Spacer(Modifier.height(6.dp))
+                // Current step + attempts
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.xs)) {
+                    Text(step.instruction, style = ZipperTheme.type.headingS, color = c.textPrimary, textAlign = TextAlign.Center)
                     Text(
-                        step.instruction,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
+                        "Attempts remaining: $attemptsLeft / 3",
+                        style = ZipperTheme.type.caption, color = if (attemptsLeft <= 1) c.statusDanger else c.textMuted,
                     )
                 }
-            }
 
-            // Error message
-            errorMsg?.let { err ->
-                Spacer(Modifier.height(12.dp))
-                Text(err, color = ZipperError, fontSize = 13.sp, textAlign = TextAlign.Center)
-            }
+                // Error state
+                errorMsg?.let { err ->
+                    Column(
+                        Modifier.fillMaxWidth().background(c.tintDangerSubtle, RoundedCornerShape(Radius.lg)).border(1.dp, c.statusDanger, RoundedCornerShape(Radius.lg)).padding(Space.lg),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        Icon(Icons.Outlined.ErrorOutline, null, tint = c.statusDanger, modifier = Modifier.size(24.dp))
+                        Text("Check failed", style = ZipperTheme.type.headingS, color = c.textPrimary, textAlign = TextAlign.Center)
+                        Text(err, style = ZipperTheme.type.bodyM, color = c.textSecondary, textAlign = TextAlign.Center)
+                        ZipperButton("Retry", onClick = { errorMsg = null; step = LivenessStep.LOOK }, style = ButtonStyle.Secondary, size = ButtonSize.Medium)
+                    }
+                }
 
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "Your selfie is encrypted and stored securely.",
-                color = MaterialTheme.colorScheme.onBackground.copy(0.3f),
-                fontSize = 11.sp, textAlign = TextAlign.Center,
-            )
+                // Capture: the liveness flow auto-captures on smile; this is the
+                // manual fallback once look + blink have passed.
+                ZipperButton(
+                    if (busy) "Verifying…" else "Capture",
+                    onClick = { if (step == LivenessStep.SMILE) step = LivenessStep.CAPTURE },
+                    gradient = true, fullWidth = true,
+                    enabled = step == LivenessStep.SMILE, loading = busy,
+                )
+
+                Text(DPDP_NOTE, style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center)
+                Spacer(Modifier.navigationBarsPadding())
+            }
         }
     }
 }
@@ -379,9 +452,9 @@ private fun classifyGender(bitmap: Bitmap, interpreter: Interpreter): String {
     for (y in 0 until size) {
         for (x in 0 until size) {
             val pixel = scaled.getPixel(x, y)
-            input[0][y][x][0] = Color.red(pixel) / 255f
-            input[0][y][x][1] = Color.green(pixel) / 255f
-            input[0][y][x][2] = Color.blue(pixel) / 255f
+            input[0][y][x][0] = AndroidColor.red(pixel) / 255f
+            input[0][y][x][1] = AndroidColor.green(pixel) / 255f
+            input[0][y][x][2] = AndroidColor.blue(pixel) / 255f
         }
     }
     val output = Array(1) { FloatArray(3) }

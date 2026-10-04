@@ -1,0 +1,35 @@
+<!-- Default avatar · horse. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Violet/400 -->
+    <path
+        android:fillColor="#FFA47CFF"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M30,30L34,8L44,28ZM66,30L62,8L52,28Z" />
+    <!-- Long face -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,52m-20,0a20,26 0 1,0 40,0a20,26 0 1,0 -40,0" />
+    <!-- Muzzle -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M48,66m-14,0a14,11 0 1,0 28,0a14,11 0 1,0 -28,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M39,44m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M57,44m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Nostrils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M42,61m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0M54,61m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0" />
+    <!-- The laugh -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M38,68h20a10,8 0 0,1 -20,0z" />
+</vector>

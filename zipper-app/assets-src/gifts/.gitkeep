@@ -1,0 +1,9 @@
+Source SVGs for the gift catalogue, generated from the Figma page
+"16 Gift Catalogue" (file KzjWYs64L1bPAmD6Bxoic2).
+
+These are original artwork drawn for Zipper — no third-party licence attaches
+to any of them. Regenerate from Figma rather than hand-editing.
+
+For Android, convert to VectorDrawable:
+    Android Studio > right-click res > New > Vector Asset > Local file
+or in bulk with svg2vector / vd-tool.

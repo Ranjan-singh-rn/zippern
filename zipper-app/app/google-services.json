@@ -1,79 +1,49 @@
 {
   "project_info": {
-    "project_number": "344965230552",
-    "firebase_url": "https://dating-app-967f3-default-rtdb.firebaseio.com",
-    "project_id": "dating-app-967f3",
-    "storage_bucket": "dating-app-967f3.firebasestorage.app"
+    "project_number": "239458555881",
+    "project_id": "zipper-83816",
+    "storage_bucket": "zipper-83816.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:344965230552:android:e5fcbe8c329c6506c8ccad",
+        "mobilesdk_app_id": "1:239458555881:android:4bbe80dbaf7a87bbb55d78",
         "android_client_info": {
           "package_name": "com.zipper.app"
         }
       },
       "oauth_client": [
         {
-          "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
-          "client_type": 3
-        }
-      ],
-      "api_key": [
-        {
-          "current_key": "AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY"
-        }
-      ],
-      "services": {
-        "appinvite_service": {
-          "other_platform_oauth_client": [
-            {
-              "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
-              "client_type": 3
-            }
-          ]
-        }
-      }
-    },
-    {
-      "client_info": {
-        "mobilesdk_app_id": "1:344965230552:android:823f59ddc3596fb3c8ccad",
-        "android_client_info": {
-          "package_name": "com.zipper.datingapp"
-        }
-      },
-      "oauth_client": [
-        {
-          "client_id": "344965230552-ph9nqq2c2r8omn035kui9gcmbdbu65fj.apps.googleusercontent.com",
+          "client_id": "239458555881-dhm0put9jmmr71dhhh9pueeq8v2l8jg5.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
-            "package_name": "com.zipper.datingapp",
-            "certificate_hash": "b88065fa1a0415fdbcc11ac6ea2c8d85eabac376"
-          }
-        },
-        {
-          "client_id": "344965230552-qm5l5kekrsgkuatlq1si96vgdomqbbfi.apps.googleusercontent.com",
-          "client_type": 1,
-          "android_info": {
-            "package_name": "com.zipper.datingapp",
+            "package_name": "com.zipper.app",
             "certificate_hash": "3fb7dbe08008ff21a71df29fbce7a93ef484092a"
           }
         },
         {
-          "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+          "client_id": "239458555881-e78gp5llime70haekgherco87rbbsamp.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.zipper.app",
+            "certificate_hash": "83ec5a2b43c9735c491ea2deec6f96434343e13c"
+          }
+        },
+        {
+          "client_id": "239458555881-gb999t0l6po3rp4ig38bt3qvmk6tg2pc.apps.googleusercontent.com",
           "client_type": 3
         }
       ],
       "api_key": [
         {
-          "current_key": "AIzaSyDG7297rR6vm8lj73aFE3P6FpM601jcJxY"
+          "current_key": "AIzaSyBO8zwx5DhXOo55YIzMQ6f2RkvSKWBzuOA"
         }
       ],
       "services": {
         "appinvite_service": {
           "other_platform_oauth_client": [
             {
-              "client_id": "344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com",
+              "client_id": "239458555881-gb999t0l6po3rp4ig38bt3qvmk6tg2pc.apps.googleusercontent.com",
               "client_type": 3
             }
           ]

@@ -59,6 +59,12 @@ fun calculateCallBeansSplit(
 const val MIN_CALL_RATE_BEANS       = 375     // Minimum host call rate (beans/min)
 const val MIN_CALL_BALANCE_DIAMONDS = 1500    // Minimum diamonds to start a call
 const val DIAMOND_TO_BEAN_RATE      = 0.5    // 1 diamond gifted = 0.5 beans to host
-const val AGENCY_CUT_PERCENT        = 5       // 5% of host earnings go to agency
+// AGENCY_CUT_PERCENT deliberately removed (10 Sep 2026).
+//
+// It declared a flat 5% taken OUT OF THE HOST'S EARNINGS. That is the
+// opposite of the agreed model: the host is paid in full and Zipper pays the
+// agency separately, on the backend's progressive slab. The constant was
+// never referenced anywhere, so nothing changes by deleting it — but leaving
+// it in place invited someone to implement it and underpay every host by 5%.
 const val PAYOUT_THRESHOLD_BEANS    = 100_000 // 1L beans needed before payout
 const val BEANS_PER_RUPEE_PAYOUT    = 100     // 100 beans = Rs.1 (i.e. 1L beans = Rs.1000)

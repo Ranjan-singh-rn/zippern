@@ -1,0 +1,26 @@
+<!-- 8A.2.5 — rejected, WITH THE REASON, and whether they may reapply.
+     The reason is mandatory on the backend and already stored on the record;
+     the gap this closes is that nobody was ever told it. Part 0.1.6 — rules
+     are written down and applied evenly; 0.2.9 — written grounds. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  Your {{ kind_label }} application was not approved, {{ name }}. The reason is
+  below in full, exactly as it was recorded.
+</p>
+
+<div style="background:#fafafa;border:1px solid #e4e4e7;border-left:3px solid #71717a;
+            border-radius:8px;padding:16px 18px;margin:0 0 18px">
+  <div style="font-size:12px;letter-spacing:.6px;text-transform:uppercase;
+              color:#71717a;margin:0 0 8px">Reason</div>
+  <div style="line-height:1.6;white-space:pre-wrap">{{ reason }}</div>
+</div>
+
+{{{ facts }}}
+
+<p style="margin:18px 0 0;line-height:1.6">
+  <strong>What happens next.</strong> {{ next_steps }}
+</p>
+<p style="color:#71717a;font-size:13px;margin:16px 0 0;line-height:1.6">
+  If you think this decision rests on something we have wrong, reply to this
+  email quoting the reference above. A named person answers it — a rejection is
+  a decision on the facts, and the facts can be corrected (0.1.7, 0.2.10).
+</p>

@@ -1,0 +1,28 @@
+<!-- 8A.2.2 — staff access added to an account that already exists.
+     To: the new staff member, who is already a Zipper user.
+
+     The sibling of 8A.2.1, and it exists because sending THAT one here was
+     actively harmful. The invitation carries a set-password link, and a
+     password-reset link aimed at somebody's existing Zipper account is a
+     working credential for an account they are already using — mailed to them
+     unprompted, worded as though the account were new. Anybody reading it as
+     instructed would reset the password on their own app login.
+
+     So: no link, no credential, and no instruction to set anything. The account
+     is theirs already; all that has changed is what it can reach. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  {{ invited_by }} has added you to the Zipper team as <strong>{{ role_label }}</strong>.
+</p>
+<p style="margin:0 0 20px;line-height:1.6">
+  You already have a Zipper account on this email address, and that is the
+  account your new access is attached to — there is nothing new to set up and no
+  new password to create. Sign in the way you normally do.
+</p>
+<p style="color:#71717a;font-size:13px;margin:22px 0 0;line-height:1.6">
+  If you have forgotten your password, use "Forgot password" on the sign-in
+  screen rather than a link in an email.
+</p>
+<p style="color:#71717a;font-size:13px;margin:22px 0 0;line-height:1.6">
+  If you were not expecting this, tell {{ invited_by }} — your existing account
+  has not been changed, and nothing about how you sign in has been altered.
+</p>

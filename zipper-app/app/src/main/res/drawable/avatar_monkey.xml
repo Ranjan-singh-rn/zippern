@@ -1,0 +1,35 @@
+<!-- Default avatar · monkey. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Gold/400 -->
+    <path
+        android:fillColor="#FFFFD05C"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M20,50m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0M76,50m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,50m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0" />
+    <!-- Face -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M48,56m-19,0a19,17 0 1,0 38,0a19,17 0 1,0 -38,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M40,50m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M56,50m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Nostrils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M45,59m-2.5,0a2.5,2.5 0 1,0 5,0a2.5,2.5 0 1,0 -5,0M51,59m-2.5,0a2.5,2.5 0 1,0 5,0a2.5,2.5 0 1,0 -5,0" />
+    <!-- Grin -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M38,64h20a10,7 0 0,1 -20,0z" />
+</vector>

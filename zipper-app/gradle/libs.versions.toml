@@ -3,11 +3,12 @@ agp = "8.5.2"
 kotlin = "2.0.0"
 ksp = "2.0.0-1.0.24"
 hilt = "2.51.1"
-composeBom = "2024.09.03"
+composeBom = "2024.10.00"
 navigationCompose = "2.8.3"
 lifecycleRuntimeKtx = "2.8.6"
 activityCompose = "1.9.3"
 coil = "2.7.0"
+media3 = "1.4.1"
 lottie = "6.5.0"
 firebaseBom = "33.5.1"
 agora = "4.5.0"
@@ -19,9 +20,18 @@ gpuimage = "2.1.0"
 accompanistPermissions = "0.36.0"
 credentials = "1.2.2"
 googleid = "1.1.1"
-mlkitFace = "16.1.7"
+mlkitFace = "16.1.7"          # bundled variant (unused — kept for reference)
+mlkitFaceUnbundled = "17.1.0"  # Play Services variant: ~12 MB smaller, model fetched on demand
 firebaseModelDownloader = "24.2.3"
 tensorflowLite = "2.14.0"
+# bzip2, for the three compressed blocks inside a bsdiff OTA patch. There is no
+# bzip2 in the Java standard library and this is the only pure-Java one that is
+# maintained — an NDK build of libbz2 would mean a new .so per ABI in an APK
+# whose size is the entire reason delta updates exist. See util/BsPatch.kt.
+commonsCompress = "1.27.1"
+
+junit4 = "4.13.2"
+coroutinesTest = "1.8.1"
 
 [libraries]
 # Compose
@@ -56,6 +66,7 @@ firebase-storage = { group = "com.google.firebase", name = "firebase-storage-ktx
 firebase-messaging = { group = "com.google.firebase", name = "firebase-messaging-ktx" }
 firebase-crashlytics = { group = "com.google.firebase", name = "firebase-crashlytics-ktx" }
 firebase-analytics = { group = "com.google.firebase", name = "firebase-analytics-ktx" }
+firebase-functions = { group = "com.google.firebase", name = "firebase-functions-ktx" }
 credentials = { group = "androidx.credentials", name = "credentials", version.ref = "credentials" }
 credentials-play-services-auth = { group = "androidx.credentials", name = "credentials-play-services-auth", version.ref = "credentials" }
 googleid = { group = "com.google.android.libraries.identity.googleid", name = "googleid", version.ref = "googleid" }
@@ -66,6 +77,14 @@ agora-rtc = { group = "io.agora.rtc", name = "full-sdk", version.ref = "agora" }
 # Coil
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 coil-gif = { group = "io.coil-kt", name = "coil-gif", version.ref = "coil" }
+coil-video = { group = "io.coil-kt", name = "coil-video", version.ref = "coil" }
+
+# Media3 (ExoPlayer + Transformer)
+media3-exoplayer    = { group = "androidx.media3", name = "media3-exoplayer",    version.ref = "media3" }
+media3-ui           = { group = "androidx.media3", name = "media3-ui",           version.ref = "media3" }
+media3-session      = { group = "androidx.media3", name = "media3-session",      version.ref = "media3" }
+media3-transformer  = { group = "androidx.media3", name = "media3-transformer",  version.ref = "media3" }
+media3-effect       = { group = "androidx.media3", name = "media3-effect",       version.ref = "media3" }
 
 # Lottie
 lottie-compose = { group = "com.airbnb.android", name = "lottie-compose", version.ref = "lottie" }
@@ -91,16 +110,33 @@ gpuimage = { group = "jp.co.cyberagent.android", name = "gpuimage", version.ref 
 accompanist-permissions = { group = "com.google.accompanist", name = "accompanist-permissions", version.ref = "accompanistPermissions" }
 
 # ML Kit
-mlkit-face-detection = { group = "com.google.mlkit", name = "face-detection", version.ref = "mlkitFace" }
+mlkit-face-detection = { group = "com.google.android.gms", name = "play-services-mlkit-face-detection", version.ref = "mlkitFaceUnbundled" }
 firebase-ml-modeldownloader = { group = "com.google.firebase", name = "firebase-ml-modeldownloader-ktx", version.ref = "firebaseModelDownloader" }
 tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 
 # Play Services
 play-services-location = { group = "com.google.android.gms", name = "play-services-location", version = "21.3.0" }
+# Block Store keeps a small secret in Google Play Services rather than in app
+# storage, so it survives "clear data", survives an uninstall, and comes across
+# on a device transfer. That is what makes quick login work the way HiClub and
+# Chamet do it; nothing an app can store about itself survives being uninstalled.
+play-services-auth-blockstore = { group = "com.google.android.gms", name = "play-services-auth-blockstore", version = "16.4.0" }
 
 # Core
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version = "1.13.1" }
 androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version = "1.0.1" }
+androidx-profileinstaller = { group = "androidx.profileinstaller", name = "profileinstaller", version = "1.3.1" }
+
+# Apache Commons Compress — used for exactly one class,
+# BZip2CompressorInputStream, by util/BsPatch.kt. Pure Java, no NDK, no ABI
+# implications, so it does not disturb `splits { abi }`.
+commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+# Added because this project shipped with no test source set at all. Every
+# constant in EconomyEngine is money, and none of it was covered.
+junit = { group = "junit", name = "junit", version.ref = "junit4" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutinesTest" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

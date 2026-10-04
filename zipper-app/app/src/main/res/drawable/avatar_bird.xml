@@ -1,0 +1,31 @@
+<!-- Default avatar · bird. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Mint/400 -->
+    <path
+        android:fillColor="#FF5CE6A8"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Body -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,52m-28,0a28,28 0 1,0 56,0a28,28 0 1,0 -56,0" />
+    <!-- Eye discs -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M39,46m-9,0a9,9 0 1,0 18,0a9,9 0 1,0 -18,0M57,46m-9,0a9,9 0 1,0 18,0a9,9 0 1,0 -18,0" />
+    <!-- Pupils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M40,47m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M56,47m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Cross brows — the whole joke of this one -->
+    <path
+        android:fillColor="#FFFF4D5E"
+        android:pathData="M30,33L46,40L44,46L28,39ZM66,33L50,40L52,46L68,39Z" />
+    <!-- Beak -->
+    <path
+        android:fillColor="#FFFFB627"
+        android:pathData="M38,58L58,58L48,68Z" />
+</vector>

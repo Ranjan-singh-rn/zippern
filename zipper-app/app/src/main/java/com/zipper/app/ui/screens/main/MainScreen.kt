@@ -1,5 +1,6 @@
 package com.zipper.app.ui.screens.main
 
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Message
@@ -14,12 +15,10 @@ import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -28,8 +27,24 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.zipper.app.ui.screens.home.HomeScreen
+import com.zipper.app.ui.screens.live.LiveBrowseScreen
 import com.zipper.app.ui.screens.placeholder.PlaceholderScreen
-import com.zipper.app.ui.theme.ZipperPink
+import com.zipper.app.ui.screens.call.CallWatcherViewModel
+import com.zipper.app.ui.screens.messages.MessagesScreen
+import com.zipper.app.ui.screens.profile.MyProfileScreen
+import com.zipper.app.ui.screens.profile.ProfileViewModel
+import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.ui.theme.Space
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import com.zipper.app.ui.components.HairlineDivider
+import com.zipper.app.ui.components.clickableNoRipple
 
 data class BottomNavItem(
     val label: String,
@@ -47,45 +62,59 @@ val bottomNavItems = listOf(
 )
 
 @Composable
-fun MainScreen() {
-    val tabNavController = rememberNavController()
+fun MainScreen(
+    onNavigateToEditProfile: () -> Unit = {},
+    onNavigateToSettings: () -> Unit = {},
+    onNavigateToDiamondShop: () -> Unit = {},
+    onNavigateToBeansCenter: () -> Unit = {},
+    onNavigateToProfile: () -> Unit = {},
+    onNavigateToUserProfile: (String) -> Unit = {},
+    onNavigateToGoLive: () -> Unit = {},
+    onNavigateToWatchLive: (String) -> Unit = {},
+    onNavigateToPartyRooms: () -> Unit = {},
+    onNavigateToMyBag: () -> Unit = {},
+    onNavigateToEarnings: () -> Unit = {},
+    onNavigateToCallHistory: () -> Unit = {},
+    onNavigateToLikes: (Int) -> Unit = {},
+    onNavigateToLevel: () -> Unit = {},
+    onNavigateToDailyRewards: () -> Unit = {},
+    onNavigateToIncomingCall: (String) -> Unit = {},
+    onNavigateToChat: (String) -> Unit = {},
+    onNavigateToAgencyDashboard: () -> Unit = {},
+    onNavigateToSellerDashboard: () -> Unit = {},
+    onNavigateToFeedback: () -> Unit = {},
+    /** The liveness capture, for a host who has not completed it. */
+    onNavigateToFaceVerification: (String) -> Unit = {},
+    /** Redeem an agency code, for a user who is not a host yet. */
+    onNavigateToJoinAgency: () -> Unit = {},
+    onLogout: () -> Unit = {},
+) {
+    val tabNavController  = rememberNavController()
+    // Incoming calls are watched at the Activity level (MainActivity), so a
+    // ring reaches the user on every screen, not only the Main tabs.
     val backStackEntry by tabNavController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
 
     Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = ZipperTheme.colors.bgBase,
+        // Don't let the outer Scaffold consume window insets — each inner screen
+        // applies statusBarsPadding() / navigationBarsPadding() itself. Without
+        // this, the status-bar inset is counted twice (once here, once in TopAppBar
+        // or HomeTopBar) causing the extra gap at the top of Home / Live tabs.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
-            NavigationBar(
-                containerColor = MaterialTheme.colorScheme.surface,
-                contentColor = MaterialTheme.colorScheme.onSurface,
-                tonalElevation = 0.dp,
-            ) {
-                bottomNavItems.forEach { item ->
-                    val selected = currentRoute == item.route
-                    NavigationBarItem(
-                        selected = selected,
-                        onClick = {
-                            tabNavController.navigate(item.route) {
-                                popUpTo(tabNavController.graph.startDestinationId) { saveState = true }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        },
-                        icon = {
-                            Icon(
-                                if (selected) item.selectedIcon else item.unselectedIcon,
-                                contentDescription = item.label,
-                            )
-                        },
-                        label = { Text(item.label) },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = ZipperPink,
-                            selectedTextColor = ZipperPink,
-                            unselectedIconColor = MaterialTheme.colorScheme.onSurface.copy(0.45f),
-                            unselectedTextColor = MaterialTheme.colorScheme.onSurface.copy(0.45f),
-                            indicatorColor = ZipperPink.copy(0.12f),
-                        ),
-                    )
+            ZipperBottomNav(currentRoute) { route ->
+                tabNavController.navigate(route) {
+                    // inclusive = true: always pop everything so tab nav has only
+                    // ONE entry at a time. This prevents the inner NavController's
+                    // BackHandler from consuming system back presses while the user
+                    // is on a screen above MainScreen (OwnProfile, GalleryViewer, etc.)
+                    popUpTo(tabNavController.graph.startDestinationId) {
+                        inclusive = true
+                        saveState = true
+                    }
+                    launchSingleTop = true
+                    restoreState = true
                 }
             }
         },
@@ -95,11 +124,98 @@ fun MainScreen() {
             startDestination = "tab_home",
             modifier = Modifier.padding(padding),
         ) {
-            composable("tab_home")     { PlaceholderScreen("Home Feed — Phase 2") }
-            composable("tab_live")     { PlaceholderScreen("Live — Phase 4") }
+            composable("tab_home") {
+                HomeScreen(
+                    onNavigateToProfile     = onNavigateToUserProfile,
+                    onWatchLive             = onNavigateToWatchLive,
+                    onNavigateToDiamondShop = onNavigateToDiamondShop,
+                    onNavigateToPartyRooms  = onNavigateToPartyRooms,
+                )
+            }
+            composable("tab_live") {
+                val profileVm: ProfileViewModel = hiltViewModel()
+                val profileState by profileVm.state.collectAsStateWithLifecycle()
+                LiveBrowseScreen(
+                    currentUser       = profileState.user,
+                    onWatchLive       = onNavigateToWatchLive,
+                    onGoLive          = onNavigateToGoLive,
+                )
+            }
             composable("tab_games")    { PlaceholderScreen("Games — Phase 9") }
-            composable("tab_messages") { PlaceholderScreen("Messages — Phase 8") }
-            composable("tab_me")       { PlaceholderScreen("Me / Profile — Phase 3") }
+            composable("tab_messages") {
+                MessagesScreen(
+                    onNavigateToChat = { otherUid, _ -> onNavigateToChat(otherUid) },
+                    onNavigateToFeedback = onNavigateToFeedback,
+                )
+            }
+            composable("tab_me") {
+                MyProfileScreen(
+                    onNavigateToProfile             = onNavigateToProfile,
+                    onNavigateToEditProfile         = onNavigateToEditProfile,
+                    onNavigateToSettings            = onNavigateToSettings,
+                    onNavigateToDiamondShop         = onNavigateToDiamondShop,
+                    onNavigateToBeansCenter         = onNavigateToBeansCenter,
+                    onNavigateToMyBag               = onNavigateToMyBag,
+                    onNavigateToEarnings            = onNavigateToEarnings,
+                    onNavigateToCallHistory         = onNavigateToCallHistory,
+                    onNavigateToLikes               = onNavigateToLikes,
+                    onNavigateToLevel               = onNavigateToLevel,
+                    onNavigateToDailyRewards        = onNavigateToDailyRewards,
+                    onNavigateToAgencyDashboard     = onNavigateToAgencyDashboard,
+                    onNavigateToSellerDashboard     = onNavigateToSellerDashboard,
+                    onNavigateToFeedback            = onNavigateToFeedback,
+                    onNavigateToFaceVerification    = onNavigateToFaceVerification,
+                    onNavigateToJoinAgency          = onNavigateToJoinAgency,
+                    onLogout                        = onLogout,
+                )
+            }
         }
+    }
+}
+
+/*
+ * Bottom nav — Figma "02 Main shell" (42:29). 64dp on bg/raised with a
+ * hairline top border. Each item: a 56×28 indicator pill (brand tint when
+ * selected) holding a 24 icon, then an 11sp Medium label 2dp below —
+ * rose/400 when selected, ink/500 otherwise.
+ */
+@Composable
+fun ZipperBottomNav(currentRoute: String?, onSelect: (String) -> Unit) {
+    val c = ZipperTheme.colors
+    Column(Modifier.fillMaxWidth().background(c.bgRaised)) {
+        HairlineDivider()
+        Row(
+            Modifier.fillMaxWidth().height(64.dp).padding(horizontal = Space.sm),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            bottomNavItems.forEach { item ->
+                val selected = currentRoute == item.route
+                Column(
+                    Modifier.weight(1f).fillMaxHeight().clickableNoRipple { onSelect(item.route) },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Box(
+                        Modifier.size(56.dp, 28.dp)
+                            .background(if (selected) c.tintBrandSubtle else Color.Transparent, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            if (selected) item.selectedIcon else item.unselectedIcon,
+                            contentDescription = item.label,
+                            tint = if (selected) c.brandPrimary else c.textMuted,
+                            modifier = Modifier.size(24.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        item.label,
+                        style = ZipperTheme.type.caption,
+                        color = if (selected) c.textBrand else c.textMuted,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.navigationBarsPadding())
     }
 }

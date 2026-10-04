@@ -1,0 +1,450 @@
+{
+  "runId": "zipper-redesign-2026-09",
+  "note": "State ledger for the Figma redesign. Conversation context gets truncated on a job this size; this file is the source of truth for IDs. Re-read it before any use_figma call that references an existing object.",
+  "figma": {
+    "fileKey": "KzjWYs64L1bPAmD6Bxoic2",
+    "fileUrl": "https://www.figma.com/design/KzjWYs64L1bPAmD6Bxoic2",
+    "account": "ranjan@codewave.com",
+    "planKey": "team::1304915518598234850"
+  },
+  "phase": "1-foundations-complete",
+  "fonts": {
+    "display": { "family": "Plus Jakarta Sans", "styles": ["Medium", "SemiBold", "Bold", "ExtraBold"], "note": "NO space in SemiBold/ExtraBold" },
+    "ui": { "family": "Inter", "styles": ["Regular", "Medium", "Semi Bold", "Bold"], "note": "SPACE in 'Semi Bold'/'Extra Bold' — differs from Jakarta, mixing them throws" }
+  },
+  "collections": {
+    "Primitives": { "id": "VariableCollectionId:3:2", "mode": "3:0", "count": 45 },
+    "Color": { "id": "VariableCollectionId:4:2", "modes": { "Dark": "4:0", "Light": "4:1" }, "count": 29 },
+    "Spacing": { "id": "VariableCollectionId:4:32", "count": 13 },
+    "Radius": { "id": "VariableCollectionId:4:46", "count": 9 },
+    "Size": { "id": "VariableCollectionId:4:56", "count": 21 }
+  },
+  "semanticColorVars": {
+    "bg/base": "VariableID:4:3", "bg/raised": "VariableID:4:4", "bg/elevated": "VariableID:4:5",
+    "bg/sunken": "VariableID:4:6", "bg/inverse": "VariableID:4:7", "bg/scrim": "VariableID:4:8",
+    "text/primary": "VariableID:4:9", "text/secondary": "VariableID:4:10", "text/muted": "VariableID:4:11",
+    "text/inverse": "VariableID:4:12", "text/brand": "VariableID:4:13", "text/on-brand": "VariableID:4:14",
+    "border/subtle": "VariableID:4:15", "border/default": "VariableID:4:16", "border/strong": "VariableID:4:17",
+    "brand/primary": "VariableID:4:18", "brand/primary-pressed": "VariableID:4:19",
+    "brand/secondary": "VariableID:4:20", "brand/gradient-from": "VariableID:4:21",
+    "brand/gradient-to": "VariableID:4:22", "brand/vip": "VariableID:4:23",
+    "currency/diamond": "VariableID:4:24", "currency/bean": "VariableID:4:25", "currency/coin": "VariableID:4:26",
+    "status/live": "VariableID:4:27", "status/online": "VariableID:4:28", "status/success": "VariableID:4:29",
+    "status/warning": "VariableID:4:30", "status/danger": "VariableID:4:31"
+  },
+  "sizeVars": {
+    "size/touch-min": "VariableID:4:57",
+    "size/icon/xs": "VariableID:4:58", "size/icon/sm": "VariableID:4:59", "size/icon/md": "VariableID:4:60",
+    "size/icon/lg": "VariableID:4:61", "size/icon/xl": "VariableID:4:62", "size/icon/2xl": "VariableID:4:63",
+    "size/avatar/xs": "VariableID:4:64", "size/avatar/sm": "VariableID:4:65", "size/avatar/md": "VariableID:4:66",
+    "size/avatar/lg": "VariableID:4:67", "size/avatar/xl": "VariableID:4:68", "size/avatar/2xl": "VariableID:4:69",
+    "size/avatar/3xl": "VariableID:4:70",
+    "size/control/sm": "VariableID:4:71", "size/control/md": "VariableID:4:72", "size/control/lg": "VariableID:4:73",
+    "size/bar/nav": "VariableID:4:74", "size/bar/top": "VariableID:4:75",
+    "size/stroke/hairline": "VariableID:4:76", "size/stroke/thick": "VariableID:4:77"
+  },
+  "spacingVars": {
+    "space/0": "VariableID:4:33", "space/2xs": "VariableID:4:34", "space/xs": "VariableID:4:35",
+    "space/sm": "VariableID:4:36", "space/md": "VariableID:4:37", "space/lg": "VariableID:4:38",
+    "space/xl": "VariableID:4:39", "space/2xl": "VariableID:4:40", "space/3xl": "VariableID:4:41",
+    "space/4xl": "VariableID:4:42", "space/5xl": "VariableID:4:43", "space/6xl": "VariableID:4:44",
+    "space/7xl": "VariableID:4:45"
+  },
+  "radiusVars": {
+    "radius/none": "VariableID:4:47", "radius/xs": "VariableID:4:48", "radius/sm": "VariableID:4:49",
+    "radius/md": "VariableID:4:50", "radius/lg": "VariableID:4:51", "radius/xl": "VariableID:4:52",
+    "radius/2xl": "VariableID:4:53", "radius/3xl": "VariableID:4:54", "radius/full": "VariableID:4:55"
+  },
+  "textStyles": {
+    "Display/XL": "S:394ee477681d14eba78e7627b47091adbe121b4a,",
+    "Display/L": "S:2374b2c6058f4093e65f6edb8d8363358c15ef1a,",
+    "Display/M": "S:61aaeadb860c8a1f76efb6a608d44f4180f9d9c5,",
+    "Heading/L": "S:ef6cda46b1afcbd5f9d5398a8f977d6cf7dea94c,",
+    "Heading/M": "S:d65b289c4abc6c579c398eddc4f64fc6976bf097,",
+    "Heading/S": "S:73d8945ffb76bbf58a3f59ec78def1e59b2f6716,",
+    "Body/L": "S:a11a647139b880e22438e5307b4c5002cc07552c,",
+    "Body/M": "S:312a75e921f2a8a5c6986d55f0c1cbbda99206f9,",
+    "Body/S": "S:d7885067200e5fe694b17b9db5cafa06878bb687,",
+    "Label/L": "S:d4e67572c086369c4162552f2b75e6bbeafbeea2,",
+    "Label/M": "S:a091f5dabe4e5f274fd840eccc360b4a0cedca78,",
+    "Label/S": "S:00f8851bafaae0ea9768b34adfd3585e2181bbb2,",
+    "Caption": "S:3d24e9099bd862d1f969a4f27df08fdcc48ee44e,",
+    "Overline": "S:0c5904f318e432fc109e1ddda86473619f7491af,",
+    "Numeric/L": "S:40b62e9b44035cdb54084c48913a5570a6f2006d,",
+    "Numeric/M": "S:50e885c897799553474a4e7fa1c2ddb57bdcc7ce,",
+    "Numeric/S": "S:671ba96797a3cea55ecef328469cd2dc1226c799,"
+  },
+  "effectStyles": {
+    "Elevation/Card": "S:948eac951d9c5f3c8494f8d50fd831ba97fc0ec0,",
+    "Elevation/Raised": "S:08451daed0e9f20d4211a1b5308218386ac89a76,",
+    "Elevation/Sheet": "S:698db147cd63c80281e7467801c6fd84a058db02,",
+    "Glow/Brand": "S:6fbcc4eeceaacca11d43f2be0941f99fed1d4df9,",
+    "Glow/Live": "S:1ecbeaef1a3075930f8d14a5daa81b784c878efa,",
+    "Glow/Gold": "S:a728d9a548a28c715227504e7ae355d24412b2f0,",
+    "Blur/Backdrop": "S:481ef2e19b18ea23f24f8de2f93ec5c3838045eb,"
+  },
+  "pages": {
+    "Cover": "0:1",
+    "Foundations": "7:16",
+    "Components": "7:18",
+    "Brand & Icons": "7:19",
+    "01 Onboarding": "7:21",
+    "02 Home & Discover": "7:22",
+    "03 Live": "7:23",
+    "04 Video Call": "7:24",
+    "05 Economy": "7:25",
+    "06 Profile & Social": "7:26",
+    "07 Settings": "7:27",
+    "08 Partner Dashboards": "7:28",
+    "09 Host": "107:2",
+    "10 Games": "117:2",
+    "11 Events & Rankings": "140:2",
+    "12 Modals & Sheets": "153:2",
+    "13 Cosmetics & VIP": "168:2",
+    "14 Social Systems": "187:2",
+    "15 Party Rooms": "187:3",
+    "16 Gift Catalogue": "205:2"
+  },
+  "gifts": {
+    "page": "16 Gift Catalogue (205:2)",
+    "board": "Catalogue board frame 205:3 — dark ink/900 board holding every gift component plus the five tier labels (205:4 … 205:8).",
+    "contactSheets": {
+      "72px 4-col drawer grid": "216:2",
+      "48px stress test": "216:518",
+      "note": "Instances, not copies. Each is a 160 wrapper FRAME with a native-size instance inside, rescaled on the WRAPPER — the same rule the icon set uses. Edit the component and both sheets update."
+    },
+    "spec": "Each gift is a COMPONENT named 'Gift / <name>', 160x160, transparent fill, clipsContent true, artwork inside a shared ~120x120 optical box. Light source is top-left on all 31. No text inside any artwork — names and prices are rendered by the UI. Flat vector with gradients, no raster, exports cleanly to SVG.",
+    "count": 31,
+    "countNote": "The brief said 30 but the named ladder lists 31 (T1 6 + T2 8 + T3 7 + T4 6 + T5 4). All 31 were drawn.",
+    "components": {
+      "tier1_impulse_2_to_50": {
+        "rose": "206:2", "heart": "206:10", "thumbs-up": "206:14",
+        "star": "206:22", "coffee": "206:26", "candy": "206:36"
+      },
+      "tier2_casual_100_to_500": {
+        "kiss": "207:2", "teddy": "207:10", "balloon": "207:31", "cupcake": "207:42",
+        "puppy": "207:58", "flower-bouquet": "207:75", "perfume": "208:2", "ice-cream": "208:17"
+      },
+      "tier3_mid_900_to_5000": {
+        "ring": "209:2", "necklace": "209:13", "crown-small": "209:24", "champagne": "215:2",
+        "cake": "209:52", "guitar": "209:68", "motorbike": "212:2"
+      },
+      "tier4_premium_10000_to_50000": {
+        "sports-car": "210:18", "diamond-ring": "210:37", "crown-royal": "210:54",
+        "yacht": "210:74", "piano": "212:22", "fireworks": "212:49"
+      },
+      "tier5_flagship_100000_plus": {
+        "castle": "213:2", "private-jet": "213:30", "dragon": "215:21", "galaxy-throne": "213:71"
+      }
+    },
+    "tierGrammar": {
+      "t1": "Single object, flat fills, 2-3 colours, no gradient, no gold, no glow, no base.",
+      "t2": "Richer colour, one white/tint highlight per form, one small accent object (heart, cherry, sparkle-free). Still no gold, no glow.",
+      "t3": "Linear gradients on the main mass, gold accents, a shared PLINTH (rounded ink/500->ink/700 bar with a gold/500 hairline and a dark contact shadow) and 4-point gold sparkles.",
+      "t4": "Full gradients, gold throughout, a blurred colour GLOW behind the object, and a wider gold DAIS (ink/500->ink/800 with a gold cap rail). Airborne subjects (fireworks, yacht) substitute water/glow for the dais.",
+      "t5": "Most ornate: multi-stop gradients, gold structure, glow, ornament (pennants, halo, star field, horns). castle and galaxy-throne carry a base; private-jet and dragon carry cloud/smoke instead."
+    },
+    "palette": "Colours are the exact Primitives hex values (rose/violet/gold/aqua/mint/coral/amber/ink). They are literal fills, NOT bound variables — gradient stops cannot carry a variable without forcing alpha to 1, and illustration fills should not be tokenised. Gold is gold/300 #ffe08a -> gold/500 #ffb627 -> gold/700 #b87503 at 135 degrees, used as the single visual signal of expense.",
+    "goldRule": "Gold appears 0 times in tier 1, 0 times in tier 2, as accents + plinth rail in tier 3, as structure in tier 4, and as the dominant material in tier 5. Tier 1's `star` deliberately uses amber/500-600 (#ffa726/#e88a00), NOT gold, so the ladder stays honest — it is the one place the two ramps sit close.",
+    "squintTestFailures": [
+      "motorbike — weakest in the set. Two wheels plus a small body mass; at 72px it can read as a quad or go-kart rather than a bike. Redrawn twice already.",
+      "piano — the top-view grand was unreadable and was replaced with a lid-plus-keyboard view. It now reads, but at 48px the keyboard stripe can read as a generic dark device.",
+      "flower-bouquet — three blooms over a cone reads as 'plant', not specifically a bouquet. The white flower centres eat too much of each bloom.",
+      "rose — reads as a generic five-petal flower on a stem, not specifically a rose. Distinct from flower-bouquet in silhouette, which is what matters, but the name overpromises.",
+      "dragon — redrawn twice; now an angular horned head with open jaws. Reads as 'horned beast', not unambiguously 'dragon', without the label.",
+      "private-jet — reads as a plane but is the dullest tier-5 item; the grey near-wing carries no gold and drops the perceived price.",
+      "champagne — the gold ice bucket is optically heavier than the bottle, so it can read as a gold bowl at 48px."
+    ],
+    "animationCandidates": {
+      "highest value": ["fireworks (burst + fade, already built as two concentric stars)", "galaxy-throne (star-field twinkle + halo rotation)", "diamond-ring (facet sparkle sweep)", "crown-royal (gem shimmer + gold sweep)", "dragon (flame flicker + eye pulse)"],
+      "good": ["castle (pennant flutter, window glow)", "sports-car (headlight flare + drive-through)", "yacht (water bob)", "champagne (cork pop + gold particles)", "balloon (float drift)", "kiss (scale pulse)"],
+      "low value": ["heart, star, thumbs-up, coffee, candy — tier 1 should stay static. Animating a 2-diamond gift removes the price signal that the static/animated split provides."]
+    },
+    "crmGapsForGiftCatalogue": [
+      "No gifts collection exists in Firestore and no CRM gift screen exists. GiftSummaryItem carries a count but no diamondValue (already logged in knownGapsBeforeCompose), so nothing can sort or price a catalogue today.",
+      "Required per-gift fields: id/slug, displayName + localisedNames, priceDiamonds, tier, category (Hot/Lucky/SVIP/Intimacy/Wealth/Festival/Bag — the Boloji tab set), sortOrder within category, active flag, availableFrom/availableUntil (IST), regionAllowList, minUserLevel / minVipTier / requiresSvip, isCombo (can be sent x1/x77/x177), comboMultipliers, isLucky + luckyOddsTable, receiverBeanValue (derived, not stored), campaignEligible flag, createdAt/updatedAt/updatedBy.",
+      "Artwork slots per gift: staticSvg (this set), staticPng2x fallback, thumbnail72, lottieJson (optional), fullScreenLottieJson (optional, for 10,000+ gifts that take over the room), audioClip (optional), and a durationMs for the send animation. Every slot needs its own uploaded-at and checksum so a bad upload is traceable.",
+      "Ordering must be an explicit integer sortOrder per (category, gift), not implicit by price — the reference drawer puts Trophy 2 next to Mystery Box 360 on purpose.",
+      "Availability windows need an explicit IST instant on both ends plus a 'hide when expired vs show as unavailable' switch, matching the timezone discipline already set on pages 11 and 13.",
+      "Price changes must be versioned, not overwritten: a gift sent yesterday at 900 must still reconcile at 900 in the ledger. Store priceDiamonds on the giftTransaction, never join live.",
+      "The catalogue needs a read-failed state distinct from an empty one, per the existing CRM lesson — an empty gift drawer from a permission error must not look like a genuinely empty category."
+    ],
+    "figmaLessons": [
+      "Vector path coordinates authored in full 160-frame space land EXACTLY right if you set vectorPaths, appendChild, and then NEVER touch node.x/node.y. Setting x=0 after appending strips the internal offset and slams the art to the frame corner — this cost the first probe.",
+      "Linear gradient transform for angle a (degrees, screen coords, y down): [[cos a, sin a, (1-cos a-sin a)/2], [-sin a, cos a, (1+sin a-cos a)/2]]. a=0 left-to-right, a=90 top-to-bottom, a=135 top-left to bottom-right.",
+      "Glow was done as an ELLIPSE with a LAYER_BLUR effect, not a radial gradient — radial gradientTransform is fiddly and blur exports to an SVG filter cleanly. Keep the glow ellipse inset >= 18px inside the frame or clipsContent cuts a hard edge in the falloff.",
+      "To fix a component without breaking its instances, remove its children and redraw INSIDE it. Deleting and recreating the component orphans every instance on the contact sheets.",
+      "Rings and arcs are ELLIPSE nodes with fills:[] and a stroke — no arc command needed. Gradient paint works on strokes."
+    ]
+  },
+  "brand": {
+    "decision": "Direction H — gold heart with a white zip on a rose-to-violet gradient squircle. Chosen over a white-on-pink version because gold-on-pink is uncommon in the category and the solid heart silhouette survives 48dp; the zip is accepted as a detail that only reads at 72dp and up.",
+    "rejected": {
+      "brokenHeart": "An earlier version cut a gap through the heart to suggest a zip. It read unmistakably as a BROKEN heart — the single worst thing a dating app can put on a home screen. The fix was making the zip a gold fastening with a slider and pull tab, so it reads as jewellery closing the heart rather than damage splitting it. Do not reintroduce a gap-based seam.",
+      "cleanZ": "A plain Z monogram scaled best but said nothing about the product.",
+      "outlineHeart": "Cleanest small, but generic — could be any of forty apps."
+    },
+    "assets": {
+      "iconFull": "14:2",
+      "adaptiveBackground": "14:14",
+      "adaptiveForeground": "14:16",
+      "monochrome": "14:27",
+      "safeZoneCheck": "14:29",
+      "wordmark": "14:54"
+    },
+    "geometry": {
+      "canvas": 512,
+      "heartPath": "M 256 372 C 180 310 132 262 132 214 C 132 172 166 150 200 150 C 224 150 244 164 256 184 C 268 164 288 150 312 150 C 346 150 380 172 380 214 C 380 262 332 310 256 372 Z",
+      "safeZone": "Adaptive icons guarantee only the centre 66% (87–425 in a 512 canvas). The heart spans x132–380, y150–372, so it clears the mask. The current dragon PNG does not, which is why its wordmark is cropped off on real launchers.",
+      "gradient": "linear rose/500 -> rose/600 @55% -> violet/500, roughly 45 degrees",
+      "cornerRadius": 112
+    }
+  },
+  "components": {
+    "Button": { "id": "15:51", "variants": 12, "axes": "Style=Primary|Secondary|Ghost|Danger, Size=Large|Medium|Small" },
+    "Avatar": { "id": "16:18", "variants": 16, "axes": "Size=SM|MD|LG|XL, Ring=None|Online|Live|VIP" },
+    "LiveBadge": { "id": "16:28", "variants": 3, "axes": "Kind=Live|Viewers|Party" },
+    "CurrencyPill": { "id": "16:38", "variants": 3, "axes": "Type=Diamond|Bean|Coin" }
+  },
+  "icons": {
+    "location": "All 68 icons are individual COMPONENTs named 'Icon / <name>' on the 'Brand & Icons' page (7:19). Use createInstance() — never redraw a glyph inline. A contact sheet of the whole set lives at node 36:103.",
+    "grid": "24x24, 1.8px stroke, ROUND cap and join, white fill. Recolour by overriding the instance fill, do not fork the component.",
+    "names": ["home","search","chevron-left","chevron-right","chevron-down","chevron-up","close","check","plus","minus","more-vertical","more-horizontal","menu","filter","settings","share","bell","edit","trash","logout","video","video-off","camera","camera-flip","mic","mic-off","phone","phone-end","speaker","speaker-off","heart","heart-filled","gift","star","star-filled","chat","send","user","users","user-plus","block","flag","crown","trending","diamond","diamond-filled","bean","coin","wallet","chart","arrow-up","arrow-down","arrow-up-right","arrow-down-left","lock","shield","eye","eye-off","clock","calendar","location","info","warning","check-circle","image","refresh","history","bank","gamepad","pip","verified","swords","globe","sparkle","copy","download","upload","link","leaderboard"],
+    "usageNotes": [
+      "Scale an icon by wrapping a NATIVE-SIZE instance in a plain FRAME and rescale() the WRAPPER. Calling rescale() on the instance itself resizes the box but not the glyph, so it renders at 24px and overhangs, colliding with adjacent text.",
+      "When recolouring an icon instance, assign fills/strokes WITHOUT setting strokeWeight — re-assigning strokes with a weight flattens the 1.8px grid to 1px across every screen.",
+      "'verified' is the scalloped disc; 'check-circle' is a plain confirmation tick. They are not interchangeable.",
+      "'swords' is the PK/battle icon. 'leaderboard' is the ranking podium. 'gamepad' is the Games tab."
+    ]
+  },
+  "tintVars": {
+    "note": "Figma COLOR variables carry alpha, so overlays are real tokens. The onboarding pass hardcoded opacity in eleven places before these existed — never write a raw opacity float again.",
+    "tint/brand-subtle": "VariableID:32:2", "tint/brand-medium": "VariableID:32:3",
+    "tint/violet-subtle": "VariableID:32:4", "tint/gold-subtle": "VariableID:32:5",
+    "tint/danger-subtle": "VariableID:32:6", "tint/success-subtle": "VariableID:32:7",
+    "tint/diamond-subtle": "VariableID:32:8",
+    "tint/glass-low": "VariableID:32:9", "tint/glass-mid": "VariableID:32:10", "tint/glass-high": "VariableID:32:11",
+    "tint/scrim-soft": "VariableID:32:12", "tint/scrim-medium": "VariableID:32:13", "tint/scrim-strong": "VariableID:32:14",
+    "size/media/sm": "VariableID:32:15", "size/media/md": "VariableID:32:16",
+    "size/media/lg": "VariableID:32:17", "size/media/xl": "VariableID:32:18"
+  },
+  "paintStyles": {
+    "note": "Paint styles carry gradients, which variables cannot. Apply with node.fillStyleId = '<id>'. This is the fix for surfaces reading as flat rectangles.",
+    "Surface/Card": "S:5760e3d2b513c5ddfdf944643446cd049a2b06f2,",
+    "Surface/Glass": "S:5560cef506be1b602ce9858a3e70dc50ec0f12d9,",
+    "Surface/Brand": "S:d12990ce3be12f3c74655c65bfd81db71f246218,",
+    "Surface/Gold": "S:7a7fe3dd96bf93ca74d3c1dbd699e3c345c04640,",
+    "Surface/Video scrim": "S:9460dc08e097f82b36366de26c1dde2e534f8f39,",
+    "Surface/Top scrim": "S:f0c7f7f192edede9a58db8a2eb396b90c2cfd427,"
+  },
+  "screens": {
+    "01 Onboarding (7:21)": { "Splash": "19:2", "Login": "19:22", "OTP verify": "21:5", "Terms": "21:31", "Profile setup": "25:6", "Face verification": "25:46", "Banned": "27:9" },
+    "02 Home & Discover (7:22)": { "Home": "41:2", "Main shell": "42:29", "Likes": "42:189" },
+    "03 Live (7:23)": { "Live browse": "45:39", "Watch live": "43:2", "Go live": "45:230", "Live summary": "46:106" },
+    "04 Video Call (7:24)": { "Video call": "59:2", "Video call low balance": "62:65", "Incoming call": "60:31", "Call history": "61:38" },
+    "05 Economy (7:25)": { "Diamond shop": "77:21", "Diamond history": "77:133", "Reseller list": "78:43", "Buy coin": "78:169", "Earnings": "79:96", "Bean history": "79:234", "My bag": "80:158", "Level": "80:309", "Daily rewards": "81:194" },
+    "06 Profile & Social (7:26)": { "Messages": "64:26", "Chat": "65:11", "My profile": "89:19", "Profile (other)": "91:77", "Edit profile": "92:103", "Gallery viewer": "94:122", "Gift details": "94:174", "Blocked users": "95:161" },
+    "07 Settings (7:27)": { "Settings": "96:2", "Legal": "97:57", "Privacy policy": "97:89", "Feedback": "98:65" },
+    "08 Partner Dashboards (7:28)": { "Agency dashboard": "99:2", "Seller dashboard": "100:20" },
+    "09 Host (107:2)": { "Become a host": "108:54", "Host home": "107:119", "Go live — broadcasting": "110:54", "Host level & charm": "110:213", "Host tasks & targets": "112:111", "Payout": "112:256" },
+    "10 Games (117:2)": {
+      "01 Games Center": "118:2",
+      "02 Category — all games": "119:59",
+      "03 Game launcher shell": "119:243",
+      "04 Game in live room — picker": "121:121",
+      "04b Game in live room — playing": "121:220",
+      "05 Game rankings": "129:229",
+      "06 Game history": "131:247",
+      "07 Result modal — win": "134:270",
+      "07b Result modal — loss": "135:302"
+    },
+    "11 Events & Rankings (140:2)": {
+      "01 Event hub": "140:3",
+      "02 Campaign — gifting event": "141:36",
+      "03 Campaign — leaderboard": "142:75",
+      "04 Campaign rules": "144:125",
+      "05 Monthly CP — Top Charm": "143:198",
+      "06 Monthly CP — Top Chosen": "145:125",
+      "07 Weekly rankings": "145:257",
+      "08 Hourly rank (in-room)": "146:164"
+    },
+    "13 Cosmetics & VIP (168:2)": {
+      "01 Me tab": "169:2",
+      "02 My Bag — Avatar frames": "170:67",
+      "03 My Bag — Entrance effects": "172:124",
+      "04 Cosmetic detail": "174:154",
+      "05 Cosmetic store": "175:154",
+      "06 SVIP": "175:304",
+      "07 Monthly card": "176:213",
+      "08 Sign-in streak": "176:273",
+      "09 Task rewards": "183:252"
+    },
+    "14 Social Systems (187:2)": {
+      "01 Intimacy detail": "188:2",
+      "02 Close Friends": "189:33",
+      "03 Honor — Charm level": "190:60",
+      "04 Top Fans": "190:146",
+      "05 Random Match": "191:97",
+      "06 Nearby": "191:175",
+      "07 Follow — People / Rooms": "192:149",
+      "07b Follow — Rooms tab": "193:237",
+      "08 Messages — Official & system": "192:360"
+    },
+    "15 Party Rooms (187:3)": {
+      "01 Party room list": "195:2",
+      "02 Party room — seated": "195:265",
+      "03 Party room — host controls": "196:160",
+      "04 Create party room": "196:338",
+      "05 Party room — games": "197:214"
+    }
+  },
+  "cosmeticsAndVipNotes": {
+    "expiryRule": "Every owned cosmetic carries BOTH an absolute instant ('Expires 17 Sep 2026, 11:59 PM IST') and a relative countdown ('9 days left'). Under 3 days the whole card flips state: status/danger stroke, tint/danger-subtle fill, the clock icon becomes 'warning', the text becomes status/danger, and the action button becomes Renew. The Me tab (169:2) carries a page-level danger banner 'N cosmetics expire within 3 days' listing the offenders by name. Boloji states expiry once, in 11px grey, at the bottom of the bag — that is the failure mode being corrected.",
+    "renewalRule": "EXTEND, not restart. Every purchase surface states it in a success-tinted callout with the arithmetic spelled out: '2 days remaining + 30 days = new expiry 10 Oct 2026, 11:59 PM IST'. The monthly card uses the same pattern ('Buying again ADDS 30 days ... two cards do not stack to 180/day'). Event items are non-renewable and say so on a NO RENEWAL chip plus a red line.",
+    "subscriptionTerms": "SVIP (175:304) and the monthly card (176:213) both put price, period, next charge date, auto-renew ON/OFF, payment method and the cancellation path ON the screen, not behind a link. SVIP auto-renews; the monthly card explicitly does NOT.",
+    "conventions": "Root frames are layoutMode NONE with absolutely positioned children. Back/overflow controls are 40px visuals inside 48x48 'Hit / … 48' frames. Segment control is 48 tall with a 40-tall inner pill. Every card is Surface/Card + Elevation/Card + radius/lg + a border/subtle hairline. Actions are radius/full pills at 48 tall. Gold (Surface/Gold + Glow/Gold) is reserved for SVIP and the Super Monthly Card only — cosmetics use per-tier accents from BagItem tiers, not gold.",
+    "tierPalette": "MyBagScreen.kt carries an 8-tier palette (SILVER/BRONZE/GOLD/PURPLE/ROYAL/NEON/GALAXY/COSMIC, each ring1/ring2/glow). The Figma tier chips map onto it. It is NOT in BagItem.kt and it has no Firestore field — tier is inferred from a hardcoded id switch (tierOf()). Move tier to a bagItems document field before build.",
+    "hardcodedInDesign": [
+      "SVIP does not exist anywhere in the codebase — no model, no repository, no Firestore collection, no CRM screen. Tier name, ₹899/30 days, all six benefits, the 20% recharge bonus, the 500-gem renewal-day credit and the auto-renew/cancel copy are invented.",
+      "Super Monthly Card does not exist either. ₹499, 90 gems/day, 30 days, 2,700 total, the claim reset at 12:00 AM IST and the extend-on-repurchase rule are invented.",
+      "BagItem has NO expiry concept at all — no purchasedAt, no expiresAt, no durationDays. Every 'N days left', every absolute expiry instant and the entire renewal-maths story on 02/03/04/05 has no backing field. MyBagScreen currently fakes it with `if (source == \"event\") \"28 days\" else \"Eternal\"`.",
+      "BagItem has no duration or price-per-duration. The store's 7-day / 30-day price ladder (900/1,200/1,600/2,800/4,200 gems) and the 'SAVE 12%' badge are invented; BagItem.price is a single Int.",
+      "Task rewards (183:252) is fully invented. No task model, no taskProgress collection, no daily/weekly reset job. The five tasks, their targets, gem values, the '+3 days Golden Crest' cosmetic-days reward and 'Claim all' are all fabricated.",
+      "The sign-in streak screen shows 50/75/100/100/150/150/200 gems + video cards on days 3/5/7, which DOES match DAILY_REWARDS_SCHEDULE in DailyReward.kt. The Day 7 'Silver Halo frame, valid 7 days' bonus and the Day 14 / Day 30 milestones (500 gems, SVIP for 3 days) are invented — the real schedule is 7 days and wraps.",
+      "'Beans Center 8,597' and 'My Gems 3,133' are illustrative figures copied from the Boloji reference.",
+      "Payment method 'UPI · phonepe@ybl' and the 24-hour cancellation window are invented; no subscription billing integration exists.",
+      "The avatar-frame previews are ELLIPSE rings with per-tier stroke colours, not real artwork. No frame/entrance artwork assets exist in Firebase Storage; MyBagScreen's LOTTIE map has bundled JSON for entrances ONLY, with frames/bubbles/cards/banners explicitly noted as unshipped."
+    ],
+    "codeDefectFound": "MyBagViewModel.kt:110 sets `minHostLevel = (d.getLong(\"minHostLevel\") ?: 0L).toInt()` on BagItem, but data/model/BagItem.kt has no minHostLevel field. There is exactly one BagItem definition in the repo. Fix before the port."
+  },
+  "eventsAndRankingsNotes": {
+    "metricHonesty": "Every board states its metric in a banner directly under the title, in the form '<board> = diamonds SENT / RECEIVED / EXCHANGED', with the period and the reset instant. SENT/RECEIVED/EXCHANGED is set in caps because that single word is the whole dispute. Gifting-event tiers say 'cumulative diamonds SENT, not received'. Top Earners is captioned as beans-after-agency-share so it is not read as comparable to the diamond boards.",
+    "timezone": "Every countdown, close time and reset on all 8 screens carries an explicit IST time. 01, 04 and 08 additionally carry a dedicated strip stating 'IST (UTC+5:30)'. Boloji states none of this; it is the single largest source of event disputes.",
+    "hardcodedInDesign": [
+      "Everything about campaigns. No campaigns/campaignEntries/campaignTiers collection exists in Firestore, no CRM campaign builder exists, no Cloud Function aggregates anything. Every event name, date, prize, tier threshold, gift list and rank figure on these 8 screens is invented.",
+      "GiftLeaderboardEntry.kt is 4 fields (uid, name, photoUrl, totalDiamonds). It carries no rank, no period, no direction (sent vs received), no tie-break timestamp, no delta. Six of these eight screens cannot be built from it.",
+      "Tier thresholds 50,000 / 1,50,000 / 4,00,000 / 10,00,000 and the prize table (5,00,000 / 2,00,000 / 50,000 / 10,000 diamonds + avatar frames) are invented — no reward config exists.",
+      "Activity Gift list (Rose 199 / Payal 999 / Peacock 4,999 / Palki 19,999) is invented; no gift catalogue with a per-campaign eligibility flag exists.",
+      "Monthly CP 'pair' concept does not exist. There is no couple/CP entity, no pairing rule, no 10,000-diamond qualification floor. Intimacy score (roadmap K7) is the nearest thing and is also unbuilt.",
+      "'Paired 62 days' on the CP rows has no data source.",
+      "Hourly rank exists only as roadmap K4. liveRooms has no hourlyRank subcollection. The 'gold room badge for the next hour' reward is invented.",
+      "Weekly reset 'Sunday 23:59:59 IST' is chosen to match the existing agency payout cron (0 0 * * 0 UTC in ZIPPER_MASTER_ROADMAP L9) — that cron currently fires at 05:30 IST Sunday, which is the wrong instant. Reconcile before build.",
+      "Event ID format EVT-POP-S3 and the 72-hour chargeback-adjustment window are invented.",
+      "Avatars are flat ellipses; the Avatar component (16:18) tops out at XL/72 and has no paired/couple variant, so CP rows use two raw ellipses with a bg-coloured stroke."
+    ],
+    "conventionsFollowed": "Root frames are layoutMode NONE with absolutely positioned children, matching 129:229 (Game rankings). Podium is #2 / #1-gold / #3 with Surface/Gold + Glow/Gold on first place. Header back and rules buttons are 40px circles inside 48x48 named 'Hit / … 48' frames so the touch target meets 48dp without breaking the existing 40px visual. Segment controls are 48 tall with 40-tall inner pills. Icons are createInstance() wrapped in a plain FRAME and rescaled on the wrapper.",
+    "openGaps": [
+      "04 Campaign rules is a scroll view: sections 1–3 (What counts / How your rank is computed / Prizes) are drawn, sections 4–5 (Exposure, Fulfilment & disputes) are only implied by the pinned 'continue below' bar. Draw them if the rules screen is built as a single tall page.",
+      "No empty, loading or read-failed state is drawn for any board. Per the existing CRM lesson, a read-failed board must not look like a genuine zero.",
+      "'Top rooms' tab on 03 and 'Last hour' tab on 08 are drawn as inactive states only."
+    ]
+  },
+  "gamesCenterNotes": {
+    "economicsUsedInDesign": {
+      "betDenominations": "10 / 100 / 500 / 1,000 / 5,000 / 10,000 diamonds — EconomyEngine.GAMING_BET_DENOMINATIONS. The chip row is exactly these six; there is no free-entry amount field anywhere.",
+      "houseEdge": "5% — EconomyEngine.GAMING_HOUSE_EDGE_PCT. Stated on the Games Center header strip, the launcher subtitle, the in-room sheet, and both result modals.",
+      "rupeeConversion": "₹2,290 per lakh diamonds (₹0.0229/diamond), taken from the pack_2290 retail package in DiamondPack.kt / DiamondShopScreen.kt. Every confirm step shows the rupee figure with the rate captioned, because a coin seller's street price differs."
+    },
+    "hardcodedInDesign": [
+      "Per-game RTP (94–96%) — no RTP field exists anywhere in the codebase. Must become a CRM field before build.",
+      "Daily spend limit 10,000 diamonds — no limit concept exists in GamingBetRepository. Invented for the responsible-play surface.",
+      "Game catalog, categories, badges (NEW/HOT/TOP), artwork gradients, provider name 'Zipper Games' and WebView URL shape games.zipper.app/<slug>?uid=…&sig=… — none of this exists in Firestore yet.",
+      "Rankings, round IDs, session timers and running-balance figures are illustrative; gamingBets carries no roundId, sessionId or balanceAfter today."
+    ],
+    "responsiblePlaySurface": "Balance is visible on every screen that can take a bet. Session spend + bet count + elapsed time sit next to the balance on 01, 03, 04, 04b and both result modals. A daily spend meter appears on 03, 04, 04b, 06 and the loss modal. House edge is stated four times and links to an Odds sheet. Rankings are explicitly labelled gross winnings, not profit, and the user's own row shows Staked / Won / Net. 06 shows staked / returned / net for the period with the rupee equivalent and a per-bet running balance."
+  },
+  "socialSystemsNotes": {
+    "nearbyPrivacyRules": "06 Nearby (191:175) is designed as a safety surface, not a discovery feature. Four rules are load-bearing and must survive the Compose port: (1) precision is stated in words and is always a RANGE — 'within ~5 km' — never an exact figure like Boloji's '0.7km'; (2) the privacy control card sits ABOVE the list, not behind a settings link, and carries the master toggle, a 3-step precision control (~1 km / ~5 km / City only) and an audience control (Everyone / Followers only / Nobody) defaulting to Followers only; (3) hosts are excluded from the index by default and, if they opt in, are pinned to City only — stated on screen in a gold strip; (4) distance is computed from a rounded geohash cell server-side, refreshed at most hourly and never while the user is in a call or a room. A destructive 'Turn Nearby off completely' pill is the last element on the screen. Distance is NEVER rendered on a host's own profile — only in this list, and only for accounts that opted in.",
+    "metricHonesty": "03 Honor (190:60) and 04 Top Fans (190:146) reuse the page-11 banner pattern: 'Charm = diamonds RECEIVED, all time' and 'Top Fans = diamonds SENT to Riya this week. Resets Sunday 23:59 IST.' 04 also carries a hidden-fan row state (eye-off icon, name suppressed, value still counted) so that opting out of the public list is visibly not the same as not gifting.",
+    "intimacyModel": "01 (188:2) states the earn rates, the anti-whale cap and the decay rule on the screen: video call +12/min (both cameras on), gift +1 per 10 diamonds capped at 60% of a level, chat +2 per two-sided exchange capped at 100/day, daily visit +20. Decay is 1%/day after 7 idle days. Unlocks are Lv5 couple frame, Lv6 Intimacy tab, Lv7 Close Friend slot.",
+    "closeFriendsModel": "02 (189:33) caps slots at 3 and says so ('no fourth slot at any price'). Slot 1 free, slot 2 at Intimacy Lv 5 with that specific person, slot 3 SVIP-only. Both sides must accept (pending state is drawn), either side can remove, and a removed slot is locked 7 days — this is the anti-harassment control.",
+    "hardcodedInDesign": [
+      "Intimacy does not exist in the codebase. Roadmap K7/J11 only. There is no intimacy collection, no scoring Cloud Function, no decay job. Every number on 188:2 — 1,20,371 / 1,80,000, the level names, all four earn rates, the 60% gift cap, the 100/day chat cap, the 1%/day decay — is invented and needs to become CRM config.",
+      "Close Friends does not exist. No slots field, no request/accept state machine, no 7-day cooldown, no privilege enforcement (the four privileges on 189:33 each need a real check in presence, call routing, message ordering and FCM fan-out).",
+      "Charm level does not exist. User.kt has hostLevel (0–10, beans-based) which is a DIFFERENT number. Charm CP thresholds (4L / 6L / 8L / 10L / 13L) and the per-level unlocks are invented.",
+      "Top Fans: TopSupportEntry.kt exists (uid/name/photoUrl/totalDiamonds/rank) and is the closest real model, but it has no period field, no sent-vs-received direction, no tie-break and no hidden flag — so the 'This week / All time' segment and the hidden-fan row cannot be built from it.",
+      "Random Match is roadmap MODULE N, entirely unbuilt. '3 free matches a day', '60 diamonds a match', '60-second window', 'charged on connect not on queue', 'screenshots blocked' and the SVIP gender filter are all invented.",
+      "Nearby has no data layer at all. User.kt has city and country (country captured at profile setup via Nominatim) but no lat/lng, no geohash, no precision preference, no visibility preference and no host opt-in flag. Nothing on 191:175 can be built today.",
+      "Follow: getFollowerCount/getFollowingCount exist in ProfileViewModel, but there is no followed-rooms concept, no Active/Live/Party status join on the follow list, and no suggestion engine. 07b (193:237) is entirely speculative.",
+      "Messages system rows: BroadcastMessage.kt exists, but there is no per-category system inbox (Official / Campaign / Game / Safety / Payments), no unread counts per category and no Intimacy tab. The anti-phishing strip is new copy, not an existing string."
+    ]
+  },
+  "partyRoomsNotes": {
+    "buildStatus": "ZIPPER_MASTER_ROADMAP MODULE E marks E1.1–E2.5 as Done. They are not. There is no PartyRoom model, no seats subcollection, no party repository, no party ViewModel and no party screen anywhere under app/src/main/java/com/zipper/app. Screen.kt:48-51 declares party_list and party_room/{roomId}; both render PlaceholderScreen. These five frames are a design-from-scratch against the roadmap text.",
+    "moderationModel": "03 (196:160) is built around five verbs, not one. Per seat: mute/unmute, remove from seat, lock/unlock seat, ban from room. Room-wide: Mute all, mic mode (Free / Consent / Host only), minimum level to take mic, auto-mute new joiners (defaulted ON and labelled Recommended), privacy (Public / Followers / Password). A Moderation card exposes Banned from this room, Reports from this room and Co-hosts. The semantics are stated on the screen: 'Remove = this seat. Kick = this session. Ban = 24 hours, appealable. Every action is logged against your uid.' Co-hosts can mute and remove but must not be able to ban.",
+    "seatStates": "02 (195:265) draws six seat states: host (gold ring + crown), speaking (success ring + mic badge), occupied-silent (neutral mic badge), muted (danger mic-off badge), empty (dashed ring + plus, labelled 'Take seat'), locked (solid ring + lock). Seat numbers are rendered as scrim chips so a moderator can name a seat in chat.",
+    "hardcodedInDesign": [
+      "The entire party data model. partyRooms, partyRooms/{id}/seats, partyRooms/{id}/messages, mic mode, seat count, theme, privacy, password, banned list, co-hosts, seat queue — none of it exists in Firestore or in Kotlin.",
+      "Mic modes Free / Consent / Host only are invented; the roadmap only mentions a mic-mode label (E2.9) with no enum.",
+      "Seat counts 4 / 6 / 8 / 12 and themes Music / Chat / Games / Study / Dating / Late night are invented.",
+      "Room hourly rank (#7 this hour) and 'Top contributor this hour' are roadmap K4, unbuilt — liveRooms has no hourlyRank subcollection and partyRooms has no document at all.",
+      "'Rooms with a cover get about 3x more joins' on 196:338 is an invented claim with no analytics behind it. Remove it or measure it before shipping.",
+      "The games sheet (197:214) reuses page-10 economics that are already flagged there: house edge 5% is real (EconomyEngine.GAMING_HOUSE_EDGE_PCT), the 10,000-diamond daily limit and the per-session staked/won/net strip are not — gamingBets carries no sessionId or balanceAfter. 'Hide my wins from the room ticker' has no backing flag.",
+      "Room thumbnails, host avatars and theme art are flat gradient fills. No party room artwork exists in Firebase Storage."
+    ],
+    "agoraRule": "E2.7 is the bug that matters. Guests must join with CLIENT_ROLE_AUDIENCE and be promoted to CLIENT_ROLE_BROADCASTER only when a seat is granted, then demoted on leave/remove/kick. AgoraManager.kt currently has a single joinAsHost (BROADCASTER) / joinAsAudience (AUDIENCE) pair with no mid-session role switch, so seat-taking cannot work without adding setClientRole at runtime. Server-side mute (host mutes a seat) must be enforced in Firestore AND via muteRemoteAudioStream, or a muted guest is only muted for themselves."
+  },
+  "knownGapsBeforeCompose": [
+    "Modals are undrawn across the set: gift sheet (the monetisation surface), viewer list, leaderboard, PK battle overlay, country picker, quality/report sheet, CallGiftSheet, BuyCoin PaymentUnavailableCard.",
+    "GoLiveScreen's broadcasting state is undrawn — it is the larger half of that file (PK sidebar, face-detection warning, viewer management, host chat).",
+    "CurrencyPill (16:38) renders its currency as a plain ellipse dot rather than the real diamond/bean/coin icon. Screens built chips from icon instances instead. Fix the component before the Compose port.",
+    "Avatar component tops out at XL/72; size/avatar/3xl (120) exists as a token but not as a variant.",
+    "No gift artwork assets exist — gift cells use icon instances and must swap to Firestore gift images.",
+    "No country flag data or assets: LiveRoom has no country field, UserCard renders city.",
+    "GiftSummaryItem carries a count but no diamondValue, so the gift trophy case has no hierarchy to sort by. Data fix before design fix.",
+    "Every numeric stat tile needs a third read-failed state alongside empty and loading — the CRM already learned this, where '0 Hosts' from a permission error looked identical to a real zero."
+  ],
+  "economicsDecidedByOwner": {
+    "decision": "OPTION A — gender-based reward percentages are kept, and the CRM becomes their source of truth. The app must display what the CRM computes, never its own constants.",
+    "callRateShownToUser": {
+      "rule": "The price a user sees is DERIVED, never stored. cost_per_min_diamonds = ceil(hostBeanRate * 100 / rewardPct). The host sets their bean rate; the reward percentage comes from CRM config; the diamond price is the quotient. Showing a stored price would let the two drift.",
+      "rewardPct": {
+        "femaleHost": 50,
+        "maleHost": 40,
+        "sameGenderHostToHost": 30,
+        "userToUser": { "maleToFemale": 50, "femaleToMale": 40, "sameGender": 30 },
+        "userToUserFixedCost": 1600,
+        "source": "Currently hardcoded in util/EconomyEngine.kt:247-263. Under Option A these move to CRM config and the app reads them."
+      },
+      "crmFieldsToAdd": [
+        "receiverPctFemaleHost", "receiverPctMaleHost", "receiverPctSameGenderHost",
+        "receiverPctUserMaleToFemale", "receiverPctUserFemaleToMale", "receiverPctUserSameGender",
+        "userToUserCallRateDiamonds"
+      ],
+      "designRule": "Any screen showing a call price shows the derived diamond figure as the headline, and may show the host's bean rate as secondary. Never present the percentage to a user — it is the host's business, not the buyer's. On host screens the percentage IS shown, captioned with its config key."
+    },
+    "agencyCommissionDisplay": {
+      "rule": "Progressive by band, like income tax. Each slice of billing is charged at its own band's rate; no single rate ever applies to the whole amount. Below the floor (₹25,001 main / ₹26,001 sub) the agency earns nothing and that slice never attracts a rate. Top band is open-ended. One rounding step on the summed products.",
+      "displayRequirement": "Every commission figure must show BOTH 'Top band' and 'Effective rate'. Showing only the band rate is the bug in zipper-crm/lib/commission.ts:118 — an agency billing Rs 4.12 lakh sees 14% on a commission that is actually about 9.4%. Any new screen repeats that bug if it shows one rate.",
+      "breakdownRow": "Show the per-band slices when the agency taps the figure: slice amount x band rate = slice commission, then the sum and the single rounding step."
+    }
+  },
+  "designDecisions": {
+    "radiusLanguage": "Pills (radius/full) for ACTIONS — buttons, chips, badges, pills. radius/lg (16) for CONTAINERS — cards, inputs, sheets, tiles. This is deliberate, not drift: a pill reads as pressable, a rounded rectangle reads as a surface. The Compose source currently uses RoundedCornerShape(12-14) for everything, so the port must move the buttons to pill, not the other way.",
+    "primaryCtaGradient": "Primary CTAs use the Surface/Brand paint style plus the Glow/Brand effect style, not the flat brand/primary fill. Matches Brush.horizontalGradient(ZipperPink, ZipperPurple) in the Compose source.",
+    "cardsAreNotFlat": "Cards take Surface/Card (a top-lit vertical gradient). Bars and sheets over video take Surface/Glass + Blur/Backdrop. Text over live video always sits on Surface/Video scrim or Surface/Top scrim, or it is unreadable on a bright stream."
+  },
+  "figmaApiGotchas": [
+    "Vector paths reject the SVG arc command 'A' — only M/L/C/Q/Z. Draw circles and rings as ELLIPSE nodes.",
+    "setBoundVariable('paddingTop', ...) throws on TEXT nodes. Wrap the text in an auto-layout frame and pad that.",
+    "Gradient stops accept per-stop variable binding via boundVariables.color, but a bound stop's alpha is forced to 1 — leave the outer stop unbound for a fade to transparent.",
+    "A bound SOLID paint with opacity != 1 can silently lose its opacity on the FIRST fills assignment to a freshly created node. Read back node.fills[0].opacity and re-assign.",
+    "Spacing/Size variables bind to width/height regardless of declared scopes — scopes only gate the picker UI.",
+    "node.query() selectors do not support escaped characters; use findOne for names containing spaces.",
+    "A thrown error rolls back the ENTIRE use_figma script — nothing partial is kept. Validate assumptions before mutating.",
+    "Vector path data must NOT contain commas. 'C 180 310 132 262 132 214' works; 'C 180 310, 132 262, 132 214' throws 'Invalid command at ,'.",
+    "layoutWrap = 'WRAP' is only valid when layoutMode = 'HORIZONTAL'. Setting it on a VERTICAL layout throws.",
+    "You cannot remove the page the plugin is currently standing on. setCurrentPageAsync elsewhere first.",
+    "resize() on a frame crops; it does NOT scale children. Use rescale(factor) to scale a frame and its contents together.",
+    "Build a frame at native scale FIRST, then rescale once. Resizing and then rescaling compounds and collapses the frame.",
+    "Inter uses 'Semi Bold' WITH a space; Plus Jakarta Sans uses 'SemiBold' WITHOUT. Mixing them throws on loadFontAsync.",
+    "outlineStroke() must be called before a stroked vector can take part in a boolean op, and it can return null."
+  ],
+  "completedSteps": ["phase0-discovery", "phase1a-primitives", "phase1c-semantic-color", "phase1b-spacing-radius-size", "phase1f-text-and-effect-styles", "phase2a-pages", "phase3-brand-mark", "phase3-button", "phase3-avatar-livebadge-currencypill"],
+  "findings": {
+    "launcherIconBroken": "app/src/main/res/drawable/ic_app_logo.png is a 1024x1024 2.9MB AI painting used as the adaptive-icon FOREGROUND. Adaptive icons mask to a circle/squircle with only the centre ~66% guaranteed visible, so the word ZIPPER along the bottom is cropped away entirely on most launchers, and the detail turns to mud at 48dp.",
+    "twoUnrelatedLogos": "The launcher shows the dragon painting; the splash shows ic_splash_logo.xml, a pink ring with a gold star. A user taps one mark and is shown a different one. There is no brand.",
+    "assetWeight": "ic_app_logo.png 2.9MB + splash_background.png 3.8MB = 6.7MB of PNG for two images, both needing replacement anyway.",
+    "splashBackgroundFixedRaster": "splash_background.png is 768x1376, a fixed raster used as a splash background — it stretches on every other aspect ratio."
+  }
+}

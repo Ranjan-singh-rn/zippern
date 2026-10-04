@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zipper — open the app to finish</title>
+  <!--
+    The fallback for the email-binding link, and nothing more.
+
+    `AuthRepository.emailLinkSettings` sets this page as the `continueUrl`, so
+    it is where the link lands when Android does NOT hand it to the app: the
+    app is not installed, the person opened the mail on a desktop, or App Link
+    verification has not completed. Without a page here the default hosting
+    site answered Firebase's "Site Not Found", which reads as a broken account
+    rather than a wrong device.
+
+    It carries no script and reads nothing from the URL. The link is a
+    single-use credential; a page that parsed it would be a second place it
+    could leak, and the app is the only thing that can spend it anyway.
+  -->
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d0b14; color: #f4f2f8;
+    }
+    main { max-width: 26rem; padding: 2rem 1.5rem; text-align: center; }
+    h1 { font-size: 1.5rem; font-weight: 700; margin: 0 0 .75rem; }
+    p  { font-size: 1rem; line-height: 1.6; color: #b9b4c7; margin: 0 0 1rem; }
+    .brand { color: #ff2d78; }
+    .note { font-size: .875rem; color: #8b8598; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Open <span class="brand">Zipper</span> to finish</h1>
+    <p>
+      Tap this link again on the phone that has the Zipper app installed, and
+      the app will finish adding your email address to your account.
+    </p>
+    <p>
+      Nothing has changed on your account yet, and the link still works.
+    </p>
+    <p class="note">
+      If you did not ask to add an email address to a Zipper account, you can
+      ignore this — the link does nothing on its own.
+    </p>
+  </main>
+</body>
+</html>

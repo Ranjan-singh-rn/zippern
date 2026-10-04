@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider roots. Exactly one, deliberately.
+
+  `external-files-path` is getExternalFilesDir(...) — app-scoped external
+  storage, which needs no storage permission, is readable by the DownloadManager
+  process, and is removed when the app is uninstalled. `path="Download/"` is the
+  literal value of Environment.DIRECTORY_DOWNLOADS, so this grants the OTA
+  download folder in ApkInstaller and nothing else.
+
+  DO NOT WIDEN THIS. Every file under a declared root is reachable through a URI
+  this provider mints, so `path="."` here — or an `<external-path>` entry, which
+  is the user's whole shared storage — would turn a component that serves one APK
+  into a general-purpose read hole. If another feature needs to share a file,
+  give it its own narrow entry rather than broadening this one.
+-->
+<paths>
+    <external-files-path
+        name="ota_downloads"
+        path="Download/" />
+</paths>

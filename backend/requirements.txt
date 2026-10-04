@@ -1,0 +1,55 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+motor==3.6.0
+pymongo==4.9.2
+firebase-admin==6.6.0
+
+# ── The Google stack, pinned deliberately ───────────────────────────────────
+#
+# `firebase-admin` pins none of these, so `pip install` resolved whatever was
+# newest on the day the container happened to be built. That is how a Cloud Run
+# deploy that changed no Python code broke every Firestore read in the API with:
+#
+#     400 Invalid database id %28default%29
+#
+# `%28default%29` is `(default)` percent-encoded — the database id was escaped
+# for a URL path and then sent as the id itself, so Firestore was asked for a
+# database whose name contains literal percent signs. Nothing in this repo
+# passes a database id at all: `firestore.client()` takes the default. It came
+# from the resolved library versions, and the machine that works and the machine
+# that does not were running different ones.
+#
+# The blast radius was the whole API, because it did not look like an outage:
+#   · `POST /api/auth/signin` could not read `crmUsers`, so it answered 401 —
+#     every agency and seller was told their password was wrong.
+#   · `/api/broadcasts/audience` answered 400, so the email composer could not
+#     resolve a single audience.
+#   · `appConfig/economy` was unreadable, so every rupee figure fell back to
+#     documented rates and was stamped PROVISIONAL.
+#
+# These are the versions that demonstrably read Firestore in zipper-83816 — the
+# set the migration scripts ran against successfully from a workstation. Pinned
+# so the container is reproducible: the same Dockerfile must produce the same
+# image next month, and a money system cannot have a dependency graph that
+# re-resolves itself on every build.
+#
+# To move any of these, change it here, redeploy, and confirm
+# `GET /api/health/firestore` still answers ok before trusting a figure.
+google-cloud-firestore==2.28.1
+google-cloud-storage==3.13.1
+google-cloud-core==2.6.1
+google-api-core==2.34.0
+google-auth==2.56.3
+googleapis-common-protos==1.75.1
+proto-plus==1.28.3
+protobuf==7.35.1
+grpcio==1.83.0
+grpcio-status==1.83.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+sendgrid==6.11.0
+httpx==0.28.1
+python-multipart==0.0.20
+email-validator==2.2.0

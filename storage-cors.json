@@ -1,0 +1,43 @@
+[
+  {
+    "//": "CORS for the Firebase Storage bucket.",
+    "//1": "Lottie animations are fetched with XHR by the CRM's preview and by",
+    "//2": "lottie-web, and a browser refuses a cross-origin fetch unless the bucket",
+    "//3": "says otherwise. A brand-new bucket has NO cors policy, which is why every",
+    "//4": "animation went blank with 'CORS blocked' immediately after the migration —",
+    "//5": "the files are there and readable, the browser just will not hand them to",
+    "//6": "the page. <img> and the Android app are unaffected, so thumbnails kept",
+    "//7": "working and only the lotties broke, which makes it look like a data",
+    "//8": "problem rather than a bucket setting.",
+    "//9": "Apply with: gsutil cors set storage-cors.json gs://zipper-83816.firebasestorage.app",
+
+    "origin": [
+      "https://zipperlive.web.app",
+      "https://zipperlive.firebaseapp.com",
+      "https://zipper-83816.web.app",
+      "https://zipper-83816.firebaseapp.com",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000"
+    ],
+
+    "//10": "GET and HEAD only. These are read-only asset fetches; uploads go through",
+    "//11": "the Firebase SDK, which does not need a CORS entry.",
+    "method": ["GET", "HEAD"],
+
+    "//12": "Range headers matter: lottie-web and the video/audio elements issue range",
+    "//13": "requests for the larger files, and without these exposed the response is",
+    "//14": "opaque to the page even though it arrived.",
+    "responseHeader": [
+      "Content-Type",
+      "Content-Length",
+      "Content-Range",
+      "Content-Encoding",
+      "Accept-Ranges",
+      "Range",
+      "Authorization",
+      "x-goog-meta-firebaseStorageDownloadTokens"
+    ],
+
+    "maxAgeSeconds": 3600
+  }
+]

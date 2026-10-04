@@ -10,8 +10,8 @@
 |---|---|
 | **Package name** | `com.zipper.app` |
 | **Firebase** | Existing project (same google-services.json) |
-| **Agora App ID** | `11b6145b01124ba6937a326f30c6850a` |
-| **Agora Primary Certificate** | `7eae4ce354064241833ad80610171a8d` |
+| **Agora App ID** | `<AGORA_APP_ID>` — not secret, but not stored here. Build reads it from `agora.appId` in `zipper-app/local.properties` (gitignored) or the `AGORA_APP_ID` env var. Canonical copy: Agora Console → Project Management. |
+| **Agora Primary Certificate** | `<AGORA_APP_CERTIFICATE>` — **secret, never in this repo.** It signs RTC tokens, so anyone holding it can mint a token for any channel and bill the account. Canonical copy: Agora Console → Project → Primary Certificate. Server copy used to mint tokens: `AGORA_APP_CERTIFICATE` in the Cloud Functions secret config (`functions/.env` locally, Secret Manager in production). Local builds may put it in `agora.appCertificate` in `zipper-app/local.properties`; it must not go into a release APK. |
 | **Camera / Beauty filters** | Device camera only — no Snap Camera Kit. Use CameraX + ML Kit for basic beauty or a free open-source filter library (GPUImage) |
 | **Payments** | Offline only. Coin sellers collect cash and manually top up diamonds. No Razorpay, no Play Billing. |
 | **Games** | Web-based casino games hosted on Firebase Hosting. URLs stored in Firestore. User's diamonds are their casino chips. |

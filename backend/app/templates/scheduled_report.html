@@ -1,0 +1,20 @@
+<!-- 8A.3 — a scheduled report. The body is a summary; the attached CSV is the
+     report. Both come from the same Report object, rendered by the same
+     functions the /reports endpoints use, so an emailed number and an exported
+     number cannot disagree. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  {{ intro }}
+</p>
+
+{{{ reports }}}
+
+<p style="color:#71717a;font-size:12px;margin:22px 0 0;line-height:1.6">
+  {{ attachment_note }}
+  <br>
+  Every figure here is generated server-side from the ledger, never from a
+  browser's view of it (8A.6.4), and means exactly what
+  <a href="{{ definitions_url }}" style="color:#3f3f46">the published definition</a>
+  says it means (8A.6.3).
+  <br>
+  Do not want this one? {{ unsubscribe_note }} (8A.3.15).
+</p>

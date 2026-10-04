@@ -1,0 +1,31 @@
+<!-- Default avatar · bunny. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Rose/400 -->
+    <path
+        android:fillColor="#FFFF6FA8"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M34,34m-8,0a8,20 0 1,0 16,0a8,20 0 1,0 -16,0M62,34m-8,0a8,20 0 1,0 16,0a8,20 0 1,0 -16,0" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,58m-24,0a24,24 0 1,0 48,0a24,24 0 1,0 -48,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M40,54m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M56,54m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FFFFC9DE"
+        android:pathData="M44,62h8a4,4 0 0,1 -8,0z" />
+    <!-- Two front teeth -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M43,68h4v9h-4zM49,68h4v9h-4z" />
+</vector>

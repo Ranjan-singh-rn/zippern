@@ -1,0 +1,24 @@
+<!-- 8A.2.13 — account deactivated, with the reason. To: the account holder.
+     0.2.9 — written grounds for deactivation. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  Your {{ kind_label }} account was deactivated on {{ at }}. You cannot sign in
+  or take new inventory or payouts while it is deactivated.
+</p>
+
+<div style="background:#fafafa;border:1px solid #e4e4e7;border-left:3px solid #71717a;
+            border-radius:8px;padding:16px 18px;margin:0 0 18px">
+  <div style="font-size:12px;letter-spacing:.6px;text-transform:uppercase;
+              color:#71717a;margin:0 0 8px">Grounds</div>
+  <div style="line-height:1.6;white-space:pre-wrap">{{ reason }}</div>
+</div>
+
+{{{ facts }}}
+
+<p style="margin:18px 0 0;line-height:1.6">
+  <strong>Your record and your money are untouched.</strong> Your history stays
+  on file and attributable, and any balance shown above remains yours. Nothing
+  is written off by a deactivation; it is a decision about access.
+</p>
+<p style="margin:14px 0 0;line-height:1.6">
+  <strong>What happens next.</strong> {{ next_steps }}
+</p>

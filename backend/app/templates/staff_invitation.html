@@ -1,0 +1,25 @@
+<!-- 8A.2.1 — staff invitation. To: the new staff member. -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  {{ invited_by }} has added you to the Zipper team as <strong>{{ role_label }}</strong>.
+</p>
+<p style="margin:0 0 20px;line-height:1.6">
+  Set your password to get started. Nobody else knows it, including whoever
+  invited you (2.1.3).
+</p>
+{{{ button }}}
+<!-- The second door, named here because this email is the only moment we are
+     certain of reaching the person. Kept below the button and in the quiet
+     style on purpose: the password is what makes the account usable, and an
+     invitation offering two equal choices is an invitation that gets neither
+     done. No link — this template is rendered without `portal_url`, and adding
+     the field to reach the profile page would make every existing caller of
+     `send_staff_invitation` raise TemplateError instead of sending. -->
+<p style="color:#71717a;font-size:13px;margin:22px 0 0;line-height:1.6">
+  Once you are signed in, you can connect Google from your profile page. It is
+  the same account either way, and it means one click to sign in instead of
+  typing your password.
+</p>
+<p style="color:#71717a;font-size:13px;margin:22px 0 0;line-height:1.6">
+  If you were not expecting this, ignore this email — the account cannot be used
+  until a password is set.
+</p>

@@ -1,0 +1,36 @@
+{
+  "name": "zipper-crm",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "//test:routing": "The partner redirect table. `lib/partnerRouting.ts` has no imports and no React on purpose, so the real module compiles and runs standalone \u2014 the spec exercises the shipped code, not a copy of it.",
+    "test:routing": "rm -rf .routing-test && tsc lib/partnerRouting.ts lib/partnerRouting.spec.ts --outDir .routing-test --module commonjs --target ES2020 --strict --moduleResolution node --esModuleInterop && node .routing-test/partnerRouting.spec.js; code=$?; rm -rf .routing-test; exit $code",
+    "//test:session": "The session gate \u2014 the only thing that may send somebody to /login. `lib/sessionGate.ts` has no imports and no React on purpose, so the real module compiles and runs standalone and the spec exercises shipped code.",
+    "test:session": "rm -rf .session-test && tsc lib/sessionGate.ts lib/sessionGate.spec.ts --outDir .session-test --module commonjs --target ES2020 --strict --moduleResolution node --esModuleInterop && node .session-test/sessionGate.spec.js; code=$?; rm -rf .session-test; exit $code"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "^18",
+    "react-dom": "^18",
+    "firebase": "^10.12.0",
+    "recharts": "^2.12.7",
+    "lucide-react": "^0.400.0",
+    "clsx": "^2.1.1",
+    "lottie-web": "^5.12.2"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "tailwindcss": "^3.4.4",
+    "postcss": "^8",
+    "autoprefixer": "^10",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.5"
+  }
+}

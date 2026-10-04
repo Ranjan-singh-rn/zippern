@@ -2,7 +2,28 @@
 <resources>
     <string name="app_name">Zipper</string>
     <string name="app_tagline">Live. Connect. Shine.</string>
-    <string name="default_web_client_id">344965230552-egtrhc5lo9u15ur1tlammmh0tsoescf9.apps.googleusercontent.com</string>
+
+    <!--
+      `default_web_client_id` is NOT declared here, deliberately.
+
+      The google-services Gradle plugin generates it from google-services.json,
+      into `build/generated/res/processDebugGoogleServices/values/values.xml`.
+      A hand-written string of the same name in the main source set OVERRIDES
+      that generated one — main beats generated, silently, with no warning.
+
+      This file used to hardcode the OAuth client of the old Firebase project
+      (`dating-app-967f3`, client 344965230552-egtrhc5…). So swapping
+      google-services.json for the new project repointed Auth, Firestore,
+      Storage and Messaging correctly — and `LoginScreen.kt` went on asking
+      Google for an ID token minted for the OLD project's client. Firebase Auth
+      on the new project rejects that as an audience mismatch, so Google
+      Sign-In fails on every device, with an error that names the credential
+      library rather than a string resource. Nobody would look in strings.xml
+      for it, because replacing the JSON is supposed to be the whole job.
+
+      Let the plugin own it. It is derived from the JSON, so it is right by
+      construction on whichever project the JSON names.
+    -->
 
     <!-- Auth -->
     <string name="enter_mobile_number">Enter your mobile number</string>

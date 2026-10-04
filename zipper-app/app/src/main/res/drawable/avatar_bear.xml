@@ -1,0 +1,35 @@
+<!-- Default avatar · bear. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Gold/500 -->
+    <path
+        android:fillColor="#FFFFB627"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M26,28m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0M70,28m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,54m-27,0a27,27 0 1,0 54,0a27,27 0 1,0 -54,0" />
+    <!-- Muzzle -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M48,64m-14,0a14,14 0 1,0 28,0a14,14 0 1,0 -28,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,46m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M58,46m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M42,58h12a6,6 0 0,1 -12,0z" />
+    <!-- Mouth -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M40,68h16a8,8 0 0,1 -16,0z" />
+</vector>

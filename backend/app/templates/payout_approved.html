@@ -1,0 +1,19 @@
+<!-- 8A.2.7 — payout approved. To: the partner. Amount, period, expected date.
+     Approved is NOT paid: the money has been authorised and has not moved yet,
+     and this email says so rather than letting "approved" read as "in your
+     account" (5.2.6, and the payout definition in reports.py). -->
+<p style="color:#3f3f46;margin:0 0 18px;line-height:1.6">
+  A payout to you has been signed off, {{ name }}.
+</p>
+{{{ facts }}}
+<p style="margin:18px 0 0;line-height:1.6">
+  <strong>What happens next.</strong> Finance executes the transfer. When the
+  money has actually left, you get a second email with the UTR — that one is
+  your receipt. Until then this amount is authorised, not paid, and it is
+  reported that way on your statement too.
+</p>
+<p style="color:#71717a;font-size:13px;margin:16px 0 0;line-height:1.6">
+  If the figure differs from what you expected, the ledger behind it is on your
+  statement, line by line, with the period and the rate that produced each entry
+  (0.1.5).
+</p>

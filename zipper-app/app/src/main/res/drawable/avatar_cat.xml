@@ -1,0 +1,35 @@
+<!-- Default avatar · cat. See ui/components/DefaultAvatars.kt for the set. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Rose/500 -->
+    <path
+        android:fillColor="#FFFF3D8B"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M22,38L28,10L46,26ZM74,38L68,10L50,26Z" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,52m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,48m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0M58,48m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0" />
+    <!-- Pupils -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M38,48m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0M58,48m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FFFFC9DE"
+        android:pathData="M43,58L53,58L48,64Z" />
+    <!-- Mouth -->
+    <path
+        android:fillColor="#FFFFC9DE"
+        android:pathData="M40,66h16a8,8 0 0,1 -16,0z" />
+</vector>

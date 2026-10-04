@@ -1,0 +1,42 @@
+<!--
+  Default avatar · fox. See ui/components/DefaultAvatars.kt for the set.
+
+  96×96 viewport, full-bleed disc in a brand hue with a flat dark silhouette on
+  top. Deliberately a handful of path commands: these inflate on the profile
+  setup screen and in every list that renders an avatar, and a path the parser
+  chokes on takes the whole screen down at runtime rather than at build time.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="96dp"
+    android:height="96dp"
+    android:viewportWidth="96"
+    android:viewportHeight="96">
+    <!-- Disc — Coral/500 -->
+    <path
+        android:fillColor="#FFFF4D5E"
+        android:pathData="M48,48m-48,0a48,48 0 1,0 96,0a48,48 0 1,0 -96,0" />
+    <!-- Ears (drawn first so the head covers their base) -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M24,34L33,8L48,30ZM72,34L63,8L48,30Z" />
+    <!-- Head -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,54m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0" />
+    <!-- Muzzle -->
+    <path
+        android:fillColor="#FFF5F6FA"
+        android:pathData="M48,66m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0" />
+    <!-- Eyes -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,48m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0M58,48m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Nose -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M48,62m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Open, laughing mouth -->
+    <path
+        android:fillColor="#FF171930"
+        android:pathData="M40,68h16a8,8 0 0,1 -16,0z" />
+</vector>
