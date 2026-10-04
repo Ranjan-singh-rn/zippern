@@ -155,65 +155,10 @@ describe('replay', () => {
     expect(r.detail).toBe('refused')
   })
 
-  /*
-   * ── A KNOWN DEFECT, LEFT VISIBLE ─────────────────────────────────────────
-   *
-   * Marked `todo` rather than deleted or weakened. It SHOULD pass; it does not,
-   * and the reason is in the code rather than in the fake:
-   *
-   *   `credRef.get()` is a plain read, outside any transaction, and
-   *   `credRef.delete()` afterwards is unconditional.
-   *
-   * So two redemptions of one secret carrying DIFFERENT challenges both read
-   * the credential as live, both verify, and both succeed — minting two custom
-   * tokens and leaving one ORPHANED replacement credential that nothing rotates
-   * and nothing cleans until its 30-day expiry.
-   *
-   * What it is not: an authentication bypass. Both attempts must produce a
-   * valid signature, so only the holder of the Keystore key can cause it — the
-   * device racing itself, not an attacker with a copied secret. And
-   * `startMobileSession` collapses the two sessions to one.
-   *
-   * What it is: "single-use" holding sequentially but not concurrently, and a
-   * quiet violation of "one device, one credential" — which `retireOthers`
-   * enforces at mint but rotation does not.
-   *
-   * The fix is small (rotate inside a transaction on `credRef`, or call
-   * `retireOthers` after rotation) and is deliberately NOT applied here: this
-   * pass is verification, not redesign. See the readiness report.
-   */
-  test('two overlapping redemptions of one credential: exactly one wins',
-    { todo: 'rotation is not atomic — credRef is read and deleted outside a transaction' },
-    async () => {
-      const { secret, keys } = seedAccount()
-      const a = await challengeAndSign(keys.privateKey)
-      const b = await challengeAndSign(keys.privateKey)
-      const results = await Promise.allSettled([
-        redeem({ token: secret, challengeId: a.challengeId, signature: a.signature, deviceId: 'dev-A' }),
-        redeem({ token: secret, challengeId: b.challengeId, signature: b.signature, deviceId: 'dev-A' }),
-      ])
-      const won = results.filter((r) => r.status === 'fulfilled' && r.value.outcome === 'allow')
-      expect(won.length).toBeLessThanOrEqual(1)
-    })
-
-  test('the concurrency gap, asserted as it actually behaves today', async () => {
-    // So the defect above is measured rather than merely described, and so a
-    // future fix breaks THIS test and forces both to be updated together.
-    const { secret, keys } = seedAccount()
-    const a = await challengeAndSign(keys.privateKey)
-    const b = await challengeAndSign(keys.privateKey)
-    await Promise.allSettled([
-      redeem({ token: secret, challengeId: a.challengeId, signature: a.signature, deviceId: 'dev-A' }),
-      redeem({ token: secret, challengeId: b.challengeId, signature: b.signature, deviceId: 'dev-A' }),
-    ])
-    expect(db.has(`quickLoginTokens/${sha(secret)}`)).toBe(false)   // the original is gone
-    expect(db.count('quickLoginTokens')).toBe(2)                     // one of them is orphaned
-    expect(db.mintedTokens.length).toBe(2)                           // and two sessions were minted
-  })
-
-  test('…and the same race with ONE challenge yields only one winner', async () => {
-    // The challenge transaction is what makes this half safe. Both attempts
-    // present the same challengeId, and only one consumption succeeds.
+  test('the same race with ONE challenge yields only one winner', async () => {
+    // The challenge transaction is what makes this half safe: both attempts
+    // present the same challengeId, and only one consumption succeeds. This has
+    // always held — it is the credential half, below, that had to be fixed.
     const { secret, keys } = seedAccount()
     const c = await challengeAndSign(keys.privateKey)
     const results = await Promise.allSettled([
@@ -252,6 +197,170 @@ describe('replay', () => {
       token: secret, challengeId: '', signature: sign(keys.privateKey, 'anything'), deviceId: 'dev-A',
     }))
     expect(r.detail).toBe('refused')
+  })
+})
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Atomic consumption — single-use under CONCURRENCY, not just in sequence
+// ══════════════════════════════════════════════════════════════════════════════
+
+/*
+ * These exist because the sequential replay tests above passed while the system
+ * still let two concurrent redemptions through.
+ *
+ * The old code took `credRef.get()` outside any transaction and then deleted
+ * unconditionally, so two attempts carrying DIFFERENT challenges both saw the
+ * credential as live and both succeeded: two custom tokens, and one orphaned
+ * replacement credential that nothing would rotate or clean for thirty days.
+ *
+ * Consumption is now a transaction whose contended resource is the credential's
+ * existence. Each assertion below is one clause of that requirement, so a
+ * regression names which guarantee it broke.
+ */
+describe('two concurrent redemptions of one credential', () => {
+  /** Fire N redemptions at one secret, each with its own fresh challenge. */
+  async function race(n, { secret, keys, deviceId = 'dev-A' }) {
+    const signed = []
+    for (let i = 0; i < n; i++) signed.push(await challengeAndSign(keys.privateKey))
+    return Promise.allSettled(signed.map((c) =>
+      redeem({ token: secret, challengeId: c.challengeId, signature: c.signature, deviceId })))
+  }
+  const winners = (rs) => rs.filter((r) => r.status === 'fulfilled' && r.value.outcome === 'allow')
+  const losers  = (rs) => rs.filter((r) => r.status === 'rejected')
+
+  test('EXACTLY ONE succeeds', async () => {
+    const acct = seedAccount()
+    const rs = await race(2, acct)
+    expect(winners(rs).length).toBe(1)
+  })
+
+  test('the loser fails cleanly, as `aborted`/`concurrent`', async () => {
+    // Not a refusal: the caller did nothing wrong and the credential was not
+    // rejected, it was spent. The detail code is deliberately NOT a
+    // QuickLoginOutcome, so `AuthRepository.refuseQuickLogin` takes its `else`
+    // branch and KEEPS the local credential — which by then is the winner's
+    // rotated replacement.
+    const acct = seedAccount()
+    const rs = await race(2, acct)
+    const l = losers(rs)
+    expect(l.length).toBe(1)
+    expect(l[0].reason.code).toBe('aborted')
+    expect(l[0].reason.details.code).toBe('concurrent')
+  })
+
+  test('exactly ONE replacement remains — no orphan', async () => {
+    const acct = seedAccount()
+    await race(2, acct)
+    expect(db.count('quickLoginTokens')).toBe(1)
+    expect(db.has(`quickLoginTokens/${sha(acct.secret)}`)).toBe(false)
+  })
+
+  test('exactly ONE session is minted', async () => {
+    const acct = seedAccount()
+    await race(2, acct)
+    expect(db.mintedTokens.length).toBe(1)
+  })
+
+  test('the surviving replacement is the WINNER\'S, and it works', async () => {
+    const acct = seedAccount()
+    const rs = await race(2, acct)
+    const won = winners(rs)[0].value
+    expect(db.has(`quickLoginTokens/${sha(won.token)}`)).toBe(true)
+    const c = await challengeAndSign(acct.keys.privateKey)
+    const next = await redeem({ token: won.token, challengeId: c.challengeId, signature: c.signature, deviceId: 'dev-A' })
+    expect(next.outcome).toBe('allow')
+  })
+
+  test('…and it still carries the device key, so the binding survives the race', async () => {
+    const acct = seedAccount()
+    // Captured before the race, because the original document is consumed by it.
+    const originalKey = db.read(`quickLoginTokens/${sha(acct.secret)}`).publicKey
+    const rs = await race(2, acct)
+    const won = winners(rs)[0].value
+    const rotated = db.read(`quickLoginTokens/${sha(won.token)}`)
+    // The property that matters: the replacement inherits the ORIGINAL's key
+    // verbatim, whatever its exact PEM whitespace. Comparing against a
+    // separately-trimmed copy was testing the trim, not the inheritance.
+    expect(rotated.publicKey).toBe(originalKey)
+    expect(rotated.version).toBe(P.CREDENTIAL_VERSION)
+    expect(rotated.uid).toBe(acct.uid)
+  })
+
+  test('FIVE at once still yields exactly one winner and one credential', async () => {
+    const acct = seedAccount()
+    const rs = await race(5, acct)
+    expect(winners(rs).length).toBe(1)
+    expect(losers(rs).length).toBe(4)
+    expect(db.count('quickLoginTokens')).toBe(1)
+    expect(db.mintedTokens.length).toBe(1)
+  })
+
+  test('the loser does NOT count against the rate limit', async () => {
+    // Losing a race is not a failed attempt. Counting it would let a flaky
+    // network walk a legitimate device into a 15-minute cool-off.
+    const acct = seedAccount()
+    await race(3, acct)
+    expect(db.has(`quickLoginRate/${sha(acct.secret)}`)).toBe(false)
+  })
+
+  test('the race is audited, and without the secret', async () => {
+    const acct = seedAccount()
+    await race(2, acct)
+    const lost = db.all('authEvents').filter((e) => e.event === 'QUICK_LOGIN_RACE_LOST')
+    expect(lost.length).toBe(1)
+    expect(JSON.stringify(lost[0]).includes(acct.secret)).toBe(false)
+    // and the winner's success is still recorded exactly once
+    expect(db.all('authEvents').filter((e) => e.event === 'QUICK_LOGIN_SUCCESS').length).toBe(1)
+  })
+
+  test('the signature requirement is NOT weakened by the transaction', async () => {
+    // A race between a valid and an invalid signature: the invalid one must
+    // lose on the signature, not on the race, and must not consume anything.
+    const { secret, keys } = seedAccount()
+    const thief = keypair()
+    const good = await challengeAndSign(keys.privateKey)
+    const bad = await QL.quickLoginChallenge.run({}, {})
+    const rs = await Promise.allSettled([
+      redeem({ token: secret, challengeId: bad.challengeId, signature: sign(thief.privateKey, bad.challenge), deviceId: 'dev-B' }),
+      redeem({ token: secret, challengeId: good.challengeId, signature: good.signature, deviceId: 'dev-A' }),
+    ])
+    expect(winners(rs).length).toBe(1)
+    const refused = rs.filter((r) => r.status === 'rejected' && r.reason.details
+      && r.reason.details.code === 'refused')
+    expect(refused.length).toBe(1)
+  })
+
+  test('account state is NOT weakened by the transaction', async () => {
+    // A banned account racing itself must still be reported as banned, twice,
+    // and must never reach the rotation path at all.
+    const acct = seedAccount({ account: { isBanned: true, banReason: 'fraud' } })
+    const rs = await race(2, acct)
+    expect(winners(rs).length).toBe(0)
+    const reported = rs.filter((r) => r.status === 'fulfilled' && r.value.outcome === 'banned')
+    expect(reported.length).toBe(2)
+    expect(db.mintedTokens.length).toBe(0)
+    expect(db.has(`quickLoginTokens/${sha(acct.secret)}`)).toBe(true)
+  })
+
+  test('a rotation that cannot commit leaves the credential live', async () => {
+    // A transaction that throws has written nothing, so the caller may retry.
+    // Reported as `aborted` for exactly that reason.
+    const { secret, keys } = seedAccount()
+    const real = db.runTransaction.bind(db)
+    let calls = 0
+    db.runTransaction = (fn) => {
+      calls++
+      // let the challenge transaction through; fail the rotation
+      return calls > 1 ? Promise.reject(new Error('contention')) : real(fn)
+    }
+    const c = await challengeAndSign(keys.privateKey)
+    let err
+    try { await redeem({ token: secret, challengeId: c.challengeId, signature: c.signature, deviceId: 'dev-A' }) }
+    catch (e) { err = e }
+    db.runTransaction = real
+    expect(err.code).toBe('aborted')
+    expect(db.has(`quickLoginTokens/${sha(secret)}`)).toBe(true)
+    expect(db.mintedTokens.length).toBe(0)
   })
 })
 

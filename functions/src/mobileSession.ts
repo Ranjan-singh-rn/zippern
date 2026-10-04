@@ -40,18 +40,26 @@
  *
  * ── The rollout tolerance, and when it ends ──────────────────────────────────
  *
- * `ENFORCE_PRESENTED_SESSION` is read from the environment and defaults to
- * FALSE. While it is false, a caller that presents NO session id is allowed
- * through and the omission is logged; a caller that presents a WRONG one is
- * refused either way.
+ * `ENFORCE_MOBILE_SESSION` is read from the environment and defaults to FALSE.
+ * While it is false, a caller that presents NO session id is allowed through and
+ * the omission is logged; a caller that presents a WRONG one is refused either
+ * way.
  *
- * That is deliberate and it is temporary. Every build currently on the estate
- * calls these functions without a session id, so turning this on before the app
- * ships would sign out every user on the platform at once. Layer 2 above has no
- * such dependency and is live immediately.
+ * The name is stated once and exactly here. This paragraph previously called it
+ * `ENFORCE_PRESENTED_SESSION`, which is read by nothing — anyone who set that
+ * would have seen no change in behaviour and reasonably concluded the control
+ * was broken. `enforcingPresentedSession()` below is the FUNCTION's name; the
+ * environment variable is `ENFORCE_MOBILE_SESSION`.
+ *
+ * That default is deliberate and it is temporary. Every build currently on the
+ * estate calls these functions without a session id, so turning this on before
+ * the app ships would sign out every user on the platform at once. Layer 2 above
+ * has no such dependency and is live immediately.
  *
  * Set `ENFORCE_MOBILE_SESSION=true` once the Android build that sends the id is
- * the minimum supported version.
+ * the minimum supported version — step 7 of the rollout in
+ * docs/workstream-0/PHASE-B-DEPLOYMENT-READINESS.md. It is NOT set anywhere
+ * today, in any environment.
  */
 
 import * as functions from 'firebase-functions'

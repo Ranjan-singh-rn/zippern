@@ -229,13 +229,19 @@ export const mintQuickLoginToken = functions
     }
   })
 
-async function writeCredential(
+/**
+ * The stored shape of a credential.
+ *
+ * Factored out so the plain write and the transactional rotation below produce
+ * byte-identical documents. Two places constructing this by hand is how one of
+ * them ends up missing `version` and silently becomes a legacy record.
+ */
+function credentialDocument(
   uid: string,
-  secret: string,
   deviceId: string,
   publicKey: string,
-): Promise<void> {
-  await store().collection(CREDENTIALS).doc(hash(secret)).set({
+): Record<string, unknown> {
+  return {
     version: CREDENTIAL_VERSION,
     uid,
     deviceId,
@@ -246,7 +252,19 @@ async function writeCredential(
     ),
     lastUsedAt: null,
     revokedAt: null,
-  })
+  }
+}
+
+async function writeCredential(
+  uid: string,
+  secret: string,
+  deviceId: string,
+  publicKey: string,
+): Promise<void> {
+  await store()
+    .collection(CREDENTIALS)
+    .doc(hash(secret))
+    .set(credentialDocument(uid, deviceId, publicKey))
 }
 
 async function retireOthers(uid: string, deviceId: string, keepHash: string): Promise<void> {
@@ -340,19 +358,72 @@ export const redeemQuickLogin = functions
       })
     }
 
-    // ── Success. Rotate, then mint. ──────────────────────────────────────────
-    //
-    // The old credential is destroyed in the same breath as the new one is
-    // written, so a captured secret is worth one race and not a month.
+    /*
+     * ── SUCCESS: CONSUME AND ROTATE, ATOMICALLY ──────────────────────────────
+     *
+     * This used to be three sequential writes — write the replacement, delete
+     * the old credential, delete the rate record — on top of a `credRef.get()`
+     * taken outside any transaction. Two redemptions of one secret carrying
+     * DIFFERENT challenges therefore both read the credential as live, both
+     * verified, and both succeeded: two custom tokens, and one ORPHANED
+     * replacement credential nothing would rotate or clean for thirty days.
+     *
+     * "Single-use" held sequentially and not concurrently, which is not what
+     * single-use means.
+     *
+     * The transaction below re-reads the credential and makes its existence the
+     * thing being competed for. Reads precede writes, as Firestore requires, so
+     * exactly one caller can observe it present and consume it; the other finds
+     * it gone and loses cleanly, having changed nothing.
+     *
+     * The challenge transaction above is still needed and still does a different
+     * job: it stops the SAME challenge being spent twice. This one stops the
+     * same CREDENTIAL being spent twice. Neither subsumes the other.
+     */
     const replacement = crypto.randomBytes(32).toString('base64url')
-    await writeCredential(
-      uid,
-      replacement,
-      String(credential?.deviceId ?? deviceId),
-      String(credential?.publicKey ?? ''),
-    )
-    await credRef.delete().catch(() => undefined)
-    await rateRef.delete().catch(() => undefined)
+    const replacementRef = store().collection(CREDENTIALS).doc(hash(replacement))
+
+    let consumed = false
+    try {
+      await store().runTransaction(async (tx) => {
+        const fresh = await tx.get(credRef)
+        // Lost the race, or revoked in the microseconds since the first read.
+        // Returning without writing is what makes the loser harmless.
+        if (!fresh.exists) return
+
+        tx.delete(credRef)
+        tx.set(
+          replacementRef,
+          credentialDocument(
+            uid,
+            String(fresh.get('deviceId') ?? deviceId),
+            String(fresh.get('publicKey') ?? ''),
+          ),
+        )
+        // The counter goes with the credential it belonged to.
+        tx.delete(rateRef)
+        consumed = true
+      })
+    } catch (err) {
+      /*
+       * A transaction that could not commit has written nothing, so the
+       * credential is still live and the caller may simply try again. Reported
+       * as `aborted` rather than a refusal for exactly that reason.
+       */
+      functions.logger.warn('quick login rotation could not commit', {
+        uid, err: String(err),
+      })
+      throw concurrent()
+    }
+
+    if (!consumed) {
+      await recordEvent('QUICK_LOGIN_RACE_LOST', {
+        uid,
+        deviceFingerprint: fingerprint(deviceId),
+        credential: credHash.slice(0, 12),
+      })
+      throw concurrent()
+    }
 
     let customToken: string
     try {
@@ -516,6 +587,33 @@ function refuse(outcome: QuickLoginOutcome, banReason = ''): functions.https.Htt
     'permission-denied',
     messageFor(outcome, banReason),
     { code: outcome },
+  )
+}
+
+/**
+ * The loser of a rotation race, and why it is not a refusal.
+ *
+ * `aborted` rather than `permission-denied`, and a detail code that is NOT one
+ * of the `QuickLoginOutcome` values, deliberately:
+ *
+ *   - The caller did nothing wrong. Nothing counts against the rate limit.
+ *   - The credential was not rejected, it was spent — by the winner, which on
+ *     this path is the same device — so the device already holds the rotated
+ *     replacement from the winning response.
+ *   - `AuthRepository.refuseQuickLogin` routes an unrecognised detail code to
+ *     its `else` branch, which reports the message and KEEPS the local
+ *     credential. A `refused` detail would have made the loser clear the
+ *     replacement the winner had just saved, turning a harmless race into a
+ *     lost credential.
+ *
+ * So this needs no Android change, and the client's existing conservatism about
+ * unknown codes is exactly the right behaviour here.
+ */
+function concurrent(): functions.https.HttpsError {
+  return new functions.https.HttpsError(
+    'aborted',
+    'Another sign-in for this account is already in progress. Please try again.',
+    { code: 'concurrent' },
   )
 }
 
