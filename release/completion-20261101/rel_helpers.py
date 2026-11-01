@@ -742,14 +742,35 @@ def apk_badging(aapt_out, expect_code, expect_name):
     print("APK-CHECK " + ("ok" if ok else "FAIL"))
 
 
-def apk_signer(signer_out):
-    txt = open(signer_out, encoding="utf-8", errors="replace").read()
-    if "CN=Android Debug" in txt:
-        print("SIGNER debug")
-    elif "certificate DN:" in txt or "Owner:" in txt:
-        print("SIGNER release")
+CERT_LINE_RE = re.compile(r"^APK \S+ SCHEMES (\S+) CERTS (\d+) SHA256 (\S+) CN (.*)$")
+
+
+def apk_cert_check(cert_out, apksigner_rc, fleet_sha256):
+    """Who signed ONE APK, decided without apksigner's text output (under build-tools 37.0.0 no pattern found a signer
+    in it): the line of tools/apk_cert.py (the certificates in the APK Signing Block) and the exit code of `apksigner
+    verify` (signature validity). ok = apksigner exit 0, exactly one distinct certificate, CN=Android Debug, SHA-256 =
+    fleet_sha256 (FLEET_CERT_SHA256 of rel_common.sh, the key that signed APK 19). Public certificate data only."""
+    lines = [l.rstrip("\n") for l in open(cert_out, encoding="utf-8", errors="replace") if l.startswith("APK ")]
+    m = CERT_LINE_RE.match(lines[0]) if len(lines) == 1 else None
+    fleet = str(fleet_sha256).strip().lower()
+    problems = []
+    if not re.fullmatch(r"[0-9a-f]{64}", fleet):
+        problems.append("FLEET_CERT_SHA256 in rel_common.sh is not a SHA-256")
+    if str(apksigner_rc) != "0":
+        problems.append("apksigner verify exit %s (the signature does not verify, or apksigner could not run: Java on PATH?)"
+                        % apksigner_rc)
+    if m is None:
+        problems.append("no signing certificate read (tools/apk_cert.py: %s)" % (" / ".join(lines)[:300] or "no output"))
     else:
-        print("SIGNER unknown")
+        schemes, n, sha, cn = m.group(1), int(m.group(2)), m.group(3).lower(), m.group(4)
+        print("SIGNER schemes=%s certificates=%d sha256=%s CN=%s" % (schemes, n, sha, cn))
+        if n != 1:
+            problems.append("%d distinct signing certificates (exactly 1 expected)" % n)
+        if cn != "Android Debug":
+            problems.append("CN=%s, not Android Debug" % cn)
+        if sha != fleet:
+            problems.append("certificate SHA-256 %s is not the fleet's %s" % (sha, fleet))
+    print("SIGNER-CHECK " + ("ok" if not problems else "FAIL: " + "; ".join(problems)))
 
 
 def android_doc_check(doc_json, channel, min_code):
@@ -964,7 +985,7 @@ if __name__ == "__main__":
         "run-service": run_service, "run-revision": run_revision, "env-diff": env_diff, "traffic-split": traffic_split,
         "rev-cond": rev_cond, "hosting-live": hosting_live, "tree-sha": tree_sha, "tree-list": tree_list,
         "file-sha": file_sha, "release-check": release_check, "upload-check": upload_check,
-        "apk-badging": apk_badging, "apk-signer": apk_signer, "android-doc-check": android_doc_check,
+        "apk-badging": apk_badging, "apk-cert-check": apk_cert_check, "android-doc-check": android_doc_check,
         "agg-requests": agg_requests, "agg-errors": agg_errors, "monitor-verdict": monitor_verdict,
         "policy-json": policy_json, "first-name": first_name, "mask-file": mask_file,
         "release-txt": release_txt, "android-doc-equal": android_doc_equal, "android-doc-abis": android_doc_abis,

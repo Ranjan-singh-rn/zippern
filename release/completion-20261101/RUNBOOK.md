@@ -146,8 +146,10 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
 - **Do on the Mac, at the release HEAD:** `cd zipper-app && ./gradlew :app:assembleProd`; install the arm64 prod APK on a
   phone that has APK 19 and run sign-in, a live room, a call and a gift (first R8 build).
 - **Do:** `./60-publish-apk.command` (PUBLISH). It verifies both ABIs (com.zipper.app, versionCode 20, 1.2.6, not
-  debuggable, `CN=Android Debug`, built after the HEAD commit), saves the current `appConfig/androidUpdate`, dry-runs
-  `publish_apk.py`, then publishes to channel `debug` with `minSupportedVersionCode 20`.
+  debuggable, built after the HEAD commit, `apksigner verify` exit 0, and exactly one signing certificate in the APK
+  Signing Block: `CN=Android Debug` with SHA-256 = `FLEET_CERT_SHA256` of rel_common.sh, the key that signed APK 19),
+  saves the current `appConfig/androidUpdate`, dry-runs `publish_apk.py`, then publishes to channel `debug` with
+  `minSupportedVersionCode 20`.
 - **Verify:** 60 PASS (record = 20/20, sha256 of each ABI = the verified APK); an APK 19 phone is offered 1.2.6 and
   installs it over the old install. From now on APK 19 sessions are refused at sign-in.
 - **Rollback:** `./61-withdraw-apk.command production/60-publish-apk-<UTC>` (WITHDRAW) — refused while wave 2b is live.

@@ -129,3 +129,6 @@ functions/lib/
 
 # local validation output (never committed)
 validation-logs/
+
+# tests/run-p1mfa-verify.command writes a summary next to its (ignored) log
+outputs/verify/p1mfa-rules-*.log.summary

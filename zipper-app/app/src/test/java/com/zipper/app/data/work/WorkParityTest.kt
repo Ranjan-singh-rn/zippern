@@ -287,7 +287,7 @@ class WorkParityTest {
 
     // ── Sessions / sign out everywhere ──────────────────────────────────────
 
-    @Test fun `sessions - offered to every signed-in work account, partners included; the observer gets no write`() {
+    @Test fun `sessions - offered to every signed-in work account, partners included, the observer gets no write`() {
         val m = module("sessions")
         assertEquals("/api/auth/sessions", (m.source as Source.Api).path)
         for (c in listOf(owner, observer, appAdmin, opsMember, techMember, agency, seller, dual, pending)) assertTrue(c.role, m.gate(c))

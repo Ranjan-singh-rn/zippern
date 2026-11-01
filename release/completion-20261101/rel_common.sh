@@ -70,6 +70,12 @@ APK_VERSION_CODE=20
 APK_VERSION_NAME="1.2.6"
 APK_MIN_SUPPORTED=20
 APK_CHANNEL="debug"
+# The fleet's signing certificate: SHA-256 of its DER encoding (CN=Android Debug, O=Android, C=US), as tools/apk_cert.py
+# reads it from the APK Signing Block. It is the key that signed APK 19 (1.2.5), i.e. the fleet's update identity: a phone
+# installs an update only if it carries the installed app's certificate, so an APK signed with another Mac's debug key
+# (also "CN=Android Debug") would be refused by every phone. 60 and LOCAL-VERIFY 6b (which reads this line with sed)
+# refuse any other certificate.
+FLEET_CERT_SHA256="4878a35fa2b4d8a0a6bcab84f22b66312385fe02523603ea23d3e190fc1948af"
 APK_NOTES="ZIPPER 1.2.6: per-minute calls, faster sign-up photos, long live streams and calls, call and live fixes. This update is required."
 
 # Backend (11): exactly these settings are added to the service template; everything else is inherited.

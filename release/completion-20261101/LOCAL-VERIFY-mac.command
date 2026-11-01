@@ -20,8 +20,9 @@
 #                   present), tests/run-p1mfa-verify.command, tests/run-phase1a-validation.sh (its emulator steps)
 #   6a   android    ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleProd
 #                   (+ --continue, so a unit-test failure does not stop the APK builds)
-#   6b   android    prod APKs: apksigner verify --print-certs (only the certificate CN and SHA-256 are kept) and
-#                   aapt dump badging (versionCode 20, no application-debuggable)
+#   6b   android    prod APKs: apksigner verify --print-certs (exit 0; its raw output is kept, never parsed), the signing
+#                   certificate read from the APK Signing Block by tools/apk_cert.py (exactly one, CN=Android Debug,
+#                   SHA-256 = FLEET_CERT_SHA256 of rel_common.sh) and aapt dump badging (versionCode 20, not debuggable)
 #
 # Production is never touched:
 #   * no deploy, publish, login or Google Cloud CLI; the emulator suites run only under the demo-zipper project,
@@ -678,27 +679,38 @@ badging() {   # apk -> aapt dump badging (aapt2 if aapt is missing or fails)
   echo "no usable aapt or aapt2 in $BT"; return 127
 }
 
+cert_field() {   # tools/apk_cert.py line, \1 SCHEMES | \2 CERTS | \3 SHA256 | \4 CN -> that field (nothing if not such a line)
+  printf '%s\n' "$1" | LC_ALL=C sed -n "s/^APK [^ ]* SCHEMES \([^ ]*\) CERTS \([0-9]*\) SHA256 \([^ ]*\) CN \(.*\)\$/$2/p" | head -n 1
+}
+
 verify_prod_apks() {
-  local plog="$LOGS/6b-android-prod-apk.log" apk="" n=0 good=0 src=0 cn="" sha="" nsig=0 errs="" bfile="" pkg=""
-  local pname="" vcode="" vname="" dbg=0 ok=0 first_sha="" same=1 vcs="" cns="" dbgs="" res="" c=""
+  local plog="$LOGS/6b-android-prod-apk.log" apk="" n=0 good=0 src=0 crc=0 line="" abi="" sfile="" errs="" bfile="" pkg=""
+  local schemes="" ncert="" sha="" cn="" pname="" vcode="" vname="" dbg=0 ok=0 fleet="" srcs="" vcs="" ncs="" cns="" shas="" dbgs="" res="" c=""
+  # The fleet's certificate, from its one source of truth: FLEET_CERT_SHA256 in rel_common.sh (read here, never sourced).
+  fleet="$(LC_ALL=C sed -n 's/^FLEET_CERT_SHA256="\([0-9a-f]\{64\}\)".*/\1/p' "$HERE/rel_common.sh" 2>/dev/null | head -n 1)"
   {
     echo "# step:     6b prod APK checks"
-    echo "# tools:    $BT/apksigner verify --print-certs ; $BT/aapt dump badging (aapt2 if aapt is unusable)"
-    echo "# kept:     from apksigner only the certificate CN and SHA-256 digest — nothing about any keystore"
-    echo "# expected: package com.zipper.app, versionCode $EXPECT_VERSION_CODE, no application-debuggable, signer CN=Android Debug"
+    echo "# tools:    $BT/apksigner verify --print-certs   signature validity = its exit code; its output is kept, never parsed"
+    echo "#           tools/apk_cert.py                     the signing certificate(s), read from the APK Signing Block"
+    echo "#           $BT/aapt dump badging   (aapt2 if aapt is unusable)"
+    echo "# kept:     apksigner's raw output as android-prod-apksigner-<abi>.txt (public certificate data only); nothing about any keystore"
+    echo "# expected: apksigner exit 0; exactly one signing certificate, CN=Android Debug, SHA-256 = FLEET_CERT_SHA256 of rel_common.sh"
+    echo "#           (${fleet:-NOT FOUND}: the key that signed APK 19 — any other key and every phone refuses the update);"
+    echo "#           package com.zipper.app, versionCode $EXPECT_VERSION_CODE, no application-debuggable"
     echo "#           (the prod build type is signed with the debug key on purpose: zipper-app/app/build.gradle.kts, A-4)"
     echo "# started:  $(date -u +%FT%TZ)"
   } > "$plog"
   while IFS= read -r apk; do
     [ -n "$apk" ] || continue
     n=$((n + 1))
-    ( JAVA_HOME="$AJ"; PATH="$AJ/bin:$PATH"; export JAVA_HOME PATH; "$BT/apksigner" verify --print-certs "$apk" ) > "$TMPROOT/signer.txt" 2>&1
+    abi="$(basename "$apk" .apk)"; abi="${abi#app-}"; abi="${abi%-prod}"
+    sfile="$OUT/android-prod-apksigner-$abi.txt"
+    ( JAVA_HOME="$AJ"; PATH="$AJ/bin:$PATH"; export JAVA_HOME PATH; "$BT/apksigner" verify --print-certs "$apk" ) > "$sfile" 2>&1
     src=$?
-    cn="$(LC_ALL=C sed -n 's/^Signer #1 certificate DN: .*CN=\([^,]*\).*/\1/p' "$TMPROOT/signer.txt" | head -n 1)"
-    sha="$(LC_ALL=C sed -n 's/^Signer #1 certificate SHA-256 digest: *\([0-9A-Fa-f]*\).*/\1/p' "$TMPROOT/signer.txt" | head -n 1)"
-    nsig="$(count_re '^Signer #[0-9]+ certificate DN:' "$TMPROOT/signer.txt")"
-    errs="$(LC_ALL=C grep -E '^(ERROR|DOES NOT VERIFY)' "$TMPROOT/signer.txt" | head -n 3 | oneline)"
-    rm -f "$TMPROOT/signer.txt"
+    errs="$(LC_ALL=C grep -E '^(ERROR|DOES NOT VERIFY)' "$sfile" | head -n 3 | oneline)"
+    line="$(python3 -I "$HERE/tools/apk_cert.py" "$apk" 2>&1)"
+    crc=$?
+    schemes="$(cert_field "$line" '\1')"; ncert="$(cert_field "$line" '\2')"; sha="$(cert_field "$line" '\3')"; cn="$(cert_field "$line" '\4')"
     bfile="$OUT/android-prod-badging-$(basename "$apk" .apk).txt"
     badging "$apk" > "$bfile" 2>&1
     pkg="$(LC_ALL=C grep -m 1 '^package:' "$bfile")"
@@ -708,20 +720,25 @@ verify_prod_apks() {
     dbg="$(count_re '^application-debuggable' "$bfile")"
     ok=1
     [ "$src" = 0 ] || ok=0
+    [ "$crc" = 0 ] || ok=0
+    [ "$ncert" = 1 ] || ok=0
     [ "$cn" = "Android Debug" ] || ok=0
+    [ -n "$fleet" ] && [ "$sha" = "$fleet" ] || ok=0
     [ "$pname" = "com.zipper.app" ] || ok=0
     [ "$vcode" = "$EXPECT_VERSION_CODE" ] || ok=0
     [ "$dbg" = 0 ] || ok=0
     [ "$ok" = 1 ] && good=$((good + 1))
-    if [ -z "$first_sha" ]; then first_sha="$sha"; elif [ "$sha" != "$first_sha" ]; then same=0; fi
-    vcs="$vcs ${vcode:-?}"; cns="$cns|${cn:-?}"; dbgs="$dbgs $([ "$dbg" = 0 ] && echo absent || echo PRESENT)"
+    srcs="$srcs $src"; vcs="$vcs ${vcode:-none}"; ncs="$ncs ${ncert:-none}"; cns="$cns|${cn:-none}"; shas="$shas ${sha:-none}"
+    dbgs="$dbgs $([ "$dbg" = 0 ] && echo absent || echo PRESENT)"
     {
       echo ""
       echo "== $(basename "$apk")   $(wc -c < "$apk" | tr -d ' ') bytes   sha256 $(shasum -a 256 "$apk" | cut -c1-64)"
-      echo "   apksigner verify:        exit $src${errs:+   $errs}"
-      echo "   signer certificates:     $nsig"
+      echo "   apksigner verify:        exit $src${errs:+   $errs}   (output: $(rel "$sfile"))"
+      [ -n "$ncert" ] || echo "   tools/apk_cert.py:       exit $crc   $(printf '%s' "$line" | oneline)"
+      echo "   signature schemes:       ${schemes:-none}"
+      echo "   signing certificates:    ${ncert:-0}"
       echo "   certificate CN:          ${cn:-?}"
-      echo "   certificate SHA-256:     ${sha:-?}"
+      echo "   certificate SHA-256:     ${sha:-?}   $(if [ -n "$fleet" ] && [ "$sha" = "$fleet" ]; then echo "= FLEET_CERT_SHA256"; else echo "NOT the fleet's certificate"; fi)"
       echo "   package:                 ${pname:-?}   versionCode=${vcode:-?}   versionName=${vname:-?}"
       echo "   application-debuggable:  $([ "$dbg" = 0 ] && echo absent || echo PRESENT)"
       echo "   verdict:                 $([ "$ok" = 1 ] && echo PASS || echo FAIL)"
@@ -729,10 +746,16 @@ verify_prod_apks() {
   done <<EOF
 $PROD_APKS
 EOF
-  if [ "$n" -gt 0 ] && [ "$good" = "$n" ] && [ "$same" = 1 ]; then res=PASS; else res=FAIL; fi
-  c="$good of $n prod APK(s) pass; versionCode $(printf '%s\n' $vcs | sort -u | tr '\n' '/' | sed 's#/$##') (want $EXPECT_VERSION_CODE); application-debuggable $(printf '%s\n' $dbgs | sort -u | tr '\n' '/' | sed 's#/$##')"
-  c="$c; signer CN=$(printf '%s\n' "${cns#|}" | tr '|' '\n' | sort -u | tr '\n' '/' | sed 's#/$##'); certificate SHA-256 ${first_sha:-?}"
-  [ "$same" = 1 ] || c="$c; the APKs are signed by DIFFERENT certificates"
+  if [ "$n" -gt 0 ] && [ "$good" = "$n" ]; then res=PASS; else res=FAIL; fi
+  c="$good of $n prod APK(s) pass; apksigner exit $(printf '%s\n' $srcs | sort -u | tr '\n' '/' | sed 's#/$##'); versionCode $(printf '%s\n' $vcs | sort -u | tr '\n' '/' | sed 's#/$##') (want $EXPECT_VERSION_CODE); application-debuggable $(printf '%s\n' $dbgs | sort -u | tr '\n' '/' | sed 's#/$##')"
+  c="$c; signing certificates $(printf '%s\n' $ncs | sort -u | tr '\n' '/' | sed 's#/$##'), CN=$(printf '%s\n' "${cns#|}" | tr '|' '\n' | sort -u | tr '\n' '/' | sed 's#/$##')"
+  if [ -z "$fleet" ]; then
+    c="$c; certificate SHA-256 $(printf '%s\n' $shas | sort -u | tr '\n' '/' | sed 's#/$##') — FLEET_CERT_SHA256 not found in rel_common.sh"
+  elif [ "$(printf '%s\n' $shas | sort -u)" = "$fleet" ]; then
+    c="$c; certificate SHA-256 $(printf '%.16s' "$fleet")… = FLEET_CERT_SHA256 (the key that signed APK 19)"
+  else
+    c="$c; certificate SHA-256 $(printf '%s\n' $shas | sort -u | tr '\n' '/' | sed 's#/$##') — NOT the fleet's $(printf '%.16s' "$fleet")…: every phone would refuse this update, do not publish"
+  fi
   echo "# finished: $(date -u +%FT%TZ)" >> "$plog"
   record 6b "android: prod APKs, apksigner + aapt badging" "$res" "-" "$c" "$(rel "$plog")"
 }
@@ -755,14 +778,22 @@ GRADLE
     record 6a "android: unit tests + debug + prod builds" FAIL - "no Java for Gradle: JAVA_HOME unset, no Android Studio JBR, /usr/libexec/java_home found nothing" -
     record 6b "android: prod APKs, apksigner + aapt badging" SKIPPED - "no build (6a)" -
   else
+    # Unit-test results left by an EARLIER run must never be counted as this run's (1 Nov: the test sources did not
+    # compile, testDebugUnitTest never ran, and 34 XML files from 25 Oct were reported as "310 tests, 0 failures").
+    MARK6A="$OUT/.6a-started"; : > "$MARK6A"
     run_step 6a android-gradle "$APP" env "JAVA_HOME=$AJ" "PATH=$AJ/bin:$PATH" ./gradlew --no-daemon --console=plain --continue \
       --init-script "$INIT" :app:testDebugUnitTest :app:assembleDebug :app:assembleProd
     G_RC=$RC; G_LOG=$LOG
     XMLD="$APP/app/build/test-results/testDebugUnitTest"
+    TSTATE="$(task_state :app:testDebugUnitTest "$G_LOG")"
     mkdir -p "$OUT/android-unit-xml"
-    UT=0; UF=0; UE=0; US=0; UX=0
+    UT=0; UF=0; UE=0; US=0; UX=0; USTALE=0
     for x in "$XMLD"/TEST-*.xml; do
       [ -f "$x" ] || continue
+      case "$TSTATE" in
+        UP-TO-DATE|FROM-CACHE) : ;;   # identical inputs: Gradle reused results that belong to this exact source
+        *) [ "$x" -nt "$MARK6A" ] || { USTALE=$((USTALE + 1)); continue; } ;;
+      esac
       UX=$((UX + 1)); cp "$x" "$OUT/android-unit-xml/"
       h="$(grep -m 1 '<testsuite ' "$x")"
       a="$(printf '%s' "$h" | sed -n 's/.* tests="\([0-9]*\)".*/\1/p')";    UT=$((UT + ${a:-0}))
@@ -778,13 +809,21 @@ GRADLE
     UP_RAN="$(LC_ALL=C grep -E '^> Task :app:uploadCrashlytics' "$G_LOG" | grep -vc ' SKIPPED$')"
     [ "$UP_RAN" = 0 ] || note "a Crashlytics upload task was NOT reported SKIPPED in 6a — read logs/6a-android-gradle.log"
     PSTATE="$(task_state :app:assembleProd "$G_LOG")"
-    record 6a "android: unit tests + debug + prod builds" "$(pf "$G_RC")" "$G_RC" \
-      "unit tests $UT, failures $UF, errors $UE, skipped $US ($UX XML files, testDebugUnitTest $(task_state :app:testDebugUnitTest "$G_LOG")); assembleDebug $(task_state :app:assembleDebug "$G_LOG") ($N_DBG APKs); assembleProd $PSTATE ($N_PROD APKs); Crashlytics upload tasks SKIPPED: $UP_SKIPPED" \
+    R6A="$(pf "$G_RC")"
+    case "$TSTATE" in
+      executed|UP-TO-DATE|FROM-CACHE) [ "$UT" -gt 0 ] && [ "$UF" = 0 ] && [ "$UE" = 0 ] || R6A=FAIL ;;
+      *) R6A=FAIL ;;   # the unit tests did not run: never a PASS, whatever the build did
+    esac
+    [ "$USTALE" = 0 ] || note "6a ignored $USTALE unit-test XML file(s) older than this run (not this build's results)"
+    record 6a "android: unit tests + debug + prod builds" "$R6A" "$G_RC" \
+      "unit tests $UT, failures $UF, errors $UE, skipped $US ($UX XML files of this run, $USTALE stale ignored, testDebugUnitTest $TSTATE); assembleDebug $(task_state :app:assembleDebug "$G_LOG") ($N_DBG APKs); assembleProd $PSTATE ($N_PROD APKs); Crashlytics upload tasks SKIPPED: $UP_SKIPPED" \
       "$(rel "$G_LOG")"
     if [ "$PSTATE" = "not run" ] || [ "$PSTATE" = "FAILED" ] || [ "$N_PROD" = 0 ]; then
       record 6b "android: prod APKs, apksigner + aapt badging" SKIPPED - "no current prod APK (assembleProd: $PSTATE)" -
     elif [ -z "$BT" ]; then
       record 6b "android: prod APKs, apksigner + aapt badging" FAIL - "no Android build-tools with apksigner under $SDK/build-tools" -
+    elif ! command -v python3 >/dev/null 2>&1; then
+      record 6b "android: prod APKs, apksigner + aapt badging" FAIL - "python3 not found on PATH (tools/apk_cert.py reads the signing certificate)" -
     else
       verify_prod_apks
     fi

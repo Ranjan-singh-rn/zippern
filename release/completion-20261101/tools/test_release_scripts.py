@@ -17,19 +17,27 @@ Two parts:
      WAVE_2B + NOT_REDEPLOYED (the `node -e` enumeration is stubbed); a deploy that stops part-way is reported per name
      and 29 rolls back exactly the updated ones; 33 refuses an index file that is not a superset of the live indexes;
      45/46/47 (Owner MFA enforcement) refuse without their preconditions and words and pin back on failure.
-     Plus unit tests of tools/android_update_doc.py restore (in-memory Firestore fake) and of fn-classify.
+     The prod APKs are synthetic ZIPs with an APK Signing Block (one v2 signer, self-signed test certificates made by
+     openssl; the copy's FLEET_CERT_SHA256 names the "fleet" one) and the apksigner stub prints a format nothing
+     parses: 60 publishes only the fleet certificate and refuses another Mac's debug key (same CN), a release key, two
+     certificates, no signing block, and apksigner exit 1.
+     Plus unit tests of tools/android_update_doc.py restore (in-memory Firestore fake), of fn-classify and of
+     tools/apk_cert.py.
 
 Usage: python3 -I tools/test_release_scripts.py <release/completion-20261101 folder>
 """
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 REL = Path(sys.argv[1]).resolve()
@@ -48,7 +56,8 @@ def sha(text):
 # ══ 1. STATIC ════════════════════════════════════════════════════════════════
 PROD_FILES = sorted(p.name for p in REL.glob("[0-9][0-9]-*.command"))
 LIBS = ["rel_common.sh", "rel_deploy_lib.sh", "rel_rules_lib.sh", "make-release-txt.sh"]
-EXPECT_SHA_LIST = sorted(PROD_FILES + LIBS + ["rel_helpers.py", "tools/android_update_doc.py", "tools/live_rules.py"])
+EXPECT_SHA_LIST = sorted(PROD_FILES + LIBS + ["rel_helpers.py", "tools/android_update_doc.py", "tools/live_rules.py",
+                                               "tools/apk_cert.py"])
 
 C10, C11, C12, C19 = ("10-grant-backend-sendgrid-secret.command", "11-deploy-backend-no-traffic.command",
                       "12-canary-backend.command", "19-rollback-backend.command")
@@ -58,6 +67,7 @@ C30, C31, C39, C40 = ("30-deploy-rules-hotfix1.command", "31-deploy-rules-rc2.co
 C32, C33 = "32-deploy-storage-hotfix1.command", "33-deploy-indexes.command"
 C45, C46, C47 = "45-enable-owner-mfa-enforcement.command", "46-move-traffic-enforce.command", "47-rollback-enforcement.command"
 REAL_PROD, REAL_NOTPROD = "4e21b7f14f7cafb01b8aacaf35368695a17d13e0", "f1af30a1d64fb8f20403fd6e7da5633cfab1234c"
+REAL_FLEET = "4878a35fa2b4d8a0a6bcab84f22b66312385fe02523603ea23d3e190fc1948af"   # the certificate that signed APK 19
 C41, C49, C50 = "41-deploy-storage-rules.command", "49-rollback-storage.command", "50-deploy-crm.command"
 C60, C61, C70, C90 = ("60-publish-apk.command", "61-withdraw-apk.command", "70-monitoring-setup.command",
                       "90-postdeploy-verify-readonly.command")
@@ -190,7 +200,15 @@ rcs = (REL / "rel_common.sh").read_text(encoding="utf-8")
 ok("rel_common.sh: rollback base refs/heads/prod-live-20261030 = 4e21b7f…, f1af30a… named NOT production",
    'PROD_FN_REF="refs/heads/prod-live-20261030"' in rcs and 'PROD_FN_COMMIT="%s"' % REAL_PROD in rcs
    and 'NOT_PROD_FN_COMMIT="%s"' % REAL_NOTPROD in rcs)
-short = ["%s:%d" % (f.name, no) for f in code_files for no, ln in logical_lines(f) if not ln.strip().startswith("#")
+# The fleet's signing certificate: pinned once (rel_common.sh); 60 and LOCAL-VERIFY 6b read the APK Signing Block.
+ok("rel_common.sh pins the fleet's signing certificate FLEET_CERT_SHA256 = %s… (the key that signed APK 19)" % REAL_FLEET[:16],
+   'FLEET_CERT_SHA256="%s"' % REAL_FLEET in rcs)
+lv_txt, c60_txt = (REL / "LOCAL-VERIFY-mac.command").read_text(encoding="utf-8"), (REL / C60).read_text(encoding="utf-8")
+ok("60 and LOCAL-VERIFY 6b take the signer from tools/apk_cert.py, never from apksigner's text; 6b reads FLEET_CERT_SHA256 from rel_common.sh",
+   "tools/apk_cert.py" in c60_txt and "tools/apk_cert.py" in lv_txt and "apk-cert-check" in c60_txt
+   and not re.search(r"certificate DN|Signer #", c60_txt + lv_txt + (REL / "rel_helpers.py").read_text(encoding="utf-8"))
+   and "FLEET_CERT_SHA256=" in lv_txt and '"$HERE/rel_common.sh"' in lv_txt and not re.search(r"^\s*FLEET_CERT_SHA256=", lv_txt, re.M))
+short =["%s:%d" % (f.name, no) for f in code_files for no, ln in logical_lines(f) if not ln.strip().startswith("#")
          and re.search(r"(?<!refs/heads/)prod-live-20261030(?!-tag)", ln.split("  #")[0])]
 ok("no script names prod-live-20261030 except as the full ref refs/heads/prod-live-20261030", not short, short)
 # The Functions waves (rel_common.sh, evaluated by bash): every exported function in exactly one list.
@@ -550,7 +568,7 @@ print("stub: unexpected firebase call " + " ".join(a)); sys.exit(9)
 '''
 
 VENV_STUB = r'''#!/usr/bin/env python3
-import json, os, sys, hashlib
+import json, os, sys, hashlib, zipfile
 ST = os.environ["STUB_STATE"]; state = json.load(open(ST))
 a = sys.argv[1:]
 open(os.environ["STUB_LOG"], "a").write("venv-python " + " ".join(a) + "\n")
@@ -586,9 +604,11 @@ if a[:2] == ["-m", "scripts.publish_apk"]:
     for abi in ("arm64-v8a", "armeabi-v7a"):
         p = os.path.join(d, "app-%s-%s.apk" % (abi, ch))
         if not os.path.isfile(p): print("  x No %s APK at %s" % (abi, p)); sys.exit(1)
-        kv = dict(x.split("=", 1) for x in open(p).read().split() if "=" in x)
+        kv = dict(x.split("=", 1) for x in zipfile.ZipFile(p).read("harness-meta.txt").decode().split() if "=" in x)
         vers.add((int(kv["versionCode"]), kv["versionName"]))
-        print("  %s\n    version    %s (%s)\n    signed as  %s" % (abi, kv["versionName"], kv["versionCode"], kv["signer"]))
+        # its signer comes from apksigner's TEXT: signer=none = it could not read that text (as publish_apk.py prints it)
+        print("  %s\n    version    %s (%s)\n    signed as  %s" % (abi, kv["versionName"], kv["versionCode"], {"none": "unrecognised certificate"}.get(kv["signer"], kv["signer"])))
+        if kv["signer"] not in ("none", ch): print("  x The %s APK is signed as '%s' but you asked to publish to '%s'. Nothing was published." % (abi, kv["signer"], ch)); sys.exit(1)
     (code, name), = vers
     cur = int((state["android"].get(ch) or {}).get("versionCode", 0))
     if code <= cur: print("  x versionCode %d is not greater than the published %d." % (code, cur)); sys.exit(1)
@@ -643,15 +663,20 @@ REAL_DATE = "/bin/date" if os.path.exists("/bin/date") else "/usr/bin/date"
 DATE_STUB = '#!/bin/bash\n# day-of-week is fixed (Wednesday) so 20 never meets its Sunday window in a test\nif [ "$*" = "-u +%%u" ]; then echo 3; exit 0; fi\nexec %s "$@"\n' % REAL_DATE
 SHASUM_STUB = '#!/bin/bash\n# shasum -a 256 [-c file] [files]\nshift 2\nexec sha256sum "$@"\n'
 AAPT_STUB = r'''#!/usr/bin/env python3
-import sys
-kv = dict(x.split("=", 1) for x in open(sys.argv[3]).read().split() if "=" in x)
+import sys, zipfile
+kv = dict(x.split("=", 1) for x in zipfile.ZipFile(sys.argv[3]).read("harness-meta.txt").decode().split() if "=" in x)
 print("package: name='%s' versionCode='%s' versionName='%s' platformBuildVersionName='15'" % (kv["package"], kv["versionCode"], kv["versionName"]))
 if kv.get("debuggable") == "yes": print("application-debuggable")
 '''
 APKSIGNER_STUB = r'''#!/usr/bin/env python3
-import sys
-kv = dict(x.split("=", 1) for x in open(sys.argv[-1]).read().split() if "=" in x)
-print("Signer #1 certificate DN: " + ("CN=Android Debug, O=Android, C=US" if kv.get("signer") == "debug" else "CN=Zipper Release, O=Zipper"))
+# apksigner verify --print-certs <apk>: exit 1 if the APK's harness-meta.txt says apksigner=fail; otherwise exit 0 with
+# text in a format no script parses (under build-tools 37.0.0 no pattern found a signer) — the signer comes from the block.
+import sys, zipfile
+kv = dict(x.split("=", 1) for x in zipfile.ZipFile(sys.argv[-1]).read("harness-meta.txt").decode().split() if "=" in x)
+if kv.get("apksigner") == "fail":
+    print("DOES NOT VERIFY\nERROR: APK Signature Scheme v2 signer 1: APK integrity check failed. CHUNKED_SHA256 digest mismatch.")
+    sys.exit(1)
+print("Verified signers: 1 (harness stub: an output format no script parses)")
 '''
 DEPLOY_CRM = '''#!/bin/bash
 # fake guarded CRM deploy (harness): asks DEPLOY, then hosting only
@@ -761,6 +786,54 @@ RELC = REPO / "release" / REL.name
 STATE, LOG = T / "state.json", T / "calls.log"
 
 
+def mkcert(name, subj):
+    """A self-signed RSA 2048 certificate (DER), made by openssl as a debug keystore holds one; the key stays in T."""
+    der = T / "certs" / (name + ".der")
+    der.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", subj,
+                        "-keyout", str(T / "certs" / (name + ".key")), "-outform", "DER", "-out", str(der)],
+                       capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return der.read_bytes() if der.exists() else b""
+
+
+# "fleet" stands for the key that signed APK 19 (its SHA-256 replaces FLEET_CERT_SHA256 in the copy's rel_common.sh),
+# "other" for another Mac's debug key (the same subject, another key), "release" for a release key.
+CERTS = {"fleet": mkcert("fleet", "/CN=Android Debug/O=Android/C=US"), "other": mkcert("other", "/CN=Android Debug/O=Android/C=US"),
+         "release": mkcert("release", "/CN=Zipper Release/O=Zipper")}
+ok("openssl made the test certificates: fleet, another Mac's debug key (same subject), a release key",
+   all(CERTS.values()) and len(set(CERTS.values())) == 3)
+FLEET_SHA = hashlib.sha256(CERTS["fleet"]).hexdigest()
+
+
+def lp(b):
+    return struct.pack("<I", len(b)) + b
+
+
+def signed_zip(meta, certs):
+    """A synthetic APK: a ZIP whose entry harness-meta.txt carries what the aapt / apksigner / publish_apk stubs read
+    and, unless certs is None, an APK Signing Block between the entries and the central directory (the end record
+    pointing past it) with one APK Signature Scheme v2 signer listing `certs` (DER). Nothing is signed: tools/apk_cert.py
+    only reads the block; the apksigner stub stands in for the verification."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("AndroidManifest.xml", "harness")
+        z.writestr("harness-meta.txt", meta)
+    d = buf.getvalue()
+    if certs is None:
+        return d
+    eocd = len(d) - 22                                                         # no ZIP comment
+    cd = struct.unpack_from("<I", d, eocd + 16)[0]
+    signed_data = lp(b"") + lp(b"".join(lp(c) for c in certs)) + lp(b"")       # digests, certificates, attributes
+    value = lp(lp(lp(signed_data) + lp(b"") + lp(b"")))                        # signers: one (signed data, signatures, key)
+    pair = struct.pack("<QI", 4 + len(value), 0x7109871A) + value
+    size = len(pair) + 24
+    block = struct.pack("<Q", size) + pair + struct.pack("<Q", size) + b"APK Sig Block 42"
+    return d[:cd] + block + d[cd:eocd + 16] + struct.pack("<I", cd + len(block)) + d[eocd + 20:]
+
+
 def put(st):
     STATE.write_text(json.dumps(st))
 
@@ -840,9 +913,10 @@ git("checkout", "-q", "-")
 git("tag", "prod-live-20261030", NOTPROD)
 shutil.copytree(REL, RELC, ignore=shutil.ignore_patterns("production", "RELEASE.txt", "SCRIPTS.sha256", "scripts-mac-*", "__pycache__"))
 rcs_copy = (RELC / "rel_common.sh").read_text(encoding="utf-8")
-ok("the copy's rel_common.sh names 4e21b7f… and f1af30a… (pointed at PROD / NOTPROD of the throwaway repository)",
-   REAL_PROD in rcs_copy and REAL_NOTPROD in rcs_copy)
-(RELC / "rel_common.sh").write_text(rcs_copy.replace(REAL_PROD, PROD).replace(REAL_NOTPROD, NOTPROD), encoding="utf-8")
+ok("the copy's rel_common.sh names 4e21b7f…, f1af30a… and the fleet certificate 4878a35f… (pointed at PROD / NOTPROD of the throwaway repository and the harness's fleet certificate)",
+   REAL_PROD in rcs_copy and REAL_NOTPROD in rcs_copy and REAL_FLEET in rcs_copy)
+(RELC / "rel_common.sh").write_text(rcs_copy.replace(REAL_PROD, PROD).replace(REAL_NOTPROD, NOTPROD).replace(REAL_FLEET, FLEET_SHA),
+                                    encoding="utf-8")
 old = time.time() - 300
 for f in [REPO / "firestore.rules", REPO / "storage.rules", HF / "firestore.rules", HF / "storage.rules"]:
     os.utime(f, (old, old))
@@ -1262,14 +1336,44 @@ ok("21 refuses before APK 20 is published with minSupportedVersionCode 20", rc =
 APKD = REPO / "zipper-app" / "app" / "build" / "outputs" / "apk" / "prod"
 
 
-def apks(code="20", dbg="no", signer="debug"):
+def apks(code="20", dbg="no", signer="debug", certs=("fleet",), apksigner="ok"):
+    """Both prod APKs. `certs`: the test certificates in the signing block (None: no block); `signer`: what publish_apk.py
+    makes of apksigner's text (none = it cannot read it); `apksigner`: ok | fail (the stub's exit 0 | 1)."""
     for abi in ("arm64-v8a", "armeabi-v7a"):
-        w(APKD / ("app-%s-prod.apk" % abi), "FAKEAPK package=com.zipper.app versionCode=%s versionName=1.2.6 debuggable=%s signer=%s abi=%s\n" % (code, dbg, signer, abi))
+        p = APKD / ("app-%s-prod.apk" % abi)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(signed_zip("FAKEAPK package=com.zipper.app versionCode=%s versionName=1.2.6 debuggable=%s signer=%s abi=%s apksigner=%s\n"
+                                 % (code, dbg, signer, abi, apksigner), None if certs is None else [CERTS[c] for c in certs]))
 
 
+apks(signer="release", certs=("release",))
+rc, o = run(C60, "PUBLISH\n")
+ok("60 refuses an APK signed with a release key (CN=Zipper Release), before any production read",
+   rc == 3 and "venv-python" not in calls() and "CN=Zipper Release, not Android Debug" in o, o[-400:])
+apks(certs=("other",))
+rc, o = run(C60, "PUBLISH\n")
+ok("60 refuses an APK signed with another Mac's debug key (CN=Android Debug, another SHA-256), before any production read",
+   rc == 3 and "venv-python" not in calls() and "is not the fleet's %s" % FLEET_SHA in o and "every phone would refuse" in o, o[-400:])
+apks(certs=("fleet", "other"))
+rc, o = run(C60, "PUBLISH\n")
+ok("60 refuses an APK whose signing block holds two certificates", rc == 3 and "venv-python" not in calls()
+   and "2 distinct signing certificates (exactly 1 expected)" in o, o[-400:])
+apks(certs=None)
+rc, o = run(C60, "PUBLISH\n")
+ok("60 refuses an APK without an APK Signing Block (although apksigner exits 0)", rc == 3 and "venv-python" not in calls()
+   and "NO-SIGNING-BLOCK" in o, o[-400:])
+apks(apksigner="fail")
+rc, o = run(C60, "PUBLISH\n")
+ok("60 refuses an APK, signed with the fleet certificate, on which apksigner verify exits non-zero",
+   rc == 3 and "venv-python" not in calls() and "apksigner verify exit 1" in o, o[-400:])
 apks(signer="release")
 rc, o = run(C60, "PUBLISH\n")
-ok("60 refuses an APK not signed with the debug certificate", rc == 3 and "--apply" not in calls(), o[-300:])
+ok("60 refuses when publish_apk.py's dry run reads the fleet-signed APKs as release (a contradiction)",
+   rc == 3 and "--apply" not in calls() and "did not agree" in o, o[-400:])
+apks(signer="none")
+rc, o = run(C60, "NO\n")
+ok("60 does not need publish_apk.py to read apksigner's text ('unrecognised certificate' passes its dry run; NO: exit 4)",
+   rc == 4 and "--apply" not in calls() and "unrecognised certificate/unrecognised certificate (no contradiction)" in o, o[-500:])
 apks(dbg="yes")
 rc, o = run(C60, "PUBLISH\n")
 ok("60 refuses a debuggable APK", rc == 3 and "--apply" not in calls(), o[-300:])
@@ -1286,6 +1390,11 @@ d = st()["android"]["debug"]
 ok("60 publishes APK 20 with minSupportedVersionCode 20 to the debug channel: PASS", rc == 0 and "RESULT: PASS" in o and d["versionCode"] == 20
    and d["minSupportedVersionCode"] == 20 and st()["android"]["release"] == before_doc["release"], o[-900:])
 ok("60 ran publish_apk.py --apply on the staged prod APKs (app-<abi>-debug.apk copies)", re.search(r"-m scripts\.publish_apk --channel debug --apk-dir \S+/apk --min-supported 20 --notes .* --apply", calls()))
+s60 = (ev60 / "SUMMARY.txt").read_text() if ev60 else ""
+ok("60 SUMMARY records each APK's certificate (CN, SHA-256 = FLEET_CERT_SHA256); apksigner's raw output and apk_cert.py's line are kept",
+   s60.count("SIGNER schemes=v2 certificates=1 sha256=%s CN=Android Debug" % FLEET_SHA) == 2 and s60.count("SIGNER-CHECK ok") == 2
+   and all((ev60 / ("apksigner-%s.txt" % a)).is_file() and (ev60 / ("apk-cert-%s.txt" % a)).is_file() for a in ("arm64-v8a", "armeabi-v7a")),
+   s60[-1500:])
 sv = ev60 / "android-update-before.json"
 ok("60 saved the previous androidUpdate document (mode 600) for 61", sv.exists() and json.loads(sv.read_text()) == before_doc and (sv.stat().st_mode & 0o777) == 0o600)
 rc, o = run(C60, "PUBLISH\n")
@@ -1505,6 +1614,23 @@ ok("fn-classify refuses a name listed in two waves (DUPLICATE)", "DUPLICATE b in
 p = subprocess.run([sys.executable, "-I", str(RELC / "rel_helpers.py"), "fn-classify", str(U / "exports.txt"), "a b", "", "c", "asia-south1", "us-central1", "c"],
                    capture_output=True, text=True)
 ok("fn-classify accepts an exact split in the right regions", p.stdout.strip().endswith("CLASSIFY ok"), p.stdout + p.stderr)
+
+# ── unit: tools/apk_cert.py — the certificate(s) of the APK Signing Block ──
+for name, certs in (("one", ["fleet"]), ("two", ["fleet", "release"]), ("none", None)):
+    (U / ("%s.apk" % name)).write_bytes(signed_zip("FAKEAPK\n", None if certs is None else [CERTS[c] for c in certs]))
+(U / "notzip.apk").write_bytes(b"not a ZIP file " * 8)
+AC = [sys.executable, "-I", str(RELC / "tools" / "apk_cert.py")]
+p = subprocess.run(AC + [str(U / "one.apk")], capture_output=True, text=True)
+ok("apk_cert.py: one v2 signer -> 'APK one.apk SCHEMES v2 CERTS 1 SHA256 <sha256 of its DER> CN Android Debug', exit 0",
+   p.returncode == 0 and p.stdout == "APK one.apk SCHEMES v2 CERTS 1 SHA256 %s CN Android Debug\n" % FLEET_SHA, p.stdout + p.stderr)
+p = subprocess.run(AC + [str(U / "two.apk")], capture_output=True, text=True)
+ok("apk_cert.py: two certificates -> CERTS 2 with both SHA-256s and both CNs", p.returncode == 0
+   and "CERTS 2 SHA256 %s,%s CN Android Debug | Zipper Release\n" % (FLEET_SHA, hashlib.sha256(CERTS["release"]).hexdigest()) in p.stdout,
+   p.stdout + p.stderr)
+p = subprocess.run(AC + [str(U / "one.apk"), str(U / "none.apk"), str(U / "notzip.apk")], capture_output=True, text=True)
+ok("apk_cert.py: no signing block -> NO-SIGNING-BLOCK, not a ZIP -> UNREADABLE, exit 2 (one line per APK)",
+   p.returncode == 2 and len(p.stdout.splitlines()) == 3 and "APK one.apk SCHEMES v2 CERTS 1 " in p.stdout
+   and "APK none.apk NO-SIGNING-BLOCK" in p.stdout and "APK notzip.apk UNREADABLE" in p.stdout, p.stdout + p.stderr)
 
 if LOG.exists():
     ALL_CALLS.append(LOG.read_text())

@@ -8,7 +8,7 @@ set -u
 umask 077
 HERE="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$HERE" || exit 2
-LIST="rel_common.sh rel_deploy_lib.sh rel_helpers.py rel_rules_lib.sh make-release-txt.sh tools/android_update_doc.py tools/live_rules.py $(ls [0-9][0-9]-*.command | LC_ALL=C sort | tr '\n' ' ')"
+LIST="rel_common.sh rel_deploy_lib.sh rel_helpers.py rel_rules_lib.sh make-release-txt.sh tools/android_update_doc.py tools/live_rules.py tools/apk_cert.py $(ls [0-9][0-9]-*.command | LC_ALL=C sort | tr '\n' ' ')"
 for f in $LIST; do [ -f "$f" ] || { echo "missing: $f" >&2; exit 2; }; done
 if command -v shasum >/dev/null 2>&1; then shasum -a 256 $LIST > SCRIPTS.sha256.new; else sha256sum $LIST > SCRIPTS.sha256.new; fi || exit 2
 [ -f SCRIPTS.sha256 ] && { diff SCRIPTS.sha256 SCRIPTS.sha256.new > /dev/null && echo "unchanged" || diff SCRIPTS.sha256 SCRIPTS.sha256.new | sed 's/^/   /'; }

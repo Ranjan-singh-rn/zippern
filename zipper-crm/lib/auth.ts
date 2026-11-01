@@ -588,7 +588,7 @@ export type GoogleSignInOutcome =
  * Without the delete, every refused Google attempt leaves a real Firebase
  * user behind — an address with no CRM document but a live credential. For
  * the observer that would be worse than untidy: the whole design is that
- * `314zipper@gmail.com` has NO Firebase account, and one popup would have
+ * the Observer's address has NO Firebase account, and one popup would have
  * created it.
  */
 async function discardGoogleAccount(user: User, wasCreatedNow: boolean): Promise<void> {

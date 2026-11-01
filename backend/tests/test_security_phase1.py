@@ -185,7 +185,20 @@ for helper in ("isStaff", "isAdmin", "isOps", "isFinance", "isTech"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 app_config = strip_comments(block("appConfig"))
-cfg_write = app_config.split("allow write:")[1].split(";")[0]
+if "allow write:" in app_config:
+    cfg_write = app_config.split("allow write:")[1].split(";")[0]
+else:
+    # RC2 D15 (lucky-gift switch): the write rule is split into create / update /
+    # delete arms over ONE helper, appConfigWriter(), so that only the Owner may
+    # change appConfig/luckyGifts.enabled. Check the helper AND that every write
+    # arm goes through it — a stricter check than the single-line form had.
+    helper = app_config[app_config.index("function appConfigWriter()"):]
+    helper = helper[: helper.index("}") + 1]
+    arms = [app_config.split(f"allow {verb}:")[1].split(";")[0] for verb in ("create", "update", "delete")]
+    ok("every appConfig write arm goes through appConfigWriter()",
+       all("appConfigWriter()" in arm for arm in arms))
+    ok("androidUpdate is never client-writable (A-5)", "docId != 'androidUpdate'" in helper)
+    cfg_write = helper + "\n" + "\n".join(arms)
 ok("the company bank account is still superadmin only",
    "docId == 'paymentCredentials' && isSuperAdmin()" in cfg_write)
 ok("and the economy config is Tech or the owner, not every admin",

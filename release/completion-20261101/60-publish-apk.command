@@ -12,9 +12,11 @@
 # folder (the build output is never renamed or modified).
 # Refuses if: the tree is dirty or not at RELEASE.txt's HEAD; build.gradle.kts at HEAD does not say versionCode 20 /
 # versionName 1.2.6; an APK is missing, older than the HEAD commit, not package com.zipper.app, not versionCode 20,
-# debuggable, or not signed with the debug certificate (CN=Android Debug); the published debug record is already
-# >= 20; the dry run of publish_apk.py does not agree. The previous androidUpdate document is SAVED first
-# (android-update-before.json + .sha256) — 61-withdraw-apk.command restores it.
+# debuggable, or not signed with the FLEET's certificate: `apksigner verify` must exit 0 (signature validity; its output
+# is kept as apksigner-<abi>.txt, never parsed) and the APK Signing Block (tools/apk_cert.py) must hold exactly one
+# certificate, CN=Android Debug, SHA-256 = FLEET_CERT_SHA256 (rel_common.sh: the key that signed APK 19); the published
+# debug record is already >= 20; the dry run of publish_apk.py does not agree. The previous androidUpdate document is
+# SAVED first (android-update-before.json + .sha256) — 61-withdraw-apk.command restores it.
 # Results: ./production/60-publish-apk-<UTC>/
 set -u
 umask 077
@@ -46,23 +48,28 @@ say "   build-tools: $BT"
 APKDIR="$REPO/zipper-app/app/build/outputs/apk/prod"
 STAGE="$OUT/apk"; mkdir -p "$STAGE" || exit 2
 HEAD_CT="$(git -C "$REPO" log -1 --format=%ct HEAD)"
+printf '%s' "${FLEET_CERT_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$' || stop "FLEET_CERT_SHA256 in rel_common.sh is not a SHA-256"
 for abi in arm64-v8a armeabi-v7a; do
   f="$APKDIR/app-$abi-prod.apk"
   [ -f "$f" ] || stop "$f not found — build it first: cd zipper-app && ./gradlew :app:assembleProd"
   [ "$($H mtime-after "$f" "$HEAD_CT")" = yes ] || stop "$(basename "$f") is older than the HEAD commit — rebuild it from the release HEAD"
   "$AAPT" dump badging "$f" > "$OUT/badging-$abi.txt" 2>>"$ERR"
+  [ -s "$OUT/badging-$abi.txt" ] || stop "aapt printed nothing for $abi (stderr.log)"
   $H apk-badging "$OUT/badging-$abi.txt" "$APK_VERSION_CODE" "$APK_VERSION_NAME" > "$OUT/apk-check-$abi.txt"
-  "$SIGNER" verify --print-certs "$f" > "$OUT/signer-$abi.txt" 2>>"$ERR"
-  [ -s "$OUT/badging-$abi.txt" ] && [ -s "$OUT/signer-$abi.txt" ] || stop "aapt or apksigner printed nothing for $abi (stderr.log; apksigner needs Java on PATH)"
-  $H apk-signer "$OUT/signer-$abi.txt" >> "$OUT/apk-check-$abi.txt"
+  # Signature validity = apksigner's exit code; its output (public certificate data) is kept as evidence, never parsed.
+  "$SIGNER" verify --print-certs "$f" > "$OUT/apksigner-$abi.txt" 2>&1
+  SRC=$?
+  # The signer = the certificate(s) in the APK Signing Block itself.
+  python3 -I "$HERE/tools/apk_cert.py" "$f" > "$OUT/apk-cert-$abi.txt" 2>>"$ERR"
+  $H apk-cert-check "$OUT/apk-cert-$abi.txt" "$SRC" "$FLEET_CERT_SHA256" >> "$OUT/apk-check-$abi.txt"
   SHA="$(shasum -a 256 "$f" | cut -c1-64)"
   echo "SHA256 $SHA" >> "$OUT/apk-check-$abi.txt"
   sed "s/^/   $abi: /" "$OUT/apk-check-$abi.txt" | tee -a "$OUT/SUMMARY.txt"
   grep -q '^APK-CHECK ok$' "$OUT/apk-check-$abi.txt" || stop "$abi APK is not com.zipper.app $APK_VERSION_CODE/$APK_VERSION_NAME non-debuggable"
-  grep -q '^SIGNER debug$' "$OUT/apk-check-$abi.txt" || stop "$abi APK is not signed with the debug certificate (CN=Android Debug) — the fleet would refuse it"
+  grep -q '^SIGNER-CHECK ok$' "$OUT/apk-check-$abi.txt" || stop "$abi APK is not signed with the fleet's certificate (CN=Android Debug, SHA-256 $FLEET_CERT_SHA256, the key that signed APK 19) — every phone would refuse it as an update: $(sed -n 's/^SIGNER-CHECK FAIL: //p' "$OUT/apk-check-$abi.txt")"
   cp "$f" "$STAGE/app-$abi-debug.apk" || stop "could not stage $abi"
   [ "$(shasum -a 256 "$STAGE/app-$abi-debug.apk" | cut -c1-64)" = "$SHA" ] || stop "staged copy differs"
-  check ok "$abi: com.zipper.app $APK_VERSION_CODE ($APK_VERSION_NAME), not debuggable, debug signer, built after HEAD"
+  check ok "$abi: com.zipper.app $APK_VERSION_CODE ($APK_VERSION_NAME), not debuggable, signed by the fleet certificate (CN=Android Debug, SHA-256 $(printf '%.16s' "$FLEET_CERT_SHA256")… = FLEET_CERT_SHA256), built after HEAD"
 done
 
 venv_env
@@ -75,8 +82,12 @@ NOWCODE="$(sed -n "s/^ANDROID $APK_CHANNEL versionCode=\([0-9]*\) .*/\1/p" "$OUT
 check ok "previous record saved (android-update-before.json — 61 restores it)"
 
 ( cd "$REPO/backend" && $VENV_ENV "$VENV_PY" -m scripts.publish_apk --channel "$APK_CHANNEL" --apk-dir "$STAGE" --min-supported "$APK_MIN_SUPPORTED" --notes "$APK_NOTES" ) > "$OUT/publish-dry-run.txt" 2>&1  #RO
-grep -q 'DRY RUN' "$OUT/publish-dry-run.txt" && grep -q "publishing .*$APK_VERSION_NAME ($APK_VERSION_CODE)" "$OUT/publish-dry-run.txt" && [ "$(grep -c 'signed as  debug' "$OUT/publish-dry-run.txt")" = 2 ] \
-  && check ok "publish_apk.py dry run: $APK_VERSION_NAME ($APK_VERSION_CODE), both ABIs signed as debug" || { tail -15 "$OUT/publish-dry-run.txt" | sed 's/^/   | /' | tee -a "$OUT/SUMMARY.txt"; stop "the publish_apk.py dry run did not agree (publish-dry-run.txt)"; }
+# publish_apk.py names the signer from apksigner's TEXT (debug if it contains CN=Android Debug); the signer was decided
+# above from the APK Signing Block, so its reading must only not contradict it: debug, or "unrecognised certificate"
+# when it cannot read that text. A "release" reading stops publish_apk.py itself before its "publishing" line.
+DRY_AS="$(sed -n 's/^[[:space:]]*signed as  //p' "$OUT/publish-dry-run.txt" | tr '\n' '/' | sed 's#/$##')"
+grep -q 'DRY RUN' "$OUT/publish-dry-run.txt" && grep -q "publishing .*$APK_VERSION_NAME ($APK_VERSION_CODE)" "$OUT/publish-dry-run.txt" && [ "$(grep -cE 'signed as  (debug|unrecognised certificate)$' "$OUT/publish-dry-run.txt")" = 2 ] \
+  && check ok "publish_apk.py dry run: $APK_VERSION_NAME ($APK_VERSION_CODE), both ABIs; its own reading of apksigner's text: ${DRY_AS:-?} (no contradiction)" || { tail -15 "$OUT/publish-dry-run.txt" | sed 's/^/   | /' | tee -a "$OUT/SUMMARY.txt"; stop "the publish_apk.py dry run did not agree (publish-dry-run.txt)"; }
 
 confirm PUBLISH "upload APK $APK_VERSION_CODE ($APK_VERSION_NAME, 2 ABIs) to gs://$BUCKET/appBuilds/$APK_CHANNEL/ and set appConfig/androidUpdate.$APK_CHANNEL = versionCode $APK_VERSION_CODE, minSupportedVersionCode $APK_MIN_SUPPORTED (APK 19 sessions are then refused at sign-in)"
 ( cd "$REPO/backend" && $VENV_ENV "$VENV_PY" -m scripts.publish_apk --channel "$APK_CHANNEL" --apk-dir "$STAGE" --min-supported "$APK_MIN_SUPPORTED" --notes "$APK_NOTES" --apply ) > "$OUT/publish-output.txt" 2>&1  #MUT-PUBLISH-APK

@@ -56,7 +56,7 @@ is slower because caches are cold. **Total: about 45–90 minutes.**
 | 5c | rules, p1mfa | `tests/run-p1mfa-verify.command`: 11 suites against the working-tree rules | 5–10 min |
 | 5d | rules, phase1a | `tests/run-phase1a-validation.sh` with only its emulator steps (its Android steps are covered by 6a) | 2–4 min |
 | 6a | Android | `./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleProd`, plus `--continue` (a test failure does not block the APKs) and the no-upload init script. JAVA_HOME: yours if set, else the Android Studio JBR, else `/usr/libexec/java_home`. | 10–30 min |
-| 6b | prod APKs | For each current APK in `app/build/outputs/apk/prod/`: `apksigner verify --print-certs` (only the certificate CN and SHA-256 are kept) and `aapt dump badging` | <1 min |
+| 6b | prod APKs | For each current APK in `app/build/outputs/apk/prod/`: `apksigner verify --print-certs` (its exit code is the signature check; its raw output is kept, never parsed), `tools/apk_cert.py` (the signing certificate, read from the APK Signing Block) and `aapt dump badging` | <1 min |
 
 ## Reading SUMMARY.txt
 
@@ -107,15 +107,21 @@ What the COUNTS column is parsed from:
   - the debug and prod APK counts;
   - how many Crashlytics upload tasks were reported SKIPPED.
 - **6b**: per APK, all of these must hold:
-  - apksigner exits 0;
-  - signer CN is **Android Debug** (prod is signed with the fleet's debug key on purpose; see
+  - `apksigner verify` exits 0 (the signature is valid). Its text is not parsed: with build-tools 37.0.0 the old
+    patterns found no signer in it. The raw output is kept as `android-prod-apksigner-<abi>.txt`; it holds public
+    certificate data only;
+  - the APK Signing Block, read by `tools/apk_cert.py`, holds exactly **one** certificate;
+  - its CN is **Android Debug** (prod is signed with the fleet's debug key on purpose; see
     `zipper-app/app/build.gradle.kts`, A-4);
+  - its SHA-256 equals `FLEET_CERT_SHA256` in `rel_common.sh` (`4878a35f…`), the key that signed APK 19. The
+    launcher reads that line with `sed`; it is the single place the fingerprint is written. Another Mac's
+    debug key is also "CN=Android Debug", so only the fingerprint tells the keys apart;
   - package is `com.zipper.app`;
   - versionCode is 20;
   - `application-debuggable` is absent.
 
-  It also records the certificate SHA-256. Compare it with the fleet's known debug-key fingerprint. The full
-  badging output is in `android-prod-badging-*.txt`.
+  The log shows the schemes, certificate count, CN and SHA-256 for each APK. The full badging output is in
+  `android-prod-badging-*.txt`.
 
 ## Production safety
 
@@ -179,5 +185,6 @@ What the COUNTS column is parsed from:
 | 5x REFUSED (runner preflight) | The runner is missing something (Java 21, a cached emulator JAR, `tests/node_modules`). Its log says what to install. |
 | Note "ports already in use" | Stop the other emulator or server, then re-run with `ONLY=rules`. |
 | 3a FAIL, "not 3.12" | Move `backend/.venv` aside. The next run recreates it from `requirements.lock`. |
-| 6b FAIL, CN is not "Android Debug" | This Mac's `~/.android/debug.keystore` is not the fleet's key. Do not publish that APK. |
+| 6b FAIL, "NOT the fleet's" certificate SHA-256 (or CN is not "Android Debug") | The APK was signed with another key, for example this Mac's own `~/.android/debug.keystore`. Every phone would refuse it as an update. Do not publish it; build with the key that signed APK 19. |
+| 6b FAIL, apksigner exit is not 0 | The signature does not verify, or apksigner could not run (it needs Java). Read `android-prod-apksigner-<abi>.txt`. |
 | Re-run one part | For example `ONLY="android" bash …/LOCAL-VERIFY-mac.command` |
