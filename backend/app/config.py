@@ -210,6 +210,31 @@ class Settings(BaseSettings):
     # always the attached CSV — the body is a preview, never a second version.
     email_report_preview_rows: int = 12
 
+    # ── Provider, retries and the SendGrid names ────────────────────────────
+    #
+    # EMAIL_PROVIDER names the one provider mail goes through. Anything other
+    # than "sendgrid" — a deliberate "disabled" included — sends nothing and
+    # records the delivery as not_configured, exactly like a missing key.
+    email_provider: str = "sendgrid"
+    #: One send asks SendGrid at most this many times (capped at 5), and asks
+    #: again only after an attempt SendGrid provably did not take — see
+    #: `email._attempt_class`. Bulk mail always makes exactly one attempt.
+    email_max_attempts: int = 3
+    #: The first wait between attempts; the second is twice this, plus jitter.
+    email_retry_base_delay_seconds: float = 1.0
+    #: The whole send — every attempt and wait. No attempt starts with less
+    #: than 5 s of it left.
+    email_send_budget_seconds: int = 30
+    #: The names the SendGrid configuration uses. When set, each replaces its
+    #: older counterpart — SENDGRID_FROM_EMAIL → MAIL_FROM, SENDGRID_FROM_NAME →
+    #: MAIL_FROM_NAME, SENDGRID_REPLY_TO → MAIL_FROM_SUPPORT — once, in
+    #: `get_settings()` (see `apply_sendgrid_names`), so every use of the sender
+    #: (alignment, unsubscribe mailbox, hints) sees one value. Empty leaves the
+    #: older names in charge.
+    sendgrid_from_email: str = ""
+    sendgrid_from_name: str = ""
+    sendgrid_reply_to: str = ""
+
     # ── Composed broadcasts — a person writing to a whole audience (8A.7.2) ──
     #
     # Every other email this system sends is generated from a record: a payout
@@ -702,9 +727,30 @@ def assert_secure_configuration(s: "Settings | None" = None) -> None:
         )
 
 
+def apply_sendgrid_names(s: "Settings") -> "Settings":
+    """SENDGRID_FROM_EMAIL / SENDGRID_FROM_NAME / SENDGRID_REPLY_TO, when set,
+    replace MAIL_FROM / MAIL_FROM_NAME / MAIL_FROM_SUPPORT.
+
+    Applied once, to the settings object the process uses, so the sender has a
+    single value everywhere it is read. A plain function rather than a pydantic
+    validator: it behaves the same on the real settings class and on the
+    stand-ins the tests use.
+    """
+    for new, old in (
+        ("sendgrid_from_email", "mail_from"),
+        ("sendgrid_from_name", "mail_from_name"),
+        ("sendgrid_reply_to", "mail_from_support"),
+    ):
+        value = str(getattr(s, new, "") or "").strip()
+        if value:
+            setattr(s, old, value)
+    return s
+
+
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
+    apply_sendgrid_names(s)
     # Outside production no email leaves this process, whatever the env file
     # holds: the key is dropped here and every delivery records not_configured.
     isolation.disable_outbound_email_outside_production(s)

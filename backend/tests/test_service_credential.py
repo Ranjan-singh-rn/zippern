@@ -1707,7 +1707,10 @@ if functions_index.exists():
     index_text = functions_index.read_text()
     ok(
         "the Cloud Function declares the secret it needs",
-        "secrets: [ACCRUAL_KEY_ENV]" in index_text
+        # Since the SendGrid change the weekly job also declares its mail
+        # key; the accrual key must still be the first (and only service)
+        # secret on that function.
+        re.search(r"secrets: \[ACCRUAL_KEY_ENV(, SENDGRID_KEY_ENV)?\]", index_text) is not None
         and "const ACCRUAL_KEY_ENV = 'ZIPPER_ACCRUAL_KEY'" in index_text,
     )
     ok(
@@ -1730,7 +1733,8 @@ if functions_index.exists():
     ok(
         "…and it is a different variable from the accrual one",
         "ZIPPER_REPORTING_KEY" != "ZIPPER_ACCRUAL_KEY"
-        and index_text.count("secrets: [ACCRUAL_KEY_ENV]") == 1,
+        and len(re.findall(r"secrets: \[ACCRUAL_KEY_ENV(?:, SENDGRID_KEY_ENV)?\]", index_text)) == 1
+        and "secrets: [ACCRUAL_KEY_ENV, ZIPPER_REPORTING_KEY" not in index_text,
     )
     # The onboarding triggers are the same pattern again with the third
     # credential, and the same separation applies: no function may hold two.

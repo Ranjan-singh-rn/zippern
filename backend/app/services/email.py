@@ -62,7 +62,10 @@ import base64
 import html as _html
 import json
 import logging
+import random
 import re
+import time
+import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +78,13 @@ from app.core.roles import Role
 from app.services.commission import rupee_text
 
 log = logging.getLogger(__name__)
+
+# The SendGrid SDK's HTTP layer (python-http-client) logs every request at DEBUG:
+# the whole body — a sign-in code, a set-password link — and the headers, which
+# carry `Authorization: Bearer <key>`. Production runs at INFO, so none of that is
+# written today; pinning the library at WARNING keeps it that way even if the
+# root level is ever lowered.
+logging.getLogger("python_http_client").setLevel(logging.WARNING)
 
 PROVIDER = "sendgrid"
 
@@ -1080,6 +1090,16 @@ def _domain_of(address: str) -> str:
     return str(address or "").rpartition("@")[2].strip().lower()
 
 
+def _masked(address: str) -> str:
+    """What a log line may say about a recipient: `***@domain`, never the address.
+
+    The delivery row keeps the full address — that is the record. A log line is
+    copied into places nobody audits, so it carries only enough to tell one
+    mail system from another.
+    """
+    return f"***@{_domain_of(address) or '?'}"
+
+
 def sender_for(identity: SenderIdentity | str) -> tuple[str, str, str]:
     """`(from_email, from_name, reply_to)` for one stream.
 
@@ -1405,6 +1425,18 @@ class ProviderResult:
     #: The `field` values SendGrid named, e.g. `["attachments.0.type"]`.
     fields: list[str] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
+    #: How many times SendGrid was asked. More than one only after an attempt
+    #: that provably never reached it or that it refused unprocessed — never
+    #: after one it may have accepted (see `_attempt_class`).
+    attempts: int = 1
+    #: The last attempt may have been accepted: a timeout or a dropped
+    #: connection after the request was written, or a 500/502/504. Recorded as a
+    #: failure and deliberately NOT sent again, so a slow success cannot become
+    #: a second email.
+    outcome_unknown: bool = False
+    #: One entry per attempt — status, exception class, classification. No
+    #: body, no address, no key.
+    attempt_log: list[dict] = field(default_factory=list)
 
 
 #: Response headers worth keeping. An allowlist rather than "everything minus a
@@ -1558,76 +1590,107 @@ def _from_exception(exc: Exception) -> ProviderResult:
     )
 
 
-def _send_via_provider(
-    *, to_email: str, to_name: str, subject: str, html: str,
-    attachments: Sequence[Attachment],
-    text: str = "",
-    identity: SenderIdentity | str = SenderIdentity.TRANSACTIONAL,
-    headers: Mapping[str, str] | None = None,
-) -> ProviderResult:
-    """One blocking call to SendGrid. Every failure path returns, none raise.
+# ── Retries: only when SendGrid provably did not take the message ─────────────
+#
+# A timeout can arrive AFTER SendGrid accepted a message: the request was
+# written, SendGrid queued it, and the answer was lost on the way back. Sending
+# it again would deliver the same email twice. So an attempt is repeated only
+# when it provably never reached SendGrid, or SendGrid refused it unprocessed:
+#
+#   retryable  urllib's `URLError` — raised only while connecting or writing
+#              the request; python-http-client lets it through unchanged — and
+#              HTTP 429 / 503 (refused; nothing was accepted).
+#   unknown    a timeout, a reset or a broken answer while waiting for the
+#              reply (TimeoutError, ConnectionError, http.client.HTTPException),
+#              HTTP 500 / 502 / 504, and anything unrecognised. Never repeated;
+#              recorded as a failure that may nevertheless have been delivered.
+#   permanent  every other 4xx — the request itself is wrong; repeating it
+#              cannot help.
 
-    What leaves here that did not before: a plain-text alternative alongside the
-    HTML, the bulk headers when the caller supplied any, a From chosen by
-    stream, and — on failure — the provider's own explanation rather than the
-    SDK's constant summary of it.
-    """
-    # Imported here, not at module scope: this module must be importable — and
-    # its templates renderable and previewable — on a machine that has no
-    # provider SDK installed.
-    try:
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import (
-            Attachment as SgAttachment,
-            Content,
-            Disposition,
-            Email,
-            FileContent,
-            FileName,
-            FileType,
-            Header,
-            Mail,
-            To,
-        )
-    except ImportError as exc:
-        return ProviderResult(False, error=f"SendGrid SDK not installed: {exc}")
+#: SendGrid refused these unprocessed; asking again cannot produce a second email.
+_RETRYABLE_STATUSES = frozenset({429, 503})
+#: Answers that do not say whether the message was taken — a server or gateway
+#: error can come back after SendGrid accepted it.
+_UNKNOWN_STATUSES = frozenset({500, 502, 504})
+#: No attempt starts with less than this left of the send budget.
+_MIN_ATTEMPT_SECONDS = 5.0
+#: However EMAIL_MAX_ATTEMPTS is set, one send never asks more often than this.
+_MAX_ATTEMPTS_CEILING = 5
 
-    from_email, from_name, reply_to = sender_for(identity)
+#: Tests only: point the real SDK at a local server. Always None in production.
+_PROVIDER_HOST: str | None = None
+#: Injectable so that a retry test does not wait in real time.
+_sleep = time.sleep
+_jitter = random.random
+_clock = time.monotonic
 
-    message = Mail(
-        from_email=Email(from_email, from_name),
-        to_emails=To(to_email, to_name or None),
-        subject=subject,
-        # text/plain first, which is both what the API requires and what stops a
-        # message being HTML-only — one of the strongest spam signals there is.
-        plain_text_content=text or text_alternative(html),
-        html_content=Content("text/html", html),
-    )
-    if reply_to:
-        message.reply_to = Email(reply_to)
 
-    for name, value in (headers or {}).items():
-        message.add_header(Header(str(name), str(value)))
+def _status_class(status: int | None) -> str:
+    if status is None:
+        return "unknown"
+    if 200 <= status < 300:
+        return "accepted"
+    if status in _RETRYABLE_STATUSES:
+        return "retryable"
+    if status in _UNKNOWN_STATUSES or status >= 500:
+        return "unknown"
+    if 400 <= status < 500:
+        return "permanent"
+    return "unknown"
 
-    for attachment in attachments:
-        message.add_attachment(
-            SgAttachment(
-                FileContent(base64.b64encode(attachment.data).decode("ascii")),
-                FileName(attachment.safe_filename()),
-                # Bare MIME type. A parameter here is a 400 for the whole
-                # message — see `Attachment.provider_type()`.
-                FileType(attachment.provider_type()),
-                Disposition("attachment"),
-            )
-        )
 
-    try:
-        client = SendGridAPIClient(settings.sendgrid_api_key)
-        client.client.timeout = int(settings.email_timeout_seconds)
-        response = client.send(message)
-    except Exception as exc:  # noqa: BLE001 — a transport failure is an outcome
-        return _from_exception(exc)
+def _attempt_class(status: int | None, exc: BaseException | None) -> str:
+    """`accepted`, `retryable`, `unknown` or `permanent` — for one attempt."""
+    if exc is None:
+        return _status_class(status)
+    # urllib raises URLError only from the request phase of
+    # `AbstractHTTPHandler.do_open` (connect, TLS, write). HTTPError is a
+    # URLError subclass that carries a real answer, so it goes by its status.
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return "retryable"
+    if status is not None:
+        return _status_class(status)
+    # TimeoutError, ConnectionError, http.client.HTTPException (RemoteDisconnected,
+    # IncompleteRead, BadStatusLine) and anything unrecognised: raised while
+    # waiting for the answer, so the request may have been taken.
+    return "unknown"
 
+
+def _retry_after_seconds(source: Any) -> float | None:
+    """The wait a refusal asked for: `Retry-After` (seconds) or `X-RateLimit-Reset` (epoch)."""
+    raw = getattr(source, "headers", None) if source is not None else None
+    if raw is None:
+        return None
+
+    def header(name: str) -> Any:
+        try:
+            value = raw.get(name)
+        except AttributeError:
+            return None
+        if value is None and isinstance(raw, Mapping):
+            for key, candidate in raw.items():
+                if str(key).lower() == name.lower():
+                    return candidate
+        return value
+
+    after = header("Retry-After")
+    if after is not None:
+        try:
+            return max(0.0, float(str(after).strip()))
+        except ValueError:
+            return None
+    reset = header("X-RateLimit-Reset")
+    if reset is not None:
+        try:
+            return max(0.0, float(str(reset).strip()) - time.time())
+        except ValueError:
+            return None
+    return None
+
+
+def _result_from_response(response: Any) -> ProviderResult:
+    """What one answer from the SDK means. A non-2xx is reached here only by a
+    client that does not raise on one — a stub, or a future SDK."""
     status = int(getattr(response, "status_code", 0) or 0)
     raw_headers = getattr(response, "headers", None)
     kept = _headers_dict(raw_headers)
@@ -1668,9 +1731,214 @@ def _send_via_provider(
     )
 
 
+def _send_via_provider(
+    *, to_email: str, to_name: str, subject: str, html: str,
+    attachments: Sequence[Attachment],
+    text: str = "",
+    identity: SenderIdentity | str = SenderIdentity.TRANSACTIONAL,
+    headers: Mapping[str, str] | None = None,
+    track: bool = True,
+    retry: bool = False,
+) -> ProviderResult:
+    """One send to SendGrid. Every failure path returns, none raise.
+
+    What leaves here that did not before: a plain-text alternative alongside the
+    HTML, the bulk headers when the caller supplied any, a From chosen by
+    stream, and — on failure — the provider's own explanation rather than the
+    SDK's constant summary of it.
+
+    `retry=True` allows up to EMAIL_MAX_ATTEMPTS attempts inside
+    EMAIL_SEND_BUDGET_SECONDS, but only after an attempt SendGrid provably did
+    not take (see `_attempt_class`). An attempt that may have been accepted is
+    never repeated; the result says `outcome_unknown` instead. With the default
+    `retry=False` there is exactly one attempt, as before.
+
+    `track=False` turns click, open, subscription and Google Analytics tracking
+    off for this message, whatever the account default is. It is used for codes,
+    set-password links and account-access mail (`_is_auth_mail`).
+    """
+    # Imported here, not at module scope: this module must be importable — and
+    # its templates renderable and previewable — on a machine that has no
+    # provider SDK installed.
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import (
+            Attachment as SgAttachment,
+            ClickTracking,
+            Content,
+            Disposition,
+            Email,
+            FileContent,
+            FileName,
+            FileType,
+            Ganalytics,
+            Header,
+            Mail,
+            OpenTracking,
+            SubscriptionTracking,
+            To,
+            TrackingSettings,
+        )
+    except ImportError as exc:
+        return ProviderResult(False, error=f"SendGrid SDK not installed: {exc}")
+
+    from_email, from_name, reply_to = sender_for(identity)
+
+    message = Mail(
+        from_email=Email(from_email, from_name),
+        to_emails=To(to_email, to_name or None),
+        subject=subject,
+        # text/plain first, which is both what the API requires and what stops a
+        # message being HTML-only — one of the strongest spam signals there is.
+        plain_text_content=text or text_alternative(html),
+        html_content=Content("text/html", html),
+    )
+    if reply_to:
+        message.reply_to = Email(reply_to)
+
+    for name, value in (headers or {}).items():
+        message.add_header(Header(str(name), str(value)))
+
+    for attachment in attachments:
+        message.add_attachment(
+            SgAttachment(
+                FileContent(base64.b64encode(attachment.data).decode("ascii")),
+                FileName(attachment.safe_filename()),
+                # Bare MIME type. A parameter here is a 400 for the whole
+                # message — see `Attachment.provider_type()`.
+                FileType(attachment.provider_type()),
+                Disposition("attachment"),
+            )
+        )
+
+    if not track:
+        tracking = TrackingSettings()
+        tracking.click_tracking = ClickTracking(False, False)
+        tracking.open_tracking = OpenTracking(False)
+        tracking.subscription_tracking = SubscriptionTracking(False)
+        tracking.ganalytics = Ganalytics(False)
+        message.tracking_settings = tracking
+
+    max_attempts = (
+        max(1, min(int(getattr(settings, "email_max_attempts", 3)), _MAX_ATTEMPTS_CEILING))
+        if retry
+        else 1
+    )
+    budget = float(getattr(settings, "email_send_budget_seconds", 30))
+    base_delay = max(0.0, float(getattr(settings, "email_retry_base_delay_seconds", 1.0)))
+    # Only a test ever sets a host; production always talks to the SDK default.
+    host = {"host": _PROVIDER_HOST} if _PROVIDER_HOST else {}
+    started = _clock()
+    attempt_log: list[dict] = []
+    result = ProviderResult(False, error="SendGrid was not called.")
+    note = ""
+
+    for attempt in range(1, max_attempts + 1):
+        remaining = budget - (_clock() - started)
+        timeout = max(1.0, min(float(settings.email_timeout_seconds), remaining))
+        failure: BaseException | None = None
+        response: Any = None
+        try:
+            client = SendGridAPIClient(settings.sendgrid_api_key, **host)
+            client.client.timeout = timeout
+            response = client.send(message)
+        except Exception as exc:  # noqa: BLE001 — a transport failure is an outcome
+            failure = exc
+            result = _from_exception(exc)
+        else:
+            result = _result_from_response(response)
+
+        verdict = _attempt_class(result.status, failure)
+        attempt_log.append(
+            {
+                "attempt": attempt,
+                "status": result.status,
+                "error": type(failure).__name__ if failure is not None else None,
+                "class": verdict,
+            }
+        )
+        if verdict != "retryable":
+            break
+        if attempt >= max_attempts:
+            if max_attempts > 1:
+                note = (
+                    f" | Gave up after {attempt} attempts; SendGrid did not take "
+                    "the message on any of them."
+                )
+            break
+        delay = base_delay * (2 ** (attempt - 1)) * (1.0 + 0.25 * _jitter())
+        asked = _retry_after_seconds(failure if failure is not None else response)
+        if asked is not None:
+            delay = max(delay, asked)
+        if (_clock() - started) + delay + _MIN_ATTEMPT_SECONDS > budget:
+            note = (
+                f" | Not retried: waiting {delay:.0f} s would leave less than "
+                f"{_MIN_ATTEMPT_SECONDS:.0f} s of the {budget:g} s send budget "
+                "(EMAIL_SEND_BUDGET_SECONDS). SendGrid did not take the message."
+            )
+            break
+        _sleep(delay)
+
+    result.attempts = len(attempt_log)
+    result.attempt_log = attempt_log
+    if attempt_log and attempt_log[-1]["class"] == "unknown":
+        result.outcome_unknown = True
+        note += (
+            " | Outcome unknown: SendGrid may have accepted this message before the "
+            "answer was lost, so it was deliberately not sent again — a second "
+            "attempt could deliver it twice."
+        )
+    if note and not result.ok:
+        result.error = (result.error or "") + note
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  deliver() — the one way anything leaves this system
 # ══════════════════════════════════════════════════════════════════════════════
+
+#: Mail that carries a code, a set-password link, or a change to who may sign
+#: in. Tracking is off for it: click tracking would route a live reset token
+#: through SendGrid's redirect and click logs, an open pixel serves nobody, and
+#: an unsubscribe link — if clicked — would make SendGrid suppress every later
+#: code sent to that address.
+_AUTH_KINDS = frozenset({"observer.otp", "staff.invitation", "staff.access_added"})
+_AUTH_KIND_PREFIXES = ("owner_mfa.",)
+
+
+def _is_auth_mail(kind: str, sensitivity: Sensitivity | str) -> bool:
+    if str(sensitivity) == str(Sensitivity.CREDENTIAL):
+        return True
+    kind = str(kind or "")
+    return kind in _AUTH_KINDS or kind.startswith(_AUTH_KIND_PREFIXES)
+
+
+def _provider_problem() -> str | None:
+    """Why nothing may go out through the configured provider, or None.
+
+    EMAIL_PROVIDER names the one provider this service sends through. Any other
+    value — including a deliberate "disabled" — stops every send at the same
+    point a missing key does, and is recorded the same way.
+    """
+    configured = str(getattr(settings, "email_provider", PROVIDER) or "").strip().lower()
+    if configured == PROVIDER:
+        return None
+    return (
+        f"EMAIL_PROVIDER is '{configured or '(empty)'}' and '{PROVIDER}' is the only "
+        "provider this service sends through, so nothing was delivered. The "
+        "record is kept: this is a configuration failure, not an email that was "
+        "never owed."
+    )
+
+
+def _attempt_fields(result: ProviderResult) -> dict[str, Any]:
+    """The retry evidence a delivery row carries — only when there is any."""
+    extra: dict[str, Any] = {}
+    if result.outcome_unknown:
+        extra["provider_outcome_unknown"] = True
+    if result.outcome_unknown or result.attempts > 1:
+        extra["provider_attempts"] = [dict(entry) for entry in result.attempt_log]
+    return extra
 
 
 async def deliver(
@@ -1739,7 +2007,7 @@ async def deliver(
 
     allowed, why = may_receive(str(sensitivity), recipient)
     if not allowed:
-        log.warning("Withheld '%s' from %s: %s", kind, address, why)
+        log.warning("Withheld '%s' from %s: %s", kind, _masked(address), why)
         return await _record_only(doc, Outcome.WITHHELD_ROLE, why)
 
     # Every rule about what may be attached is applied here, once, before the
@@ -1778,12 +2046,24 @@ async def deliver(
 
     record_id, duplicate = await _insert_record(doc)
     if duplicate:
-        log.info("'%s' → %s already sent (dedupe %s).", kind, address, dedupe_key)
+        log.info("'%s' → %s already sent (dedupe %s).", kind, _masked(address), dedupe_key)
         doc["outcome"] = str(Outcome.DUPLICATE)
         doc["error"] = "Already sent for this event; nothing re-sent."
         return doc
 
     doc["id"] = str(record_id)
+
+    problem = _provider_problem()
+    if problem is not None:
+        patch = {
+            "outcome": str(Outcome.NOT_CONFIGURED),
+            "attempts": 1,
+            "error": problem,
+        }
+        await _close_record(record_id, patch)
+        doc.update(patch)
+        log.error("Email '%s' to %s not sent — EMAIL_PROVIDER is not '%s'.", kind, _masked(address), PROVIDER)
+        return doc
 
     if not settings.sendgrid_api_key:
         patch = {
@@ -1797,7 +2077,7 @@ async def deliver(
         }
         await _close_record(record_id, patch)
         doc.update(patch)
-        log.error("Email '%s' to %s not sent — SENDGRID_API_KEY is unset.", kind, address)
+        log.error("Email '%s' to %s not sent — SENDGRID_API_KEY is unset.", kind, _masked(address))
         return doc
 
     result = await asyncio.to_thread(
@@ -1810,10 +2090,15 @@ async def deliver(
         text=text,
         identity=identity,
         headers=headers,
+        # Codes, set-password links and access changes go out untracked.
+        track=not _is_auth_mail(kind, sensitivity),
+        # Bulk mail (reports, broadcasts) keeps exactly one attempt: a broadcast
+        # stops on the first 429 by design, and pacing is its job, not ours.
+        retry=unsubscribe is None,
     )
 
     patch: dict[str, Any] = {
-        "attempts": 1,
+        "attempts": result.attempts,
         "provider_status": result.status,
         "provider_message_id": result.message_id,
         # Kept whether or not it failed, so a 202 that later bounces still shows
@@ -1821,13 +2106,14 @@ async def deliver(
         "provider_reason": result.reason or None,
         "provider_headers": result.headers or {},
     }
+    patch.update(_attempt_fields(result))
     if result.ok:
         patch["outcome"] = str(Outcome.SENT)
         patch["sent_at"] = _now()
         patch["error"] = None
         patch["provider_error_body"] = None
         patch["provider_error_fields"] = []
-        log.info("Email '%s' → %s accepted (%s).", kind, address, result.status)
+        log.info("Email '%s' → %s accepted (%s).", kind, _masked(address), result.status)
     else:
         patch["outcome"] = str(Outcome.FAILED)
         patch["error"] = result.error
@@ -1838,7 +2124,7 @@ async def deliver(
         patch["provider_error_fields"] = list(result.fields)
         log.error(
             "Email '%s' → %s FAILED (HTTP %s)%s: %s",
-            kind, address, result.status,
+            kind, _masked(address), result.status,
             f" on {', '.join(result.fields)}" if result.fields else "",
             result.error,
         )
@@ -2125,11 +2411,19 @@ def _deliver_blocking(
         _record_blocking(doc)
         return False
 
+    problem = _provider_problem()
+    if problem is not None:
+        doc["outcome"] = str(Outcome.NOT_CONFIGURED)
+        doc["error"] = problem
+        _record_blocking(doc)
+        log.error("Email '%s' to %s not sent — EMAIL_PROVIDER is not '%s'.", kind, _masked(doc["to"]), PROVIDER)
+        return False
+
     if not settings.sendgrid_api_key:
         doc["outcome"] = str(Outcome.NOT_CONFIGURED)
         doc["error"] = "SENDGRID_API_KEY is not set in this environment."
         _record_blocking(doc)
-        log.error("Email '%s' to %s not sent — SENDGRID_API_KEY is unset.", kind, doc["to"])
+        log.error("Email '%s' to %s not sent — SENDGRID_API_KEY is unset.", kind, _masked(doc["to"]))
         return False
 
     record_id = _record_blocking(doc)
@@ -2140,11 +2434,16 @@ def _deliver_blocking(
         # reply to either must reach a human. Never bulk: neither carries an
         # unsubscribe, because neither is optional mail.
         identity=SenderIdentity.TRANSACTIONAL,
+        # All three senders here are a code, a set-password link or an access
+        # change: untracked. A refusal SendGrid provably did not act on is
+        # retried; anything that may have been accepted is not.
+        track=not _is_auth_mail(kind, sensitivity),
+        retry=True,
     )
     _close_blocking(
         record_id,
         {
-            "attempts": 1,
+            "attempts": result.attempts,
             "provider_status": result.status,
             "provider_message_id": result.message_id,
             "provider_reason": result.reason or None,
@@ -2154,12 +2453,13 @@ def _deliver_blocking(
             "outcome": str(Outcome.SENT if result.ok else Outcome.FAILED),
             "sent_at": _now() if result.ok else None,
             "error": result.error,
+            **_attempt_fields(result),
         },
     )
     if not result.ok:
         log.error(
             "Email '%s' → %s FAILED (HTTP %s)%s: %s",
-            kind, doc["to"], result.status,
+            kind, _masked(doc["to"]), result.status,
             f" on {', '.join(result.fields)}" if result.fields else "",
             result.error,
         )
@@ -2261,22 +2561,10 @@ def send_observer_otp(code: str, ttl_minutes: int) -> bool:
         meta={"ttl_minutes": ttl_minutes},
     )
 
-    # Outside production, if the mail did not go out, print the code so the flow
-    # can still be tested. Never in production — it would put a valid credential
-    # in the log.
-    if not delivered and not settings.is_production:
-        log.warning(
-            "\n"
-            "  ┌────────────────────────────────────────────────┐\n"
-            "  │  EMAIL NOT DELIVERED — development fallback     │\n"
-            "  │                                                │\n"
-            "  │  Observer sign-in code:  %-21s │\n"
-            "  │  Valid for %d minutes                          │\n"
-            "  └────────────────────────────────────────────────┘\n",
-            code,
-            ttl_minutes,
-        )
-
+    # The code is never written to a log either — in no environment. (A
+    # development fallback used to print it when the mail did not go out; a valid
+    # sign-in code in a log is a credential in a log.) Tests read the code from
+    # the fake provider's captured message instead.
     return delivered
 
 

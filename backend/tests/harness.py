@@ -895,6 +895,9 @@ _REASONS = {
     413: "Payload Too Large",
     429: "Too Many Requests",
     500: "Internal Server Error",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
 }
 
 
@@ -920,6 +923,13 @@ class FakeSendGrid:
         #: Set False to answer a non-2xx with a response object instead of an
         #: exception — the path a stub or a future SDK would take.
         self.raise_on_error_status = True
+        #: Scripted answers, one per attempt, consumed before `next_status` /
+        #: `raise_on_send`: an int is a status (the message reached the fake
+        #: provider), an exception is raised before it did. Empty by default,
+        #: so every existing test sees exactly the behaviour it always had.
+        self.queue: list = []
+        #: The per-attempt timeout each client was given, in call order.
+        self.timeouts: list = []
 
     def install(self) -> None:
         # Lift any import block left by `uninstall_sendgrid()` first, or the
@@ -930,14 +940,19 @@ class FakeSendGrid:
         outer = self
 
         class SendGridAPIClient:
-            def __init__(self, api_key=None):
+            def __init__(self, api_key=None, **kwargs):
                 # The key reaches the client and stops there. It is never
                 # stored on a sent record, and the test asserts that.
                 self.api_key = api_key
+                self.host = kwargs.get("host")
                 self.client = types.SimpleNamespace(timeout=None)
 
             def send(self, message):
-                if outer.raise_on_send:
+                outer.timeouts.append(self.client.timeout)
+                scripted = outer.queue.pop(0) if outer.queue else None
+                if isinstance(scripted, BaseException):
+                    raise scripted
+                if scripted is None and outer.raise_on_send:
                     raise outer.raise_on_send
                 outer.sent.append(
                     {
@@ -949,9 +964,10 @@ class FakeSendGrid:
                         "reply_to": message.reply_to,
                         "headers": dict(message.headers),
                         "attachments": list(message.attachments),
+                        "tracking": message.tracking_settings,
                     }
                 )
-                status = int(outer.next_status)
+                status = int(scripted if scripted is not None else outer.next_status)
                 if status >= 300 and outer.raise_on_error_status:
                     error = BadRequestsError if status == 400 else HTTPError
                     headers = outer.next_headers
@@ -982,7 +998,46 @@ class FakeSendGrid:
             FileType=lambda v: v,
             Disposition=lambda v: v,
             Header=lambda key, value: (key, value),
+            TrackingSettings=_TrackingSettings,
+            ClickTracking=_ClickTracking,
+            OpenTracking=_OpenTracking,
+            SubscriptionTracking=_SubscriptionTracking,
+            Ganalytics=_Ganalytics,
         )
+
+
+# Tracking settings the way the SDK's helpers hold them: plain attributes, so a
+# test can read back exactly what the code under test switched off.
+class _ClickTracking:
+    def __init__(self, enable=None, enable_text=None):
+        self.enable = enable
+        self.enable_text = enable_text
+
+
+class _OpenTracking:
+    def __init__(self, enable=None, substitution_tag=None):
+        self.enable = enable
+        self.substitution_tag = substitution_tag
+
+
+class _SubscriptionTracking:
+    def __init__(self, enable=None, text=None, html=None, substitution_tag=None):
+        self.enable = enable
+
+
+class _Ganalytics:
+    def __init__(self, enable=None, utm_source=None, utm_medium=None, utm_term=None,
+                 utm_content=None, utm_campaign=None):
+        self.enable = enable
+
+
+class _TrackingSettings:
+    def __init__(self, click_tracking=None, open_tracking=None,
+                 subscription_tracking=None, ganalytics=None):
+        self.click_tracking = click_tracking
+        self.open_tracking = open_tracking
+        self.subscription_tracking = subscription_tracking
+        self.ganalytics = ganalytics
 
 
 class _Mail:
@@ -994,6 +1049,7 @@ class _Mail:
         self.plain_text_content = plain_text_content
         self.html_content = html_content
         self.reply_to = None
+        self.tracking_settings = None
         self.attachments: list[Any] = []
         self.headers: dict[str, str] = {}
 
