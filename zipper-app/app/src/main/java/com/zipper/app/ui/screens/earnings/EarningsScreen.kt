@@ -36,6 +36,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.text.style.TextOverflow
 import com.zipper.app.util.millis
+import com.zipper.app.util.HostSuspension
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -72,6 +73,12 @@ data class EarningsUiState(
      * on a refusal to stay hidden.
      */
     val isHost: Boolean = false,
+    /**
+     * Spec §5: the server refused Host home because the HOST ROLE is
+     * suspended — its own sentence (until when, and why). Shown in place of
+     * the host block; the bean activity below stays, earnings are untouched.
+     */
+    val hostSuspension: String? = null,
 )
 
 @HiltViewModel
@@ -95,11 +102,18 @@ class EarningsViewModel @Inject constructor(
         viewModelScope.launch {
             when (val res = hostStats.hostHome()) {
                 is HostStatsRepository.Result.Ok ->
-                    _state.update { it.copy(home = res.home, error = null) }
+                    _state.update { it.copy(home = res.home, error = null, hostSuspension = null) }
                 is HostStatsRepository.Result.Failed ->
                     // A non-host calling this is refused, which is correct and
                     // not worth surfacing — the screen simply has no host block.
-                    _state.update { it.copy(home = null) }
+                    // A SUSPENDED Host role is (§5): the server says until when
+                    // and why, and the host should read exactly that.
+                    _state.update {
+                        it.copy(
+                            home = null,
+                            hostSuspension = if (HostSuspension.isRefusal(res.detail)) res.message else null,
+                        )
+                    }
             }
         }
     }
@@ -195,6 +209,8 @@ fun EarningsScreen(
     // nothing host-level.
     val showHost = com.zipper.app.util.LevelVisibility.showHostEarnings(state.isHost, state.home != null)
     val home = state.home?.takeIf { showHost }
+    // §5: a suspended Host role — the server's sentence, in place of the host block.
+    val suspension = state.hostSuspension
 
     ZipperScreen(topBar = { TopBar("Earnings", onBack = onBack) { CurrencyPill(Currency.Bean, state.currentBeans, onClick = onConvertBeans) } }) { _ ->
         if (state.isLoading && home == null) { LoadingState(); return@ZipperScreen }
@@ -278,6 +294,8 @@ fun EarningsScreen(
                         }
                     }
                 }
+            } else if (suspension != null) {
+                item { Notice(suspension, c.statusDanger) }
             } else if (state.isHost) {
                 item { Notice("Host figures unavailable — the server couldn't be reached. Pull down or come back in a moment.", c.textSecondary) }
             }

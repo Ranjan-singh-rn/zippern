@@ -105,6 +105,11 @@ rules_version = '2';
 //   D13 partyRooms/{roomId}/private/{docId}: explicit deny-all — the room PIN
 //      secret functions/src/party.ts keeps at private/secret. No rule ever
 //      admitted it (the catch-all denies); stated.              needs: none.
+//   D14 §5 Host role suspension: users `hostSuspended` / `hostSuspendedUntil` /
+//      `hostSuspendedReason` / `hostSuspensionDays` / `hostStatusBeforeSuspension`
+//      and the `hostSuspended*` / `hostResumed*` stamps on both protected
+//      lists; liveRooms `mayGoLive()` refuses a suspended Host role.
+//                                    needs: backend users.suspend_host / resume_host.
 //
 // ── Indexes (firestore.indexes.json, additive; never accept a deletion) ─────
 //   staffRoster(role, isActive) — needed by C1. The Owner work hub (APK ≥ 20)
@@ -2150,6 +2155,19 @@ service cloud.firestore {
           'hostRestoredAt', 'hostRestoredBy', 'hostRestoredByName', 'hostRestoredByRole',
           'hostActivatedAt',
           'agencyTransferredAt', 'agencyTransferredFrom',
+          /*
+           * §5 Host role suspension. Written only by `users.suspend_host` /
+           * `resume_host` and the expiry sweep (Admin SDK), and READ as the
+           * decision itself: `hostEligibility.hostRoleSuspension` refuses every
+           * Host-only callable while `hostSuspended` is true, and `mayGoLive()`
+           * below refuses the room. A Host who could write `hostSuspended:
+           * false` would lift their own suspension with no Resume, no audit
+           * entry and no notice — so no client writes any of them.
+           */
+          'hostSuspended', 'hostSuspendedUntil', 'hostSuspendedReason', 'hostSuspensionDays',
+          'hostStatusBeforeSuspension',
+          'hostSuspendedBy', 'hostSuspendedByName', 'hostSuspendedByRole', 'hostSuspendedAt',
+          'hostResumedBy', 'hostResumedByName', 'hostResumedByRole', 'hostResumedAt',
         ];
       }
 
@@ -2341,6 +2359,15 @@ service cloud.firestore {
           'hostRevokedByRole', 'hostRevokedReason',
           'hostRestoredAt', 'hostRestoredBy', 'hostRestoredByName', 'hostRestoredByRole',
           'agencyTransferredAt', 'agencyTransferredFrom',
+
+          // §5 Host role suspension: the state and its stamps. The API
+          // (`POST /users/{uid}/suspend-host` / `resume-host`, gated, audited,
+          // the host and the agency told) is the only path; a staff browser
+          // clearing `hostSuspended` is a Resume with every safeguard removed.
+          'hostSuspended', 'hostSuspendedUntil', 'hostSuspendedReason', 'hostSuspensionDays',
+          'hostStatusBeforeSuspension',
+          'hostSuspendedBy', 'hostSuspendedByName', 'hostSuspendedByRole', 'hostSuspendedAt',
+          'hostResumedBy', 'hostResumedByName', 'hostResumedByRole', 'hostResumedAt',
         ];
       }
 
@@ -3371,6 +3398,11 @@ service cloud.firestore {
             && liveHost().isHost == true
             && liveHost().isVerifiedHost == true
             && liveHost().get('isBanned', false) != true
+            // §5: a suspended Host ROLE does not go live — the role is kept
+            // (`isHost` stays true), so this flag is what says no. Strict, and
+            // only the flag: the backend's sweep lifts an expired term. Same
+            // document, so no extra read.
+            && liveHost().get('hostSuspended', false) != true
             // RF-27: every restriction, in every spelling — `accountState`
             // suspended/banned/deleting and `isSuspended`/`isDeleted` — not
             // `isBanned` alone. Same document, so no extra read.

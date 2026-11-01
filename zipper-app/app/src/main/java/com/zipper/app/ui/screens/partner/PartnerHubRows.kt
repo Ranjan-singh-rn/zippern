@@ -38,6 +38,13 @@ object PartnerHubRows {
     const val REVOKED = "revoked"
 
     /**
+     * §5: the Host role is SUSPENDED — still held (the same role, roster and
+     * earnings), paused until staff resume it. Never a revocation, never an
+     * application.
+     */
+    const val SUSPENDED = "suspended"
+
+    /**
      * Decision 15 (RC): approved by the Owner, NOT started — the account does
      * not yet hold BOTH a verified phone and a verified email. Shown as a
      * waiting role with the verification steps, never as a role that works.
@@ -143,7 +150,7 @@ object PartnerHubRows {
                         "sub_agency" -> " · under a sub-agency"
                         "agency" -> " · under an agency"
                         else -> ""
-                    },
+                    } + (if (elig.hostStatus == SUSPENDED) " · suspended" else ""),
                 )
             }
         }

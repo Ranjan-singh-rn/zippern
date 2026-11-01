@@ -1187,7 +1187,11 @@ writes = {(row[0], row[1]) for row in table if "require_write" in row[3].split("
 # It lifts nothing, but it is a moderation write about an account, so it is
 # staff-only like `/decide` beside it: no agency may recommend on its own host's
 # appeal.
-check("require_write guards sixty routes", len(writes), 60)
+# 62 since §5 Host role suspension: `POST /users/{uid}/suspend-host` and
+# `POST /users/{uid}/resume-host`, on revoke-host's gate (`can_approve_kyc`).
+# Each pauses or lifts a Host's role, so — like revoke-host beside them — no
+# agency may reach either, least of all for its own host.
+check("require_write guards sixty-two routes", len(writes), 62)
 # The four moderation operations are four distinct routes on this guard. Named
 # rather than counted, so that collapsing resume back into unban — which is the
 # defect this pins shut — is a diff somebody reads rather than a number that

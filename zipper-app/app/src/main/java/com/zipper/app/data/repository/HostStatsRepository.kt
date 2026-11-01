@@ -77,12 +77,18 @@ class HostStatsRepository @Inject constructor(
 
     sealed interface Result {
         data class Ok(val home: HostHome) : Result
-        data class Failed(val message: String) : Result
+        /**
+         * [detail] is the server's `details.code` — `HOST_ROLE_SUSPENDED` when
+         * the Host role is suspended (§5), in which case [message] is the
+         * server's sentence (until when, and why) and is worth showing. A
+         * plain non-host refusal carries none.
+         */
+        data class Failed(val message: String, val detail: String = "") : Result
     }
 
     suspend fun hostHome(): Result = when (val res = money.getHostHome()) {
         is MoneyFunctions.Result.Ok -> Result.Ok(res.value)
-        is MoneyFunctions.Result.Failed -> Result.Failed(res.userMessage)
+        is MoneyFunctions.Result.Failed -> Result.Failed(res.userMessage, res.detail)
     }
 
     /**

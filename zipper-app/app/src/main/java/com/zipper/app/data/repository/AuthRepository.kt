@@ -2585,6 +2585,13 @@ class AuthRepository @Inject constructor(
             HostFunctions.ReferralRefusal.ROLE_REVOKED    -> ReferralResult.Error(
                 "Your Host role was revoked. Request reinstatement instead of applying again."
             )
+            // §5: the server's own sentence — until when, and why. The SAME
+            // Host role comes back when staff resume it; a code changes nothing.
+            HostFunctions.ReferralRefusal.HOST_SUSPENDED  -> ReferralResult.Error(
+                res.message.ifBlank {
+                    "Your Host role is suspended. It comes back when it is resumed — a referral code does not change that."
+                }
+            )
             HostFunctions.ReferralRefusal.UNKNOWN         -> ReferralResult.Error("That code could not be used.")
         }
         is HostFunctions.CodeCheck.Failed -> ReferralResult.Error(res.message)

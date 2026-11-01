@@ -163,6 +163,18 @@ data class User(
      * THROWS rather than returning null — see util/FirestoreTime.kt.
      */
     val suspendedUntil: Long = 0L,
+    /**
+     * Spec §5 partner role suspension, for the HOST role only — not an account
+     * restriction ([isBanned] / [isSuspended] stay as they are, and so does
+     * [isHost]). Written by the backend alone (`users.suspend_host` /
+     * `resume_host`); while it is true every host-only path refuses with the
+     * server's sentence (see `util/HostSuspension`).
+     */
+    val hostSuspended: Boolean = false,
+    /** End of the Host-role suspension in millis, or 0 when it runs until resumed. Read through [millis]. */
+    val hostSuspendedUntil: Long = 0L,
+    /** The reason staff gave for suspending the Host role; shown to the host with the refusal. */
+    val hostSuspendedReason: String = "",
     val sessionToken: String = "",
 
     val createdAt: Long = System.currentTimeMillis(),
@@ -277,6 +289,11 @@ data class User(
             // returning null — which would take down the snapshot callback
             // this runs inside, on the document of every suspended user.
             suspendedUntil = doc.millis("suspendedUntil", 0L),
+            // The Host role's own suspension. `== true`, like every server
+            // gate; the end is a Timestamp, so `millis` (0 = until resumed).
+            hostSuspended = doc.get("hostSuspended") == true,
+            hostSuspendedUntil = doc.millis("hostSuspendedUntil", 0L),
+            hostSuspendedReason = doc.getString("hostSuspendedReason") ?: "",
             sessionToken = doc.getString("sessionToken") ?: "",
             createdAt = doc.millis("createdAt", 0L),
             theme = doc.getString("theme") ?: "system",

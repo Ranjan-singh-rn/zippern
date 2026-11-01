@@ -24,6 +24,7 @@ import com.zipper.app.ui.components.*
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import kotlinx.coroutines.delay
 
 /*
  * Incoming call — Figma 60:31.
@@ -42,11 +43,20 @@ fun IncomingCallScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val c = ZipperTheme.colors
-    var accepting by remember { mutableStateOf(false) }
+    val accepting = state.accepting
+    val refusal = state.error
 
-    LaunchedEffect(state.status) {
-        when (state.status) {
-            CallStatus.ENDED, CallStatus.DECLINED, CallStatus.MISSED -> onCallDeclined()
+    LaunchedEffect(state.status, refusal, accepting) {
+        when {
+            // A refused accept is SAID before the screen closes — the server's
+            // own sentence ("You need 750 diamonds…", or a Host whose role is
+            // suspended: until when, and why). It used to close at once and
+            // the reason was never seen.
+            refusal != null -> { delay(4_000); onCallDeclined() }
+            // Waiting for the server: the ring it closed may arrive first.
+            accepting -> Unit
+            state.status == CallStatus.ENDED || state.status == CallStatus.DECLINED ||
+                state.status == CallStatus.MISSED -> onCallDeclined()
             else -> Unit
         }
     }
@@ -136,6 +146,16 @@ fun IncomingCallScreen(
                 }
             }
 
+            if (refusal != null) {
+                Spacer(Modifier.height(Space.xl))
+                Text(
+                    refusal,
+                    style = ZipperTheme.type.bodyM, color = c.textPrimary, textAlign = TextAlign.Center,
+                    modifier = Modifier.background(c.scrimMedium, RoundedCornerShape(Radius.lg))
+                        .padding(horizontal = Space.lg, vertical = Space.md),
+                )
+            }
+
             Spacer(Modifier.weight(1f))
 
             Row(horizontalArrangement = Arrangement.spacedBy(80.dp), modifier = Modifier.padding(bottom = Space.x5l)) {
@@ -145,8 +165,8 @@ fun IncomingCallScreen(
                 )
                 CallAction(
                     R.drawable.ic_video_call, if (accepting) "Connecting…" else "Accept", c.statusSuccess,
-                    enabled = !accepting,
-                    onClick = { accepting = true; viewModel.accept() },
+                    enabled = !accepting && refusal == null,
+                    onClick = { viewModel.accept() },
                 )
             }
         }

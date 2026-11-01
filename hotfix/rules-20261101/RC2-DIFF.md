@@ -5,7 +5,7 @@ RC2 = the repository's top-level `firestore.rules`, `storage.rules` and `firesto
 
 | File | sha256 (at time of writing) | Lines |
 |---|---|---|
-| `firestore.rules` (RC2) | `520b883dc73a9b7726bddb2af9d47b30b98a12c1b7c9911f8fab681a11bd4dd0` | 4,497 |
+| `firestore.rules` (RC2) | `1e0ee32a80b3eb63c08e0da3817061953085ff358e509d2bb6516d5a0807a3eb` | 4529 |
 | `storage.rules` (RC2) | `2fd706a67381c5e9e385a6d4d2615da5cca3833bab8bfb16b6c861f400639dd8` | 993 |
 | `firestore.indexes.json` (RC2) | `6c4dbc36139214d797e7c937424659c410643ba848dd6084298a0091b28dc5a5` | 66 composite + 3 field overrides |
 | DEPLOYED Firestore (live since 20 Oct, ruleset `b2104a12…`) | `17b8ffee1383716bb784292271c162e22e1e99d860d35d351d0c72ee93694d45` | 4,049 |
@@ -115,3 +115,7 @@ The deployed `agents(referralCode, status, __name__)` and `diamondResellers(stat
 4. D5 (gender set once) is in RC2 from the previous pass but was not in the 1 Nov brief — keep or drop?
 5. No script deploys Storage rules (hotfix-1 S2 or RC2 S1/S2) in `release/completion-20261101` yet.
 6. The APK-20 work hub gates `feedback.triage` to `app_member` too, but the rules (unchanged) admit only ops / admins / support to read `feedbackTickets`; an `app_member` sees an empty list.
+
+## Addendum (1 Nov, later)
+
+- **D14 Host role suspension:** the `hostSuspended*` fields on `users/{uid}` are server-written only (owner and staff arms refuse them), and go-live is refused while `hostSuspended == true`. Covered by the D14 block in `tests/firestore.rc2.rules.test.mjs`. The rules hash above includes this change; re-run `tests/run-rc2-rules-tests.command` before script 31.

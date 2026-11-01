@@ -222,6 +222,23 @@ class Suspend(BaseModel):
     )
 
 
+class HostSuspend(BaseModel):
+    """A suspension of the HOST ROLE only (§5), with an optional term.
+
+    Ten characters of reason, not three: the host and their agency are both
+    told it. `days` is the account suspension's bound (1 to 365); omitted means
+    "until somebody resumes it", and the daily run lifts a timed one.
+    """
+
+    reason: str = Field(min_length=10, max_length=1000)
+    days: int | None = Field(
+        default=None,
+        ge=1,
+        le=365,
+        description="Suspension length in days. Omit for 'until the Host role is resumed'.",
+    )
+
+
 class DeviceBan(BaseModel):
     device_id: str = Field(min_length=1, max_length=200)
     device_type: DeviceType
@@ -1001,6 +1018,52 @@ async def restore_host(uid: str, body: Reason, user: dict = Depends(require_writ
     and recommends on the person's reinstatement request instead."""
     try:
         return await svc.restore_host(uid, body.reason, user)
+    except UserError as exc:
+        raise _fail(exc) from exc
+
+
+# ── Host role suspension (§5 partner role suspension, the Host capability) ────
+#
+# Only the Host role pauses: the account, the person's other roles, the Host
+# record (agency link, roster row, verification) and the earnings history stay.
+# The gate is revoke-host's — `can_approve_kyc` on `require_write` — so Support
+# (no `can_approve_kyc`) and the Observer (no write) are refused, and no partner
+# reaches either route. Resuming is the same gate: a suspension is lifted by
+# whoever may impose one, while a REVOKED role is refused by the service and
+# comes back only through the Owner-decided reinstatement.
+
+
+@router.post(
+    "/{uid}/suspend-host",
+    dependencies=[Depends(require_permission(Permission.CAN_APPROVE_KYC))],
+)
+async def suspend_host(uid: str, body: HostSuspend, user: dict = Depends(require_write)):
+    """Suspend the Host role, for `days` or until resumed.
+
+    Ends the host's live rooms, freezes host money for the Owner's review and
+    tells the host and their agency. Answers `{uid, host: {status: "suspended",
+    suspendedUntil, reason}, notified: {host, agency}, audit_id}`; the same
+    request again answers the standing suspension with `already: true`.
+    400 for anybody who is not an approved, current Host or is already
+    suspended on other terms."""
+    try:
+        return await svc.suspend_host(uid, body.reason, user, days=getattr(body, "days", None))
+    except UserError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post(
+    "/{uid}/resume-host",
+    dependencies=[Depends(require_permission(Permission.CAN_APPROVE_KYC))],
+)
+async def resume_host(uid: str, body: Reason, user: dict = Depends(require_write)):
+    """Lift a Host-role suspension: the SAME record works again.
+
+    Answers `{uid, host: {status: <what it was before>}, notified, audit_id}`.
+    A revoked Host is refused — reinstatement is the Owner's decision on a
+    request, never a resume. Frozen money is not released here."""
+    try:
+        return await svc.resume_host(uid, body.reason, user)
     except UserError as exc:
         raise _fail(exc) from exc
 

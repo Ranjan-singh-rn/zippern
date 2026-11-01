@@ -35,6 +35,9 @@
  *   D12 rateLimits: deny-all for every client (functions/src/rateLimit.ts).
  *   D13 partyRooms/{id}/private/{doc}: deny-all (the PIN secret of party.ts);
  *       the room, seats and listeners read as before.
+ *   D14 §5 Host role suspension: `hostSuspended` (and its term / stamps) is
+ *       server-only for the host and for staff, and a suspended verified Host
+ *       cannot open a live room (`mayGoLive`); an unsuspended one still can.
  *   E   C-1 still withheld: the live self-signup login write passes.
  *   S   static (no emulator): each RC2 match block exists exactly once in the
  *       rules text, and firestore.indexes.json (ZIPPER_INDEXES_FILE) declares
@@ -610,6 +613,25 @@ async function main() {
   await ok('D13 (unchanged): …and its seats', () => getDoc(D(user, 'partyRooms/PR1/seats/0')))
   await ok('D13 (unchanged): …and its listeners', () => getDocs(collection(fs(user), 'partyRooms/PR1/listeners')))
   await no('D13 (unchanged): a signed-out caller cannot read the room', () => getDoc(D(nobody, 'partyRooms/PR1')))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('D14 — §5 Host role suspension: the flag is server-only, and a suspended Host does not go live')
+  // ══════════════════════════════════════════════════════════════════════════
+  // The shape `users.suspend_host` leaves: the role kept (isHost, isVerifiedHost),
+  // the suspension beside it. `uidLiveHost` is the same Host, not suspended.
+  await seed('users/uidSuspHost', { uid: 'uidSuspHost', name: 'sh', isProfileComplete: true, isHost: true, isVerifiedHost: true,
+    agencyId: 'AG1', hostSuspended: true, hostSuspendedReason: 'Repeated no-shows', hostSuspendedAt: new Date(),
+    hostSuspendedUntil: new Date(Date.now() + 3 * 864e5), hostSuspensionDays: 3, hostStatusBeforeSuspension: 'active' })
+  await seed('users/uidLiveHost', { uid: 'uidLiveHost', name: 'lh', isProfileComplete: true, isHost: true, isVerifiedHost: true, agencyId: 'AG1' })
+  const suspHost = phoneCtx('uidSuspHost', '08'), liveHost = phoneCtx('uidLiveHost', '09')
+  await no('D14: the suspended Host cannot lift its own suspension (hostSuspended: false)',
+    () => updateDoc(D(suspHost, 'users/uidSuspHost'), { hostSuspended: false }))
+  await no('D14: a staff browser cannot clear it either (Resume is the API, audited)',
+    () => updateDoc(D(opsAdmin, 'users/uidSuspHost'), { hostSuspended: false, hostSuspendedUntil: deleteField() }))
+  await no('D14: a suspended verified Host cannot open a live room (mayGoLive)',
+    () => setDoc(D(suspHost, 'liveRooms/LR_SUSP'), { hostUid: 'uidSuspHost', title: 't', isActive: true }))
+  await ok('D14 (control): the same Host unsuspended opens one',
+    () => setDoc(D(liveHost, 'liveRooms/LR_LIVE'), { hostUid: 'uidLiveHost', title: 't', isActive: true }))
 
   // ══════════════════════════════════════════════════════════════════════════
   console.log('E — C-1 still withheld: the live CRM\'s self-signup login write passes')

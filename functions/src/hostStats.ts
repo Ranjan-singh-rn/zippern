@@ -1,6 +1,7 @@
 import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
 import { istDateKey, istWeekKey } from './time'
+import { hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails } from './hostEligibility'
 
 const db = admin.firestore()
 
@@ -216,6 +217,18 @@ export const getHostHome = functions
     if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Account not found.')
     if (userSnap.get('isHost') !== true) {
       throw new functions.https.HttpsError('permission-denied', 'This is for hosts only.')
+    }
+    /*
+     * §5: the Host dashboard is closed while the Host role is suspended — the
+     * role-specific screen, not the money. Beans already earned stay on the
+     * account and in the wallet history; the refusal carries the term and the
+     * reason (`details`) so Host Home can say why it is closed and until when.
+     */
+    const suspended = hostRoleSuspension(userSnap)
+    if (suspended) {
+      throw new functions.https.HttpsError(
+        'permission-denied', hostSuspendedMessage(suspended), hostSuspensionDetails(suspended),
+      )
     }
 
     const callEarnings = Number(userSnap.get('hostCallEarnings') ?? 0)

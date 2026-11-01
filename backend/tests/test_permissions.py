@@ -634,6 +634,10 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     ("POST", "/users/{uid}/revoke-host"): {"can_approve_kyc"},
     # UGP-B: restoring a revoked Host costs what revoking it costs.
     ("POST", "/users/{uid}/restore-host"): {"can_approve_kyc"},
+    # §5 Host role suspension: pausing and lifting the Host role cost what
+    # revoking it costs — the revoke gate, nothing weaker.
+    ("POST", "/users/{uid}/suspend-host"): {"can_approve_kyc"},
+    ("POST", "/users/{uid}/resume-host"): {"can_approve_kyc"},
     ("POST", "/users/{uid}/seller-flag"): {"can_approve_seller"},
     ("GET", "/host-verification/pending"): {"can_approve_kyc"},
     ("GET", "/host-verification/{uid}"): {"can_approve_kyc"},

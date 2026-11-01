@@ -82,6 +82,7 @@ from app.services import crm_directory as crm
 from app.services import notices
 from app.services import partner_ops as ops
 from app.services import partner_roles
+from app.services import user_roles
 from app.services.partner_ops import PartnerOpsError
 from app.services.partners import PartnerKind, PartnerStatus
 
@@ -417,7 +418,12 @@ def _moment(value: Any) -> float | None:
 
 
 def host_state(user: dict | None) -> str:
-    """`"active"`, `"revoked"` or `""` for one `users/{uid}` document. Pure.
+    """`"active"`, `"suspended"`, `"revoked"` or `""` for one `users/{uid}`
+    document. Pure.
+
+    Suspended (§5 partner role suspension) = a Host whose role is paused by
+    `users.suspend_host`: still `isHost`, still holding the slot, the agency
+    and the record — only Host actions stop until `resume_host`.
 
     Revoked (C1) = not a Host now, a revocation stamp on the document
     (`hostRevokedAt`, or the older `hostRemovedAt`), and no restore after it.
@@ -427,7 +433,7 @@ def host_state(user: dict | None) -> str:
     """
     user = user or {}
     if user.get("isHost"):
-        return "active"
+        return "suspended" if user_roles.host_role_suspended(user) else "active"
     revoked = user.get("hostRevokedAt") or user.get("hostRemovedAt")
     if not revoked:
         return ""
@@ -499,8 +505,12 @@ async def held_roles(uid: str) -> dict[str, Any]:
                 _iso(user.get("hostRevokedAt") or user.get("hostRemovedAt"))
                 if state == "revoked" else ""
             ),
+            # §5: a paused Host role says until when and why (the app shows it).
+            **({"suspended_until": _iso(user.get("hostSuspendedUntil")) or None,
+                "suspension_reason": str(user.get("hostSuspendedReason") or "")}
+               if state == "suspended" else {}),
         }
-    if state != "active":
+    if state not in ("active", "suspended"):
         pending = await _pending_host_application(uid)
         if pending:
             p_agency = str(pending.get("agencyId") or "").strip()
@@ -642,6 +652,9 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
         held_host = held.get("host")
         if held_host and str(held_host.get("status") or "active") == "revoked":
             blocked["host"] = partner_roles.revoked_refusal("host")
+        elif held_host and str(held_host.get("status") or "") == "suspended":
+            # §5: the role is paused, not gone — it comes back when resumed.
+            blocked["host"] = "Your Host role is suspended. It is the same role and comes back when it is resumed."
         elif held_host:
             blocked["host"] = "You are already a Host."
         elif str((held.get("pending_host_application") or {}).get("status") or "") == "awaiting_verification":

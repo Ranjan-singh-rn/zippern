@@ -122,7 +122,10 @@ class PartnerFunctions @Inject constructor(
         val isInternal: Boolean = false,
         /** C1: every revoked role, each with its reinstatement request if any. */
         val revoked: List<RevokedRole> = emptyList(),
-        /** C1: `held.host.status` — `active`, `revoked`, or "" when there is no Host record. */
+        /**
+         * C1: `held.host.status` — `active`, `revoked`, `suspended` (§5: the
+         * Host role paused, still held), or "" when there is no Host record.
+         */
         val hostStatus: String = "",
         val hostRevokedAt: String = "",
         /**

@@ -835,6 +835,33 @@ async def daily(now: datetime | None = None) -> dict:
         log.error("Expired suspensions could not be lifted: %s", exc)
         suspensions = {"error": str(exc)}
 
+    # §5: a timed HOST-ROLE suspension ends the same way — `resume_host`, the
+    # same Host record working again, audited as `host.resumed` by the machine
+    # (its own `system:` uid), on or after its date. Only the role was paused,
+    # so only the role is resumed; the account is not this sweep's business.
+    host_suspensions: dict = {}
+    try:
+        from app.services import users as users_svc
+
+        host_suspensions = await users_svc.lift_expired_host_suspensions(
+            {
+                "uid": "system:host_suspension_sweep",
+                "name": "Scheduled job",
+                "role": "system",
+            }
+        )
+        if host_suspensions.get("lifted"):
+            log.info("Resumed %d expired Host-role suspensions", len(host_suspensions["lifted"]))
+        if host_suspensions.get("failed"):
+            log.error(
+                "%d expired Host-role suspension(s) could not be resumed: %s",
+                len(host_suspensions["failed"]),
+                host_suspensions["failed"],
+            )
+    except Exception as exc:  # noqa: BLE001 — never let this stop the reports
+        log.error("Expired Host-role suspensions could not be lifted: %s", exc)
+        host_suspensions = {"error": str(exc)}
+
     since, until = yesterday(now)
     # The business-calendar date, not `since.date()`. At UTC+05:30 the window
     # for the 28th starts at 18:30 UTC on the 27th, and a dedupe key naming the
@@ -979,6 +1006,7 @@ async def daily(now: datetime | None = None) -> dict:
         # Recorded on the run, so a suspension that failed to lift is visible in
         # the job history rather than only in a log line nobody reads.
         "suspensions_lifted": suspensions,
+        "host_suspensions_lifted": host_suspensions,
         "errors": [r["error"] for r in results if r.get("error")],
     }
     await _record_run(summary)

@@ -2620,6 +2620,11 @@ async def revoke_host(
     # applications list and the eligibility answer can say why — not only the
     # audit log and a notice that scrolls away.
     patch["hostRevokedReason"] = reason
+    # §5: revoking a SUSPENDED Host ends the role and the pause with it. Left
+    # on the record, the suspension would come back with a later restore.
+    suspension_superseded = user_roles.host_role_suspended(user)
+    if suspension_superseded:
+        patch.update(_host_suspension_cleared())
     # RC (confirmed): the revoked Host's pending earnings are frozen for the
     # Owner's review, first; the beans stop in the same write as the revocation.
     patch.update(money_freeze.hold_fields("the Host role's revocation"))
@@ -2666,6 +2671,7 @@ async def revoke_host(
             # Stated: the person's account and their other roles are untouched.
             "account_touched": False,
             "other_roles_touched": False,
+            **({"host_suspension_superseded": True} if suspension_superseded else {}),
             **(meta or {}),
         },
     )
@@ -2686,8 +2692,11 @@ async def revoke_host(
     )
 
 
-async def _end_live_rooms_of(uid: str, reason: str, actor: dict) -> dict:
+async def _end_live_rooms_of(uid: str, reason: str, actor: dict, *, why: str = "Host role revoked") -> dict:
     """End every ACTIVE live room hosted by `uid`. Never raises.
+
+    `why` names the Host-role decision in each room's end reason (the host's
+    app shows it): a revocation, or a suspension (`suspend_host`).
 
     Returns `{"ended": [room ids], "failed": [{"room_id", "error"}]}`.
     """
@@ -2710,10 +2719,10 @@ async def _end_live_rooms_of(uid: str, reason: str, actor: dict) -> dict:
         return {"ended": [], "failed": [{"room_id": "", "error": f"rooms could not be listed: {exc}"}]}
     for room_id in rooms:
         try:
-            await live_svc.end_room(room_id, f"{reason} (Host role revoked)", actor)
+            await live_svc.end_room(room_id, f"{reason} ({why})", actor)
             out["ended"].append(room_id)
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
-            log.warning("live room %s of %s not ended on revocation: %s", room_id, uid, exc)
+            log.warning("live room %s of %s not ended (%s): %s", room_id, uid, why, exc)
             out["failed"].append({"room_id": room_id, "error": str(exc)})
     return out
 
@@ -2721,7 +2730,8 @@ async def _end_live_rooms_of(uid: str, reason: str, actor: dict) -> dict:
 async def _notify_agency_of_host_change(
     agency_id: str, host_uid: str, host_name: str, change: str, reason: str,
 ) -> bool:
-    """Tell the agency's owner that one of their Hosts was revoked (§5). Never raises."""
+    """Tell the agency's owner that one of their Hosts was revoked, suspended or
+    resumed (§5: "notify host and agency"). `change` names it. Never raises."""
     from app.services import notices
     from app.services import partner_roles
 
@@ -2834,6 +2844,10 @@ async def restore_host(
     before = {"isHost": False, "agencyId": user.get("agencyId", "")}
     patch: dict = {"isHost": True, "hostRestoredAt": now, "agencyId": agency_id}
     patch.update(_stamp(actor, "hostRestored"))
+    # §5: a restored role starts active. `revoke_host` clears a suspension it
+    # ends; this covers a record revoked before it did.
+    if user_roles.host_role_suspended(user):
+        patch.update(_host_suspension_cleared())
 
     # The roster row, re-written onto the SAME agency (merge: a surviving row is
     # repaired, never duplicated).
@@ -2906,6 +2920,422 @@ async def restore_host(
 
     closed = await role_appeals.close_after_direct_restore(uid, "host", actor)
     return _result(uid, before, after, audit_id, closed_requests=closed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Host role suspension — §5 partner role suspension, for the Host capability
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# "Temporary restriction of only the selected capability … Preserve canonical
+# account, other valid roles, partner record, relationships and history. Block
+# role-specific dashboards/actions and new role transactions. Keep the role
+# slot/record while suspended. Resume same record through authorised workflow."
+#
+# Agency, Sub-agency and Coin Seller have this as `partner_ops.deactivate_partner`
+# / `reactivate_partner`. A Host is not a `partners` row — the record is
+# `users/{uid}` (`isHost`, `agencyId`, `callRateBeans`), the agency roster row
+# and the verification record — so the pause is written on `users/{uid}`, beside
+# the flag it pauses, and nowhere else:
+#
+#   hostSuspended                 true while paused — the flag every gate reads
+#   hostSuspendedUntil            end of a timed suspension (absent = until resumed)
+#   hostSuspendedReason           the reason; the host and their agency read it
+#   hostSuspensionDays            the term asked for (absent = indefinite)
+#   hostStatusBeforeSuspension    what Resume gives back ("active")
+#   hostSuspended{By,ByName,ByRole,At} / hostResumed{By,ByName,ByRole,At}
+#
+# Admin SDK only: `firestore.rules` lists every one in ownerProtectedFields()
+# and staffProtectedFields().
+#
+# NOTHING ELSE MOVES. `isHost` stays true (the slot is kept and still counts for
+# the one-role rule, `user_roles.HELD_HOST_STATUSES`); `isVerifiedHost`, the
+# agency link, the rate, the roster row, the verification record and every
+# ledger row are untouched. Beans already earned stay the host's and — as on
+# every suspension (RC, CRM-FLOW 9.48; `deactivate_partner` does the same) — are
+# FROZEN for the Owner's review; Resume does not release them.
+#
+# WHAT STOPS, AND WHERE: going live (`firestore.rules` mayGoLive and the
+# publisher token in `generateAgoraToken`), paid calls as the earner
+# (`startCall`, `acceptCall`; `tickCall` ends one in progress), the call rate,
+# Host Home, the face capture and a referral redemption — one predicate,
+# `functions/src/hostEligibility.ts`. Viewer and user features do not. The
+# host's live rooms are ended here, now. There is no Host-only API session or
+# token claim to revoke, and the person's account sessions are deliberately left
+# alone: only the role is paused, and an Agora publisher token cannot be minted
+# again while the flag is set.
+#
+# EXPIRY: the daily run (`scheduling.daily` → `lift_expired_host_suspensions`)
+# resumes a timed suspension on or after its date, through `resume_host`,
+# audited as `host.resumed` by the machine. The gates read the flag only.
+
+#: The shortest reason a Host-role suspension takes — the host and their agency
+#: both read it.
+HOST_SUSPENSION_MIN_REASON = 10
+HOST_SUSPENSION_MAX_DAYS = 365
+
+
+class HostRoleChanged(UserError):
+    """The Host record moved under the decision (a revoke, a second suspension).
+
+    409, like the partner records' "changed while it was being suspended":
+    nothing was written, reload and decide again.
+    """
+
+    status_code = 409
+
+
+def _host_suspension_cleared() -> dict:
+    """The pause's state fields, cleared. The `hostSuspended*` / `hostResumed*`
+    stamps stay on the record as history, as `suspendedBy*` does after Resume."""
+    return {
+        "hostSuspended": False,
+        "hostSuspendedUntil": fb_firestore.DELETE_FIELD,
+        "hostSuspendedReason": fb_firestore.DELETE_FIELD,
+        "hostSuspensionDays": fb_firestore.DELETE_FIELD,
+        "hostStatusBeforeSuspension": fb_firestore.DELETE_FIELD,
+    }
+
+
+def _utc_moment(value: Any) -> datetime | None:
+    """A stored moment as an aware UTC datetime, or None."""
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _host_term(until: Any) -> str:
+    """'until 04 Nov 2026, 10:15 UTC' or 'until it is resumed' — the wording the
+    Functions refusal and the email use."""
+    moment = _utc_moment(until)
+    return f"until {moment.strftime('%d %b %Y, %H:%M UTC')}" if moment else "until it is resumed"
+
+
+def host_suspension_view(user: dict) -> dict:
+    """The `host` block of the contract for a suspended Host."""
+    return {
+        "status": "suspended",
+        "suspendedUntil": _iso(user.get("hostSuspendedUntil")) or None,
+        "reason": str(user.get("hostSuspendedReason") or ""),
+    }
+
+
+def _same_term(user: dict, reason: str, days: int | None) -> bool:
+    """Is this request the suspension already standing — a retry, a double press?"""
+    stored = user.get("hostSuspensionDays")
+    try:
+        stored_days = int(stored) if stored is not None else None
+    except (TypeError, ValueError):
+        stored_days = None
+    return str(user.get("hostSuspendedReason") or "").strip() == reason and stored_days == days
+
+
+async def _latest_audit_id(uid: str, action: str) -> str:
+    """The newest `action` entry on this account, for an idempotent answer. '' if unreadable."""
+    try:
+        for entry in await audit.history_for("user", uid):
+            if entry.get("action") == action:
+                return str(entry.get("id") or "")
+    except Exception as exc:  # noqa: BLE001 — the repeat still answers
+        log.warning("audit history of %s could not be read: %s", uid, exc)
+    return ""
+
+
+def _host_state_write(uid: str, expected: str, patch: dict) -> str:
+    """Blocking — the conditional write: `patch` lands only while the record's
+    Host state is still `expected`. Returns '' when written, else the state found.
+
+    A transaction, so a revoke or a second decision racing this one is not
+    overwritten — the same guarantee the partner records get from their
+    status-conditional `find_one_and_update`.
+    """
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    ref = _user_ref(uid)
+
+    @fb_firestore.transactional
+    def _apply(transaction) -> str:
+        snap = ref.get(transaction=transaction)
+        if not getattr(snap, "exists", False):
+            return "missing"
+        found = apps.host_state(snap.to_dict() or {}) or "not_a_host"
+        if found != expected:
+            return found
+        transaction.update(ref, patch)
+        return ""
+
+    return _apply(firebase.firestore_client().transaction())
+
+
+async def suspend_host(
+    uid: str, reason: str, actor: dict, *, days: int | None = None,
+    meta: dict | None = None, enforce_target_policy: bool = True,
+) -> dict:
+    """Suspend ONLY the Host role (§5) — the account, the person's other roles,
+    the Host record and its history all stay. See the block above.
+
+    Refused (400) unless this is an approved, current Host: never a Host, a
+    revoked Host (that is reinstatement territory), or one already suspended on
+    different terms. The SAME request again — a retry, a double press — returns
+    the standing suspension with `already: True` and writes nothing. `days` is
+    1–365; without it the suspension stands until somebody resumes it.
+    """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="suspend the Host role on")
+
+    reason = (reason or "").strip()
+    if len(reason) < HOST_SUSPENSION_MIN_REASON:
+        raise UserError(
+            f"A reason of at least {HOST_SUSPENSION_MIN_REASON} characters is required — "
+            "the host and their agency are told it."
+        )
+    if days is not None and (
+        isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= HOST_SUSPENSION_MAX_DAYS
+    ):
+        raise UserError("A Host-role suspension runs from 1 to 365 days, or until it is resumed.")
+
+    user = await _load_user(uid)
+    from app.services import partner_applications as apps  # local: apps imports this module
+    from app.services import notices
+
+    state = apps.host_state(user)
+    if state == "suspended":
+        if _same_term(user, reason, days):
+            return {
+                "uid": uid,
+                "host": host_suspension_view(user),
+                "notified": {"host": False, "agency": False},
+                "audit_id": await _latest_audit_id(uid, audit.Action.HOST_SUSPENDED),
+                "already": True,
+            }
+        raise UserError(
+            f"The Host role is already suspended {_host_term(user.get('hostSuspendedUntil'))}"
+            f" — reason: {str(user.get('hostSuspendedReason') or '')}. Resume it first to change "
+            "the term or the reason. Nothing was changed."
+        )
+    if state == "revoked":
+        raise UserError(
+            "This Host role was revoked, so there is nothing to suspend. A revoked role comes "
+            "back only through a reinstatement request the Owner decides."
+        )
+    if state != "active":
+        raise UserError("This account is not an approved Host, so there is no Host role to suspend.")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    until = now + timedelta(days=days) if days is not None else None
+    agency_id = str(user.get("agencyId") or "")
+    before = {"hostStatus": state, "isHost": True, "isVerifiedHost": bool(user.get("isVerifiedHost")),
+              "agencyId": agency_id}
+
+    patch: dict = {
+        "hostSuspended": True,
+        "hostSuspendedReason": reason,
+        "hostStatusBeforeSuspension": state,
+        # Indefinite clears any date a stale record carries, so the sweep never
+        # lifts it on an old schedule (as `suspend_user` does).
+        "hostSuspendedUntil": until if until is not None else fb_firestore.DELETE_FIELD,
+        "hostSuspensionDays": days if days is not None else fb_firestore.DELETE_FIELD,
+        **_stamp(actor, "hostSuspended"),
+        # RC (confirmed): the Host's beans stop in the same write as the pause.
+        **money_freeze.hold_fields("the Host role's suspension"),
+    }
+    # RC (confirmed, CRM-FLOW 9.48): pending Host earnings and transfers are
+    # frozen for the Owner's review FIRST — the cause partner role suspensions
+    # use. The person's partner records are not this decision's (only the Host
+    # role is paused), so they are left out.
+    await money_freeze.freeze_user(uid, cause="role_suspended", label="the Host role's suspension",
+                                   reason=reason, actor=actor, include_partners=False, db=get_db())
+    found = await _fs(_host_state_write, uid, "active", patch)
+    if found:
+        raise HostRoleChanged(
+            f"This Host record changed while it was being suspended (it is now '{found}'). "
+            "Reload it and decide again."
+        )
+
+    # "Block … new role transactions": every room this Host is streaming in is
+    # ended through the existing intervention, audited as its own act. Best
+    # effort and reported — the pause is committed above.
+    live_rooms = await _end_live_rooms_of(uid, reason, actor, why="Host role suspended")
+
+    until_iso = until.isoformat() if until else None
+    after = {"hostStatus": "suspended", "isHost": True, "isVerifiedHost": before["isVerifiedHost"],
+             "agencyId": agency_id, "hostSuspendedUntil": until_iso or ""}
+    audit_id = await audit.record(
+        actor=actor,
+        action=audit.Action.HOST_SUSPENDED,
+        subject_type="user",
+        subject_id=uid,
+        reason=reason,
+        before=before,
+        after=after,
+        meta={
+            "days": days,
+            "until": until_iso,
+            "lifted_by": "scheduled sweep" if until else "manual resume",
+            "agency_id": agency_id,
+            "live_rooms_ended": live_rooms["ended"],
+            "live_rooms_not_ended": live_rooms["failed"],
+            "money_frozen": True,
+            # Stated: only the role paused — the account, the other roles and
+            # the Host record (roster row, verification, rate) are untouched.
+            "account_touched": False,
+            "other_roles_touched": False,
+            "record_kept": True,
+            **(meta or {}),
+        },
+    )
+    # Tell the host and their agency (§5). Best effort, and last.
+    notified_host = await notices.host_suspended(uid, reason, str(audit_id or ""), until=until)
+    notified_agency = await _notify_agency_of_host_change(
+        agency_id, uid, str(user.get("name") or ""), "suspended", reason,
+    )
+    return {
+        "uid": uid,
+        "host": {"status": "suspended", "suspendedUntil": until_iso, "reason": reason},
+        "notified": {"host": notified_host, "agency": notified_agency},
+        "audit_id": audit_id,
+        "already": False,
+        "before": before,
+        "after": after,
+        "live_rooms_ended": live_rooms["ended"],
+        "live_rooms_not_ended": live_rooms["failed"],
+        "money_frozen": True,
+        "note": (
+            "Only the Host role is paused: going live, paid calls as a Host and Host Home "
+            "are refused until it is resumed. The account, the other roles, the agency link, "
+            "the verification and the earnings history are kept; host money is frozen for "
+            "the Owner's review."
+        ),
+    }
+
+
+async def resume_host(
+    uid: str, reason: str, actor: dict, *, meta: dict | None = None,
+    enforce_target_policy: bool = True,
+) -> dict:
+    """Lift a Host-role suspension: the SAME record works again (§5).
+
+    The gate is the one that suspended it (the revoke gate); unlike a REVOKED
+    role — refused here by name, it comes back only through a reinstatement
+    request the Owner decides — a suspension is lifted by whoever may impose
+    one, exactly as `partner_ops.reactivate_partner` lifts a partner's. Refused
+    for a Host that is not suspended, and for an account that is itself
+    suspended or banned (lift that first). Nothing frozen is released: the
+    Owner decides that on the frozen-money queue.
+    """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="resume the Host role on")
+
+    reason = _require_reason(reason)
+    user = await _load_user(uid)
+    from app.services import partner_applications as apps  # local: apps imports this module
+    from app.services import notices
+
+    state = apps.host_state(user)
+    if state == "revoked":
+        raise UserError(
+            "This Host role was revoked, not suspended. A revoked role comes back only through "
+            "a reinstatement request the Owner decides — it is not resumed."
+        )
+    if state == "active":
+        raise UserError("The Host role is not suspended, so there is nothing to resume.")
+    if state != "suspended":
+        raise UserError("This account is not a Host, so there is no Host role to resume.")
+    if restriction_of(user):
+        raise UserError(
+            "This account is suspended or banned. Lift that first — a role is not resumed onto "
+            "a restricted account. Nothing was changed."
+        )
+
+    previous = str(user.get("hostStatusBeforeSuspension") or "active")
+    agency_id = str(user.get("agencyId") or "")
+    before = {"hostStatus": "suspended", "hostSuspendedUntil": _iso(user.get("hostSuspendedUntil")),
+              "hostSuspendedReason": str(user.get("hostSuspendedReason") or ""), "agencyId": agency_id}
+    patch = {**_host_suspension_cleared(), **_stamp(actor, "hostResumed")}
+    found = await _fs(_host_state_write, uid, "suspended", patch)
+    if found:
+        raise HostRoleChanged(
+            f"This Host record changed while it was being resumed (it is now '{found}'). "
+            "Reload it and decide again."
+        )
+
+    after = {"hostStatus": previous, "agencyId": agency_id}
+    audit_id = await audit.record(
+        actor=actor,
+        action=audit.Action.HOST_RESUMED,
+        subject_type="user",
+        subject_id=uid,
+        reason=reason,
+        before=before,
+        after=after,
+        meta={
+            "previous_status": previous,
+            "original_reason": before["hostSuspendedReason"],
+            "lifted_by": "manual resume",
+            "agency_id": agency_id,
+            # Stated, not implied: the freeze stands until the Owner decides it.
+            "money_released": False,
+            "account_touched": False,
+            "other_roles_touched": False,
+            **(meta or {}),
+        },
+    )
+    notified_host = await notices.host_resumed(uid, str(audit_id or ""))
+    # The agency is told the role is back; the staff note stays internal.
+    notified_agency = await _notify_agency_of_host_change(
+        agency_id, uid, str(user.get("name") or ""), "resumed", "",
+    )
+    return {
+        "uid": uid,
+        "host": {"status": previous},
+        "notified": {"host": notified_host, "agency": notified_agency},
+        "audit_id": audit_id,
+        "before": before,
+        "after": after,
+        "money_released": False,
+        "note": (
+            "The same Host role works again. Host money frozen by the suspension stays frozen "
+            "until the Owner decides it on the frozen-money queue."
+        ),
+    }
+
+
+async def lift_expired_host_suspensions(actor: dict, limit: int = 200) -> dict:
+    """Resume every Host role whose timed suspension has run out. Daily.
+
+    Each lift is a real `resume_host`, audited as `host.resumed` with the
+    reason saying what lifted it, and inheriting its refusals (a revoked role,
+    a restricted account) — reported in `failed`, never forced. A suspension
+    with no `hostSuspendedUntil` is the indefinite kind and is never touched.
+
+    An equality query on the flag (served by the automatic single-field index),
+    the date compared here: the suspended Hosts at any moment are a handful,
+    and a range on a second field would need a composite index for nothing.
+    """
+    now = datetime.now(timezone.utc)
+    col = firebase.firestore_client().collection(USERS)
+    query = col.where(filter=FieldFilter("hostSuspended", "==", True)).limit(min(limit, MAX_READ))
+    docs = await _fs(lambda: list(query.stream()))
+
+    lifted: list[str] = []
+    failed: list[dict] = []
+    due = 0
+    for d in docs:
+        until = _utc_moment((d.to_dict() or {}).get("hostSuspendedUntil"))
+        if until is None or until > now:
+            continue
+        due += 1
+        try:
+            # `enforce_target_policy=False`: a scheduled job, not a person
+            # acting through user management (see `lift_expired_suspensions`).
+            await resume_host(
+                d.id, "Host-role suspension period ended.", actor,
+                meta={"lifted_by": "scheduled sweep"}, enforce_target_policy=False,
+            )
+            lifted.append(d.id)
+        except Exception as exc:  # noqa: BLE001 — one failure must not stop the sweep
+            failed.append({"uid": d.id, "error": str(exc)})
+
+    return {"checked": len(docs), "due": due, "lifted": lifted, "failed": failed}
 
 
 # ── The host application decision — one writer, both status fields ────────────

@@ -222,6 +222,12 @@ async def _validate(kind: str, subject_id: str, to_agency_id: str, db) -> dict[s
         user = await asyncio.to_thread(_read_doc, "users", subject_id)
         if user is None:
             raise TransferError("There is no account with that id.")
+        if apps.host_state(user) == "suspended":
+            # §5: a paused Host role takes no new role action; it is resumed
+            # (same record) first, then moved if that is still wanted.
+            raise TransferError(
+                "This Host role is suspended. Resume it before filing a transfer."
+            )
         if apps.host_state(user) != "active":
             raise TransferError(
                 "This account is not an active Host — a revoked Host is reinstated "

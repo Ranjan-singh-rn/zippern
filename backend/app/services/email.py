@@ -3486,7 +3486,15 @@ TEMPLATES: dict[str, Template] = {t.name: t for t in (
     _t("role.revoked", "§4 / C1", _TX, "role holder", "partner_ops.revoke_partner / users.revoke_host",
        tone="critical", heading="Role revoked"),
     _t("agency.host_changed", "§5", _TX, "agency owner",
-       "users.revoke_host / restore_host — the host's agency is told", heading="Your roster changed"),
+       "users.revoke_host / restore_host / suspend_host / resume_host — the host's agency is told",
+       heading="Your roster changed"),
+    # §5 partner role suspension, Host capability: only the role pauses, so it
+    # leaves as a role change (transactional), like `role.suspended` — the
+    # account itself is untouched (that one is `account.suspended`, security).
+    _t("host.suspended", "§5", _TX, "host", "users.suspend_host", tone="warning",
+       heading="Host role suspended"),
+    _t("host.resumed", "§5", _TX, "host", "users.resume_host / expired host-suspension sweep",
+       heading="Host role active again"),
     # ── warning / suspension / ban (§12 "warning/suspension/ban")
     _t("user.warning", "UGP", _TX, "user", "users.warn_user", tone="warning", heading="Official warning"),
     _t("account.suspended", "§5", _SEC, "user", "users.suspend_user", tone="critical",

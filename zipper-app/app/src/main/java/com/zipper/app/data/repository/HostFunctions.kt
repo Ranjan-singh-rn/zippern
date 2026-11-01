@@ -2,6 +2,7 @@ package com.zipper.app.data.repository
 
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
+import com.zipper.app.util.HostSuspension
 import com.zipper.app.util.ServerRefusals
 import kotlinx.coroutines.tasks.await
 import com.zipper.app.util.SessionManager
@@ -64,12 +65,19 @@ class HostFunctions @Inject constructor(
         GUEST,
         /** C1 (B04): this account's Host role was revoked — reinstatement, not a code. */
         ROLE_REVOKED,
+        /**
+         * §5: this account's Host role is SUSPENDED (`host_suspended`). The same
+         * role comes back when staff resume it; a code changes nothing. The
+         * server sends its sentence (until when, and why) as `message`.
+         */
+        HOST_SUSPENDED,
         UNKNOWN,
     }
 
     sealed interface CodeCheck {
         data class Valid(val agencyName: String) : CodeCheck
-        data class Invalid(val reason: ReferralRefusal) : CodeCheck
+        /** [message] is the server's own sentence when it sent one (a suspended Host role), else "". */
+        data class Invalid(val reason: ReferralRefusal, val message: String = "") : CodeCheck
         data class Failed(val message: String) : CodeCheck
     }
 
@@ -107,8 +115,10 @@ class HostFunctions @Inject constructor(
                         "other_agency"     -> ReferralRefusal.OTHER_AGENCY
                         "guest"            -> ReferralRefusal.GUEST
                         "role_revoked"     -> ReferralRefusal.ROLE_REVOKED
+                        HostSuspension.REFERRAL_REASON -> ReferralRefusal.HOST_SUSPENDED
                         else               -> ReferralRefusal.UNKNOWN
-                    }
+                    },
+                    message = m["message"] as? String ?: "",
                 )
             }
         }

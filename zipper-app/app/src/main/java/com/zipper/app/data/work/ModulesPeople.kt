@@ -47,6 +47,22 @@ private val userActions: List<WorkAction> = listOf(
     WorkAction("user.restoreHost", "Restore Host role", "/api/users/{param:uid}/restore-host",
         gate = { c -> c.isOwner && c.has(Perm.APPROVE_KYC) }, inputs = listOf(reason()),
         confirm = "Restore the revoked Host role from its approved application?"),
+    // §5 partner role suspension, for the Host role: ONLY that capability is
+    // paused — the account, its other roles, the agency roster row, the
+    // verification and the earnings stay — and Resume brings back the SAME
+    // record. Same capability as revoke-host; offered from the Host row the
+    // server reported for this account (`GET /users/{uid}/roles`).
+    WorkAction("user.suspendHost", "Suspend Host role", "/api/users/{param:uid}/suspend-host", danger = true,
+        gate = { c -> c.has(Perm.APPROVE_KYC) },
+        showFor = { root, _ -> hostRoleStatus(root) == "active" },
+        inputs = listOf(reason(10, help = "At least ten characters. The host and their agency are told, with this reason."),
+            Input("days", "Days (blank = until resumed)", InputType.Int, required = false, min = 1, max = 365)),
+        confirm = "Suspend only the Host role? Their live rooms end and host calls stop; the account, other roles, roster, verification and earnings stay. Host money is frozen for the Owner's review."),
+    WorkAction("user.resumeHost", "Resume Host role", "/api/users/{param:uid}/resume-host",
+        gate = { c -> c.has(Perm.APPROVE_KYC) },
+        showFor = { root, _ -> hostRoleStatus(root) == "suspended" },
+        inputs = listOf(reason()),
+        confirm = "Resume the suspended Host role on the same record? A money freeze is not released by this."),
     WorkAction("user.sellerFlag", "Remove shop seller flag", "/api/users/{param:uid}/seller-flag", danger = true,
         gate = { c -> c.has(Perm.APPROVE_SELLER) }, inputs = listOf(reason()), fixed = mapOf("is_seller" to false),
         confirm = "Remove the display seller flag? Refused while an approved Coin Seller record exists."),
@@ -105,6 +121,9 @@ internal val peopleModules: List<WorkModule> = listOf(
         detail = listOf(Field("Role", "label"), Field("Record ID", "id"), Field("Name", "name"),
             Field("Status", "status", FieldKind.Status), Field("Active", "is_active", FieldKind.Bool),
             Field("Main agency", "parent_id"), Field("Agency", "agency_id"), Field("Verified", "verified", FieldKind.Bool),
+            // §5: a suspended Host row carries its term (absent = until resumed) and the reason.
+            Field("Suspended until", "suspended_until", FieldKind.Date),
+            Field("Suspension reason", "suspension_reason", FieldKind.LongText),
             Field("Application", "application_id"), Field("Allowed actions", "actions", FieldKind.Json)),
         actions = listOf(
             WorkAction("role.revokePartner", "Revoke this role", "/api/partner-ops/partners/{item:id}/revoke", danger = true,

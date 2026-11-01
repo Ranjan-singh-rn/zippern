@@ -8,6 +8,8 @@ import { getHostLadder, hostLevelFor } from './hostStats'
 import {
   heldByAnotherAgency, restrictionOn, decisionRefusal, agencyCodeRefusal, guestRefusal,
   hostRoleRevoked, hostOfSameAgency, activeHostRefusal, HOST_REVOKED_REFUSAL, ROLE_REVOKED,
+  hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails, refusalDetails,
+  HOST_ROLE_SUSPENDED,
 } from './hostEligibility'
 import { sameNumber } from './phone'
 import { hostBlockedFor } from './crmRoles'
@@ -330,6 +332,21 @@ export const activateHost = functions
       }
 
       /*
+       * ── A SUSPENDED HOST ROLE IS NOT REDEEMED AROUND (§5) ──────────────────
+       *
+       * The suspension keeps the role, the record and the agency link; it comes
+       * back through Resume (or the end of its term), on the same record. A
+       * code — even this host's own agency's, whose re-entry path rewrites the
+       * roster row — is not a way round it, and neither is another agency's.
+       */
+      const suspended = hostRoleSuspension(userSnap)
+      if (suspended) {
+        throw new functions.https.HttpsError(
+          'failed-precondition', hostSuspendedMessage(suspended), hostSuspensionDetails(suspended),
+        )
+      }
+
+      /*
        * ── ONE HOST, ONE AGENCY ───────────────────────────────────────────────
        *
        * Without this, a host already attached to agency A who redeems a code
@@ -595,6 +612,14 @@ export const setCallRate = functions
     if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Account not found.')
     if (userSnap.get('isHost') !== true) {
       throw new functions.https.HttpsError('permission-denied', 'This is for hosts only.')
+    }
+    // §5: the price of a suspended Host's time is not changed while the role is
+    // suspended — there are no calls to price; the rate stands for the resume.
+    const suspended = hostRoleSuspension(userSnap)
+    if (suspended) {
+      throw new functions.https.HttpsError(
+        'permission-denied', hostSuspendedMessage(suspended), hostSuspensionDetails(suspended),
+      )
     }
     // The same rule `startCall` prices on and `getHostHome` reports: an
     // unverified host is charged out at the base rate whatever their level, so
@@ -866,6 +891,15 @@ export const checkReferralCode = functions
       if (hostRoleRevoked(userSnap)) {
         return { valid: false, reason: 'role_revoked', code: ROLE_REVOKED, message: HOST_REVOKED_REFUSAL }
       }
+      // §5: redemption refuses a suspended Host role, so the pre-flight does,
+      // with the same sentence and `details.code`.
+      const suspended = hostRoleSuspension(userSnap)
+      if (suspended) {
+        return {
+          valid: false, reason: 'host_suspended', code: HOST_ROLE_SUSPENDED,
+          message: hostSuspendedMessage(suspended),
+        }
+      }
       if (heldByAnotherAgency(userSnap, String(app.agencyId ?? ''))) {
         return { valid: false, reason: 'other_agency' }
       }
@@ -928,9 +962,11 @@ export const submitHostCapture = functions
     await assertActiveSession(uid, data, 'submitHostCapture', context.auth?.token)   // Phase 1A (SESSION-001/003)
 
     const userRef = db.collection('users').doc(uid)
+    // §5: a suspended Host role submits no face either (`HOST_ROLE_SUSPENDED`,
+    // term and reason in `details`); the record waits for the resume.
     const notHost = activeHostRefusal(await userRef.get())
     if (notHost) {
-      throw new functions.https.HttpsError('permission-denied', notHost.message, { code: notHost.code })
+      throw new functions.https.HttpsError('permission-denied', notHost.message, refusalDetails(notHost))
     }
 
     const verRef = db.collection('hostVerification').doc(uid)

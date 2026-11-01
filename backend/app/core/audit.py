@@ -341,6 +341,18 @@ class Action:
     #: Finance or an Owner lifted that hold so the item can be decided.
     MONEY_ITEM_RELEASED = "money.item_released"
 
+    # --- host role suspension ---
+    #: §5 partner role suspension, for the Host capability: the role is paused
+    #: (`users.suspend_host`) — the account, the person's other roles, the
+    #: Host record (`isHost`, verification, agency roster row) and the earnings
+    #: history are all kept, and only Host actions stop. Its own action, not
+    #: `host.revoked` (an ending) and not `user.suspended` (the whole account).
+    HOST_SUSPENDED = "host.suspended"
+    #: The same Host record working again (`users.resume_host`): by a person
+    #: holding the revoke gate, or by the daily sweep when a timed suspension's
+    #: term has run out. Never a reinstatement — a revoked Host is not resumed.
+    HOST_RESUMED = "host.resumed"
+
 
 def _entry(
     *,

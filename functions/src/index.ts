@@ -25,7 +25,7 @@ import {
 } from './publicSeller'
 import { type CrmUserDoc, syncClaim } from './storageClaims'
 import { assertActiveSession } from './mobileSession'
-import { activeHostRefusal } from './hostEligibility'
+import { activeHostRefusal, refusalDetails } from './hostEligibility'
 import { rosterRowIsCurrent } from './roster'
 import { type MailIdentity, SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
 import { activeOwnerEmails, sendOnce } from './mailLog'
@@ -2204,12 +2204,17 @@ export const generateAgoraToken = functions
    * created, and the document outlives it: a Host revoked or removed since kept
    * getting a publisher token for a room opened before. Refused, not quietly
    * downgraded to a viewer, so the app can say why the stream will not start.
+   *
+   * §5: a SUSPENDED Host role is refused here too (`HOST_ROLE_SUSPENDED`, with
+   * the term and the reason in `details`) — the suspension ends the rooms that
+   * were live, and this is what stops a renewal publishing into one again.
+   * Watching is a viewer's token and is not touched.
    */
   const refuseUnlessCurrentHost = (): void => {
     const notHost = activeHostRefusal(callerSnap)
     if (notHost) {
       functions.logger.info('agora: refused a host token', { channelName, callerUid, code: notHost.code })
-      throw new functions.https.HttpsError('permission-denied', notHost.message, { code: notHost.code })
+      throw new functions.https.HttpsError('permission-denied', notHost.message, refusalDetails(notHost))
     }
   }
 

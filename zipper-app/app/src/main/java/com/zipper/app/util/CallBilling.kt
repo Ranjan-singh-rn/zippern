@@ -44,6 +44,13 @@ object CallBilling {
     const val END_PARTY_RESTRICTED = "party_restricted"
     const val END_SESSION_DISPLACED = "session_displaced"
 
+    /**
+     * Spec §5: the earner's HOST ROLE was suspended while the call ran
+     * (`tickCall` ends it at the gate). Only the Host role — the account is
+     * not restricted — so the payer is not told why, only that it ended.
+     */
+    const val END_HOST_SUSPENDED = "host_suspended"
+
     /** What the server last told us about the call's billing. */
     data class Snapshot(
         /** `startedAtMs` from the server, or null before the call connected. */
@@ -149,6 +156,10 @@ object CallBilling {
             else "The call ended because the other person ran out of diamonds for the next minute."
         END_PARTY_RESTRICTED -> "The call was ended because an account on it is restricted."
         END_SESSION_DISPLACED -> "The call was ended because the account was opened on another device."
+        END_HOST_SUSPENDED ->
+            if (isPayer) "The call was ended because this host is not taking calls right now. " +
+                "The minutes already charged stay charged."
+            else "The call was ended because your Host role is suspended. Your account is not affected."
         else -> null
     }
 

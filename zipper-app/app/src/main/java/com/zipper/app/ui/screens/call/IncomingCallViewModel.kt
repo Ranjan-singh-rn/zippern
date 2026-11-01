@@ -27,6 +27,13 @@ data class IncomingCallUiState(
     val navigateToCall: Boolean = false,
     /** Why the accept was refused, phrased by the server. */
     val error: String? = null,
+    /**
+     * Accept was pressed and the server has not answered yet. A refused accept
+     * closes the ringing call document in the same transaction (e.g. a Host
+     * whose role is suspended), and that snapshot can land before the refusal
+     * itself — so the screen waits for the answer rather than closing silently.
+     */
+    val accepting: Boolean = false,
 )
 
 @HiltViewModel
@@ -96,15 +103,17 @@ class IncomingCallViewModel @Inject constructor(
     }
 
     fun accept() {
+        if (_state.value.accepting) return
+        _state.update { it.copy(accepting = true) }
         viewModelScope.launch {
             // acceptCall returns a message on failure rather than throwing, so
             // the catch that used to end the call on any exception would have
             // let a refused accept through as a success.
             val error = callRepo.acceptCall(callId)
             if (error == null) {
-                _state.update { it.copy(navigateToCall = true) }
+                _state.update { it.copy(navigateToCall = true, accepting = false) }
             } else {
-                _state.update { it.copy(status = CallStatus.ENDED, error = error) }
+                _state.update { it.copy(status = CallStatus.ENDED, error = error, accepting = false) }
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.zipper.app.ui.screens.live
 
 import com.zipper.app.util.LiveModeration
+import com.zipper.app.util.HostSuspension
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -228,6 +229,20 @@ class GoLiveViewModel @Inject constructor(
                             error = "Going live is for hosts. Apply with an agency referral code to become one.",
                         )
                     }
+                    return@launch
+                }
+                /*
+                 * §5: a SUSPENDED Host role does not go live. The rules refuse
+                 * the room (`mayGoLive`) with a bare PERMISSION_DENIED, so the
+                 * server's own sentence — until when, and why — is said here
+                 * first. Only the Host role is paused; the account is not
+                 * restricted, so watching and joining parties still work.
+                 */
+                val suspended = HostSuspension.messageFor(
+                    user.isHost, user.hostSuspended, user.hostSuspendedUntil, user.hostSuspendedReason,
+                )
+                if (suspended != null) {
+                    _state.update { it.copy(isLoading = false, error = suspended) }
                     return@launch
                 }
                 if (!user.isVerifiedHost) {

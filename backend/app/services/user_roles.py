@@ -39,6 +39,32 @@ log = logging.getLogger(__name__)
 #: and revoked are history.
 HELD_PARTNER_STATUSES = frozenset({"approved", "suspended"})
 
+#: The same for the Host role. A SUSPENDED Host still holds the role (§5: the
+#: slot and the record are kept while it is paused), exactly as a suspended
+#: partner record does.
+HELD_HOST_STATUSES = frozenset({"active", "suspended"})
+
+
+def host_role_suspended(user: dict | None) -> bool:
+    """Is this account's Host role paused (§5 partner role suspension)? Pure.
+
+    The flag `users.suspend_host` writes and every gate reads — the Functions
+    (`hostEligibility.hostRoleSuspension`) and `firestore.rules` (`mayGoLive`)
+    ask the same strict question. `is True`, never truthiness: a stray string
+    must not pause anybody's role.
+    """
+    return bool(user) and (user or {}).get("hostSuspended") is True
+
+
+def _iso_or_none(value: Any) -> str | None:
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())
+        except Exception:  # noqa: BLE001 — a shape we do not recognise
+            return None
+    return None
+
 #: The CRM's words for a role, keyed by the kind each record carries.
 ROLE_LABELS = {
     "host": "Host",
@@ -65,7 +91,7 @@ def count_held(roles: list[dict[str, Any]]) -> int:
     n = 0
     for r in roles:
         if r.get("role") == "host":
-            n += 1 if r.get("status") == "active" else 0
+            n += 1 if r.get("status") in HELD_HOST_STATUSES else 0
         elif str(r.get("status") or "") in HELD_PARTNER_STATUSES:
             n += 1
     return n
@@ -73,7 +99,7 @@ def count_held(roles: list[dict[str, Any]]) -> int:
 
 def _held(r: dict[str, Any]) -> bool:
     if r.get("role") == "host":
-        return r.get("status") == "active"
+        return r.get("status") in HELD_HOST_STATUSES
     return str(r.get("status") or "") in HELD_PARTNER_STATUSES
 
 
@@ -83,7 +109,9 @@ def allowed_role_actions(roles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     `revoke` only when two or more roles are held and this one is held.
     `restore` for a partner record that is suspended or revoked, and for a
     revoked Host that has an approved application to restore from — the server
-    re-checks everything when it is pressed.
+    re-checks everything when it is pressed. `resume` for a SUSPENDED Host
+    (`POST /users/{uid}/resume-host`): the same record, lifted — never offered
+    on a revoked one, which only comes back through reinstatement.
     """
     held = count_held(roles)
     out: list[dict[str, Any]] = []
@@ -94,6 +122,8 @@ def allowed_role_actions(roles: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if r.get("role") == "host":
             if r.get("status") == "revoked" and r.get("restorable"):
                 actions.append("restore")
+            elif r.get("status") == "suspended":
+                actions.append("resume")
         elif str(r.get("status") or "") in ("suspended", "revoked"):
             actions.append("restore")
         out.append({**r, "actions": actions})
@@ -108,7 +138,7 @@ def deduction_currencies(roles: list[dict[str, Any]]) -> list[str]:
     open question is FLOW-MAP D6). Everyone else — including a person with no
     role — is a User, so diamonds.
     """
-    host = any(r.get("role") == "host" and r.get("status") == "active" for r in roles)
+    host = any(r.get("role") == "host" and r.get("status") in HELD_HOST_STATUSES for r in roles)
     other = any(r.get("role") != "host" and _held(r) for r in roles)
     if host and other:
         return ["beans", "diamonds"]
@@ -204,10 +234,15 @@ async def role_inventory(uid: str, *, user: dict | None = None, db=None) -> dict
     agency_id = str(user.get("agencyId") or "").strip()
 
     if user.get("isHost"):
+        # §5: a suspended Host is still a Host — same record, same agency, same
+        # verification — reported with its own status, term and reason.
+        suspended = host_role_suspended(user)
         roles.append({
-            "role": "host", "label": "Host", "status": "active",
+            "role": "host", "label": "Host", "status": "suspended" if suspended else "active",
             "verified": bool(user.get("isVerifiedHost")), "agency_id": agency_id,
             "application_id": (approved_apps[0]["id"] if approved_apps else ""),
+            **({"suspended_until": _iso_or_none(user.get("hostSuspendedUntil")),
+                "suspension_reason": str(user.get("hostSuspendedReason") or "")} if suspended else {}),
         })
     elif user.get("hostRevokedAt") or user.get("hostRemovedAt"):
         restore_agency = agency_id or str((approved_apps[0] if approved_apps else {}).get("agencyId") or "")

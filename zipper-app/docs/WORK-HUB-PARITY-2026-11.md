@@ -57,17 +57,17 @@ reason) · **Not a Work-hub capability** (public form, app edge, machine).
 
 | | Count |
 |---|---|
-| `lib/api.ts` functions | 122 |
-| … on mobile | 90 (41 reads, 38 writes, 11 Owner-only writes) |
+| `lib/api.ts` functions | 124 |
+| … on mobile | 92 (41 reads, 40 writes, 11 Owner-only writes) |
 | … app door (sign-in, renewal, sign-out, Owner two-step) | 9 |
 | … CRM-only · Owner / Observer governance | 12 |
 | … CRM-only, other reason | 6 |
 | … gaps | 2 |
 | … not Work-hub capabilities | 3 |
 | Other CRM clients + Android-first routes (§ C, the 9 app-edge routes as one row) | 132 rows: 72 mobile (10 Android-first, 7 Owner-only writes), 29 CRM-only (8 governance), 4 gaps, 8 no client yet, 17 not Work-hub, 1 app door, 1 removed everywhere |
-| Backend routes | 255 |
+| Backend routes | 257 |
 | Permission keys / roles | 20 / 16 |
-| Work-hub screens / distinct actions | 84 / 154 |
+| Work-hub screens / distinct actions | 84 / 156 |
 
 ## Per-role counts (pinned by `WorkParityTest`)
 
@@ -83,11 +83,11 @@ holds an agency record, `seller` a seller record, `agency+seller` both,
 <!-- role-counts:begin -->
 | Session | Screens | Writes | Reads | Links | CRM-only markers |
 |---|---|---|---|---|---|
-| `owner` | 81 | 116 | 13 | 22 | 2 |
+| `owner` | 81 | 118 | 13 | 22 | 2 |
 | `observer` | 50 | 0 | 8 | 17 | 2 |
 | `app_admin` | 65 | 46 | 11 | 18 | 2 |
 | `app_member` | 40 | 26 | 8 | 11 | 2 |
-| `ops_admin` | 68 | 55 | 11 | 20 | 2 |
+| `ops_admin` | 68 | 57 | 11 | 20 | 2 |
 | `ops_member` | 43 | 19 | 10 | 18 | 2 |
 | `finance_admin` | 69 | 54 | 11 | 20 | 2 |
 | `finance_member` | 50 | 28 | 11 | 20 | 2 |
@@ -191,6 +191,8 @@ Routes as served (`/api` prefix). Guards are the route's dependencies; keys are
 | `users.roles` | GET `/api/users/{uid}/roles` | `current_user` | `users.record` (screen) | Mobile (read) |
 | `users.restoreHost` | POST `/api/users/{uid}/restore-host` | `require_write` · `can_approve_kyc` · service: Owner only | `users.record/user.restoreHost` | Mobile |
 | `users.revokeHost` | POST `/api/users/{uid}/revoke-host` | `require_write` · `can_approve_kyc` | `users.record/user.revokeHost` | Mobile |
+| `users.suspendHost` | POST `/api/users/{uid}/suspend-host` | `require_write` · `can_approve_kyc` | `users.record/user.suspendHost` (offered while the Host row is `active`) | Mobile |
+| `users.resumeHost` | POST `/api/users/{uid}/resume-host` | `require_write` · `can_approve_kyc` | `users.record/user.resumeHost` (offered while the Host row is `suspended`) | Mobile |
 | `users.decideHostApplication` | POST `/api/users/host-applications/{application_id}/decide` | `require_write` · `can_approve_kyc` | `hosts.applications/hostApp.decide` | Mobile |
 | `users.decideHostPendingChanges` | POST `/api/users/host-applications/{application_id}/pending-changes/decide` | `require_write` · `can_approve_kyc` | `hosts.applications/hostApp.changes` | Mobile |
 | `users.requestBalanceChange` | POST `/api/users/{uid}/balance-request` | `require_write` · `can_adjust_balance` | `users.record/user.balance` | Mobile |
@@ -279,7 +281,7 @@ broadcasts: the audience rules; live rooms: Ops or an Owner).
 | `can_ban_users` | owner, app_admin, app_member | 10 — `POST /users/devices/bans`; `POST /users/devices/bans/{device_id}/unban`; `GET /users/appeals/{appeal_id}/evidence`; `POST /users/appeals/{appeal_id}/recommend`; `POST /users/appeals/{appeal_id}/decide`; `POST /users/{uid}/ban`; `POST /users/{uid}/unban`; `POST /users/{uid}/suspend`; `POST /users/{uid}/resume`; `POST /users/reports/{id}/action (suspend, ban)` | `appeal.evidence`, `appeal.recommend`, `device.ban`, `device.unban`, `live.ban`, `user.ban`, `user.resume`, `user.suspend`, `user.unban` |
 | `can_adjust_balance` | owner, app_admin, finance_admin | 4 — `POST /users/balance-cards/{card_id}/execute`; `POST /users/{uid}/balance-request`; `POST /users/{uid}/warn`; `POST /users/reports/{id}/action (deduct)` | `card.exec.balance`, `user.balance` |
 | `can_view_agencies` | owner, app_admin, ops_admin, ops_member, finance_admin, finance_member | 0 — — | `hostApp.docs`, `partner.documents`, `partners.directory (screen)`, `partners.one (screen)` |
-| `can_approve_kyc` | owner, ops_admin | 22 — `POST /partner-ops/partners`; `POST /partner-ops/partners/{partner_id}/attach-login`; `POST /partner-ops/partners/{partner_id}/approve`; `POST /partner-ops/partners/{partner_id}/grant-capability`; `POST /partner-ops/partners/{partner_id}/second-role`; `POST /partner-ops/partners/{partner_id}/reject`; `POST /partner-ops/partners/{partner_id}/pending-changes/decide`; `POST /partner-ops/partners/{partner_id}/deactivate`; `POST /partner-ops/partners/{partner_id}/reactivate`; `POST /partner-ops/partners/{partner_id}/revoke`; `POST /partner-ops/partners/{partner_id}/activate`; `GET /partner-ops/role-appeals`; `POST /partner-ops/role-appeals/{appeal_id}/recommend`; `POST /partner-ops/transfers`; `GET /partner-ops/transfers`; `POST /users/host-applications/{application_id}/decide`; `POST /users/host-applications/{application_id}/pending-changes/decide`; `POST /users/{uid}/revoke-host`; `POST /users/{uid}/restore-host`; `GET /host-verification/pending`; `GET /host-verification/{uid}`; `POST /host-verification/{uid}/review` | `hostApp.changes`, `hostApp.decide`, `hostVerification`, `partner.activate`, `partner.approve`, `partner.changes`, `partner.deactivate`, `partner.reactivate`, `partner.reject`, `partner.revoke`, `partner.secondRole`, `partners.directory (screen)`, `partners.one (screen)`, `role.revokePartner`, `roleAppeal.recommend`, `roleAppeals`, `transfer.new`, `transfers`, `user.restoreHost`, `user.revokeHost`, `user.transfer`, `verify.review` |
+| `can_approve_kyc` | owner, ops_admin | 24 — `POST /partner-ops/partners`; `POST /partner-ops/partners/{partner_id}/attach-login`; `POST /partner-ops/partners/{partner_id}/approve`; `POST /partner-ops/partners/{partner_id}/grant-capability`; `POST /partner-ops/partners/{partner_id}/second-role`; `POST /partner-ops/partners/{partner_id}/reject`; `POST /partner-ops/partners/{partner_id}/pending-changes/decide`; `POST /partner-ops/partners/{partner_id}/deactivate`; `POST /partner-ops/partners/{partner_id}/reactivate`; `POST /partner-ops/partners/{partner_id}/revoke`; `POST /partner-ops/partners/{partner_id}/activate`; `GET /partner-ops/role-appeals`; `POST /partner-ops/role-appeals/{appeal_id}/recommend`; `POST /partner-ops/transfers`; `GET /partner-ops/transfers`; `POST /users/host-applications/{application_id}/decide`; `POST /users/host-applications/{application_id}/pending-changes/decide`; `POST /users/{uid}/revoke-host`; `POST /users/{uid}/restore-host`; `POST /users/{uid}/suspend-host`; `POST /users/{uid}/resume-host`; `GET /host-verification/pending`; `GET /host-verification/{uid}`; `POST /host-verification/{uid}/review` | `hostApp.changes`, `hostApp.decide`, `hostVerification`, `partner.activate`, `partner.approve`, `partner.changes`, `partner.deactivate`, `partner.reactivate`, `partner.reject`, `partner.revoke`, `partner.secondRole`, `partners.directory (screen)`, `partners.one (screen)`, `role.revokePartner`, `roleAppeal.recommend`, `roleAppeals`, `transfer.new`, `transfers`, `user.restoreHost`, `user.resumeHost`, `user.revokeHost`, `user.suspendHost`, `user.transfer`, `verify.review` |
 | `can_view_sellers` | owner, app_admin, ops_admin, ops_member, finance_admin, finance_member | 0 — — | `partner.documents`, `partners.directory (screen)`, `partners.one (screen)`, `recharges`, `sales` |
 | `can_approve_seller` | owner, ops_admin | 13 — `POST /partner-ops/partners/{partner_id}/attach-login`; `POST /partner-ops/partners/{partner_id}/virtual-account`; `POST /partner-ops/partners/{partner_id}/approve`; `POST /partner-ops/partners/{partner_id}/grant-capability`; `POST /partner-ops/partners/{partner_id}/second-role`; `POST /partner-ops/partners/{partner_id}/reject`; `POST /partner-ops/partners/{partner_id}/deactivate`; `POST /partner-ops/partners/{partner_id}/reactivate`; `POST /partner-ops/partners/{partner_id}/revoke`; `POST /partner-ops/partners/{partner_id}/activate`; `GET /partner-ops/role-appeals`; `POST /partner-ops/role-appeals/{appeal_id}/recommend`; `POST /users/{uid}/seller-flag` | `partner.activate`, `partner.approve`, `partner.deactivate`, `partner.reactivate`, `partner.reject`, `partner.revoke`, `partner.secondRole`, `partner.van`, `partners.directory (screen)`, `partners.one (screen)`, `role.revokePartner`, `roleAppeal.recommend`, `roleAppeals`, `user.sellerFlag` |
 | `can_coin_operations` | owner, finance_admin, finance_member | 14 — `POST /partner-ops/coin-purchases/{card_id}/execute`; `POST /partner-ops/sellers/{seller_id}/lending`; `POST /partner-ops/lending/{card_id}/execute`; `POST /partner-ops/sellers/{seller_id}/repayments`; `POST /partner-ops/repayments/{card_id}/execute`; `POST /partner-ops/sellers/{seller_id}/recoveries`; `POST /partner-ops/recoveries/{card_id}/execute`; `POST /partner-ops/partners/{partner_id}/write-off`; `POST /partner-ops/write-offs/{card_id}/execute`; `POST /partner-ops/sales/{sale_id}/approve`; `POST /partner-ops/recharges/{recharge_id}/approve`; `POST /partner-ops/recharges/{recharge_id}/reject`; `POST /partner-ops/recharges/{recharge_id}/refund`; `POST /partner-ops/recharges/{recharge_id}/refund/decide` | `card.exec.coin`, `card.exec.lend`, `card.exec.recover`, `card.exec.repay`, `card.exec.writeoff`, `cards.coinPurchases`, `coinReq.convert`, `coinRequests`, `partner.lend`, `partner.recover`, `partner.repay`, `partner.writeoff`, `partners.directory (screen)`, `partners.one (screen)`, `recharge.approve`, `recharge.refund`, `recharge.refundDecide`, `recharge.reject`, `recharges`, `sale.approve`, `sales`, `seller.buy` |
@@ -499,3 +501,11 @@ odds tables (structured, ppm-validated editor in the CRM).
 | `data/work/WorkModulesTest` | every route exists on the backend; every write confirms; observer reads only; partner allowlist; owner-only decisions; permission names = server's |
 | `ui/screens/auth/OwnerMfaGateTest` | the whole MFA state machine; code / recovery normalisation; lock countdown; server answers → events; `client: "android"`; no code replay; session memory-only; Sign out / Continue / Observer sign-out wiring; no credential in any log line |
 | `util/Apk20WiringTest` | the gate wraps Main; crm-role pre-filter written at sign-in and cold start |
+
+## Addendum — CRM screens added later on 1 Nov 2026
+
+The CRM now has the screens this document recorded as missing: Owner fast path (board), ban/suspension appeal
+recommend + Owner decide (`/operations/appeals`), ban scope/category/evidence form, departments and vacancy (`/team`),
+sessions (`/sessions`), held items, replica drift and Owner notices (`/finance/integrity`), payout policy
+(`/finance/payouts`), transfer recommendation/hold (`/transfers`), and Host suspend/resume (user page). The Android
+"Decide in the CRM" note for the fast path now points at a real screen.

@@ -28,6 +28,18 @@ internal fun stat(item: Item, path: String = "status"): String = item.jsonPath(p
 
 internal fun statusIn(vararg s: String): (Item, Caps) -> Boolean = { item, _ -> stat(item) in s }
 
+/**
+ * The Host row's status in a `GET /users/{uid}/roles` body (`user_roles.
+ * role_inventory`): "active", "suspended", "revoked", "pending" — or "" when
+ * the account holds no Host record at all. The users.record page actions
+ * read it from the page's root, so Suspend / Resume Host are offered only
+ * in the state each applies to. Pure; `HostSuspensionActionsTest` runs it.
+ */
+internal fun hostRoleStatus(root: Item): String =
+    (root["roles"] as? List<*>).orEmpty()
+        .firstOrNull { (it as? Map<*, *>)?.get("role") == "host" }
+        .jsonPath("status").jsonText().orEmpty()
+
 // ── §5 ban: reason + scope + category + evidence (routers/users.py `Ban`) ─────
 
 /** The server bounds these only by length; the labels are the CRM's working vocabulary. */

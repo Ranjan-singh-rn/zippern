@@ -307,14 +307,35 @@ import { rateFor } from './pricing'
 import {
   assertActiveSession, presentedSessionId, restrictionVerdict, signInPredatesCutoff,
 } from './mobileSession'
+import {
+  hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails,
+  HOST_UNAVAILABLE, HOST_UNAVAILABLE_REFUSAL, type FieldReader,
+} from './hostEligibility'
 
 /**
  * P0-6: end reasons decided by the server inside `tickCall`. A call ended for
  * one of these bills through the minute in progress at the moment the server
  * decided it (`endingAt`), not at whatever later moment the client calls
  * `endCall`, and the server's reason survives whatever the client sends.
+ *
+ * §5 `host_suspended`: the earning Host's role was suspended mid-call. The
+ * minutes already charged stay charged; nothing after the gate instant is.
  */
-const GATED_END_REASONS = new Set(['party_restricted', 'session_displaced', 'insufficient_diamonds'])
+const GATED_END_REASONS = new Set([
+  'party_restricted', 'session_displaced', 'insufficient_diamonds', 'host_suspended',
+])
+
+/**
+ * §5 Host role suspension, on a call: is the side that EARNS a Host whose role
+ * is suspended? A suspended Host earns nothing new — no call is placed, picked
+ * up or billed with them as the earner — while the same person may still PAY
+ * for a call like any user (a viewer/user feature is not a Host one), and the
+ * beans they already earned are untouched. `isHost` is asked first: the
+ * suspension is a state of a held Host role.
+ */
+function earningHostSuspension(earner: FieldReader) {
+  return earner.get('isHost') === true ? hostRoleSuspension(earner) : null
+}
 
 
 // ── startCall ────────────────────────────────────────────────────────────────
@@ -374,6 +395,24 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
       }
 
       const { perMin, pct, earner, payer } = rateFor(cfg, caller, peer)
+
+      /*
+       * §5: a suspended Host role takes no new paid call — rung by a user, or
+       * ringing one. Asked of the EARNING side as `rateFor` decided it, so a
+       * suspended Host who dials another Host (and pays, as any caller does)
+       * is a user making a call and is let through. The Host is told why and
+       * until when; the person ringing them is told only that this host is
+       * not taking calls — the reason is not theirs to read.
+       */
+      const earnerSuspension = earningHostSuspension(earner === 'caller' ? callerSnap : peerSnap)
+      if (earnerSuspension) {
+        if (earner === 'caller') {
+          throw new HttpsError(
+            'permission-denied', hostSuspendedMessage(earnerSuspension), hostSuspensionDetails(earnerSuspension),
+          )
+        }
+        throw new HttpsError('failed-precondition', HOST_UNAVAILABLE_REFUSAL, { code: HOST_UNAVAILABLE })
+      }
 
       /*
        * One minute up front — CHECKED AGAINST THE PAYER.
@@ -549,6 +588,22 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
       if (restricted) {
         closeUnconnected('party_restricted')
         return { refused: new HttpsError('permission-denied', 'This call cannot be connected right now.') }
+      }
+
+      // §5: the Host role of the earning side was suspended while it rang. The
+      // first minute is never taken; the ring is closed with the reason on the
+      // call. The suspended Host picking up is told why; a user picking up a
+      // call a suspended Host placed is told only that it cannot connect.
+      const earnerSuspension = earningHostSuspension(earnerSnap)
+      if (earnerSuspension) {
+        closeUnconnected('host_suspended')
+        return {
+          refused: earnerUid === uid
+            ? new HttpsError(
+              'permission-denied', hostSuspendedMessage(earnerSuspension), hostSuspensionDetails(earnerSuspension),
+            )
+            : new HttpsError('failed-precondition', HOST_UNAVAILABLE_REFUSAL, { code: HOST_UNAVAILABLE }),
+        }
       }
 
       const balance = Number(payerSnap.get('diamonds') ?? 0)
@@ -757,8 +812,12 @@ export const tickCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) 
       const displaced = signInPredatesCutoff(
         payerSnap.get('credentialsValidAfter'), req.auth?.token?.auth_time, Math.floor(nowMs / 1000),
       ) || (presented !== '' && recordedSession !== '' && presented !== recordedSession)
-      if (restricted || displaced) {
-        const endReason = restricted ? 'party_restricted' : 'session_displaced'
+      // §5: the earning Host's role was suspended mid-call. Ended at this gate
+      // like a restriction: the minutes charged so far stay charged (they are
+      // earnings already made), settlement bills through this instant only.
+      const hostSuspended = earningHostSuspension(earnerSnap) !== null
+      if (restricted || displaced || hostSuspended) {
+        const endReason = restricted ? 'party_restricted' : displaced ? 'session_displaced' : 'host_suspended'
         logger.warn('tickCall ended a call at the gate', { callId, endReason })
         tx.update(callRef, {
           status: 'ending', endReason,

@@ -237,22 +237,129 @@ export function hostOfSameAgency(snap: FieldReader, applicationAgencyId: string)
   return snap.get('isHost') === true && held !== '' && held === applicationAgencyId.trim()
 }
 
+// ── §5 Partner role suspension, for the Host role ────────────────────────────
+//
+// "Temporary restriction of only the selected capability … keep the role slot /
+// record while suspended … resume the same record." `users.suspend_host` in the
+// backend writes `hostSuspended: true` (+ `hostSuspendedUntil` when the term
+// has an end, `hostSuspendedReason`) and leaves `isHost`, the verification, the
+// agency link, the roster row and the earnings exactly as they were; `resume_host`
+// (by a person, or the backend's daily sweep once the term is over) writes it
+// back to false. So every Host-only path asks the flag — strictly `=== true`,
+// and ONLY the flag: an end date that has passed is lifted by the sweep, not
+// guessed here, so the server, the CRM and the app never disagree about it.
+
+/**
+ * `HttpsError.details.code` when the caller's own Host role is suspended.
+ *
+ * Deliberately NOT `ACCOUNT_RESTRICTED`: the account is untouched — the person
+ * still uses the app, their other roles and their wallet — and the app signs a
+ * device out on that code.
+ */
+export const HOST_ROLE_SUSPENDED = 'HOST_ROLE_SUSPENDED'
+
+/**
+ * `HttpsError.details.code` a THIRD party gets when the host they are calling
+ * is suspended. The reason and the term are the host's business, not theirs.
+ */
+export const HOST_UNAVAILABLE = 'HOST_UNAVAILABLE'
+
+/** What that third party is told — no reason, no date. */
+export const HOST_UNAVAILABLE_REFUSAL = 'This host is not taking calls right now.'
+
+/** A standing Host-role suspension, as the gates and the refusals need it. */
+export interface HostSuspension {
+  /** The end of the term as ISO-8601 (UTC), or null — until resumed, or unreadable. */
+  until: string | null
+  untilMs: number | null
+  reason: string
+}
+
+/**
+ * The Host role's own suspension, or null when there is none. Pure.
+ *
+ * Null unless `hostSuspended` is exactly `true` (a string `'true'` from a bad
+ * write is not a suspension, as everywhere in this file). `hostSuspendedUntil`
+ * absent means "until resumed"; one that cannot be read is reported as no end
+ * date rather than guessed — the refusal still stands, because the flag does.
+ */
+export function hostRoleSuspension(snap: FieldReader): HostSuspension | null {
+  if (snap.get('hostSuspended') !== true) return null
+  const raw = snap.get('hostSuspendedUntil')
+  const ms = raw == null || raw === '' || raw === false ? 0 : stampMillis(raw)
+  const untilMs = ms > 0 ? ms : null
+  return {
+    until: untilMs === null ? null : new Date(untilMs).toISOString(),
+    untilMs,
+    reason: String(snap.get('hostSuspendedReason') ?? '').trim(),
+  }
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/**
+ * `04 Nov 2026, 10:15 UTC` — the backend's `email.when`, so the date the host
+ * reads on the phone is the one in their email and in-app notice.
+ */
+export function whenUtc(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getUTCDate())} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}, ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`
+}
+
+/**
+ * The sentence the suspended host is shown, word for word the one the backend
+ * and the app use: `Your Host role is suspended until <when> — reason: <reason>`,
+ * `<when>` being "it is resumed" for a suspension with no end date; with no
+ * reason on record the `— reason:` part is left off rather than left empty.
+ */
+export function hostSuspendedMessage(s: HostSuspension): string {
+  const when = s.untilMs === null ? 'it is resumed' : whenUtc(s.untilMs)
+  return `Your Host role is suspended until ${when}` + (s.reason ? ` — reason: ${s.reason}` : '')
+}
+
+/** `HttpsError.details` for the suspended host's own refusal. */
+export function hostSuspensionDetails(s: HostSuspension): { code: string; until: string | null; reason: string } {
+  return { code: HOST_ROLE_SUSPENDED, until: s.until, reason: s.reason }
+}
+
 /** Why the caller may not act as a Host right now, for `HttpsError.details`. */
 export interface HostRefusal {
   code: string
   message: string
+  /** `HOST_ROLE_SUSPENDED` only: the end of the term (ISO, UTC) or null. */
+  until?: string | null
+  /** `HOST_ROLE_SUSPENDED` only: the reason staff gave. */
+  reason?: string
+}
+
+/**
+ * `HttpsError.details` for a refusal: its code, and — for a suspended Host
+ * role — the term and the reason, so the app can show the same sentence the
+ * server wrote without parsing it.
+ */
+export function refusalDetails(r: HostRefusal): Record<string, unknown> {
+  return r.code === HOST_ROLE_SUSPENDED
+    ? { code: r.code, until: r.until ?? null, reason: r.reason ?? '' }
+    : { code: r.code }
 }
 
 /**
  * B41: may this account act AS a Host right now — submit a face capture, take
  * the publisher token for its own live room? `null` when it may.
  *
- * Current (`isHost` exactly true), not revoked (`hostRoleRevoked`), and not
- * restricted (`restrictionOn`). Those callables also pass the session gate,
+ * Current (`isHost` exactly true), not revoked (`hostRoleRevoked`), not
+ * restricted (`restrictionOn`), and — §5 — the Host role not suspended
+ * (`hostRoleSuspension`). Those callables also pass the session gate,
  * which refuses a restricted account first; the restriction is asked again
  * here so this decision is complete on its own. `ACCOUNT_RESTRICTED` is the
  * session gate's code (`mobileSession.ts`), spelt out because this file
  * imports nothing.
+ *
+ * Order: restricted → revoked → not a host → suspended. A suspension is a
+ * state OF a held Host role, so somebody who holds no Host role is told that,
+ * not about a suspension left on a document.
  */
 export function activeHostRefusal(snap: FieldReader): HostRefusal | null {
   if (restrictionOn(snap)) {
@@ -260,5 +367,14 @@ export function activeHostRefusal(snap: FieldReader): HostRefusal | null {
   }
   if (hostRoleRevoked(snap)) return { code: ROLE_REVOKED, message: HOST_REVOKED_REFUSAL }
   if (snap.get('isHost') !== true) return { code: NOT_A_HOST, message: 'This is for hosts only.' }
+  const suspension = hostRoleSuspension(snap)
+  if (suspension) {
+    return {
+      code: HOST_ROLE_SUSPENDED,
+      message: hostSuspendedMessage(suspension),
+      until: suspension.until,
+      reason: suspension.reason,
+    }
+  }
   return null
 }

@@ -1119,6 +1119,51 @@ async def host_restored(uid: str, application_id: str, revoked_at_epoch: int) ->
     )
 
 
+async def host_suspended(uid: str, reason: str, audit_id: str, *, until: datetime | None = None) -> bool:
+    """§5 partner role suspension, Host: the person is told — with the reason
+    and the end date — that only the Host role is paused.
+
+    Keyed on the audit entry of the suspension, so a retried delivery is one
+    message and a later suspension of the same person is a second one.
+    """
+    term = f"until {mail.when(until)}" if until else "until it is resumed"
+    return await deliver(
+        uid, f"host_suspended_{uid}_{audit_id or 'x'}",
+        type="host_suspended",
+        title="Host role suspended",
+        body=(
+            f"Your Host role is suspended {term}."
+            + (f" Reason: {reason}" if reason else "")
+            + " Until then you cannot go live or take paid calls as a Host. Your account, your "
+            "other roles, your agency and your earnings history are unchanged; host money "
+            "already earned stays yours and is held for review."
+        ),
+        reason=reason,
+        meta={"role": "host", "status": "suspended", "until": until.isoformat() if until else None},
+        related_id=str(audit_id or uid),
+        email=EmailLeg(template="host.suspended",
+                       rows=[("Role", "Host"), ("Until", mail.when(until) if until else "Until it is resumed")],
+                       next_steps="Ask through the app if you want the decision reviewed."),
+    )
+
+
+async def host_resumed(uid: str, audit_id: str) -> bool:
+    """The SAME Host role working again (§5), by a person or at the end of its
+    term. Keyed on the resume's audit entry, like `host_suspended`."""
+    return await deliver(
+        uid, f"host_resumed_{uid}_{audit_id or 'x'}",
+        type="host_resumed",
+        title="Host role active again",
+        body=(
+            "Your Host role is active again — the same role, under the same agency, with "
+            "your earnings history unchanged."
+        ),
+        meta={"role": "host", "status": "active"},
+        related_id=str(audit_id or uid),
+        email=EmailLeg(template="host.resumed", rows=[("Role", "Host")]),
+    )
+
+
 async def host_verification_required(uid: str) -> bool:
     return await deliver(
         uid, f"host_verification_required_{uid}",
