@@ -1,8 +1,6 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const sgMail = require('@sendgrid/mail')
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const { RtcTokenBuilder, RtcRole } = require('agora-access-token')
 
 admin.initializeApp()
@@ -29,43 +27,23 @@ import { type CrmUserDoc, syncClaim } from './storageClaims'
 import { assertActiveSession } from './mobileSession'
 import { activeHostRefusal } from './hostEligibility'
 import { rosterRowIsCurrent } from './roster'
+import { SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
 
 const asiaFirestore = functions.region('asia-south1').firestore
+// The Firestore triggers that send email: the same region, plus the SendGrid
+// key from Secret Manager (see mail.ts). Every other trigger keeps the builder
+// above, so no other function is given the key.
+const asiaFirestoreMail = functions.region('asia-south1').runWith({ secrets: [SENDGRID_KEY_ENV] }).firestore
 
 // ── Email via SendGrid ────────────────────────────────────────────────────────
-// API key is loaded from functions/.env as SG_MAIL_KEY
+// Everything about the provider is in mail.ts. The key is the Secret Manager
+// secret ZIPPER_SENDGRID_API_KEY, which only the functions that send email
+// declare. The contract is the one this function always had: no key → logged
+// and skipped; a failed send throws — now a sanitized error, because the SDK's
+// own error for a network failure carries the request headers, key included.
 
 async function sendMail(to: string, subject: string, html: string): Promise<void> {
-  // SG_MAIL_KEY is set in functions/.env and deployed automatically by Firebase CLI
-  const apiKey = process.env.SG_MAIL_KEY || ''
-  // Phase 1A: no part of the key is ever logged (this used to print its first
-  // six characters), and the recipient is reduced to its domain.
-  functions.logger.info('sendMail called', {
-    toDomain: String(to).split('@')[1] ?? '',
-    hasKey: apiKey !== '',
-  })
-  if (!apiKey) {
-    functions.logger.error('SG_MAIL_KEY not set — email will NOT be sent. Set it in functions/.env or via: firebase functions:config:set sendgrid.key="SG.xxx"')
-    return
-  }
-  sgMail.setApiKey(apiKey)
-  try {
-    await sgMail.send({
-      to,
-      from: { email: '314zipper@gmail.com', name: 'Zipper Team' },
-      subject,
-      html,
-    })
-    // UGP: the recipient is reduced to its domain here too, as the note above
-    // already promised — these two lines used to print the full address.
-    functions.logger.info('✅ Email sent', { toDomain: String(to).split('@')[1] ?? '' })
-  } catch (sgErr: any) {
-    functions.logger.error('❌ SendGrid error', {
-      toDomain: String(to).split('@')[1] ?? '',
-      code: sgErr?.code ?? sgErr?.response?.statusCode ?? '',
-    })
-    throw sgErr
-  }
+  await sendNotificationMail(to, subject, html)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -975,7 +953,7 @@ export const weeklyPayoutReportGenerator = functions
     // The credential, from Google Secret Manager. Declaring it here is what
     // puts it in `process.env` at runtime and nowhere else — not in
     // functions/.env, not in the deployed source, not in a config file.
-    secrets: [ACCRUAL_KEY_ENV],
+    secrets: [ACCRUAL_KEY_ENV, SENDGRID_KEY_ENV],
     // The report plus two API calls per agency. The default 60s is not enough
     // once there are more than a handful of agencies; `ACCRUAL_BUDGET_MS`
     // leaves headroom inside this so a slow backend is reported rather than
@@ -1708,7 +1686,7 @@ async function signInHint(uid: string): Promise<string> {
   }
 }
 
-export const onAgencyApproved = asiaFirestore
+export const onAgencyApproved = asiaFirestoreMail
   .document('agencies/{agencyId}')
   .onUpdate(async (change, context) => {
     const before = change.before.data()
@@ -1763,8 +1741,8 @@ export const onAgencyApproved = asiaFirestore
     <div style="padding:28px 32px;">
 
       <p style="color:#cbd5e1;line-height:1.7;font-size:15px;margin:0 0 24px;">
-        Hi <strong style="color:#ffffff;">${ownerName}</strong>,<br><br>
-        Great news! Your agency <strong style="color:#ffffff;">${agencyName}</strong> has been
+        Hi <strong style="color:#ffffff;">${escapeHtml(ownerName)}</strong>,<br><br>
+        Great news! Your agency <strong style="color:#ffffff;">${escapeHtml(agencyName)}</strong> has been
         <strong style="color:#22c55e;">approved</strong>. You can now log in to your CRM dashboard
         and start onboarding hosts.
       </p>
@@ -1786,11 +1764,11 @@ export const onAgencyApproved = asiaFirestore
         <table style="width:100%;border-collapse:collapse;">
           <tr>
             <td style="color:#64748b;font-size:13px;padding:6px 0;width:80px;">Email</td>
-            <td style="color:#ffffff;font-size:14px;font-weight:600;padding:6px 0;">${email}</td>
+            <td style="color:#ffffff;font-size:14px;font-weight:600;padding:6px 0;">${escapeHtml(email)}</td>
           </tr>
           <tr>
             <td style="color:#64748b;font-size:13px;padding:6px 0;">Password</td>
-            <td style="color:#94a3b8;font-size:13px;font-style:italic;padding:6px 0;">${signInWith}</td>
+            <td style="color:#94a3b8;font-size:13px;font-style:italic;padding:6px 0;">${escapeHtml(signInWith)}</td>
           </tr>
         </table>
       </div>
@@ -1816,7 +1794,7 @@ export const onAgencyApproved = asiaFirestore
 
     <!-- Footer -->
     <div style="background:#0f172a;border-top:1px solid #1e293b;padding:16px 32px;text-align:center;">
-      <p style="color:#475569;font-size:12px;margin:0;">© Zipper Live &nbsp;·&nbsp; ${agencyName}</p>
+      <p style="color:#475569;font-size:12px;margin:0;">© Zipper Live &nbsp;·&nbsp; ${escapeHtml(agencyName)}</p>
     </div>
   </div>
 
@@ -2339,7 +2317,7 @@ function getISOWeekNumber(date: Date): number {
 //    Requires: SENDGRID_API_KEY environment variable
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const onAgencyRegistered = asiaFirestore
+export const onAgencyRegistered = asiaFirestoreMail
   .document('agencies/{agencyId}')
   .onCreate(async (snap) => {
     const data = snap.data()
@@ -2366,14 +2344,14 @@ export const onAgencyRegistered = asiaFirestore
     <div style="background:linear-gradient(135deg,#ec4899 0%,#8b5cf6 100%);padding:32px;text-align:center;">
       <div style="font-size:48px;margin-bottom:12px;">🎉</div>
       <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:800;">Registration Successful!</h1>
-      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;opacity:0.9;">Welcome to Zipper Live, ${name}</p>
+      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;opacity:0.9;">Welcome to Zipper Live, ${escapeHtml(name)}</p>
     </div>
 
     <!-- Body -->
     <div style="padding:28px 32px;">
 
       <p style="color:#cbd5e1;line-height:1.7;margin:0 0 20px;font-size:15px;">
-        Your agency <strong style="color:#ffffff;">${agencyName}</strong> has been registered successfully.
+        Your agency <strong style="color:#ffffff;">${escapeHtml(agencyName)}</strong> has been registered successfully.
         Our team will review your details and KYC documents within <strong style="color:#f8fafc;">1–2 business days</strong>.
       </p>
 
@@ -2393,7 +2371,7 @@ export const onAgencyRegistered = asiaFirestore
       <!-- Agency info pill -->
       <div style="display:inline-block;background:#1e1b4b;border:1px solid #312e81;border-radius:8px;padding:10px 16px;margin-bottom:24px;">
         <span style="color:#818cf8;font-size:12px;font-weight:600;">Agency Name &nbsp;•&nbsp; </span>
-        <span style="color:#c7d2fe;font-size:14px;font-weight:700;">${agencyName}</span>
+        <span style="color:#c7d2fe;font-size:14px;font-weight:700;">${escapeHtml(agencyName)}</span>
       </div>
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
@@ -2443,7 +2421,7 @@ export const onAgencyRegistered = asiaFirestore
 // that field *changes*. A field present from the first write never changes, so
 // it never fired — which is precisely why those sellers heard nothing.
 
-export const onSellerRegistered = asiaFirestore
+export const onSellerRegistered = asiaFirestoreMail
   .document('sellers/{sellerId}')
   .onCreate(async (snap) => {
     const data = snap.data()
@@ -2470,7 +2448,7 @@ export const onSellerRegistered = asiaFirestore
     <div style="background:linear-gradient(135deg,#f59e0b 0%,#d97706 100%);padding:32px;text-align:center;">
       <div style="font-size:48px;margin-bottom:12px;">🛍️</div>
       <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:800;">Application Received!</h1>
-      <p style="color:#fef3c7;margin:8px 0 0;font-size:14px;opacity:0.9;">Welcome aboard, ${name}</p>
+      <p style="color:#fef3c7;margin:8px 0 0;font-size:14px;opacity:0.9;">Welcome aboard, ${escapeHtml(name)}</p>
     </div>
 
     <!-- Body -->
@@ -2522,7 +2500,7 @@ export const onSellerRegistered = asiaFirestore
 //     Triggers on: update to sellers/{sellerId} where isApproved changes to true
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const onSellerApproved = asiaFirestore
+export const onSellerApproved = asiaFirestoreMail
   .document('sellers/{sellerId}')
   .onUpdate(async (change) => {
     const before = change.before.data()
@@ -2567,7 +2545,7 @@ export const onSellerApproved = asiaFirestore
     <div style="padding:28px 32px;">
 
       <p style="color:#cbd5e1;line-height:1.7;font-size:15px;margin:0 0 24px;">
-        Hi <strong style="color:#ffffff;">${name}</strong>,<br><br>
+        Hi <strong style="color:#ffffff;">${escapeHtml(name)}</strong>,<br><br>
         Your Zipper Coin Seller account has been <strong style="color:#22c55e;">approved</strong>!
         You can now log in and start selling Zipper coins to users in your area.
       </p>
@@ -2589,11 +2567,11 @@ export const onSellerApproved = asiaFirestore
         <table style="width:100%;border-collapse:collapse;">
           <tr>
             <td style="color:#64748b;font-size:13px;padding:6px 0;width:80px;">Email</td>
-            <td style="color:#ffffff;font-size:14px;font-weight:600;padding:6px 0;">${email}</td>
+            <td style="color:#ffffff;font-size:14px;font-weight:600;padding:6px 0;">${escapeHtml(email)}</td>
           </tr>
           <tr>
             <td style="color:#64748b;font-size:13px;padding:6px 0;">Password</td>
-            <td style="color:#94a3b8;font-size:13px;font-style:italic;padding:6px 0;">${signInWith}</td>
+            <td style="color:#94a3b8;font-size:13px;font-style:italic;padding:6px 0;">${escapeHtml(signInWith)}</td>
           </tr>
         </table>
       </div>
@@ -2641,7 +2619,7 @@ export const onSellerApproved = asiaFirestore
 //     Avoids callable functions (which require IAM invoker policy changes).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const onAgencyResendEmail = asiaFirestore
+export const onAgencyResendEmail = asiaFirestoreMail
   .document('agencies/{agencyId}')
   .onUpdate(async (change) => {
     const before = change.before.data()
@@ -2671,11 +2649,11 @@ export const onAgencyResendEmail = asiaFirestore
     <div style="background:linear-gradient(135deg,#ec4899 0%,#8b5cf6 100%);padding:32px;text-align:center;">
       <div style="font-size:48px;margin-bottom:12px;">🎉</div>
       <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:800;">Registration Successful!</h1>
-      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;">Welcome to Zipper Live, ${ownerName}</p>
+      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;">Welcome to Zipper Live, ${escapeHtml(ownerName)}</p>
     </div>
     <div style="padding:28px 32px;">
       <p style="color:#cbd5e1;line-height:1.7;margin:0 0 20px;font-size:15px;">
-        Your agency <strong style="color:#ffffff;">${agencyName}</strong> has been registered.
+        Your agency <strong style="color:#ffffff;">${escapeHtml(agencyName)}</strong> has been registered.
         Our team will review your details within <strong style="color:#f8fafc;">1–2 business days</strong>.
       </p>
       <div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:20px;margin:0 0 24px;">
@@ -2697,7 +2675,7 @@ export const onAgencyResendEmail = asiaFirestore
 </div>
 </body></html>`
       await sendMail(email, `✅ Registration received — ${agencyName} | Zipper Live`, html)
-      functions.logger.info(`Resent registration email for agency to ${email}`)
+      functions.logger.info('Resent registration email for agency', { toDomain: mailDomain(email) })
     }
 
     if (resendType === 'approval') {
@@ -2716,8 +2694,8 @@ export const onAgencyResendEmail = asiaFirestore
     </div>
     <div style="padding:28px 32px;">
       <p style="color:#cbd5e1;line-height:1.7;font-size:15px;margin:0 0 24px;">
-        Hi <strong style="color:#ffffff;">${ownerName}</strong>,<br><br>
-        Your agency <strong style="color:#ffffff;">${agencyName}</strong> is <strong style="color:#22c55e;">approved</strong>.
+        Hi <strong style="color:#ffffff;">${escapeHtml(ownerName)}</strong>,<br><br>
+        Your agency <strong style="color:#ffffff;">${escapeHtml(agencyName)}</strong> is <strong style="color:#22c55e;">approved</strong>.
         Log in to the CRM to start onboarding hosts.
       </p>
       <div style="text-align:center;margin:28px 0;">
@@ -2734,7 +2712,7 @@ export const onAgencyResendEmail = asiaFirestore
 </div>
 </body></html>`
       await sendMail(email, `✅ Your agency "${agencyName}" is approved — Log in now | Zipper Live`, html)
-      functions.logger.info(`Resent approval email for agency to ${email}`)
+      functions.logger.info('Resent approval email for agency', { toDomain: mailDomain(email) })
     }
 
     return null
@@ -2745,7 +2723,7 @@ export const onAgencyResendEmail = asiaFirestore
 //     This function detects the field, sends the email, then clears it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const onSellerResendEmail = asiaFirestore
+export const onSellerResendEmail = asiaFirestoreMail
   .document('sellers/{sellerId}')
   .onUpdate(async (change) => {
     const before = change.before.data()
@@ -2774,7 +2752,7 @@ export const onSellerResendEmail = asiaFirestore
     <div style="background:linear-gradient(135deg,#ec4899 0%,#8b5cf6 100%);padding:32px;text-align:center;">
       <div style="font-size:48px;margin-bottom:12px;">🎉</div>
       <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:800;">Application Received!</h1>
-      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;">Welcome to Zipper Live, ${sellerName}</p>
+      <p style="color:#fce7f3;margin:8px 0 0;font-size:14px;">Welcome to Zipper Live, ${escapeHtml(sellerName)}</p>
     </div>
     <div style="padding:28px 32px;">
       <p style="color:#cbd5e1;line-height:1.7;margin:0 0 20px;font-size:15px;">
@@ -2800,7 +2778,7 @@ export const onSellerResendEmail = asiaFirestore
 </div>
 </body></html>`
       await sendMail(email, `✅ Application received — Zipper Coin Seller`, html)
-      functions.logger.info(`Resent seller registration email to ${email}`)
+      functions.logger.info('Resent seller registration email', { toDomain: mailDomain(email) })
     }
 
     if (resendType === 'approval') {
@@ -2819,7 +2797,7 @@ export const onSellerResendEmail = asiaFirestore
     </div>
     <div style="padding:28px 32px;">
       <p style="color:#cbd5e1;line-height:1.7;font-size:15px;margin:0 0 24px;">
-        Hi <strong style="color:#ffffff;">${sellerName}</strong>,<br><br>
+        Hi <strong style="color:#ffffff;">${escapeHtml(sellerName)}</strong>,<br><br>
         Your Zipper Coin Seller account has been <strong style="color:#22c55e;">approved</strong>!
         You can now log in and start selling coins.
       </p>
@@ -2837,7 +2815,7 @@ export const onSellerResendEmail = asiaFirestore
 </div>
 </body></html>`
       await sendMail(email, `🎉 You're approved — Start selling Zipper coins!`, html)
-      functions.logger.info(`Resent seller approval email to ${email}`)
+      functions.logger.info('Resent seller approval email', { toDomain: mailDomain(email) })
     }
 
     return null

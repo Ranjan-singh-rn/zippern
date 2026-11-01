@@ -56,7 +56,7 @@ import * as crypto from 'crypto'
 import { assertActiveSession } from './mobileSession'
 import { bindContactCore, emailKey, isObserverEmail, sameUidSessionToken } from './identity'
 import { recordEvent } from './quickLogin'
-import { mailDomain, sendTransactionalMail } from './mail'
+import { SENDGRID_KEY_ENV, mailDomain, sendTransactionalMail } from './mail'
 import { recordEmailProof } from './contactProof'
 
 export const EMAIL_OTP_CHALLENGES = 'emailOtpChallenges'
@@ -337,6 +337,7 @@ const ACTIVE_HOLDER =
 
 export const requestEmailBindCode = functions
   .region('asia-south1')
+  .runWith({ secrets: [SENDGRID_KEY_ENV] })
   .https.onCall(async (data: { email?: string }, context) => {
     const uid = requireUid(context)
     const token = (context.auth?.token ?? {}) as Record<string, unknown>
@@ -669,6 +670,7 @@ async function partnerLoginAddress(uid: string): Promise<string> {
 
 export const requestLoginEmailCode = functions
   .region('asia-south1')
+  .runWith({ secrets: [SENDGRID_KEY_ENV] })
   .https.onCall(async (_data: unknown, context) => {
     const uid = requireUid(context)
     const email = await partnerLoginAddress(uid)
