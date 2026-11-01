@@ -10,9 +10,11 @@
 # has versionCode >= 20 and minSupportedVersionCode >= 20 (read-only, with the backend's own credential).
 # Production change (after you type DEPLOY2B), exactly:
 #   firebase deploy --only functions:generateAgoraToken,functions:settleGift,functions:startCall,functions:acceptCall,functions:tickCall,functions:endCall,functions:declineCall,functions:sweepStaleCalls --project zipper-83816 --non-interactive
-# from the same kind of fresh tree as 20 (committed HEAD, tests first, functions/.env copied never displayed).
+# from the same kind of fresh tree as 20 (committed HEAD, tests first, functions/.env copied never displayed; the
+# exports of its compiled lib/index.js must be exactly WAVE_2A + WAVE_2B + NOT_REDEPLOYED in their regions).
 # settleGift and the call functions are MONEY functions: the scope check and env-drift check protect them the same
-# way. Rollback: 29-rollback-functions.command 2b. Results: ./production/21-functions-2b-<UTC>/
+# way; a deploy that ends non-zero is reported as in 20 (SCOPE PARTIAL, updated.txt / not-updated.txt).
+# Rollback: 29-rollback-functions.command 2b [<this evidence folder>]. Results: ./production/21-functions-2b-<UTC>/
 set -u
 umask 077
 . "$(dirname "$0")/rel_common.sh"
@@ -47,6 +49,7 @@ check ok "all wave-2b functions are ACTIVE"
 build_fn_tree HEAD
 grep -q "^$(grep '^TREE functions ' "$RELEASE_TXT")\$" "$OUT/deploy-tree.txt" && check ok "deploy tree = RELEASE.txt functions tree" || stop "the unpacked functions tree does not match RELEASE.txt"
 install_build_test
+check_exports
 add_env
 env_drift $EXISTING
 
@@ -63,4 +66,5 @@ tail -25 "$OUT/firebase-deploy.log" | sed 's/^/   | /' | tee -a "$OUT/SUMMARY.tx
 
 say ""; say "== After"
 verify_after "$CSV" $WAVE_2B
-finish "consider 29-rollback-functions.command 2b"
+grep -q '^SCOPE PARTIAL' "$OUT/scope.txt" && finish "PARTIAL — not updated: $(tr '\n' ' ' < "$OUT/not-updated.txt")— re-run 21 to finish the wave, or roll back exactly the updated ones: 29-rollback-functions.command 2b $OUT"
+finish "consider 29-rollback-functions.command 2b $OUT"

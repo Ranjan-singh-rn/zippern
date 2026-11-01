@@ -1,5 +1,9 @@
 #!/bin/bash
-# ZIPPER completion release — 29: ROLLBACK of a Functions wave. Usage: 29-rollback-functions.command <2a|2b>
+# ZIPPER completion release — 29: ROLLBACK of a Functions wave.
+# Usage: 29-rollback-functions.command <2a|2b> [<evidence folder of 20 (2a) or 21 (2b)>]
+# Without a folder: every function of the wave that exists. With the folder of a 20/21 run (production/20-functions-2a-
+# <UTC> or production/21-functions-2b-<UTC>): EXACTLY the functions that run updated — its updated.txt (updateTime
+# changed), e.g. after a deploy that stopped part-way on the write quota; its not-updated.txt ones are left alone.
 # Redeploys the SAME function names from the functions/ tree of BASE_COMMIT (RELEASE.txt) — by default the commit of
 # branch prod-live-20261030 (4e21b7f, tag prod-live-20261030-tag; make-release-txt.sh resolves refs/heads/…): the
 # exact production Functions tree, i.e. the 20 Oct baseline plus the SendGrid wave-A files (src/index.ts, src/mail.ts,
@@ -11,7 +15,8 @@
 # out of it and its hash is checked against `git ls-tree` of the same commit. npm ci, tsc and every test run on that
 # tree first.
 # Production change (after you type ROLLBACK), exactly:
-#   firebase deploy --only functions:<the wave's names> --project zipper-83816 --non-interactive
+#   firebase deploy --only functions:<the wave's names, or exactly updated.txt> --project zipper-83816 --non-interactive
+# (a rollback that itself ends non-zero is reported like 20: SCOPE PARTIAL, updated.txt / not-updated.txt).
 # When the SendGrid base hash file is present, this script reports per source file whether the rollback text equals
 # the 20 Oct deployed text (only the three wave-A files may differ). Not changed: secrets, grants, every other
 # function, rules, hosting, Cloud Run.
@@ -21,8 +26,12 @@ umask 077
 . "$(dirname "$0")/rel_common.sh"
 . "$HERE/rel_deploy_lib.sh"
 verify_scripts
-WAVE_ID="${1:-}"
-case "$WAVE_ID" in 2a) WAVE="$WAVE_2A";; 2b) WAVE="$WAVE_2B";; *) echo "Usage: $0 <2a|2b>" >&2; exit 2;; esac
+WAVE_ID="${1:-}"; SRC_DIR="${2:-}"
+case "$WAVE_ID" in
+  2a) WAVE="$WAVE_2A"; EVIDENCE_GLOB='20-functions-2a-*Z';;
+  2b) WAVE="$WAVE_2B"; EVIDENCE_GLOB='21-functions-2b-*Z';;
+  *) echo "Usage: $0 <2a|2b> [<evidence folder of 20 or 21>]" >&2; exit 2;;
+esac
 new_out "29-rollback-functions-$WAVE_ID"
 WT="$OUT/worktree"
 cleanup() {
@@ -38,6 +47,20 @@ require_release
 [ "$BASE_COMMIT" != "$NOT_PROD_FN_COMMIT" ] || stop "BASE_COMMIT in RELEASE.txt is $(printf '%s' "$BASE_COMMIT" | cut -c1-12) (f1af30a) — NOT production: its functions/ carries the unshipped Owner-MFA gate. Regenerate RELEASE.txt with ./make-release-txt.sh (default: the production tree $PROD_FN_REF)"
 if [ "$BASE_COMMIT" = "$PROD_FN_COMMIT" ]; then BASE_DESC="the production Functions tree $PROD_FN_REF"
 else BASE_DESC="an explicit BASE_COMMIT, NOT the production tree $PROD_FN_REF ($(printf '%s' "$PROD_FN_COMMIT" | cut -c1-12))"; fi
+if [ -n "$SRC_DIR" ]; then
+  [ -d "$SRC_DIR" ] || stop "evidence folder not found: $SRC_DIR"
+  case "$(basename "$SRC_DIR")" in $EVIDENCE_GLOB) ;; *) stop "$(basename "$SRC_DIR") is not an evidence folder of wave $WAVE_ID ($EVIDENCE_GLOB)";; esac
+  [ -f "$SRC_DIR/updated.txt" ] || stop "$SRC_DIR has no updated.txt (an older run): roll back the whole wave (no folder argument)"
+  SEL=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s' "$f" | grep -Eq '^[A-Za-z][A-Za-z0-9_]*$' || stop "$(basename "$SRC_DIR")/updated.txt holds a line that is not a function name"
+    case " $WAVE " in *" $f "*) SEL="$SEL $f";; *) stop "$(basename "$SRC_DIR")/updated.txt names $f, which is not in wave $WAVE_ID";; esac
+  done < "$SRC_DIR/updated.txt"
+  [ -n "$SEL" ] || stop "$(basename "$SRC_DIR") updated no function (updated.txt is empty) — nothing to roll back"
+  say "rolling back EXACTLY the $(echo $SEL | wc -w | tr -d ' ') function(s) $(basename "$SRC_DIR") updated (updated.txt); the $(cat "$SRC_DIR/not-updated.txt" 2>/dev/null | grep -c .) in its not-updated.txt are left as they are"
+  WAVE="$(echo $SEL)"
+fi
 say "wave $WAVE_ID: $WAVE"
 say "rollback source: functions/ at BASE_COMMIT $(printf '%s' "$BASE_COMMIT" | cut -c1-12) = $BASE_DESC"
 

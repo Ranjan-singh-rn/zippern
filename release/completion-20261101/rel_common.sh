@@ -21,15 +21,40 @@ WEEKLY="weeklyPayoutReportGenerator"
 WEEKLY_REGION="us-central1"
 
 # Functions, by name. Wave 2a has no client dependency; wave 2b needs APK 20 on the phones first (RUNBOOK.md step 8).
-# Names from the §12 mail commit and the hygiene commits go into the two EXTRA lists once those commits are on the
-# release HEAD; then regenerate SCRIPTS.sha256 with tools/write-scripts-sha256.command (reviewed procedure), commit,
-# and regenerate RELEASE.txt (make-release-txt.sh).
+# Every one of the 104 functions functions/src/index.ts exports is in exactly ONE of WAVE_2A, WAVE_2B, NOT_REDEPLOYED:
+# 103 execute code changed since the production tree (git diff refs/heads/prod-live-20261030..HEAD -- functions/src,
+# followed through the module imports: index.ts, mobileSession.ts, time.ts, identity.ts, mail.ts … are shared), so
+# they are redeployed; 20/21 enumerate the exports of the built deploy tree and refuse on any other split (check_exports
+# in rel_deploy_lib.sh). After a reviewed change here: tools/write-scripts-sha256.command, commit, make-release-txt.sh.
 WAVE_2A_CORE="releaseBeansForWeek weeklyPayoutReportGenerator syncPublicProfile backfillPublicProfiles startMobileSession"
-WAVE_2A_MAIL=""      # the 8 e-mail functions (requestEmailBindCode ... onSellerResendEmail) only if mail.ts/index.ts changed what they send
-WAVE_2A_HYGIENE=""   # e.g. purgeDeletedAccounts requestAccountDeletion onApprovalApproved claimDailyReward pushLiveStarted dailyPlatformStatsAggregator
+WAVE_2A_MAIL="requestEmailBindCode requestLoginEmailCode onAgencyApproved onAgencyRegistered onSellerRegistered onSellerApproved \
+onAgencyResendEmail onSellerResendEmail"
+# every other function whose code changed:
+WAVE_2A_HYGIENE="activateHost adoptEmailAccount bindVerifiedIdentity cancelPartySeatRequest checkPartnerActivation \
+checkReferralCode claimDailyReward claimGuestIdentity convertBeans createPartyRoom dailyPlatformStatsAggregator \
+decidePartySeatRequest endMobileSession endPartyRoom equipBagItem expireCosmetics findExistingAccount getHostHome \
+getPayoutStatus invitePartySeat joinPartyRoom leavePartyRoom leavePartySeat mintQuickLoginToken myPartnerApplications \
+myRoleAppeals onAgencyPhotoReplaced onApprovalApproved onPayoutApproved onRechargeApproved partnerEligibility \
+partnerParents partnerVerificationState purchaseBagItem purgeDeletedAccounts purgeMyAccountNow pushCallStatus \
+pushChatMessage pushIncomingCall pushLiveStarted quickLoginChallenge recoverAccount redeemQuickLogin \
+registerAgencyPartner registerSellerPartner reportContactConflict requestAccountDeletion requestPartySeat \
+resolveIdentity respondPartySeatInvite revokeQuickLogin revokeQuickLoginOnRestriction scheduledAlertScan \
+scheduledDailyReports scheduledMonthlyReports scheduledPartnerStatements scheduledReconciliation \
+scheduledTransactionalSweep scheduledWeeklyBusinessReport setCallRate setPartyAdmin setPartySeatLock setPartySeatMute \
+submitAccountAppeal submitHostApplication submitHostCapture submitPartnerApplication submitRechargeRequest \
+submitRoleAppeal sweepEmptyPartyRooms sweepHostLevels sweepQuickLoginTokens syncLivePresence syncMyRoles syncPhoneKey \
+syncPublicSeller syncStorageRoleClaim takePartySeat toggleLike updatePartyRoom verifyEmailBindCode verifyLoginEmailCode"
 WAVE_2A="$WAVE_2A_CORE $WAVE_2A_MAIL $WAVE_2A_HYGIENE"
 WAVE_2B="generateAgoraToken settleGift startCall acceptCall tickCall endCall declineCall sweepStaleCalls"
+# Not redeployed: its code is unchanged — src/invitationCleanup.ts imports only firebase-functions and firebase-admin and
+# is identical in the production tree; production keeps its 20 Oct deployment.
+NOT_REDEPLOYED="onHostInvitationWithdrawn"
 EMAIL_FNS="requestEmailBindCode requestLoginEmailCode onAgencyApproved onAgencyRegistered onSellerRegistered onSellerApproved onAgencyResendEmail onSellerResendEmail"
+# Functions declared without .region() run in us-central1 (Firebase's default region): the weekly report and the eight
+# reporting schedulers. Every other function runs in asia-south1. fn_state / fn_env_drift describe each one in its
+# region; 20/21 refuse if the compiled code declares another region for any function (check_exports).
+FN_US_CENTRAL1="weeklyPayoutReportGenerator dailyPlatformStatsAggregator scheduledTransactionalSweep scheduledAlertScan \
+scheduledReconciliation scheduledDailyReports scheduledWeeklyBusinessReport scheduledPartnerStatements scheduledMonthlyReports"
 
 # Functions rollback base (make-release-txt.sh -> RELEASE.txt BASE_COMMIT -> 29): the exact production Functions tree,
 # branch prod-live-20261030 = the 20 Oct baseline + the SendGrid wave-A files live since 30 Oct (tag
@@ -56,6 +81,7 @@ REPO="$(cd "$HERE/../.." && pwd -P)"                # …/zippern
 RELEASE_TXT="$HERE/RELEASE.txt"
 STATE_BACKEND="$HERE/production/backend-revision.txt"
 STATE_CRM="$HERE/production/crm-live.txt"
+STATE_ENFORCE="$HERE/production/enforce-revision.txt"   # 45: the Owner-MFA enforcement revision (name=) and its base=
 FN_ENV="$REPO/functions/.env"                       # copied into deploy trees, never displayed, never opened by a script
 H="python3 -I $HERE/rel_helpers.py"
 
@@ -140,12 +166,16 @@ who() {
   say "gcloud: $(gcloud --version 2>>"$ERR" | head -1)   project: $(gcloud config get-value project 2>/dev/null)   account: $(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>>"$ERR" | sed -E 's/^(.).*@/\1***@/')"  #RO
 }
 
+# fn_region <fn>: the region the function runs in (FN_US_CENTRAL1 above: us-central1; every other one: asia-south1).
+fn_region() {
+  case " $FN_US_CENTRAL1 " in *" $1 "*) printf '%s' "$WEEKLY_REGION";; *) printf '%s' "$REGION";; esac
+}
+
 # fn_state <file> <fn...>: one line per function (describe piped straight into the parser; never saved).
 fn_state() {
   local file="$1"; shift; : > "$file"
   for f in "$@"; do
-    local region="$REGION"; [ "$f" = "$WEEKLY" ] && region="$WEEKLY_REGION"
-    gcloud functions describe "$f" --region "$region" --project "$P" --format=json 2>>"$ERR" | $H fn-describe - "$f" >> "$file"  #RO
+    gcloud functions describe "$f" --region "$(fn_region "$f")" --project "$P" --format=json 2>>"$ERR" | $H fn-describe - "$f" >> "$file"  #RO
   done
 }
 
@@ -153,8 +183,7 @@ fn_state() {
 fn_env_drift() {
   local file="$1" dotenv="$2"; shift 2; : > "$file"
   for f in "$@"; do
-    local region="$REGION"; [ "$f" = "$WEEKLY" ] && region="$WEEKLY_REGION"
-    gcloud functions describe "$f" --region "$region" --project "$P" --format=json 2>>"$ERR" | $H fn-describe - "$f" "$dotenv" | grep '^ENV ' >> "$file"  #RO
+    gcloud functions describe "$f" --region "$(fn_region "$f")" --project "$P" --format=json 2>>"$ERR" | $H fn-describe - "$f" "$dotenv" | grep '^ENV ' >> "$file"  #RO
   done
 }
 
@@ -177,6 +206,18 @@ revision_state() {
 # split_now <status|spec>: "NAME=PCT,..." of the live service, or LATEST-TARGET-PRESENT.
 split_now() {
   gcloud run services describe "$SERVICE" --project "$P" --region "$REGION" --format='json(spec.traffic,status.traffic)' 2>>"$ERR" | $H traffic-split "$1" -  #RO
+}
+
+# enforce_state: NEW (the Owner-MFA enforcement revision), BASE (the completion revision it was made from) and WANT_DIG
+# from production/enforce-revision.txt (written by 45), validated: revision names, never the retired revision, NEW != BASE.
+enforce_state() {
+  [ -f "$STATE_ENFORCE" ] || stop "$STATE_ENFORCE does not exist (run 45 first)"
+  NEW="$(sed -n 's/^name=//p' "$STATE_ENFORCE" | head -1)"; BASE="$(sed -n 's/^base=//p' "$STATE_ENFORCE" | head -1)"
+  WANT_DIG="$(sed -n 's/^digest=//p' "$STATE_ENFORCE" | head -1)"
+  printf '%s\n%s\n' "$NEW" "$BASE" | grep -Evq '^zipper-api-[0-9]{5}-[a-z0-9]{3}$' && stop "bad revision names in enforce-revision.txt"
+  printf '%s' "$WANT_DIG" | grep -Eq '^sha256:[0-9a-f]{64}$' || stop "bad digest in enforce-revision.txt"
+  [ "$NEW" != "$RETIRED_REV" ] && [ "$BASE" != "$RETIRED_REV" ] && [ "$NEW" != "$BASE" ] || stop "$RETIRED_REV must never receive traffic, and NEW must differ from BASE"
+  say "NEW=$NEW (Owner MFA enforcement: OWNER_MFA_REQUIRED=true)  BASE=$BASE (completion revision)"
 }
 
 # hosting_live <file>: the live Hosting version of the CRM site (people's addresses in the JSON are never saved).

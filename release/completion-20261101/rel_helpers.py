@@ -203,7 +203,10 @@ def env_names(path):
 
 def compare_lists(before, after, expected_csv):
     """Which functions changed (updateTime) between two fn-list files. A function that appears only after
-    the deploy (new in this release) counts as changed; one that disappears is always unexpected."""
+    the deploy (new in this release) counts as changed; one that disappears is always unexpected.
+    Every expected name is printed as UPDATED or NOT-UPDATED. SCOPE PASS: exactly the expected names changed;
+    SCOPE PARTIAL: only expected names changed but not all of them (a deploy that stopped part-way);
+    SCOPE FAIL: anything else changed or disappeared."""
     def read(p):
         out = {}
         for line in open(p, encoding="utf-8"):
@@ -217,15 +220,224 @@ def compare_lists(before, after, expected_csv):
     for n in sorted(changed):
         print("CHANGED %s %s -> %s" % (n, b.get(n, "-"), a.get(n, "-")))
     print("FUNCTIONS before=%d after=%d changed=%d" % (len(b), len(a), len(changed)))
-    ok = changed == expected and set(b) <= set(a)
-    if not ok:
-        for n in sorted(expected - changed):
-            print("NOT-CHANGED-BUT-EXPECTED %s" % n)
-        for n in sorted(changed - expected):
-            print("CHANGED-BUT-NOT-EXPECTED %s" % n)
-        for n in sorted(set(b) - set(a)):
-            print("DISAPPEARED %s" % n)
-    print("SCOPE " + ("PASS" if ok else "FAIL"))
+    updated = expected & changed & set(a)
+    for n in sorted(expected):
+        print(("UPDATED %s" if n in updated else "NOT-UPDATED %s") % n)
+    unexpected, gone = changed - expected, set(b) - set(a)
+    for n in sorted(unexpected):
+        print("CHANGED-BUT-NOT-EXPECTED %s" % n)
+    for n in sorted(gone):
+        print("DISAPPEARED %s" % n)
+    print("WAVE updated=%d of %d" % (len(updated), len(expected)))
+    if unexpected or gone:
+        print("SCOPE FAIL")
+    else:
+        print("SCOPE " + ("PASS" if updated == expected else "PARTIAL"))
+
+
+def fn_classify(exports_path, wave_2a, wave_2b, not_redeployed, region, default_region, default_region_names):
+    """exports.txt (one `EXPORT name region` line per export of lib/index.js; other output of the module load is
+    ignored) against the three lists: every exported name in exactly one list, every listed name exported, no name
+    twice, and each function in the region the scripts describe it in (default_region for default_region_names, else
+    region). Names and regions only."""
+    lists = [("WAVE_2A", wave_2a.split()), ("WAVE_2B", wave_2b.split()), ("NOT_REDEPLOYED", not_redeployed.split())]
+    exported = {}
+    for line in open(exports_path, encoding="utf-8"):
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "EXPORT":
+            exported[parts[1]] = parts[2] if len(parts) > 2 else "?"
+    where, problems = {}, 0
+    for lst, names in lists:
+        for n in names:
+            where.setdefault(n, []).append(lst)
+    print("EXPORTS %d (lib/index.js of the deploy tree)" % len(exported))
+    print("LISTS %s (%d names)" % (" ".join("%s=%d" % (lst, len(names)) for lst, names in lists), len(where)))
+    for n in sorted(where):
+        if len(where[n]) > 1:
+            problems += 1
+            print("DUPLICATE %s in %s" % (n, ",".join(where[n])))
+    for n in sorted(set(exported) - set(where)):
+        problems += 1
+        print("UNCLASSIFIED %s (exported, in no list)" % n)
+    for n in sorted(set(where) - set(exported)):
+        problems += 1
+        print("NOT-EXPORTED %s (listed in %s)" % (n, ",".join(where[n])))
+    dflt = set(default_region_names.split())
+    for n in sorted(exported):
+        want = default_region if n in dflt else region
+        if exported[n] != want:
+            problems += 1
+            print("REGION %s code=%s scripts=%s" % (n, exported[n], want))
+    print("CLASSIFY " + ("ok" if problems == 0 and exported else "FAIL"))
+
+
+# ── Firestore indexes (33) ───────────────────────────────────────────────────
+
+#: The automatic single-field indexes of a Firestore database (used if the live __default__ config is not listed).
+AUTO_FIELD_INDEXES = {("COLLECTION", "ASCENDING", ""), ("COLLECTION", "DESCENDING", ""), ("COLLECTION", "", "CONTAINS")}
+
+
+def _ix_fields(fields):
+    """Composite-index fields as (path, order, arrayConfig, vector), with the trailing __name__ that Firestore always adds
+    made explicit (direction of the last field; ASCENDING after a non-directional one): file and API then compare equal."""
+    out = []
+    for f in fields or []:
+        vec = json.dumps(f.get("vectorConfig"), sort_keys=True) if f.get("vectorConfig") else ""
+        out.append((str(f.get("fieldPath", "?")), f.get("order") or "", f.get("arrayConfig") or "", vec))
+    if not out or out[-1][0] != "__name__":
+        out.append(("__name__", out[-1][1] if out and out[-1][1] else "ASCENDING", "", ""))
+    return tuple(out)
+
+
+def _ix_parts(name):
+    """…/collectionGroups/<C>/indexes/<id> or …/collectionGroups/<C>/fields/<F> -> (C, last segment)."""
+    s = str(name or "")
+    tail = s.split("/collectionGroups/", 1)[-1]
+    return tail.split("/", 1)[0], tail.rsplit("/", 1)[-1]
+
+
+def _fmt_ix(k):
+    return "%s %s [%s]" % (k[0], k[1], ", ".join("%s %s" % (p, o or a or ("vector" if v else "?")) for p, o, a, v in k[2]))
+
+
+def _fmt_cfg(c):
+    return "%s %s" % (c[0], c[1] or c[2])
+
+
+def _live_composite(src):
+    """`gcloud firestore indexes composite list --format=json` -> {key: state}, or None if not a list."""
+    d = load(src)
+    if not isinstance(d, list):
+        return None
+    out = {}
+    for x in d:
+        out[(_ix_parts(x.get("name"))[0], x.get("queryScope") or "COLLECTION", _ix_fields(x.get("fields")))] = x.get("state", "?")
+    return out
+
+
+def _live_fields(src):
+    """`gcloud firestore indexes fields list --format=json` -> (the __default__ configs {cfg: state} or None,
+    {(collectionGroup, fieldPath): ({cfg: state}, ttl)} of the explicit overrides), or (None, None) if not a list."""
+    d = load(src)
+    if not isinstance(d, list):
+        return None, None
+    default, over = None, {}
+    for x in d:
+        cg, fp = _ix_parts(x.get("name"))
+        ic = x.get("indexConfig") or {}
+        cfgs = {}
+        for ix in ic.get("indexes") or []:
+            f = (ix.get("fields") or [{}])[0]
+            cfgs[(ix.get("queryScope") or "COLLECTION", f.get("order") or "", f.get("arrayConfig") or "")] = ix.get("state", "?")
+        ttl = bool(x.get("ttlConfig"))
+        if cg == "__default__":
+            default = cfgs
+        elif not ic.get("usesAncestorConfig") or ttl:
+            over[(cg, fp)] = (cfgs, ttl)
+    return default, over
+
+
+def _file_specs(spec):
+    comp = [(str(i.get("collectionGroup", "?")), i.get("queryScope") or "COLLECTION", _ix_fields(i.get("fields")))
+            for i in spec.get("indexes") or []]
+    over = {}
+    for o in spec.get("fieldOverrides") or []:
+        cfgs = set((ix.get("queryScope") or "COLLECTION", ix.get("order") or "", ix.get("arrayConfig") or "")
+                   for ix in o.get("indexes") or [])
+        over[(str(o.get("collectionGroup", "?")), str(o.get("fieldPath", "?")))] = (cfgs, bool(o.get("ttl")))
+    return comp, over
+
+
+def indexes_check(spec_path, composite_src, fields_src):
+    """Is firestore.indexes.json a SUPERSET of the live indexes? Every live composite index and every live field
+    override must be in the file, and no field override of the file may drop a single-field index (or a TTL) that is
+    live today — for a field without a live override, the automatic indexes of __default__. Prints what a deploy
+    would create (TO-CREATE) and patch (TO-PATCH), and SUPERSET ok|FAIL. Index definitions only."""
+    spec = load(spec_path)
+    live_c = _live_composite(composite_src)
+    default, live_o = _live_fields(fields_src)
+    if not isinstance(spec, dict) or live_c is None or live_o is None:
+        print("INDEXES unreadable (file %s, live composite %s, live fields %s)" % (
+            "ok" if isinstance(spec, dict) else "unreadable", "ok" if live_c is not None else "unreadable",
+            "ok" if live_o is not None else "unreadable"))
+        print("SUPERSET FAIL")
+        return
+    file_c, file_o = _file_specs(spec)
+    print("LIVE composite=%d field-overrides=%d   FILE composite=%d field-overrides=%d" % (
+        len(live_c), len(live_o), len(set(file_c)), len(file_o)))
+    problems = 0
+    for k in sorted(set(live_c) - set(file_c)):
+        problems += 1
+        print("LIVE-NOT-IN-FILE index %s" % _fmt_ix(k))
+    for k in sorted(set(live_o) - set(file_o)):
+        problems += 1
+        print("LIVE-NOT-IN-FILE field-override %s.%s" % k)
+    auto = set(default) if default is not None else AUTO_FIELD_INDEXES
+    patch = 0
+    for k in sorted(file_o):
+        fcfg, fttl = file_o[k]
+        lcfg, lttl = (set(live_o[k][0]), live_o[k][1]) if k in live_o else (auto, False)
+        for c in sorted(lcfg - fcfg):
+            problems += 1
+            print("WOULD-REMOVE field-override %s.%s %s%s" % (k[0], k[1], _fmt_cfg(c), "" if k in live_o else " (automatic index)"))
+        if lttl and not fttl:
+            problems += 1
+            print("WOULD-REMOVE ttl %s.%s" % k)
+        if k not in live_o or fcfg != lcfg or fttl != lttl:
+            patch += 1
+            print("TO-PATCH field-override %s.%s adds: %s%s" % (k[0], k[1], ", ".join(_fmt_cfg(c) for c in sorted(fcfg - lcfg)) or "-",
+                                                             "; ttl: %s" % ("on" if fttl else "off") if fttl != lttl else ""))
+    new = sorted(set(file_c) - set(live_c))
+    for k in new:
+        print("TO-CREATE index %s" % _fmt_ix(k))
+    print("CHANGES %d (create %d composite, patch %d field overrides)" % (len(new) + patch, len(new), patch))
+    print("SUPERSET " + ("ok" if problems == 0 else "FAIL"))
+
+
+def indexes_ready(spec_path, composite_src, fields_src, before_composite="", before_fields=""):
+    """Build state of every index of the file (composite indexes and each field-override index: READY, CREATING, …,
+    ABSENT) and, given the lists read before the deploy, whether every index live then is live now (KEPT-ALL)."""
+    spec = load(spec_path)
+    live_c = _live_composite(composite_src)
+    _, live_o = _live_fields(fields_src)
+    if not isinstance(spec, dict) or live_c is None or live_o is None:
+        print("INDEXES unreadable")
+        print("INDEXES-READY no")
+        return
+    file_c, file_o = _file_specs(spec)
+    total = ready = 0
+    for k in sorted(set(file_c)):
+        total += 1
+        if live_c.get(k) == "READY":
+            ready += 1
+        else:
+            print("BUILDING index %s state=%s" % (_fmt_ix(k), live_c.get(k, "ABSENT")))
+    for k in sorted(file_o):
+        now = (live_o.get(k) or ({}, False))[0]
+        for c in sorted(file_o[k][0]):
+            total += 1
+            if now.get(c) == "READY":
+                ready += 1
+            else:
+                print("BUILDING field-override %s.%s %s state=%s" % (k[0], k[1], _fmt_cfg(c), now.get(c, "ABSENT")))
+    print("READY-COUNT %d of %d" % (ready, total))
+    if before_composite:
+        bc = _live_composite(before_composite) or {}
+        _, bo = _live_fields(before_fields)
+        gone = 0
+        for k in sorted(set(bc) - set(live_c)):
+            gone += 1
+            print("GONE index %s" % _fmt_ix(k))
+        for k in sorted(bo or {}):
+            now_cfg, now_ttl = live_o.get(k) or ({}, False)
+            for c in sorted(set(bo[k][0]) - set(now_cfg)):
+                gone += 1
+                print("GONE field-override %s.%s %s" % (k[0], k[1], _fmt_cfg(c)))
+            if bo[k][1] and not now_ttl:
+                gone += 1
+                print("GONE ttl %s.%s" % k)
+        print("KEPT-ALL " + ("yes" if gone == 0 else "no"))
+    print("INDEXES-READY " + ("yes" if ready == total else "no"))
 
 
 # ── Cloud Run ────────────────────────────────────────────────────────────────
@@ -748,6 +960,7 @@ if __name__ == "__main__":
     {
         "secret-meta": secret_meta, "versions": versions, "iam": iam, "project-sa-roles": project_sa_roles,
         "fn-describe": fn_describe, "fn-list": fn_list, "env-names": env_names, "compare-lists": compare_lists,
+        "fn-classify": fn_classify, "indexes-check": indexes_check, "indexes-ready": indexes_ready,
         "run-service": run_service, "run-revision": run_revision, "env-diff": env_diff, "traffic-split": traffic_split,
         "rev-cond": rev_cond, "hosting-live": hosting_live, "tree-sha": tree_sha, "tree-list": tree_list,
         "file-sha": file_sha, "release-check": release_check, "upload-check": upload_check,

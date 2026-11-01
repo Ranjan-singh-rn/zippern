@@ -2,8 +2,10 @@
 # ZIPPER completion release — 90: READ-ONLY post-deploy verification. Usage: 90-postdeploy-verify-readonly.command [minutes]
 # Production effect: none (describes, lists, the read-only rules/Android readers, and log COUNTS — no log text is read
 # or saved). Prints one table (also TABLE.txt):
-#   Cloud Run   traffic 100% on the completion revision by name (spec and status), no latestRevision target, no tag,
-#               the retired revision without traffic, the revision Ready with the recorded image digest
+#   Cloud Run   traffic 100% by name (spec and status) on the completion revision — after step 9b on the Owner-MFA
+#               enforcement revision of ./production/enforce-revision.txt — no latestRevision target, no tag, the
+#               retired revision without traffic, the revision Ready with the recorded image digest, and
+#               OWNER_MFA_REQUIRED=true on it (spec §8; FAIL until step 9b is done)
 #   Functions   every wave 2a/2b function ACTIVE, its version, and whether it is the version 20/21 recorded
 #   Secrets/IAM ZIPPER_SENDGRID_API_KEY enabled with the backend and Functions grants; the Storage agent role
 #   Rules       live Firestore and Storage sha256 = firestore.rules / storage.rules of RELEASE.txt
@@ -38,16 +40,20 @@ cmp_row() { if [ "$2" = "$3" ]; then row PASS "$1" "$2" "$3"; else row FAIL "$1"
 # ── Cloud Run ──
 NEW=""; WANT_DIG=""
 [ -f "$STATE_BACKEND" ] && { NEW="$(sed -n 's/^name=//p' "$STATE_BACKEND" | head -1)"; WANT_DIG="$(sed -n 's/^digest=//p' "$STATE_BACKEND" | head -1)"; }
+# after step 9b: the enforcement revision (45: the completion revision's image + OWNER_MFA_REQUIRED=true) serves instead
+[ -f "$STATE_ENFORCE" ] && { NEW="$(sed -n 's/^name=//p' "$STATE_ENFORCE" | head -1)"; WANT_DIG="$(sed -n 's/^digest=//p' "$STATE_ENFORCE" | head -1)"; }
 service_state "$OUT/service.txt"
 cmp_row "run: traffic (status)" "${NEW:-<backend-revision.txt>}=100" "$(sed -n 's/^TRAFFIC status //p' "$OUT/service.txt")"
 cmp_row "run: traffic (spec)" "${NEW:-<backend-revision.txt>}=100" "$(sed -n 's/^TRAFFIC spec //p' "$OUT/service.txt")"
 cmp_row "run: tags" "none" "$(sed -n 's/^TAGS //p' "$OUT/service.txt")"
 grep -q "$RETIRED_REV=" "$OUT/service.txt" && row FAIL "run: $RETIRED_REV traffic" "none" "HAS TRAFFIC" || row PASS "run: $RETIRED_REV traffic" "none" "none"
 if [ -n "$NEW" ]; then
-  revision_state "$OUT/revision-new.txt" "$NEW"
+  revision_state "$OUT/revision-new.txt" "$NEW" OWNER_MFA_REQUIRED=true
   REVLINE="$(grep '^REV ' "$OUT/revision-new.txt")"
   case "$REVLINE" in *" ready=True active=True "*) row PASS "run: $NEW ready/active" "True/True" "True/True";; *) row FAIL "run: $NEW ready/active" "True/True" "see revision-new.txt";; esac
   cmp_row "run: $NEW image digest" "$(printf '%s' "$WANT_DIG" | cut -c1-19)…" "$(printf '%s' "$REVLINE" | sed -n 's/.* digest=\([^ ]*\) .*/\1/p' | cut -c1-19)…"
+  grep -q '^VALUE OWNER_MFA_REQUIRED expected$' "$OUT/revision-new.txt" && row PASS "run: Owner MFA enforced (OWNER_MFA_REQUIRED)" "true" "true" \
+    || row FAIL "run: Owner MFA enforced (OWNER_MFA_REQUIRED)" "true (step 9b)" "$(sed -n 's/^VALUE OWNER_MFA_REQUIRED //p' "$OUT/revision-new.txt")"
 fi
 
 # ── Functions ──

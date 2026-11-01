@@ -1,4 +1,4 @@
-# ZIPPER completion release 20261101 — shared rules helpers (sourced by 30/31/32/39/41/49). bash 3.2 compatible.
+# ZIPPER completion release 20261101 — shared rules helpers (sourced by 30/31/32/33/39/41/45/46/49/50). bash 3.2 compatible.
 # Holds NO deploy command: each script runs its own, exactly as written in it.
 
 # rules_evidence <results-dir> <rules-file...>: the emulator results folder for the bundle must exist, hold
@@ -57,14 +57,30 @@ rules_workdir() {
   say "   deploy folder: $WS ($(ls "$WS" | tr '\n' ' '))"
 }
 
-# require_backend_serving_new: the completion backend revision (11) serves 100% (the rc2 rules and CRM need it).
+# require_backend_serving_new: the completion backend revision (11) serves 100% (the rc2 rules and CRM need it) — or,
+# after step 9b, the Owner-MFA enforcement revision 45 made from it (enforce-revision.txt base= that revision; same image).
 require_backend_serving_new() {
   [ -f "$STATE_BACKEND" ] || stop "$STATE_BACKEND does not exist (the completion backend is not deployed)"
-  local new now
+  local new now enf=""
   new="$(sed -n 's/^name=//p' "$STATE_BACKEND" | head -1)"
+  [ -f "$STATE_ENFORCE" ] && [ "$(sed -n 's/^base=//p' "$STATE_ENFORCE" | head -1)" = "$new" ] && enf="$(sed -n 's/^name=//p' "$STATE_ENFORCE" | head -1)"
   now="$(split_now status)"
+  if [ -n "$enf" ] && [ "$now" = "$enf=100" ]; then check ok "backend serving 100% = the Owner-MFA enforcement revision $enf (the completion revision $new + OWNER_MFA_REQUIRED=true)"; return 0; fi
   [ "$now" = "$new=100" ] || stop "the backend serving 100% is '$now', not the completion revision $new (finish the canary first)"
   check ok "backend serving 100% = completion revision $new"
+}
+
+# require_rc2_rules_live: 31 released the RC2 Firestore rules (an evidence folder of it says RESULT: PASS) and the LIVE
+# Firestore rules text is still the repository's firestore.rules (= RELEASE.txt) — not rolled back by 39 since.
+require_rc2_rules_live() {
+  local last31 want
+  last31="$(grep -l '^RESULT: PASS' "$HERE/production/31-rules-rc2-"*Z/SUMMARY.txt 2>/dev/null | LC_ALL=C sort | tail -1)"
+  [ -n "$last31" ] || stop "no PASS evidence of 31 (the RC2 Firestore rules) in production/ — step 9 first"
+  last31="$(dirname "$last31")"
+  want="$(shasum -a 256 "$REPO/firestore.rules" | cut -c1-64)"
+  save_live_rules firestore "$OUT/live-firestore"
+  [ "$LIVE_SHA" = "$want" ] || stop "the live Firestore rules ($LIVE_SHA) are not the RC2 firestore.rules ($want) — rolled back by 39? Release them again (31) first"
+  check ok "RC2 Firestore rules live = firestore.rules ($want; 31 evidence $(basename "$last31"))"
 }
 
 # require_crm_live: the new CRM is live (50 recorded its Hosting version) and still the live version.

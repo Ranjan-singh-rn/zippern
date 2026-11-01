@@ -12,8 +12,12 @@ Two parts:
      refused without its word, rollbacks run their reviewed command, and the gates refuse: dirty tree, RELEASE.txt
      mismatch, tampered SCRIPTS.sha256, missing/old/failed emulator evidence, a hotfix text off its SHA256SUMS, missing
      IAM role, unpublished APK, wave 2b live, and a Functions rollback base that is not refs/heads/prod-live-20261030
-     (f1af30a refused; the short name, shadowed by a same-named tag, never resolved).
-     Plus a unit test of tools/android_update_doc.py restore against an in-memory Firestore fake.
+     (f1af30a refused; the short name, shadowed by a same-named tag, never resolved). The fake project holds the 104
+     production functions (95 gen1 + 9 gen2; 9 in us-central1); 20/21 refuse an export split other than WAVE_2A +
+     WAVE_2B + NOT_REDEPLOYED (the `node -e` enumeration is stubbed); a deploy that stops part-way is reported per name
+     and 29 rolls back exactly the updated ones; 33 refuses an index file that is not a superset of the live indexes;
+     45/46/47 (Owner MFA enforcement) refuse without their preconditions and words and pin back on failure.
+     Plus unit tests of tools/android_update_doc.py restore (in-memory Firestore fake) and of fn-classify.
 
 Usage: python3 -I tools/test_release_scripts.py <release/completion-20261101 folder>
 """
@@ -51,7 +55,8 @@ C10, C11, C12, C19 = ("10-grant-backend-sendgrid-secret.command", "11-deploy-bac
 C20, C21, C29 = "20-deploy-functions-wave2a.command", "21-deploy-functions-wave2b.command", "29-rollback-functions.command"
 C30, C31, C39, C40 = ("30-deploy-rules-hotfix1.command", "31-deploy-rules-rc2.command", "39-rollback-rules.command",
                       "40-storage-iam-grant.command")
-C32 = "32-deploy-storage-hotfix1.command"
+C32, C33 = "32-deploy-storage-hotfix1.command", "33-deploy-indexes.command"
+C45, C46, C47 = "45-enable-owner-mfa-enforcement.command", "46-move-traffic-enforce.command", "47-rollback-enforcement.command"
 REAL_PROD, REAL_NOTPROD = "4e21b7f14f7cafb01b8aacaf35368695a17d13e0", "f1af30a1d64fb8f20403fd6e7da5633cfab1234c"
 C41, C49, C50 = "41-deploy-storage-rules.command", "49-rollback-storage.command", "50-deploy-crm.command"
 C60, C61, C70, C90 = ("60-publish-apk.command", "61-withdraw-apk.command", "70-monitoring-setup.command",
@@ -74,6 +79,12 @@ EXPECTED_MUT = {
     "MUT-RULES-HOTFIX1": (C30, "firebase deploy --only firestore:rules --project zipper-83816 --non-interactive"),
     "MUT-STORAGE-HOTFIX1": (C32, "firebase deploy --only storage --project zipper-83816 --non-interactive"),
     "MUT-RULES-RC2": (C31, "firebase deploy --only firestore:rules,firestore:indexes --project zipper-83816 --non-interactive"),
+    "MUT-INDEXES": (C33, "firebase deploy --only firestore:indexes --project zipper-83816 --non-interactive < /dev/null"),
+    "MUT-ENFORCE-NEW": (C45, "gcloud run services update zipper-api --project zipper-83816 --region asia-south1 --update-env-vars OWNER_MFA_REQUIRED=true --no-traffic"),
+    "MUT-ENFORCE-NEW-PIN-BACK": (C45, UT + '--to-revisions "$BASE=100"'),
+    "MUT-ENFORCE-TRAFFIC": (C46, UT + '--to-revisions "$NEW=100"'),
+    "MUT-ENFORCE-PIN-BACK": (C46, UT + '--to-revisions "$BASE=100"'),
+    "MUT-ENFORCE-ROLLBACK": (C47, UT + '--to-revisions "$BASE=100"'),
     "MUT-RULES-ROLLBACK": (C39, "firebase deploy --only firestore:rules --project zipper-83816 --non-interactive"),
     "MUT-STORAGE-IAM": (C40, "gcloud projects add-iam-policy-binding zipper-83816 --member=" + SA_STORAGE + " --role=roles/firebaserules.firestoreServiceAgent --condition=None"),
     "MUT-STORAGE-RC2": (C41, "firebase deploy --only storage --project zipper-83816 --non-interactive"),
@@ -87,7 +98,8 @@ EXPECTED_MUT = {
     "MUT-MON-POLICY": (C70, 'gcloud alpha monitoring policies create --project zipper-83816 --policy-from-file="$OUT/policy-$kind.json"'),
 }
 WORDS = {C10: "GRANT", C11: "DEPLOY", C12: "CANARY10", C19: "ROLLBACK", C20: "DEPLOY2A", C21: "DEPLOY2B", C29: "ROLLBACK",
-         C30: "RELEASE", C31: "RELEASE", C32: "RELEASE", C39: "ROLLBACK", C40: "GRANT", C41: "RELEASE", C49: "ROLLBACK", C50: "CRM",
+         C30: "RELEASE", C31: "RELEASE", C32: "RELEASE", C33: "INDEXES", C39: "ROLLBACK", C40: "GRANT", C41: "RELEASE",
+         C45: "ENFORCE-NEW", C46: "ENFORCE", C47: "ROLLBACK", C49: "ROLLBACK", C50: "CRM",
          C60: "PUBLISH", C61: "WITHDRAW", C70: "MONITOR"}
 RO_VERBS = ["gcloud --version", "gcloud config get-value", "gcloud auth list", "gcloud run services describe",
             "gcloud run revisions describe", "gcloud functions describe", "gcloud functions list",
@@ -96,6 +108,7 @@ RO_VERBS = ["gcloud --version", "gcloud config get-value", "gcloud auth list", "
             "gcloud artifacts repositories describe", "gcloud services list", "gcloud builds list", "gcloud builds log",
             "gcloud storage buckets describe", "gcloud alpha monitoring policies list",
             "gcloud beta monitoring channels list", "gcloud monitoring uptime list-configs",
+            "gcloud firestore indexes composite list", "gcloud firestore indexes fields list",
             "firebase --version", "firebase hosting:channel:list"]
 FORBIDDEN = [r"(gcloud|update-traffic)[^#]*--to-latest", r"versions\s+access", r"firebase\s[^#]*--force\b", r"secrets\s+delete", r"versions\s+destroy",
              r"functions\s+delete", r"set-iam-policy", r"run\s+services\s+delete", r"revisions\s+delete",
@@ -180,6 +193,31 @@ ok("rel_common.sh: rollback base refs/heads/prod-live-20261030 = 4e21b7f…, f1a
 short = ["%s:%d" % (f.name, no) for f in code_files for no, ln in logical_lines(f) if not ln.strip().startswith("#")
          and re.search(r"(?<!refs/heads/)prod-live-20261030(?!-tag)", ln.split("  #")[0])]
 ok("no script names prod-live-20261030 except as the full ref refs/heads/prod-live-20261030", not short, short)
+# The Functions waves (rel_common.sh, evaluated by bash): every exported function in exactly one list.
+LIST_NAMES = ["WAVE_2A_CORE", "WAVE_2A_MAIL", "WAVE_2A_HYGIENE", "WAVE_2A", "WAVE_2B", "NOT_REDEPLOYED", "EMAIL_FNS", "FN_US_CENTRAL1"]
+lp = subprocess.run(["/bin/bash", "-c", '. ./rel_common.sh >/dev/null 2>&1; for v in %s; do eval "printf \'%%s=%%s\\n\' $v \\"\\$$v\\""; done' % " ".join(LIST_NAMES)],
+                    cwd=str(REL), capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"})
+LISTS = {k: v.split() for k, v in (l.split("=", 1) for l in lp.stdout.splitlines() if "=" in l)}
+ok("rel_common.sh lists readable (%s)" % ", ".join(LIST_NAMES), set(LISTS) == set(LIST_NAMES), lp.stdout[-300:] + lp.stderr[-300:])
+ALL3 = LISTS.get("WAVE_2A", []) + LISTS.get("WAVE_2B", []) + LISTS.get("NOT_REDEPLOYED", [])
+ok("WAVE_2A, WAVE_2B and NOT_REDEPLOYED are disjoint and no name appears twice", len(ALL3) == len(set(ALL3)),
+   sorted(n for n in set(ALL3) if ALL3.count(n) > 1))
+ok("WAVE_2A ∪ WAVE_2B ∪ NOT_REDEPLOYED = 104 names (every production function)", len(set(ALL3)) == 104, len(set(ALL3)))
+ok("WAVE_2A = core 5 + mail 8 + hygiene 82; WAVE_2A_MAIL = the 8 EMAIL_FNS; WAVE_2B the 8 call/gift functions; NOT_REDEPLOYED = onHostInvitationWithdrawn",
+   LISTS.get("WAVE_2A_CORE") == ["releaseBeansForWeek", "weeklyPayoutReportGenerator", "syncPublicProfile", "backfillPublicProfiles", "startMobileSession"]
+   and len(LISTS.get("WAVE_2A_MAIL", [])) == 8 and LISTS.get("WAVE_2A_MAIL") == LISTS.get("EMAIL_FNS")
+   and len(LISTS.get("WAVE_2A_HYGIENE", [])) == 82
+   and LISTS.get("WAVE_2A") == LISTS.get("WAVE_2A_CORE", []) + LISTS.get("WAVE_2A_MAIL", []) + LISTS.get("WAVE_2A_HYGIENE", [])
+   and LISTS.get("WAVE_2B") == ["generateAgoraToken", "settleGift", "startCall", "acceptCall", "tickCall", "endCall", "declineCall", "sweepStaleCalls"]
+   and LISTS.get("NOT_REDEPLOYED") == ["onHostInvitationWithdrawn"], {k: len(v) for k, v in LISTS.items()})
+# The functions declared without .region() (us-central1) and the 2nd-gen ones, as functions/src declares them.
+US_CENTRAL1 = {"weeklyPayoutReportGenerator", "dailyPlatformStatsAggregator", "scheduledTransactionalSweep", "scheduledAlertScan",
+               "scheduledReconciliation", "scheduledDailyReports", "scheduledWeeklyBusinessReport", "scheduledPartnerStatements",
+               "scheduledMonthlyReports"}
+GEN2 = {"settleGift", "startCall", "acceptCall", "declineCall", "tickCall", "endCall", "recoverAccount", "purgeMyAccountNow", "requestAccountDeletion"}
+ok("FN_US_CENTRAL1 = the 9 functions declared without .region()", set(LISTS.get("FN_US_CENTRAL1", [])) == US_CENTRAL1, LISTS.get("FN_US_CENTRAL1"))
+ok("WAVE_2A carries the 3 gen-2 account functions; WAVE_2B the 6 gen-2 call/gift functions",
+   GEN2 <= set(ALL3) and {"recoverAccount", "purgeMyAccountNow", "requestAccountDeletion"} <= set(LISTS.get("WAVE_2A", [])))
 appr = REL / "APPROVAL-COMMANDS.txt"
 if appr.exists():
     ok("APPROVAL-COMMANDS.txt has no --to-latest and no secret read",
@@ -207,10 +245,9 @@ AGENT = "service-239458555881@gcp-sa-firebasestorage.iam.gserviceaccount.com"
 OLD_CRM = "ba740f4158292308"
 SECRET_VALUES = ["fake-agora-cert-value", "SG.fake-old-key", "ops-mailbox@example.com"]
 PEOPLE = ["someone@example.com", "operator@example.com", "alerts.owner@example.org"]
-WAVE_2A = ["releaseBeansForWeek", "weeklyPayoutReportGenerator", "syncPublicProfile", "backfillPublicProfiles", "startMobileSession"]
-WAVE_2B = ["generateAgoraToken", "settleGift", "startCall", "acceptCall", "tickCall", "endCall", "declineCall", "sweepStaleCalls"]
-EMAIL_FNS = ["requestEmailBindCode", "requestLoginEmailCode", "onAgencyApproved", "onAgencyRegistered", "onSellerRegistered",
-             "onSellerApproved", "onAgencyResendEmail", "onSellerResendEmail"]
+WAVE_2A, WAVE_2B, NOT_REDEPLOYED = LISTS.get("WAVE_2A", []), LISTS.get("WAVE_2B", []), LISTS.get("NOT_REDEPLOYED", [])
+EMAIL_FNS = LISTS.get("EMAIL_FNS", [])
+ALL_FNS = WAVE_2A + WAVE_2B + NOT_REDEPLOYED   # the 104 functions functions/src/index.ts exports (and production runs)
 FN_ENV = {"AGORA_APP_CERTIFICATE": "fake-agora-cert-value", "SG_MAIL_KEY": "SG.fake-old-key", "API_BASE": "https://api.example"}
 DEPLOYED_FS = "rules_version = '2';\n// DEPLOYED 20 Oct firestore\nservice cloud.firestore { match /databases/{d}/documents { } }\n"
 DEPLOYED_ST = "rules_version = '2';\n// DEPLOYED 20 Oct storage\nservice firebase.storage { match /b/{b}/o { } }\n"
@@ -245,8 +282,9 @@ svc = state["service"]
 IMG = "asia-south1-docker.pkg.dev/zipper-83816/cloud-run-source-deploy/zipper-api@"
 def rev_json(name):
     r = state["revisions"][name]
+    cond = "True" if r.get("ready", True) else "False"
     return {"metadata": {"name": name, "creationTimestamp": "2026-11-01T00:00:00Z"},
-            "status": {"imageDigest": IMG + r["digest"], "conditions": [{"type": t, "status": "True"} for t in ("Ready", "Active", "ResourcesAvailable", "ContainerHealthy")]},
+            "status": {"imageDigest": IMG + r["digest"], "conditions": [{"type": t, "status": cond} for t in ("Ready", "Active", "ResourcesAvailable", "ContainerHealthy")]},
             "spec": {"serviceAccountName": BSA, "containers": [{"image": IMG + r["digest"], "env": r["env"]}]}}
 def svc_json():
     tr = [{"revisionName": t["revisionName"], "percent": t["percent"]} for t in svc["traffic"]]
@@ -276,6 +314,18 @@ if a[:2] == ["run", "deploy"]:
     svc["latest"] = new; svc["tags"][tag] = new; svc["template_env"] = env; svc["generation"] += 1
     if state.get("deploy_moves_traffic"): svc["traffic"] = [{"revisionName": new, "percent": 100}]
     save(); print("Service [zipper-api] revision [%s] has been deployed and is serving 0 percent of traffic." % new); sys.exit(0)
+if a[:3] == ["run", "services", "update"]:
+    # a template change: a new revision from the template's image (the latest revision's digest) with the env update
+    assert "--no-traffic" in a, "services update without --no-traffic"
+    base, new = svc["latest"], "zipper-api-00050-enf"
+    env = [dict(e) for e in svc["template_env"]]
+    for pair in (flag("--update-env-vars") or "").split(","):
+        n, v = pair.split("=", 1)
+        env = [e for e in env if e["name"] != n] + [{"name": n, "value": v}]
+    state["revisions"][new] = {"digest": state["revisions"][base]["digest"], "env": env}
+    svc["latest"] = new; svc["template_env"] = env; svc["generation"] += 1
+    if state.get("update_moves_traffic"): svc["traffic"] = [{"revisionName": new, "percent": 100}]
+    save(); print("Service [zipper-api] revision [%s] has been deployed and is serving 0 percent of traffic." % new); sys.exit(0)
 if a[:3] == ["run", "services", "update-traffic"]:
     if flag("--to-revisions"):
         tr = []
@@ -290,9 +340,34 @@ if a[:3] == ["run", "services", "update-traffic"]:
     svc["generation"] += 1; save(); sys.exit(0)
 if a[:2] == ["functions", "describe"]:
     f = state["functions"].get(a[2])
-    if not f: fail("NOT_FOUND: function " + a[2])
+    if not f or "/locations/%s/" % flag("--region") not in f["name"]: fail("NOT_FOUND: function %s in %s" % (a[2], flag("--region")))
     out(f)
-if a[:2] == ["functions", "list"]: out(list(state["functions"].values()))
+if a[:2] == ["functions", "list"]:
+    # an update the CLI left running finishes on the second look (status DEPLOY_IN_PROGRESS / state DEPLOYING until then)
+    busy = [f for f in state["functions"].values() if f.get("pending_update")]
+    for f in busy:
+        if f.get("polls_left", 0) > 0: f["polls_left"] -= 1
+        else:
+            f["updateTime"] = f.pop("pending_update"); f.pop("polls_left", None)
+            f["state" if "state" in f else "status"] = "ACTIVE"
+    if busy: save()
+    out(list(state["functions"].values()))
+ix = state["indexes"]
+def tick(rows):
+    moved = False
+    for r in rows:
+        for x in ([r] if "fields" in r else (r.get("indexConfig") or {}).get("indexes") or []):
+            if x.get("state") == "CREATING" and not state.get("indexes_stuck"):
+                if x.get("polls", 0) > 0: x["polls"] -= 1
+                else: x["state"] = "READY"; x.pop("polls", None)
+                moved = True
+    return moved
+if a[:4] == ["firestore", "indexes", "composite", "list"]:
+    if tick(ix["composite"]): save()
+    out(ix["composite"])
+if a[:4] == ["firestore", "indexes", "fields", "list"]:
+    if tick(ix["fields"]): save()
+    out(ix["fields"])
 sec = state["secrets"]
 if a[:2] == ["secrets", "describe"]:
     if a[2] not in sec: fail("NOT_FOUND")
@@ -373,6 +448,37 @@ ST = os.environ["STUB_STATE"]; state = json.load(open(ST))
 open(os.environ["STUB_LOG"], "a").write("firebase " + " ".join(sys.argv[1:]) + " [cwd=" + os.getcwd() + "]\n")
 a = sys.argv[1:]
 def save(): json.dump(state, open(ST, "w"))
+def canon(cg, scope, fields):
+    fs = [(f.get("fieldPath"), f.get("order") or "", f.get("arrayConfig") or "") for f in fields]
+    if not fs or fs[-1][0] != "__name__": fs.append(("__name__", fs[-1][1] if fs and fs[-1][1] else "ASCENDING", ""))
+    return (cg, scope or "COLLECTION", tuple(fs))
+def deploy_indexes(spec):
+    # as the CLI without --force: creates what is missing, PATCHes each field override to the file's config, deletes nothing
+    ix = state["indexes"]
+    live = {canon(r["name"].split("/collectionGroups/")[1].split("/")[0], r["queryScope"], r["fields"]) for r in ix["composite"]}
+    want = set()
+    for i in spec.get("indexes", []):
+        k = canon(i["collectionGroup"], i.get("queryScope"), i["fields"]); want.add(k)
+        if k not in live:
+            ix["composite"].append({"name": "projects/zipper-83816/databases/(default)/collectionGroups/%s/indexes/NEW%d" % (k[0], len(ix["composite"])),
+                                    "queryScope": k[1], "state": "CREATING", "polls": 1,
+                                    "fields": [dict({"fieldPath": p}, **({"order": o} if o else {"arrayConfig": c})) for p, o, c in k[2]]})
+            live.add(k)
+    for o in spec.get("fieldOverrides", []):
+        name = "projects/zipper-83816/databases/(default)/collectionGroups/%s/fields/%s" % (o["collectionGroup"], o["fieldPath"])
+        cur = next((r for r in ix["fields"] if r["name"] == name), None)
+        old = {(x["queryScope"], x["fields"][0].get("order", ""), x["fields"][0].get("arrayConfig", "")): x.get("state")
+               for x in ((cur or {}).get("indexConfig") or {}).get("indexes", [])}
+        new = []
+        for c in o.get("indexes", []):
+            key = (c.get("queryScope", "COLLECTION"), c.get("order", ""), c.get("arrayConfig", ""))
+            fld = dict({"fieldPath": o["fieldPath"]}, **({"order": c["order"]} if c.get("order") else {"arrayConfig": c.get("arrayConfig")}))
+            new.append(dict({"queryScope": key[0], "fields": [fld], "state": old.get(key) or "CREATING"}, **({} if old.get(key) else {"polls": 1})))
+        row = {"name": name, "indexConfig": {"indexes": new}}
+        if cur: ix["fields"][ix["fields"].index(cur)] = row
+        else: ix["fields"].append(row)
+    extra = [k for k in live if k not in want]
+    return ("i  firestore: there are %d indexes defined in your project that are not present in your firestore indexes file. To delete them, run this command with the --force flag.\n" % len(extra)) if extra else ""
 if a[:1] == ["--version"]: print("15.17.0"); sys.exit(0)
 if a[:1] == ["hosting:channel:list"]:
     print(json.dumps({"status": "success", "result": {"channels": [{"name": "projects/zipper-83816/sites/zipperlive/channels/live",
@@ -394,21 +500,47 @@ if a[:1] == ["deploy"]:
         assert os.path.exists("functions/.env") and os.path.isdir("functions/lib") and os.path.isdir("functions/node_modules"), "functions not prepared"
         src = open("functions/src/index.ts").read().splitlines()[0]
         dotenv = dict(l.split("=", 1) for l in open("functions/.env").read().splitlines() if "=" in l)
-        for n in [p.split(":", 1)[1] for p in parts]:
+        names = [p.split(":", 1)[1] for p in parts]
+        fail_after = state.pop("deploy_fail_after", None)      # the write quota outlasts the CLI's retries after N updates
+        in_progress = state.pop("deploy_in_progress", None)    # this one's update is still running when the CLI exits
+        done = []
+        for n in names:
+            if fail_after is not None and len(done) >= fail_after: break
             f = state["functions"].get(n) or {"name": "projects/zipper-83816/locations/asia-south1/functions/" + n, "status": "ACTIVE",
                                              "entryPoint": n, "runtime": "nodejs22", "serviceAccountEmail": "zipper-83816@appspot.gserviceaccount.com",
                                              "versionId": "0", "secretEnvironmentVariables": []}
-            f["versionId"] = str(int(f["versionId"]) + 1); state["clock"] += 1
-            f["updateTime"] = "2026-11-01T02:%02d:%02dZ" % (state["clock"] // 60 % 60, state["clock"] % 60)
-            f["environmentVariables"] = dict(dotenv, FIREBASE_CONFIG="{}", GCLOUD_PROJECT="zipper-83816")
+            state["clock"] += 1
+            ut = "2026-11-01T%02d:%02d:%02dZ" % (2 + state["clock"] // 3600, state["clock"] // 60 % 60, state["clock"] % 60)
+            env = dict(dotenv, FIREBASE_CONFIG="{}", GCLOUD_PROJECT="zipper-83816")
+            if "serviceConfig" in f:   # 2nd gen: a new Cloud Run revision behind the function
+                sc = f["serviceConfig"]; sc["environmentVariables"] = dict(env, LOG_EXECUTION_ID="true")
+                sc["revision"] = "%s-%05d-abc" % (n.lower(), int(sc["revision"].split("-")[1]) + 1)
+            else:
+                f["versionId"] = str(int(f["versionId"]) + 1); f["environmentVariables"] = env
             f["source"] = src
-            state["functions"][n] = f
-        save(); print("+  Deploy complete!"); sys.exit(0)
-    if parts in (["firestore:rules"], ["firestore:rules", "firestore:indexes"]):
+            if n == in_progress:
+                f["pending_update"] = ut; f["polls_left"] = 1
+                f["state" if "state" in f else "status"] = "DEPLOYING" if "state" in f else "DEPLOY_IN_PROGRESS"
+            else:
+                f["updateTime"] = ut
+            state["functions"][n] = f; done.append(n)
+        save()
+        if fail_after is not None:
+            print("Functions deploy had errors with the following functions:\n" + "".join("\t%s(asia-south1)\n" % n for n in names[len(done):]))
+            print("Error: There was an error deploying functions"); sys.exit(2)
+        print("+  Deploy complete!"); sys.exit(0)
+    if parts in (["firestore:rules"], ["firestore:rules", "firestore:indexes"], ["firestore:indexes"]):
         assert set(cfg) == {"firestore"}, "deploy folder carries more than firestore"
-        state["rules"]["firestore"] = open(cfg["firestore"]["rules"]).read()
-        if "firestore:indexes" in parts: json.load(open(cfg["firestore"]["indexes"]))
-        save(); print("+  firestore: released rules firestore.rules to cloud.firestore\n+  Deploy complete!"); sys.exit(0)
+        if parts == ["firestore:indexes"]:
+            assert set(cfg["firestore"]) == {"database", "indexes"} and sorted(os.listdir(".")) == ["firebase.json", "firestore.indexes.json"], "indexes deploy folder is not indexes-only"
+        msg = ""
+        if "firestore:rules" in parts:
+            state["rules"]["firestore"] = open(cfg["firestore"]["rules"]).read()
+            msg += "+  firestore: released rules firestore.rules to cloud.firestore\n"
+        if "firestore:indexes" in parts:
+            msg += deploy_indexes(json.load(open(cfg["firestore"]["indexes"])))
+            msg += "+  firestore: deployed indexes in firestore.indexes.json successfully for (default) database\n"
+        save(); print(msg + "+  Deploy complete!"); sys.exit(0)
     if parts == ["storage"]:
         assert cfg == {"storage": {"rules": "storage.rules"}}, "storage deploy config is not the single default-bucket form"
         state["rules"]["storage"] = open("storage.rules").read()
@@ -499,6 +631,10 @@ NODE_STUB = '''#!/bin/bash
 case "$1" in
   --version) echo v22.11.0;;
   --test) printf 'TAP version 13\\nok 1 - a\\n# tests 3\\n# suites 0\\n# pass 3\\n# fail 0\\n';;
+  -e) # the export enumeration of check_exports: "name region" per export, from the harness's control file
+      echo "node -e cwd=$PWD home=$HOME stublog=${STUB_LOG:-unset} gcloud_project=${GCLOUD_PROJECT:-unset}" >> "@EXPORTS@.calls"
+      [ -f lib/index.js ] || { echo "Error: Cannot find module './lib/index.js'" >&2; exit 1; }
+      case "$2" in *'require("./lib/index.js")'*) cat "@EXPORTS@";; *) echo "stub: unexpected node -e" >&2; exit 9;; esac;;
 esac
 exit 0
 '''
@@ -543,20 +679,53 @@ TEMPLATE_ENV = SERVING_ENV + [{"name": "OWNER_MFA_REQUIRED", "value": "false"},
                               {"name": "OWNER_MFA_ENCRYPTION_KEY", "valueFrom": {"secretKeyRef": {"name": "OWNER_MFA_ENCRYPTION_KEY", "key": "1"}}}]
 
 
+def fn_obj(n):
+    """One production function as `gcloud functions describe/list` returns it: 1st gen (v1 shape, App Engine identity)
+    or 2nd gen (v2 shape, compute identity); us-central1 for the functions declared without .region()."""
+    sec = []
+    if n == "weeklyPayoutReportGenerator":
+        sec = [{"key": "ZIPPER_ACCRUAL_KEY", "secret": "ZIPPER_ACCRUAL_KEY", "version": "1"},
+               {"key": "ZIPPER_SENDGRID_API_KEY", "secret": "ZIPPER_SENDGRID_API_KEY", "version": "1"}]
+    elif n in EMAIL_FNS:
+        sec = [{"key": "ZIPPER_SENDGRID_API_KEY", "secret": "ZIPPER_SENDGRID_API_KEY", "version": "1"}]
+    name = "projects/zipper-83816/locations/%s/functions/%s" % ("us-central1" if n in US_CENTRAL1 else "asia-south1", n)
+    env = dict(FN_ENV, FIREBASE_CONFIG="{}", GCLOUD_PROJECT=P)
+    if n in GEN2:
+        return {"name": name, "state": "ACTIVE", "environment": "GEN_2", "updateTime": "2026-10-20T08:31:41Z",
+                "buildConfig": {"runtime": "nodejs22", "entryPoint": n},
+                "serviceConfig": {"serviceAccountEmail": BACKEND_SA, "revision": "%s-00006-abc" % n.lower(),
+                                  "environmentVariables": dict(env, LOG_EXECUTION_ID="true"), "secretEnvironmentVariables": sec},
+                "source": PROD_SRC}
+    return {"name": name, "status": "ACTIVE", "entryPoint": n, "runtime": "nodejs22", "serviceAccountEmail": FN_SA,
+            "updateTime": "2026-10-20T08:31:41Z", "versionId": "6", "environmentVariables": env,
+            "secretEnvironmentVariables": sec, "source": PROD_SRC}
+
+
+# firestore.indexes.json of the throwaway repository: 2 composite indexes live today (one written with its __name__, as
+# the CLI's export does), 2 new ones, and the live collection-group override of beanTransactions.type.
+IDX_FILE = {"indexes": [
+    {"collectionGroup": "calls", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "agents", "queryScope": "COLLECTION", "density": "SPARSE_ALL", "fields": [
+        {"fieldPath": "referralCode", "order": "ASCENDING"}, {"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "__name__", "order": "ASCENDING"}]},
+    {"collectionGroup": "publicProfiles", "queryScope": "COLLECTION", "fields": [
+        {"fieldPath": "isListed", "order": "ASCENDING"}, {"fieldPath": "languageCodes", "arrayConfig": "CONTAINS"}, {"fieldPath": "lastSeen", "order": "DESCENDING"}]},
+    {"collectionGroup": "techTickets", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]}],
+    "fieldOverrides": [{"collectionGroup": "beanTransactions", "fieldPath": "type", "indexes": [{"queryScope": "COLLECTION_GROUP", "order": "ASCENDING"}]}]}
+DB = "projects/zipper-83816/databases/(default)/collectionGroups/"
+
+
+def live_ix(cg, fields, n, scope="COLLECTION", state="READY"):
+    return {"name": DB + "%s/indexes/LIVE%d" % (cg, n), "queryScope": scope, "fields": fields, "state": state, "density": "SPARSE_ALL"}
+
+
+def live_field(cg, fp, cfgs):
+    return {"name": DB + "%s/fields/%s" % (cg, fp), "indexConfig": {"ancestorField": DB + "__default__/fields/*", "indexes": [
+        {"queryScope": s, "fields": [dict({"fieldPath": fp}, **({"order": o} if o in ("ASCENDING", "DESCENDING") else {"arrayConfig": o}))], "state": "READY"}
+        for s, o in cfgs]}}
+
+
 def fresh_state():
-    fns = {}
-    names = WAVE_2A + WAVE_2B + EMAIL_FNS + ["fnOther%03d" % i for i in range(90)]
-    for n in names:
-        sec = []
-        if n == "weeklyPayoutReportGenerator":
-            sec = [{"key": "ZIPPER_ACCRUAL_KEY", "secret": "ZIPPER_ACCRUAL_KEY", "version": "1"},
-                   {"key": "ZIPPER_SENDGRID_API_KEY", "secret": "ZIPPER_SENDGRID_API_KEY", "version": "1"}]
-        elif n in EMAIL_FNS:
-            sec = [{"key": "ZIPPER_SENDGRID_API_KEY", "secret": "ZIPPER_SENDGRID_API_KEY", "version": "1"}]
-        fns[n] = {"name": "projects/zipper-83816/locations/asia-south1/functions/" + n, "status": "ACTIVE", "entryPoint": n,
-                  "runtime": "nodejs22", "serviceAccountEmail": FN_SA, "updateTime": "2026-10-20T08:31:41Z", "versionId": "6",
-                  "environmentVariables": dict(FN_ENV, FIREBASE_CONFIG="{}", GCLOUD_PROJECT=P), "secretEnvironmentVariables": sec,
-                  "source": PROD_SRC}
+    fns = {n: fn_obj(n) for n in ALL_FNS}
     return {
         "service": {"traffic": [{"revisionName": SERVING, "percent": 100}], "tags": {}, "latest": TEMPLATE,
                     "template_env": TEMPLATE_ENV, "generation": 47},
@@ -578,6 +747,11 @@ def fresh_state():
         "monitoring": {"policies": [], "channels": [], "uptime": []},
         "backend_state": {},
         "log_counts": {"accepted (": 1},
+        "indexes": {"composite": [
+            live_ix("calls", [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}, {"fieldPath": "__name__", "order": "DESCENDING"}], 1),
+            live_ix("agents", [{"fieldPath": "referralCode", "order": "ASCENDING"}, {"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "__name__", "order": "ASCENDING"}], 2)],
+            "fields": [live_field("__default__", "*", [("COLLECTION", "ASCENDING"), ("COLLECTION", "DESCENDING"), ("COLLECTION", "CONTAINS")]),
+                       live_field("beanTransactions", "type", [("COLLECTION_GROUP", "ASCENDING")])]},
     }
 
 
@@ -607,8 +781,11 @@ def git(*args, check=True):
                            "-c", "commit.gpgsign=false", *args], capture_output=True, text=True, check=check).stdout.strip()
 
 
-# stubs
-for name, body in [("gcloud", GCLOUD_STUB), ("firebase", FIREBASE_STUB), ("npm", NPM_STUB), ("node", NODE_STUB),
+# stubs (node -e prints the export list of the harness's control file T/exports.txt: the 104 production functions)
+EXPORTS = T / "exports.txt"
+GOOD_EXPORTS = "".join("EXPORT %s %s\n" % (n, "us-central1" if n in US_CENTRAL1 else "asia-south1") for n in ALL_FNS)
+EXPORTS.write_text(GOOD_EXPORTS)
+for name, body in [("gcloud", GCLOUD_STUB), ("firebase", FIREBASE_STUB), ("npm", NPM_STUB), ("node", NODE_STUB.replace("@EXPORTS@", str(EXPORTS))),
                    ("curl", CURL_STUB), ("sleep", SLEEP_STUB), ("date", DATE_STUB)] + \
                   ([] if shutil.which("shasum") else [("shasum", SHASUM_STUB)]):
     w(BIN / name, body, 0o755)
@@ -640,7 +817,7 @@ w(REPO / "zipper-crm" / "package.json", '{"name":"zipper-crm"}\n')
 w(REPO / "zipper-crm" / "app" / "page.tsx", "export default function P() { return null }\n")
 w(REPO / "firestore.rules", RC2_FS)
 w(REPO / "storage.rules", RC2_ST)
-w(REPO / "firestore.indexes.json", '{"indexes": [], "fieldOverrides": []}\n')
+w(REPO / "firestore.indexes.json", json.dumps(IDX_FILE, indent=1) + "\n")
 w(REPO / "firebase.json", json.dumps({"firestore": {"rules": "firestore.rules"}, "storage": {"rules": "storage.rules"},
                                       "functions": [{"source": "functions", "codebase": "default"}],
                                       "hosting": [{"target": "production", "public": "zipper-crm/out"}]}, indent=1) + "\n")
@@ -686,11 +863,12 @@ put(fresh_state())
 ALL_CALLS = []
 
 
-def run(script, stdin="", args=()):
+def run(script, stdin="", args=(), env=None):
     if LOG.exists():
         ALL_CALLS.append(LOG.read_text())
         LOG.unlink()
-    p = subprocess.run(["/bin/bash", str(RELC / script), *args], input=stdin, text=True, env=ENV, capture_output=True, timeout=600)
+    p = subprocess.run(["/bin/bash", str(RELC / script), *args], input=stdin, text=True, env=dict(ENV, **(env or {})),
+                       capture_output=True, timeout=900)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -749,7 +927,7 @@ ok("RELEASE.txt and production/ are git-ignored (the tree stays clean)", git("st
 # ── 00 preflight ──
 rc, o = run("00-preflight-readonly.command")
 ok("00 read-only preflight passes on the expected production state", rc == 0 and "RESULT: PASS" in o, o[-1500:])
-MUTATING = r"add-iam|remove-iam|firebase deploy|run deploy|update-traffic| create |android_update_doc.py restore|--apply|POST"
+MUTATING = r"add-iam|remove-iam|firebase deploy|run deploy|update-traffic|run services update | create |android_update_doc.py restore|--apply|POST"
 ok("00 runs no mutating command", not re.search(MUTATING, calls()), re.findall(r".*(?:%s).*" % MUTATING, calls())[:3])
 ok("00 shows no environment value, secret or unmasked address", not leaks(o), leaks(o))
 
@@ -898,14 +1076,88 @@ ok("49 on 32's evidence re-releases the saved 20 Oct text; no IAM question (role
 time.sleep(1.1)
 run(C32, "RELEASE\n")
 
+# ── 33 Firestore indexes (step 2, after 32) ──
+good_ix = st()["indexes"]
+s = st(); s["indexes"]["composite"].append(live_ix("legacyThings", [{"fieldPath": "a", "order": "ASCENDING"}, {"fieldPath": "b", "order": "ASCENDING"}, {"fieldPath": "__name__", "order": "ASCENDING"}], 9)); put(s)
+rc, o = run(C33, "INDEXES\n")
+ok("33 refuses when a live composite index is not in firestore.indexes.json (it could be deleted), nothing deployed",
+   rc == 3 and "LIVE-NOT-IN-FILE index legacyThings" in o and "firebase deploy" not in calls(), o[-500:])
+s = st(); s["indexes"] = json.loads(json.dumps(good_ix)); s["indexes"]["fields"][1] = live_field("beanTransactions", "type", [("COLLECTION_GROUP", "ASCENDING"), ("COLLECTION", "ASCENDING")]); put(s)
+rc, o = run(C33, "INDEXES\n")
+ok("33 refuses a field override of the file that would drop a live single-field index, nothing deployed",
+   rc == 3 and "WOULD-REMOVE field-override beanTransactions.type COLLECTION ASCENDING" in o and "firebase deploy" not in calls(), o[-500:])
+s = st(); s["indexes"] = json.loads(json.dumps(good_ix)); put(s)
+rc, o = run(C33, "NO\n")
+ok("33 refuses without INDEXES (exit 4) after its read-only superset check; nothing deployed",
+   rc == 4 and "SUPERSET ok" in o and "TO-CREATE index publicProfiles" in o and "firebase deploy" not in calls(), o[-600:])
+rc, o = run(C33, "INDEXES\n")
+ev33 = newest("33-indexes-")
+ix_now = st()["indexes"]
+ok("33 deploys ONLY firestore:indexes from a temp folder with the reviewed command, waits until READY: PASS",
+   rc == 0 and "RESULT: PASS" in o and "firebase deploy --only firestore:indexes --project zipper-83816 --non-interactive [cwd=%s/deploy-workdir]" % ev33 in calls()
+   and len(ix_now["composite"]) == 4 and all(x["state"] == "READY" for x in ix_now["composite"]) and "still building" in o, o[-1500:])
+wd33 = (ev33 or T) / "deploy-workdir"
+ok("33 deploy folder: only firestore.indexes.json and firebase.json {\"firestore\":{\"database\":\"(default)\",\"indexes\":…}}",
+   wd33.is_dir() and sorted(x.name for x in wd33.iterdir()) == ["firebase.json", "firestore.indexes.json"]
+   and json.loads((wd33 / "firebase.json").read_text()) == {"firestore": {"database": "(default)", "indexes": "firestore.indexes.json"}})
+ok("33 kept every index live before (KEPT-ALL) and changed no rules", "every index that was live before is still live" in o
+   and st()["rules"]["firestore"] == HOTFIX_FS and st()["rules"]["storage"] == HOTFIX_ST, o[-600:])
+rc, o = run(C33, "")
+ok("33 re-run: nothing to deploy, no prompt, READY: PASS", rc == 0 and "ABOUT TO" not in o and "firebase deploy" not in calls() and "RESULT: PASS" in o, o[-400:])
+s = st(); s["indexes"]["composite"][3]["state"] = "CREATING"; s["indexes_stuck"] = True; put(s)
+rc, o = run(C33, "")
+ok("33 reports the indexes still building after its 30-minute poll (FAIL) and deploys nothing",
+   rc == 1 and "BUILDING index techTickets" in o and "still building after 30 min" in o and "firebase deploy" not in calls(), o[-600:])
+s = st(); s.pop("indexes_stuck"); s["indexes"]["composite"][3]["state"] = "READY"; put(s)
+
 # ── 20 / 29 Functions wave 2a ──
 WAVE_2A_ONLY = ",".join("functions:" + n for n in WAVE_2A)
 rc, o = run(C20, "NO\n")
-ok("20 refuses without DEPLOY2A (exit 4), after building and testing the exact tree", rc == 4 and "firebase deploy" not in calls() and "node --test on the exact tree: 3/3" in o, o[-800:])
+ok("20 refuses without DEPLOY2A (exit 4), after building, testing and classifying the exact tree",
+   rc == 4 and "firebase deploy" not in calls() and "node --test on the exact tree: 3/3" in o and "CLASSIFY ok" in o
+   and "each of the 104 exported functions is in exactly one of WAVE_2A, WAVE_2B, NOT_REDEPLOYED" in o, o[-800:])
+ncalls = Path(str(EXPORTS) + ".calls").read_text() if Path(str(EXPORTS) + ".calls").exists() else ""
+ok("20 lists the exports with node -e in the built deploy tree, empty environment (no stub log, demo project id)",
+   re.search(r"cwd=\S*/production/20-functions-2a-\d{8}T\d{6}Z/deploy/functions home=\S*/home stublog=unset gcloud_project=demo-zipper-exports", ncalls), ncalls[-300:])
+EXPORTS.write_text("module load says hello (not an export line)\n" + GOOD_EXPORTS + "EXPORT brandNewFunction asia-south1\n")
 rc, o = run(C20, "DEPLOY2A\n")
-ok("20 deploys wave 2a only and verifies (SCOPE PASS, changed=5): PASS", rc == 0 and "RESULT: PASS" in o and "SCOPE PASS" in o and "changed=5" in o, o[-1500:])
+ok("20 refuses an exported function that is in no list (UNCLASSIFIED), nothing deployed",
+   rc == 3 and "UNCLASSIFIED brandNewFunction" in o and "EXPORTS 105 " in o and "firebase deploy" not in calls(), o[-600:])
+EXPORTS.write_text("".join(l + "\n" for l in GOOD_EXPORTS.splitlines() if not l.startswith("EXPORT syncPhoneKey ")))
+rc, o = run(C20, "DEPLOY2A\n")
+ok("20 refuses a listed function the deploy tree does not export (NOT-EXPORTED), nothing deployed",
+   rc == 3 and "NOT-EXPORTED syncPhoneKey (listed in WAVE_2A)" in o and "firebase deploy" not in calls(), o[-600:])
+EXPORTS.write_text(GOOD_EXPORTS.replace("EXPORT scheduledAlertScan us-central1", "EXPORT scheduledAlertScan asia-south1"))
+rc, o = run(C20, "DEPLOY2A\n")
+ok("20 refuses a function declared in another region than the scripts describe it in, nothing deployed",
+   rc == 3 and "REGION scheduledAlertScan code=asia-south1 scripts=us-central1" in o and "firebase deploy" not in calls(), o[-600:])
+EXPORTS.write_text(GOOD_EXPORTS)
+s = st(); s["deploy_fail_after"] = 40; put(s)
+rc, o = run(C20, "DEPLOY2A\n")
+ev20p = newest("20-functions-2a-")
+upd = (ev20p / "updated.txt").read_text().split() if (ev20p / "updated.txt").exists() else []
+nupd = (ev20p / "not-updated.txt").read_text().split() if (ev20p / "not-updated.txt").exists() else []
+ok("20 after a deploy that stops part-way (CLI exit 2): FAIL, SCOPE PARTIAL, updated.txt = the 40 updated, not-updated.txt = the other 55",
+   rc == 1 and "SCOPE PARTIAL" in o and "WAVE updated=40 of 95" in o and upd == sorted(WAVE_2A[:40]) and nupd == sorted(WAVE_2A[40:])
+   and "29-rollback-functions.command 2a %s" % ev20p in o, o[-1500:])
+rc, o = run(C29, "ROLLBACK\n", ("2b", str(ev20p)))
+ok("29 refuses an evidence folder of another wave", rc == 3 and "not an evidence folder of wave 2b" in o and "firebase deploy" not in calls(), o[-300:])
+rc, o = run(C29, "ROLLBACK\n", ("2a", str(ev20p)))
+ok("29 2a <that evidence> rolls back EXACTLY the 40 updated functions from the production tree: PASS",
+   rc == 0 and "RESULT: PASS" in o and "rolling back EXACTLY the 40 function(s)" in o
+   and "firebase deploy --only %s --project zipper-83816 --non-interactive" % ",".join("functions:" + n for n in sorted(WAVE_2A[:40])) in calls()
+   and all(st()["functions"][n]["source"] == PROD_SRC for n in WAVE_2A) and "SCOPE PASS" in o and "changed=40" in o, o[-1500:])
+time.sleep(1.1)
+s = st(); s["deploy_in_progress"] = "requestAccountDeletion"; put(s)
+rc, o = run(C20, "DEPLOY2A\n")
+ok("20 deploys wave 2a only and verifies (SCOPE PASS, changed=95), after waiting for a 2nd-gen update still running: PASS",
+   rc == 0 and "RESULT: PASS" in o and "SCOPE PASS" in o and "changed=95" in o and "still deploying (1/20" in o, o[-1500:])
+ok("20 checked every function's own runtime identity (1st gen App Engine, 2nd gen compute) and region", "all 95 functions keep their runtime identity" in o
+   and "all 95 functions ACTIVE" in o, o[-1500:])
 ok("20 ran exactly the reviewed command", "firebase deploy --only %s --project zipper-83816 --non-interactive" % WAVE_2A_ONLY in calls())
-ok("20 deployed the RELEASE tree (functions v2)", all(st()["functions"][n]["source"].startswith("// functions v2") for n in WAVE_2A))
+ok("20 deployed the RELEASE tree (functions v2) to the 95, nothing to wave 2b or NOT_REDEPLOYED",
+   all(st()["functions"][n]["source"].startswith("// functions v2") for n in WAVE_2A)
+   and all(st()["functions"][n]["source"] == PROD_SRC for n in WAVE_2B + NOT_REDEPLOYED))
 ok("20 left no .env copy and no node_modules", not list((RELC / "production").glob("20-*/deploy/functions/.env")) and not list((RELC / "production").glob("20-*/deploy/functions/node_modules")))
 ok("20 output shows no environment value", not leaks(o), leaks(o))
 s = st(); s2 = json.loads(json.dumps(s)); s2["functions"]["releaseBeansForWeek"]["environmentVariables"]["API_BASE"] = "https://other.example"; put(s2)
@@ -1038,10 +1290,16 @@ sv = ev60 / "android-update-before.json"
 ok("60 saved the previous androidUpdate document (mode 600) for 61", sv.exists() and json.loads(sv.read_text()) == before_doc and (sv.stat().st_mode & 0o777) == 0o600)
 rc, o = run(C60, "PUBLISH\n")
 ok("60 re-run refuses: version 20 already published", rc == 3 and "--apply" not in calls(), o[-300:])
-rc, o = run(C21, "NO\n")
-ok("21 refuses without DEPLOY2B (exit 4)", rc == 4 and "firebase deploy" not in calls(), o[-300:])
+EXPORTS.write_text(GOOD_EXPORTS + "EXPORT brandNewFunction asia-south1\n")
 rc, o = run(C21, "DEPLOY2B\n")
-ok("21 deploys wave 2b only and verifies: PASS", rc == 0 and "RESULT: PASS" in o and "changed=8" in o
+ok("21 refuses an exported function that is in no list (UNCLASSIFIED), nothing deployed",
+   rc == 3 and "UNCLASSIFIED brandNewFunction" in o and "firebase deploy" not in calls(), o[-600:])
+EXPORTS.write_text(GOOD_EXPORTS)
+rc, o = run(C21, "NO\n")
+ok("21 refuses without DEPLOY2B (exit 4)", rc == 4 and "firebase deploy" not in calls() and "CLASSIFY ok" in o, o[-300:])
+rc, o = run(C21, "DEPLOY2B\n")
+ok("21 deploys wave 2b only and verifies (6 of the 8 are 2nd gen, compute identity): PASS", rc == 0 and "RESULT: PASS" in o and "changed=8" in o
+   and "all 8 functions keep their runtime identity" in o
    and "firebase deploy --only %s --project zipper-83816 --non-interactive" % ",".join("functions:" + n for n in WAVE_2B) in calls(), o[-1200:])
 rc, o = run(C61, "WITHDRAW\n", (str(ev60),))
 ok("61 refuses while wave 2b is live (roll 2b back first)", rc == 3 and "wave 2b" in o and "restore" not in calls(), o[-300:])
@@ -1057,6 +1315,89 @@ time.sleep(1.1)
 run(C60, "PUBLISH\n")
 time.sleep(1.1)
 run(C21, "DEPLOY2B\n")
+
+# ── 45 / 46 / 47 Owner MFA enforcement (step 9b) ──
+OWN = {"ALL_OWNERS_ENROLLED": "yes"}
+ENF = "zipper-api-00050-enf"
+es = RELC / "production" / "enforce-revision.txt"
+rc, o = run(C90, "", ("60",))
+ok("90 FAILs the Owner-MFA row before step 9b (the completion revision has OWNER_MFA_REQUIRED=false)",
+   rc == 1 and re.search(r"FAIL\s+run: Owner MFA enforced \(OWNER_MFA_REQUIRED\)\s+true \(step 9b\)\s+DIFFERENT", o), o[-3000:])
+rc, o = run(C45, "ENFORCE-NEW\n")
+ok("45 refuses without ALL_OWNERS_ENROLLED=yes (exit 3), nothing changed", rc == 3 and "ALL_OWNERS_ENROLLED=yes is not set" in o and "services update" not in calls(), o[-300:])
+s = st(); s["rules"]["firestore"] = HOTFIX_FS; put(s)
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 refuses while the live Firestore rules are not the RC2 text (rolled back)", rc == 3 and "not the RC2 firestore.rules" in o and "services update" not in calls(), o[-300:])
+s = st(); s["rules"]["firestore"] = RC2_FS; put(s)
+crm.rename(crm.with_name("crm-hold"))
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 refuses while the MFA CRM is not recorded live", rc == 3 and "crm-live.txt does not exist" in o and "services update" not in calls(), o[-300:])
+crm.with_name("crm-hold").rename(crm)
+s = st(); s["service"]["traffic"] = [{"revisionName": NEW, "percent": 50}, {"revisionName": SERVING, "percent": 50}]; put(s)
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 refuses unless the completion revision serves exactly 100%", rc == 3 and "not exactly 100% on the completion revision" in o and "services update" not in calls(), o[-300:])
+s = st(); s["service"]["traffic"] = [{"revisionName": NEW, "percent": 100}]; put(s)
+rc, o = run(C45, "NO\n", env=OWN)
+ok("45 refuses without ENFORCE-NEW (exit 4) after its read-only gate (RC2 rules, CRM, 100%, OWNER_MFA_REQUIRED=false)",
+   rc == 4 and "services update" not in calls() and "RC2 Firestore rules live" in o and "MFA CRM live" in o and "OWNER_MFA_REQUIRED=false" in o, o[-800:])
+s = st(); s["update_moves_traffic"] = True; put(s)
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 pins traffic straight back to the completion revision by name if the update moved it (FAIL, nothing recorded)",
+   rc == 1 and UT + "--to-revisions %s=100" % NEW in calls() and st()["service"]["traffic"] == [{"revisionName": NEW, "percent": 100}] and not es.exists(), o[-800:])
+s = st(); s.pop("update_moves_traffic"); s["service"]["latest"] = NEW; s["service"]["template_env"] = s["revisions"][NEW]["env"]; s["revisions"].pop(ENF); put(s)
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 creates the enforcement revision at 0% with exactly the reviewed command: PASS", rc == 0 and "RESULT: PASS" in o
+   and EXPECTED_MUT["MUT-ENFORCE-NEW"][1] in calls() and st()["service"]["traffic"] == [{"revisionName": NEW, "percent": 100}], o[-1500:])
+ok("45 verified OWNER_MFA_REQUIRED=true, the same image, the completion revision's environment names; no value shown",
+   "OWNER_MFA_REQUIRED = true" in o and "same image as %s" % NEW in o and "environment names and secret versions identical" in o and not leaks(o), o[-1000:])
+ok("45 recorded enforce-revision.txt: name = the enforcement revision (NEW), base = the completion revision (BASE), digest, head",
+   es.exists() and "name=%s\n" % ENF in es.read_text() and "base=%s\n" % NEW in es.read_text() and "digest=sha256:%s\n" % ("9" * 64) in es.read_text()
+   and "head=%s\n" % HEAD in es.read_text())
+rc, o = run(C45, "ENFORCE-NEW\n", env=OWN)
+ok("45 refuses a second run while enforce-revision.txt exists", rc == 3 and "already exists" in o and "services update" not in calls(), o[-300:])
+rc, o = run(C46, "ENFORCE\n")
+ok("46 refuses without ALL_OWNERS_ENROLLED=yes (exit 3)", rc == 3 and "update-traffic" not in calls(), o[-300:])
+rc, o = run(C46, "NO\n", env=OWN)
+ok("46 refuses without ENFORCE (exit 4), traffic unchanged", rc == 4 and "update-traffic" not in calls()
+   and st()["service"]["traffic"] == [{"revisionName": NEW, "percent": 100}], o[-400:])
+s = st(); s["revisions"][ENF]["ready"] = False; put(s)
+rc, o = run(C46, "ENFORCE\n", env=OWN)
+ok("46 pins back to the completion revision automatically when the enforcement revision is not live within 120 s (FAIL)",
+   rc == 1 and UT + "--to-revisions %s=100" % ENF in calls() and UT + "--to-revisions %s=100" % NEW in calls()
+   and st()["service"]["traffic"] == [{"revisionName": NEW, "percent": 100}], o[-800:])
+s = st(); s["revisions"][ENF]["ready"] = True; put(s)
+rc, o = run(C46, "ENFORCE\n", env=OWN)
+c = calls()
+ok("46 moves 100% to the enforcement revision by name; /api/health ok and unauthenticated /api/auth/mfa/status 401: PASS",
+   rc == 0 and "RESULT: PASS" in o and UT + "--to-revisions %s=100" % ENF in c and st()["service"]["traffic"] == [{"revisionName": ENF, "percent": 100}]
+   and "https://zipper-api-abc-el.a.run.app/api/auth/mfa/status" in c and "https://zipper-api-abc-el.a.run.app/api/health" in c, o[-800:])
+rc, o = run(C46, "", env=OWN)
+ok("46 re-run: enforcement already live, no prompt", rc == 0 and "ABOUT TO" not in o and "update-traffic" not in calls(), o[-300:])
+rc, o = run(C41, "")
+ok("after 9b, 41 accepts the enforcement revision as the completion backend (re-run: already live)",
+   rc == 0 and "the Owner-MFA enforcement revision %s" % ENF in o and "firebase deploy" not in calls(), o[-400:])
+rc, o = run(C47, "NO\n")
+ok("47 refuses without ROLLBACK (exit 4)", rc == 4 and "update-traffic" not in calls(), o[-300:])
+rc, o = run(C47, "ROLLBACK\n")
+ok("47 pins 100% back to the completion revision by name with the reviewed command: PASS (enforcement off)",
+   rc == 0 and "RESULT: PASS" in o and UT + "--to-revisions %s=100" % NEW in calls() and st()["service"]["traffic"] == [{"revisionName": NEW, "percent": 100}], o[-500:])
+rc, o = run(C47, "")
+ok("47 re-run: nothing to do, no prompt", rc == 0 and "ABOUT TO" not in o and "update-traffic" not in calls(), o[-300:])
+s = st(); s["service"]["traffic"] = [{"revisionName": SERVING, "percent": 100}]; put(s)
+rc, o = run(C47, "ROLLBACK\n")
+ok("47 refuses while the enforcement revision has no traffic (whole-backend rollback is 19)", rc == 3 and "has no traffic" in o and "update-traffic" not in calls(), o[-300:])
+s = st(); s["service"]["traffic"] = [{"revisionName": NEW, "percent": 100}]; put(s)
+good_es = es.read_text()
+es.write_text(good_es.replace("base=%s\n" % NEW, "base=%s\n" % RETIRED))
+rc47, o47 = run(C47, "ROLLBACK\n")
+c47 = calls()
+rc46, o46 = run(C46, "ENFORCE\n", env=OWN)
+ok("46 and 47 refuse an enforce-revision.txt that names zipper-api-00048-pit (never receives traffic)",
+   rc47 == 3 and rc46 == 3 and "must never receive traffic" in o47 and "must never receive traffic" in o46
+   and "update-traffic" not in c47 + calls(), (o47 + o46)[-400:])
+es.write_text(good_es)
+rc, o = run(C46, "ENFORCE\n", env=OWN)
+ok("46 again: Owner MFA enforcement live for the post-deploy verification", rc == 0 and st()["service"]["traffic"] == [{"revisionName": ENF, "percent": 100}], o[-300:])
 
 # ── 70 monitoring ──
 rc, o = run(C70, "not-an-address\nMONITOR\n")
@@ -1155,6 +1496,15 @@ p = subprocess.run([sys.executable, str(RELC / "tools" / "android_update_doc.py"
 after = json.loads((U / "fs.json").read_text())["doc"]
 ok("android_update_doc.py restore replaces the debug map exactly (no leftover minSupportedVersionCode/patches; release untouched)",
    p.returncode == 0 and after["debug"] == saved["debug"] and after["release"] == live["release"], p.stdout + p.stderr + json.dumps(after)[:300])
+
+# ── unit: rel_helpers.py fn-classify — a name in two lists, and the exact split ──
+w(U / "exports.txt", "EXPORT a asia-south1\nEXPORT b asia-south1\nEXPORT c us-central1\n")
+p = subprocess.run([sys.executable, "-I", str(RELC / "rel_helpers.py"), "fn-classify", str(U / "exports.txt"), "a b", "b", "c", "asia-south1", "us-central1", "c"],
+                   capture_output=True, text=True)
+ok("fn-classify refuses a name listed in two waves (DUPLICATE)", "DUPLICATE b in WAVE_2A,WAVE_2B" in p.stdout and "CLASSIFY FAIL" in p.stdout, p.stdout + p.stderr)
+p = subprocess.run([sys.executable, "-I", str(RELC / "rel_helpers.py"), "fn-classify", str(U / "exports.txt"), "a b", "", "c", "asia-south1", "us-central1", "c"],
+                   capture_output=True, text=True)
+ok("fn-classify accepts an exact split in the right regions", p.stdout.strip().endswith("CLASSIFY ok"), p.stdout + p.stderr)
 
 if LOG.exists():
     ALL_CALLS.append(LOG.read_text())
