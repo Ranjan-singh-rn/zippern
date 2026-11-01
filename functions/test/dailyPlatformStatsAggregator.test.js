@@ -49,6 +49,9 @@ beforeEach(() => {
   db.seed(`users/${R}`, { name: 'Host', beans: 0, isHost: true, isVerifiedHost: true })
   db.seed('gifts/rose', { name: 'Rose', category: 'normal', diamondCost: 10, earningRate: 50, isActive: true })
   db.seed('gifts/lucky1', { name: 'Lucky Box', category: 'lucky', diamondCost: 100, earningRate: 5, isActive: true })
+  // Lucky gifts are off unless the Owner's switch is on; this file rolls one up,
+  // so the switch is on (the table itself is the documented defaults).
+  db.seed('appConfig/luckyGifts', { enabled: true })
 })
 afterEach(() => {
   mock.timers.reset()

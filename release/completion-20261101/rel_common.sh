@@ -45,7 +45,7 @@ APK_VERSION_CODE=20
 APK_VERSION_NAME="1.2.6"
 APK_MIN_SUPPORTED=20
 APK_CHANNEL="debug"
-APK_NOTES="ZIPPER 1.2.6: per-minute calls, lucky combo gifts, faster sign-up photos, call and live fixes. This update is required."
+APK_NOTES="ZIPPER 1.2.6: per-minute calls, faster sign-up photos, long live streams and calls, call and live fixes. This update is required."
 
 # Backend (11): exactly these settings are added to the service template; everything else is inherited.
 BACKEND_ENV_ADD="EMAIL_PROVIDER=sendgrid,SENDGRID_FROM_EMAIL=no-reply@zipperlive.org,SENDGRID_FROM_NAME=ZIPPER Live"

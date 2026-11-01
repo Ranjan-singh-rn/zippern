@@ -128,7 +128,7 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
 ## Step 8 — Functions wave 2b (needs APK 20 on the phones)
 - **Functions:** generateAgoraToken, settleGift, startCall, acceptCall, tickCall, endCall, declineCall, sweepStaleCalls (MONEY).
 - **Precondition:** APK 20 published with minSupportedVersionCode ≥ 20 (checked) and the fleet updated.
-- **Do:** `./21-deploy-functions-wave2b.command` (DEPLOY2B). **Verify:** as step 5; one call and one lucky gift on APK 20.
+- **Do:** `./21-deploy-functions-wave2b.command` (DEPLOY2B). **Verify:** as step 5; one call on APK 20 (first minute charged at connect, next at the 60 s mark). Lucky gifts stay **off** (`appConfig/luckyGifts.enabled` absent/false): one lucky-gift attempt must show "Lucky gifts are not available right now." and charge nothing. Enabling them is a separate Owner decision in the CRM (App Config → Lucky gifts) after legal clearance under the Online Gaming Act 2025 — not part of this release.
 - **Rollback:** `./29-rollback-functions.command 2b` (ROLLBACK; the production tree `prod-live-20261030`, as step 5) — do
   this BEFORE any withdraw of APK 20.
 

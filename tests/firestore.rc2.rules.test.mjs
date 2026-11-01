@@ -38,6 +38,8 @@
  *   D14 §5 Host role suspension: `hostSuspended` (and its term / stamps) is
  *       server-only for the host and for staff, and a suspended verified Host
  *       cannot open a live room (`mayGoLive`); an unsuspended one still can.
+ *   D15 appConfig/luckyGifts.enabled (the lucky-gift switch) is the Owner's:
+ *       a Tech write to luckyGifts may not change it.
  *   E   C-1 still withheld: the live self-signup login write passes.
  *   S   static (no emulator): each RC2 match block exists exactly once in the
  *       rules text, and firestore.indexes.json (ZIPPER_INDEXES_FILE) declares
@@ -545,6 +547,7 @@ async function main() {
   await no('D10: an ops admin cannot write luckyGifts', () => updateDoc(D(opsAdmin, 'appConfig/luckyGifts'), { receiverPct: 100 }))
   await no('D10: a user cannot write luckyGifts', () => updateDoc(D(user, 'appConfig/luckyGifts'), { receiverPct: 100 }))
   await no('D10: an unbound Owner cannot write luckyGifts', () => updateDoc(D(ownerUnbound, 'appConfig/luckyGifts'), { version: 9 }))
+  await no('D15: a tech admin cannot switch lucky gifts on (enabled is the Owner\'s)', () => updateDoc(D(techAdmin, 'appConfig/luckyGifts'), { enabled: true, version: 4 }))
   await ok('D7 (unchanged): the Owner writes paymentCredentials', () => updateDoc(D(owner, 'appConfig/paymentCredentials'), { bankName: 'C' }))
   await no('D7 (unchanged): a tech admin cannot write paymentCredentials', () => updateDoc(D(techAdmin, 'appConfig/paymentCredentials'), { bankName: 'D' }))
   await no('D7: a CRM seller who may READ the credentials cannot write them', () => updateDoc(D(seller, 'appConfig/paymentCredentials'), { bankAccount: '999' }))

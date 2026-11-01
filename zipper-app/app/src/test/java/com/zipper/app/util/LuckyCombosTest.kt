@@ -1,5 +1,8 @@
 package com.zipper.app.util
 
+import com.zipper.app.data.repository.GiftRepository
+import com.zipper.app.data.repository.GiftResult
+import com.zipper.app.data.repository.MoneyFunctions
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -9,9 +12,74 @@ import java.io.File
 
 /**
  * APK 20 / spec §11 — lucky gifts are sent as a combo the server configured,
- * and the client never rolls the result.
+ * and the client never rolls the result. And they are OFF until the Owner
+ * turns them on (`appConfig/luckyGifts.enabled`, after legal clearance): the
+ * sheet shows them as unavailable, and the server's LUCKY_GIFTS_DISABLED
+ * refusal reads "Lucky gifts are not available right now."
  */
 class LuckyCombosTest {
+
+    private val main = listOf(File("src/main/java"), File("app/src/main/java")).first { it.exists() }
+    private fun src(rel: String) = File(main, "com/zipper/app/$rel").readText()
+
+    @Test fun `the Owner's switch is on only for a real true, and off by default`() {
+        assertTrue(LuckyCombos.parseEnabled(true))
+        assertFalse(LuckyCombos.parseEnabled(null))
+        assertFalse(LuckyCombos.parseEnabled(false))
+        assertFalse(LuckyCombos.parseEnabled("true"))
+        assertFalse(LuckyCombos.parseEnabled(1L))
+        // Read beside the combos; an absent or unreadable document is off.
+        val repo = src("data/repository/LuckyGiftConfigRepository.kt")
+        assertTrue(repo.contains("enabled = LuckyCombos.parseEnabled(snap.get(\"enabled\"))"))
+        assertTrue("the default Config is OFF", repo.contains("val enabled: Boolean = false"))
+        assertTrue("an absent document is the default Config", repo.contains("if (!snap.exists()) Config()"))
+    }
+
+    @Test fun `while the switch is off a lucky gift cannot be sent and a normal gift still can`() {
+        assertFalse(LuckyCombos.sendable(isLucky = true, enabled = false))
+        assertTrue(LuckyCombos.sendable(isLucky = true, enabled = true))
+        assertTrue(LuckyCombos.sendable(isLucky = false, enabled = false))
+        assertTrue(LuckyCombos.sendable(isLucky = false, enabled = true))
+    }
+
+    @Test fun `the server's LUCKY_GIFTS_DISABLED refusal reads as lucky gifts not available`() {
+        assertEquals("LUCKY_GIFTS_DISABLED", LuckyCombos.DISABLED_CODE)
+        assertEquals("Lucky gifts are not available right now.", LuckyCombos.UNAVAILABLE_MESSAGE)
+        assertEquals(LuckyCombos.UNAVAILABLE_MESSAGE, LuckyCombos.refusalMessage("LUCKY_GIFTS_DISABLED"))
+        assertEquals(LuckyCombos.UNAVAILABLE_MESSAGE, LuckyCombos.refusalMessage(" LUCKY_GIFTS_DISABLED "))
+        for (other in listOf(null, "", "LUCKY_PAYOUT_GUARD", "SESSION_DISPLACED", "lucky_gifts_disabled")) {
+            assertNull("'$other' is not the switch", LuckyCombos.refusalMessage(other))
+        }
+    }
+
+    @Test fun `every send path maps the switch refusal by its code, never into the diamond branch`() {
+        val off = { message: String -> MoneyFunctions.Result.Failed("FAILED_PRECONDITION", message, "LUCKY_GIFTS_DISABLED") }
+        assertEquals(GiftResult.Error("Lucky gifts are not available right now."),
+            GiftRepository.failureOf(off("Lucky gifts are not available right now.")))
+        // A reworded server sentence that mentions diamonds still reads as the switch, not as a short balance.
+        assertEquals(GiftResult.Error("Lucky gifts are not available right now."),
+            GiftRepository.failureOf(off("Lucky gifts cannot take your diamonds right now.")))
+        // Everything else is unchanged.
+        assertEquals(GiftResult.InsufficientDiamonds, GiftRepository.failureOf(
+            MoneyFunctions.Result.Failed("FAILED_PRECONDITION", "Not enough diamonds. This costs 1700, you have 1699.")))
+        assertEquals(GiftResult.Error("Lucky gifts are unavailable right now."), GiftRepository.failureOf(
+            MoneyFunctions.Result.Failed("FAILED_PRECONDITION", "Lucky gifts are unavailable right now.", "LUCKY_PAYOUT_GUARD")))
+        // The live and party paths use the same mapping.
+        assertTrue(src("data/repository/LiveRepository.kt").contains("GiftRepository.failureOf(res)"))
+        assertTrue(src("data/repository/PartyRepository.kt").contains("GiftRepository.failureOf(res)"))
+    }
+
+    @Test fun `the gift sheet shows a lucky gift as unavailable while the switch is off`() {
+        val drawer = src("ui/components/GiftDrawer.kt")
+        assertTrue(drawer.contains("val luckyEnabled = luckyConfig.enabled"))
+        assertTrue(drawer.contains("unavailable = !com.zipper.app.util.LuckyCombos.sendable(gift.isLucky, luckyEnabled)"))
+        assertTrue("the sheet says why", drawer.contains("com.zipper.app.util.LuckyCombos.UNAVAILABLE_MESSAGE"))
+        assertTrue("Send is disabled", drawer.contains("enabled = selected != null && !nothingPicked && !luckyUnavailable"))
+        assertTrue("and refuses anyway", drawer.contains("if (!com.zipper.app.util.LuckyCombos.sendable(g.isLucky, luckyEnabled)) return@ZipperButton"))
+        assertTrue("the switch is re-read when the sheet opens", drawer.contains("LaunchedEffect(luckyConfigVm) { luckyConfigVm.refresh() }"))
+        // Normal gifts keep their quantity chips and Send.
+        assertTrue(drawer.contains("(if (luckySelected) combos else QUANTITIES).forEach"))
+    }
 
     @Test fun `defaults match the server's LUCKY_DEFAULTS`() {
         assertEquals(listOf(10, 17, 25, 77), LuckyCombos.DEFAULT)

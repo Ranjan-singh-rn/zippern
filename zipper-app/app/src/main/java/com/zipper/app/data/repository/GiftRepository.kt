@@ -161,12 +161,20 @@ class GiftRepository @Inject constructor(
             )
         }
 
-        /** A refusal as the screens read it: "not enough diamonds" gets its own branch. */
-        fun failureOf(res: MoneyFunctions.Result.Failed): GiftResult = when (res.code) {
-            "FAILED_PRECONDITION" ->
-                if (res.userMessage.contains("diamond", ignoreCase = true)) GiftResult.InsufficientDiamonds
-                else GiftResult.Error(res.userMessage)
-            else -> GiftResult.Error(res.userMessage)
+        /**
+         * A refusal as the screens read it: "not enough diamonds" gets its own
+         * branch. The Owner's lucky-gift switch being off is recognised by the
+         * server's code (`LUCKY_GIFTS_DISABLED`), never by its wording, and
+         * reads "Lucky gifts are not available right now."
+         */
+        fun failureOf(res: MoneyFunctions.Result.Failed): GiftResult {
+            LuckyCombos.refusalMessage(res.detail)?.let { return GiftResult.Error(it) }
+            return when (res.code) {
+                "FAILED_PRECONDITION" ->
+                    if (res.userMessage.contains("diamond", ignoreCase = true)) GiftResult.InsufficientDiamonds
+                    else GiftResult.Error(res.userMessage)
+                else -> GiftResult.Error(res.userMessage)
+            }
         }
     }
 

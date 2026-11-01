@@ -6,6 +6,10 @@
  * earns 85 beans (5%), the sender's reward is multiplier × 100 — between 500
  * (×5) and 10,000 (×100) — credited in the SAME transaction as the charge.
  *
+ * Lucky gifts are OFF unless the Owner's switch is on
+ * (`appConfig/luckyGifts.enabled === true`). The tests that exercise the
+ * mechanics seed the switch on; "the Owner's switch" below covers it off.
+ *
  * Run:  node --test test/luckyGifts.test.js
  */
 
@@ -35,6 +39,26 @@ function stubRoll(value) {
   crypto.randomInt = (min, max) => { rollLog.push([min, max]); return value }
 }
 afterEach(() => { crypto.randomInt = realRandomInt; rollLog.length = 0 })
+
+// ── Recording reads ──────────────────────────────────────────────────────────
+// Every document read in the fake goes through DocRef#get — a transaction's
+// `tx.get` included — so wrapping it records which documents a send read, in
+// order. `onRead` runs after the snapshot is taken (the fake's get is
+// synchronous up to its return), so it can change the document for the NEXT
+// read without changing this one.
+const DocRefProto = Object.getPrototypeOf(db.collection('_').doc('_'))
+const realDocGet = DocRefProto.get
+const reads = []
+function recordReads(onRead) {
+  reads.length = 0
+  DocRefProto.get = function () {
+    reads.push(this.path)
+    const snap = realDocGet.call(this)
+    if (onRead) onRead(this.path)
+    return snap
+  }
+}
+afterEach(() => { DocRefProto.get = realDocGet; reads.length = 0 })
 
 // ══ The pure parts ═══════════════════════════════════════════════════════════
 
@@ -163,7 +187,11 @@ describe('the roll', () => {
 const LUCKY = { name: 'Lucky Box', emoji: '🎲', category: 'lucky', diamondCost: 100, earningRate: 5, isActive: true }
 const ROSE = { name: 'Rose', emoji: '🌹', category: 'normal', diamondCost: 10, earningRate: 50, isActive: true }
 
-function seedWorld({ senderDiamonds = 5000, luckyDoc } = {}) {
+/** The Owner's switch on, nothing else: the table is the documented defaults (version 0). */
+const ON = Object.freeze({ enabled: true })
+
+/** `luckyDoc: null` leaves `appConfig/luckyGifts` absent. */
+function seedWorld({ senderDiamonds = 5000, luckyDoc = ON } = {}) {
   db._docs.clear()
   L.resetLuckyConfigCache()
   db.seed(`users/${S}`, { name: 'Sender', diamonds: senderDiamonds })
@@ -277,7 +305,7 @@ describe('settleGift: a lucky combo', () => {
   })
 
   test('the configured document is what runs: version, combos, share and odds', async () => {
-    seedWorld({ luckyDoc: { version: 7, combos: [20, 50], receiverPct: 10, odds: [{ multiplier: 5, weight: 1 }, { multiplier: 10, weight: 1 }] } })
+    seedWorld({ luckyDoc: { enabled: true, version: 7, combos: [20, 50], receiverPct: 10, odds: [{ multiplier: 5, weight: 1 }, { multiplier: 10, weight: 1 }] } })
     stubRoll(1500)                                           // second bucket of 2 × 1000
     const r = await send({ giftId: 'lucky1', receiverUid: R, combo: 20 })
     expect(r.lucky).toEqual({ combo: 20, unit: 100, multiplier: 10, reward: 1000, configVersion: 7 })
@@ -351,7 +379,7 @@ describe('settleGift: a lucky combo', () => {
 })
 
 describe('settleGift: the guard at read time', () => {
-  const LOSING = { version: 9, odds: [{ multiplier: 5, weight: 50 }, { multiplier: 100, weight: 50 }] }
+  const LOSING = { enabled: true, version: 9, odds: [{ multiplier: 5, weight: 50 }, { multiplier: 100, weight: 50 }] }
 
   test('a losing table with no earlier valid version refuses the send with a clear error, nothing written', async () => {
     seedWorld({ luckyDoc: LOSING })
@@ -367,7 +395,7 @@ describe('settleGift: the guard at read time', () => {
   })
 
   test('a losing table after a valid one: the last valid version is used, never a built-in table', async () => {
-    seedWorld({ luckyDoc: { version: 4, combos: [10, 17], receiverPct: 5, odds: [[5, 90], [10, 10]] } })
+    seedWorld({ luckyDoc: { enabled: true, version: 4, combos: [10, 17], receiverPct: 5, odds: [[5, 90], [10, 10]] } })
     stubRoll(0)
     const first = await send({ giftId: 'lucky1', receiverUid: R, combo: 17 })
     expect(first.lucky.configVersion).toBe(4)
@@ -380,12 +408,172 @@ describe('settleGift: the guard at read time', () => {
     expect(rollLog).toEqual([[0, 100_000], [0, 100_000]])    // version 4's table both times
   })
 
-  test('the default table is accepted when the document is absent, and recorded as version 0', async () => {
-    seedWorld({ senderDiamonds: 10_000 })
+  test('an enabled document with no table runs on the default table, recorded as version 0', async () => {
+    seedWorld({ senderDiamonds: 10_000, luckyDoc: { enabled: true } })
     stubRoll(0)
     const r = await send({ giftId: 'lucky1', receiverUid: R, combo: 77 })
     expect(r.lucky.configVersion).toBe(0)
     expect(r.totalCost).toBe(7700)
+    expect(r.beansCredited).toBe(385)                        // the default 5%
+    expect(rollLog).toEqual([[0, DEFAULT_TOTAL]])            // the default odds
+  })
+
+  test('an enabled document missing some fields takes the defaults for those only', async () => {
+    seedWorld({ luckyDoc: { enabled: true, version: 5, receiverPct: 3 } })
+    stubRoll(0)
+    const r = await send({ giftId: 'lucky1', receiverUid: R, combo: 25 })
+    expect(r.lucky.configVersion).toBe(5)
+    expect(r.beansCredited).toBe(75)                         // 3% of 2,500, from the document
+    expect(rollLog).toEqual([[0, DEFAULT_TOTAL]])            // odds absent → the default table
+    const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 12, idempotencyKey: 'k2' }))
+    expect(e.message).toBe('Lucky gifts are sent as a combo of 10, 17, 25, 77.')   // combos absent → defaults
+  })
+})
+
+// ══ The Owner's switch ═══════════════════════════════════════════════════════
+
+describe('settleGift: the Owner\'s switch (appConfig/luckyGifts.enabled)', () => {
+  const OFF_MESSAGE = 'Lucky gifts are not available right now.'
+  const TABLE = { version: 3, combos: [10, 17, 25, 77], receiverPct: 5, odds: [[5, 84], [10, 10], [25, 4], [50, 1.5], [100, 0.5]] }
+
+  /** A refusal of the switch: the code, the sentence, the details code. */
+  function expectSwitchRefusal(e) {
+    expect(e && e.code).toBe('failed-precondition')
+    expect(e.message).toBe(OFF_MESSAGE)
+    expect(e.details).toEqual({ code: 'LUCKY_GIFTS_DISABLED' })
+  }
+
+  /** Nothing moved: no write or delete of any kind, the balances as seeded, no row, no claim, no roll. */
+  function expectNothingWritten(before) {
+    expect(db.writes).toBe(before.writes)
+    expect(db.deletes).toBe(before.deletes)
+    expect(sender().diamonds).toBe(5000)
+    expect(sender().totalGemsSpent).toBe(undefined)
+    expect(receiver().beans).toBe(0)
+    expect(giftRows().length).toBe(0)
+    expect(senderDiamondRows().length).toBe(0)
+    expect(db.count(`users/${R}/beanTransactions`)).toBe(0)
+    expect(db.count('giftIdempotency')).toBe(0)
+    expect(db.count('giftEvents')).toBe(0)
+    expect(db.count('platformRevenue')).toBe(0)
+    expect(rollLog.length).toBe(0)
+  }
+  const counters = () => ({ writes: db.writes, deletes: db.deletes })
+
+  test('pure: only an existing document whose enabled is exactly true is on', () => {
+    expect(L.luckyGiftsEnabled(undefined, false)).toBe(false)
+    expect(L.luckyGiftsEnabled({ enabled: true }, false)).toBe(false)
+    expect(L.luckyGiftsEnabled({ enabled: true }, true)).toBe(true)
+    for (const enabled of [false, 'true', 1, null, undefined, {}]) {
+      expect(L.luckyGiftsEnabled({ enabled }, true)).toBe(false)
+    }
+    expect(L.luckyGiftsEnabled({ ...TABLE }, true)).toBe(false)           // a table without the switch is off
+    expect(L.LUCKY_GIFTS_DISABLED).toBe('LUCKY_GIFTS_DISABLED')
+    expect(L.LUCKY_GIFTS_DISABLED_MESSAGE).toBe(OFF_MESSAGE)
+    // The guard does not read the switch: the same verdict either way.
+    expect(L.validateLuckyConfig({ ...TABLE, enabled: false })).toEqual(L.validateLuckyConfig({ ...TABLE, enabled: true }))
+    expect(L.validateLuckyConfig({ enabled: true }).ok).toBe(true)
+  })
+
+  test('document absent: the lucky send is refused before anything else is read, nothing written', async () => {
+    seedWorld({ luckyDoc: null })
+    stubRoll(0)
+    const before = counters()
+    recordReads()
+    const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 17 }))
+    expectSwitchRefusal(e)
+    // The switch is the ONLY document read: not the account, not either balance.
+    expect(reads).toEqual(['appConfig/luckyGifts'])
+    expectNothingWritten(before)
+  })
+
+  test('enabled: false refuses the same way, whatever the table says; so does any value but true', async () => {
+    for (const luckyDoc of [{ ...TABLE, enabled: false }, { ...TABLE }, { ...TABLE, enabled: 'true' }, { ...TABLE, enabled: 1 }]) {
+      seedWorld({ luckyDoc })
+      stubRoll(0)
+      const before = counters()
+      recordReads()
+      const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 17 }))
+      expectSwitchRefusal(e)
+      expect(reads).toEqual(['appConfig/luckyGifts'])
+      expect(reads.includes(`users/${S}`)).toBe(false)
+      expectNothingWritten(before)
+    }
+  })
+
+  test('a broke sender is told the switch is off, not that the balance is short', async () => {
+    seedWorld({ senderDiamonds: 0, luckyDoc: { ...TABLE, enabled: false } })
+    const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 10 }))
+    expectSwitchRefusal(e)
+    expect(sender().diamonds).toBe(0)
+  })
+
+  test('enabled: true runs the mechanics unchanged: charge, receiver share, roll and reward in one commit', async () => {
+    seedWorld({ luckyDoc: { ...TABLE, enabled: true } })
+    stubRoll(94_000)                                         // the ×25 bucket
+    const r = await send({ giftId: 'lucky1', receiverUid: R, combo: 17 })
+    expect(r.lucky).toEqual({ combo: 17, unit: 100, multiplier: 25, reward: 2500, configVersion: 3 })
+    expect(r.totalCost).toBe(1700)
+    expect(r.beansCredited).toBe(85)
+    expect(sender().diamonds).toBe(5000 - 1700 + 2500)
+    expect(receiver().beans).toBe(85)
+    expect(db.all('platformRevenue')[0].platformCut).toBe(1700 - 85 - 2500)
+  })
+
+  test('a normal gift is unaffected in all three states, and never reads the switch', async () => {
+    for (const luckyDoc of [null, { ...TABLE, enabled: false }, { ...TABLE, enabled: true }]) {
+      seedWorld({ luckyDoc })
+      stubRoll(0)
+      recordReads()
+      const r = await send({ giftId: 'rose', receiverUid: R, quantity: 3 })
+      expect(r.replayed).toBe(false)
+      expect(r.totalCost).toBe(30)
+      expect(r.beansCredited).toBe(15)
+      expect(r.receiverPct).toBe(50)
+      expect(r.lucky).toBe(undefined)
+      expect(sender().diamonds).toBe(4970)
+      expect(receiver().beans).toBe(15)
+      expect(giftRows().length).toBe(1)
+      expect(db.all('platformRevenue')[0].platformCut).toBe(15)
+      expect(rollLog.length).toBe(0)
+      expect(reads.includes('appConfig/luckyGifts')).toBe(false)
+    }
+  })
+
+  test('a lucky gift sent without a combo while off is refused LUCKY_GIFTS_DISABLED too, nothing written', async () => {
+    seedWorld({ luckyDoc: { ...TABLE, enabled: false } })
+    const before = counters()
+    const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, quantity: 17 }))
+    expectSwitchRefusal(e)
+    expectNothingWritten(before)
+  })
+
+  test('switched off between the early read and the transaction: the transaction\'s own read refuses, nothing written', async () => {
+    seedWorld({ luckyDoc: { ...TABLE, enabled: true } })
+    stubRoll(0)
+    const before = counters()
+    let flipped = false
+    recordReads((path) => {
+      if (path === 'appConfig/luckyGifts' && !flipped) {
+        flipped = true
+        db.seed('appConfig/luckyGifts', { ...TABLE, enabled: false })   // the Owner switches off mid-send
+      }
+    })
+    const e = await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 17 }))
+    expectSwitchRefusal(e)
+    expect(reads.filter((p) => p === 'appConfig/luckyGifts').length).toBe(2)   // early, then under the transaction
+    expectNothingWritten(before)
+  })
+
+  test('switched back on: the stored table runs again', async () => {
+    seedWorld({ luckyDoc: { ...TABLE, enabled: false } })
+    expectSwitchRefusal(await refusal(send({ giftId: 'lucky1', receiverUid: R, combo: 10 })))
+    db.seed('appConfig/luckyGifts', { ...TABLE, version: 4, enabled: true })
+    stubRoll(0)
+    const r = await send({ giftId: 'lucky1', receiverUid: R, combo: 10, idempotencyKey: 'k2' })
+    expect(r.lucky.configVersion).toBe(4)
+    expect(r.lucky.reward).toBe(500)
+    expect(sender().diamonds).toBe(5000 - 1000 + 500)
   })
 })
 

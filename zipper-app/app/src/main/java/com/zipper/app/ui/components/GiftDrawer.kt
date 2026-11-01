@@ -27,6 +27,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
@@ -66,6 +67,13 @@ import com.zipper.app.ui.theme.ZipperTheme
  * number handed to `onSend` is the combo. The SERVER rolls the reward (5× to
  * 100× one unit) and the screen celebrates what came back; nothing here
  * computes, predicts or simulates it.
+ *
+ * Lucky gifts are OFF until the Owner turns them on (`appConfig/luckyGifts
+ * .enabled`, after legal clearance under the Online Gaming Act 2025). While
+ * off — the default, and what an absent or unreadable document means — a
+ * lucky gift is shown dimmed and, when picked, says "Lucky gifts are not
+ * available right now." with the Send button disabled. The sheet re-reads the
+ * switch each time it opens. Normal gifts are untouched.
  */
 
 private val QUANTITIES = listOf(1, 10, 77, 177, 520, 1314)
@@ -138,14 +146,20 @@ fun GiftDrawer(
     val c = ZipperTheme.colors
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    // One shared read of the lucky configuration (see LuckyGiftConfigViewModel).
+    // One shared read of the lucky configuration (see LuckyGiftConfigViewModel),
+    // refreshed each time the sheet opens so the Owner's switch is current.
     val luckyConfigVm: LuckyGiftConfigViewModel = androidx.hilt.navigation.compose.hiltViewModel()
     val luckyConfig by luckyConfigVm.config.collectAsState()
+    LaunchedEffect(luckyConfigVm) { luckyConfigVm.refresh() }
     val receiverPct = luckyReceiverPct ?: luckyConfig.receiverPct
 
     var selected by remember { mutableStateOf<GiftItem?>(null) }
     var quantity by remember { mutableIntStateOf(1) }
     val luckySelected = selected?.isLucky == true
+    // The Owner's switch. Off — the default — leaves a lucky gift visible but
+    // not sendable; the server refuses it anyway (LUCKY_GIFTS_DISABLED).
+    val luckyEnabled = luckyConfig.enabled
+    val luckyUnavailable = selected?.let { !com.zipper.app.util.LuckyCombos.sendable(it.isLucky, luckyEnabled) } ?: false
     val combos = remember(luckyCombos, luckyConfig) {
         val list = luckyCombos ?: luckyConfig.combos
         if (list.isEmpty()) com.zipper.app.util.LuckyCombos.DEFAULT else list
@@ -189,8 +203,9 @@ fun GiftDrawer(
      * the balance was fine right up until three of the four sends failed.
      */
     val payees = if (multiSelect) selectedRecipientIds.size.coerceAtLeast(1) else 1
-    val total = (selected?.costDiamonds ?: 0L) * quantity * payees
-    val insufficient = selected != null && total > balanceDiamonds
+    // Nothing is quoted for a gift that cannot be sent.
+    val total = if (luckyUnavailable) 0L else (selected?.costDiamonds ?: 0L) * quantity * payees
+    val insufficient = selected != null && !luckyUnavailable && total > balanceDiamonds
     val nothingPicked = multiSelect && selectedRecipientIds.isEmpty()
 
     ModalBottomSheet(
@@ -362,60 +377,73 @@ fun GiftDrawer(
                     verticalArrangement = Arrangement.spacedBy(Space.sm),
                 ) {
                     items(visible, key = { it.id }) { gift ->
-                        GiftTile(gift, selected?.id == gift.id) { pick(gift) }
+                        GiftTile(
+                            gift, selected?.id == gift.id,
+                            unavailable = !com.zipper.app.util.LuckyCombos.sendable(gift.isLucky, luckyEnabled),
+                        ) { pick(gift) }
                     }
                 }
             }
 
-            // Quantity row — or, for a lucky gift, the COMBO picker.
-            if (luckySelected) {
-                Row(
-                    Modifier.fillMaxWidth().padding(start = Space.md, end = Space.md, top = Space.sm),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Combo", style = ZipperTheme.type.labelS, color = c.brandVip)
-                    Spacer(Modifier.width(Space.sm))
-                    Text(
-                        "Lucky gifts are sent as a combo",
-                        style = ZipperTheme.type.caption, color = c.textSecondary,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                    .padding(horizontal = Space.md, vertical = Space.sm),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                (if (luckySelected) combos else QUANTITIES).forEach { q ->
-                    val active = q == quantity
-                    Box(
-                        Modifier
-                            .height(34.dp)
-                            .background(
-                                if (active) (if (luckySelected) c.tintGoldSubtle else c.tintBrandMedium) else c.glassMid,
-                                CircleShape,
-                            )
-                            .border(1.dp, if (active) (if (luckySelected) c.brandVip else c.brandPrimary) else c.borderSubtle, CircleShape)
-                            .clickableNoRipple { quantity = q }
-                            .padding(horizontal = 14.dp),
-                        contentAlignment = Alignment.Center,
+            // Quantity row — or, for a lucky gift, the COMBO picker. While the
+            // Owner's switch is off a lucky gift gets neither: one line saying
+            // it is not available, and the Send button below stays disabled.
+            if (luckyUnavailable) {
+                Text(
+                    com.zipper.app.util.LuckyCombos.UNAVAILABLE_MESSAGE,
+                    style = ZipperTheme.type.bodyS, color = c.statusWarning,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = Space.md, vertical = Space.md),
+                )
+            } else {
+                if (luckySelected) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = Space.md, end = Space.md, top = Space.sm),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        Text("Combo", style = ZipperTheme.type.labelS, color = c.brandVip)
+                        Spacer(Modifier.width(Space.sm))
                         Text(
-                            if (luckySelected) "×$q" else q.toString(), style = ZipperTheme.type.labelS,
-                            color = if (active) c.textPrimary else c.textSecondary,
+                            "Lucky gifts are sent as a combo",
+                            style = ZipperTheme.type.caption, color = c.textSecondary,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
-            }
-            if (luckySelected) {
-                val unit = selected?.costDiamonds ?: 0L
-                Text(
-                    com.zipper.app.util.LuckyCombos.explainer(unit, quantity, receiverPct),
-                    style = ZipperTheme.type.caption, color = c.textMuted,
-                    modifier = Modifier.padding(horizontal = Space.md),
-                )
-                Spacer(Modifier.height(Space.xs))
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .padding(horizontal = Space.md, vertical = Space.sm),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    (if (luckySelected) combos else QUANTITIES).forEach { q ->
+                        val active = q == quantity
+                        Box(
+                            Modifier
+                                .height(34.dp)
+                                .background(
+                                    if (active) (if (luckySelected) c.tintGoldSubtle else c.tintBrandMedium) else c.glassMid,
+                                    CircleShape,
+                                )
+                                .border(1.dp, if (active) (if (luckySelected) c.brandVip else c.brandPrimary) else c.borderSubtle, CircleShape)
+                                .clickableNoRipple { quantity = q }
+                                .padding(horizontal = 14.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                if (luckySelected) "×$q" else q.toString(), style = ZipperTheme.type.labelS,
+                                color = if (active) c.textPrimary else c.textSecondary,
+                            )
+                        }
+                    }
+                }
+                if (luckySelected) {
+                    val unit = selected?.costDiamonds ?: 0L
+                    Text(
+                        com.zipper.app.util.LuckyCombos.explainer(unit, quantity, receiverPct),
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                        modifier = Modifier.padding(horizontal = Space.md),
+                    )
+                    Spacer(Modifier.height(Space.xs))
+                }
             }
 
             // Insufficient-balance strip (Figma 154:100)
@@ -459,6 +487,7 @@ fun GiftDrawer(
                 }
                 ZipperButton(
                     text = when {
+                        luckyUnavailable -> "Unavailable"
                         insufficient -> "Recharge"
                         luckySelected -> "Send combo ×$quantity"
                         multiSelect && payees > 1 -> "Send ×$payees"
@@ -466,11 +495,13 @@ fun GiftDrawer(
                     },
                     onClick = {
                         val g = selected ?: return@ZipperButton
+                        // The button is disabled for it too: a lucky gift is never sent while the switch is off.
+                        if (!com.zipper.app.util.LuckyCombos.sendable(g.isLucky, luckyEnabled)) return@ZipperButton
                         if (insufficient) onRecharge() else onSend(g, quantity)
                     },
                     size = ButtonSize.Medium,
                     gradient = true,
-                    enabled = selected != null && !nothingPicked,
+                    enabled = selected != null && !nothingPicked && !luckyUnavailable,
                     loading = sending,
                 )
             }
@@ -512,12 +543,14 @@ private fun RecipientChip(recipient: GiftRecipient, selected: Boolean, onClick: 
     }
 }
 
+/** [unavailable]: a lucky gift while the Owner's switch is off — shown dimmed; picking it explains why it cannot be sent. */
 @Composable
-private fun GiftTile(gift: GiftItem, selected: Boolean, onClick: () -> Unit) {
+private fun GiftTile(gift: GiftItem, selected: Boolean, unavailable: Boolean = false, onClick: () -> Unit) {
     val c = ZipperTheme.colors
     Column(
         Modifier
             .height(94.dp)
+            .alpha(if (unavailable) 0.45f else 1f)
             .clip(RoundedCornerShape(Radius.lg))
             .background(if (selected) c.tintBrandMedium else c.glassLow)
             .border(1.dp, if (selected) c.brandPrimary else c.borderSubtle, RoundedCornerShape(Radius.lg))

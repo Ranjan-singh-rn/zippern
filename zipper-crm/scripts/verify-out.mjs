@@ -96,6 +96,9 @@ const MUST_BE_PRESENT = [
   // Lucky gifts: the server's payout guard runs in the browser before the save.
   ['lucky-gift payout guard is in the bundle',
    'exceeds the ceiling'],
+  // …and the Owner's switch, behind the legal warning (off until clearance).
+  ['lucky-gift Owner switch and its legal warning are in the bundle',
+   'Confirm legal clearance (Online Gaming Act 2025) before enabling.'],
   // §5: the public appeal asks for the phone number or email on the account —
   // without it the server refuses every appeal (CONTACT_REQUIRED) — and tells
   // a wrong one (CONTACT_MISMATCH) apart.

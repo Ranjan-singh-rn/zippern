@@ -9,14 +9,18 @@
  * When the Functions source is present beside this repo, the guard's three
  * formulas are also compared textually.
  *
+ * The Owner's switch (`enabled`): off unless exactly true, as the server reads
+ * it; only `superadmin` may change it, and only a deliberate flip is written.
+ *
  *   npm run test:luckygifts
  */
 
 import * as fs from 'fs'
 import * as path from 'path'
 import {
-  LUCKY_CONFIG_PATH, LUCKY_DEFAULTS, LUCKY_LIMITS, comboMargins, expectedMultiplier,
-  luckyPayoutCeiling, nextVersion, oddsShares, validateLuckyConfig,
+  LUCKY_CONFIG_PATH, LUCKY_DEFAULTS, LUCKY_ENABLE_WARNING, LUCKY_GIFTS_DISABLED, LUCKY_GIFTS_DISABLED_MESSAGE,
+  LUCKY_LIMITS, comboMargins, enabledToWrite, expectedMultiplier, luckyEnabledOf, luckyPayoutCeiling,
+  mayToggleLuckyGifts, nextVersion, oddsShares, validateLuckyConfig,
 } from './luckyGiftsGuard'
 
 let checks = 0
@@ -121,6 +125,32 @@ eq('nextVersion from 7', nextVersion(7), 8)
 eq('nextVersion from a float floors first', nextVersion(7.9), 8)
 eq('nextVersion from nothing', [nextVersion(undefined), nextVersion(null), nextVersion('x'), nextVersion(-3)], [1, 1, 1, 1])
 
+// ── the Owner's switch: `enabled` ─────────────────────────────────────────────
+eq('the warning, verbatim', LUCKY_ENABLE_WARNING,
+  'Confirm legal clearance (Online Gaming Act 2025) before enabling. Turning this on lets users spend diamonds on a random reward.')
+eq('the server\'s refusal code and sentence', [LUCKY_GIFTS_DISABLED, LUCKY_GIFTS_DISABLED_MESSAGE],
+  ['LUCKY_GIFTS_DISABLED', 'Lucky gifts are not available right now.'])
+eq('off by default: an absent document is off', [luckyEnabledOf(null), luckyEnabledOf(undefined), luckyEnabledOf({})], [false, false, false])
+eq('the defaults carry no switch (off)', luckyEnabledOf(LUCKY_DEFAULTS), false)
+eq('on only when enabled is exactly true',
+  [true, false, 'true', 1, null].map((enabled) => luckyEnabledOf({ enabled })), [true, false, false, false, false])
+eq('only the Owner may flip it',
+  ['superadmin', 'tech_admin', 'tech_member', 'finance_admin', 'superadmin_mfa_pending', '', null, undefined].map((r) => mayToggleLuckyGifts(r)),
+  [true, false, false, false, false, false, false, false])
+eq('a Tech save writes no enabled, whatever the form holds',
+  [enabledToWrite('tech_admin', false, true), enabledToWrite('tech_member', true, false), enabledToWrite('tech_admin', false, false)],
+  [undefined, undefined, undefined])
+eq('the Owner\'s flip is written: off → on, on → off',
+  [enabledToWrite('superadmin', false, true), enabledToWrite('superadmin', true, false)], [true, false])
+eq('the Owner\'s save of the table alone writes no enabled',
+  [enabledToWrite('superadmin', false, false), enabledToWrite('superadmin', true, true)], [undefined, undefined])
+{
+  // The guard does not read the switch: same verdict, same config, either way.
+  const table = { version: 2, combos: [10, 17], receiverPct: 5, odds: [[5, 90], [10, 10]] }
+  eq('the guard ignores enabled', validateLuckyConfig({ ...table, enabled: true }), validateLuckyConfig({ ...table, enabled: false }))
+  ok('…and an enabled-only document validates on the defaults', validateLuckyConfig({ enabled: true }).ok)
+}
+
 // ── parity with the server module, when it is beside this repo ───────────────
 {
   const server = path.join(__dirname, '..', '..', 'functions', 'src', 'luckyGifts.ts')
@@ -147,6 +177,10 @@ eq('nextVersion from nothing', [nextVersion(undefined), nextVersion(null), nextV
     const lS = between(s, 'export const LUCKY_LIMITS', '\n})\n')
     const lC = between(c, 'export const LUCKY_LIMITS', '\n})\n')
     ok('LUCKY_LIMITS are identical to the server\'s', lS.length > 0 && lS.replace(/\s+/g, ' ') === lC.replace(/\s+/g, ' ').replace(' on the server', ''))
+    // The switch: the same code, the same sentence, the same test (exactly true).
+    ok('the server refuses with the same code', s.includes(`export const LUCKY_GIFTS_DISABLED = '${LUCKY_GIFTS_DISABLED}'`))
+    ok('…and the same sentence', s.includes(`export const LUCKY_GIFTS_DISABLED_MESSAGE = '${LUCKY_GIFTS_DISABLED_MESSAGE}'`))
+    ok('…and reads the switch as this module does (exists and enabled === true)', s.includes('return exists && !!data && data.enabled === true'))
   } else {
     console.log('  (functions/src/luckyGifts.ts not beside this repo — textual parity not checked)')
   }
@@ -160,6 +194,17 @@ eq('nextVersion from nothing', [nextVersion(undefined), nextVersion(null), nextV
   ok('…and shows the expected multiplier and the per-combo margin', page.includes('comboMargins(') && page.includes('expectedMultiplier'))
   const cfg = fs.readFileSync(path.join(__dirname, '..', 'lib', 'appConfig.ts'), 'utf8')
   ok('the save writes updatedAt and updatedBy', cfg.includes("'luckyGifts'") && cfg.includes('updatedBy'))
+  // The switch on the page: Owner-only, off by default, the warning, a confirmation, the server's state.
+  ok('the page has an Enabled switch', page.includes('role="switch"') && page.includes('aria-checked={draft.enabled}'))
+  ok('…only the Owner can flip it', page.includes('mayToggleLuckyGifts(crmUser?.role)') && page.includes('disabled={!isOwner || saving}'))
+  ok('…it starts from the server (absent → off)', page.includes('enabled: luckyEnabledOf(cfg)') && page.includes('const serverEnabled = luckyEnabledOf(server)'))
+  ok('…the warning is shown beside it and in the confirmation', (page.match(/\{LUCKY_ENABLE_WARNING\}/g) ?? []).length >= 2)
+  ok('…turning it ON waits for the legal-clearance tick', page.includes('disabled={saving || (turningOn && !legalOk)}') && page.includes('if (turningOn && !legalOk) return'))
+  ok('…and "Load defaults" resets the table, not the switch', page.includes('enabled: d.enabled }))'))
+  // The save: a merge, with `enabled` only from enabledToWrite (so a Tech save leaves it as stored).
+  ok('the save decides enabled with enabledToWrite', cfg.includes('enabledToWrite(actor.role, lucky.loaded, lucky.requested)'))
+  ok('…writes it only when decided', cfg.includes('...(enabled === undefined ? {} : { enabled })'))
+  ok('…and merges, so a save without it keeps the stored switch', /setDoc\(doc\(db, 'appConfig', 'luckyGifts'\)[\s\S]*?\}, \{ merge: true \}\)/.test(cfg))
 }
 
 if (failures.length) {
@@ -170,3 +215,4 @@ if (failures.length) {
 console.log(`All ${checks} lucky-gift checks passed.`)
 console.log('  · E = Σ(m×w)/Σw must not exceed minCombo × (1 − pct/100) × 0.9 — the server\'s guard, run before the save')
 console.log('  · multipliers whole 5–100, weights > 0, combos whole ≥ 10 and unique, pct 0–100; version bumped past the server\'s')
+console.log('  · enabled: off unless exactly true (absent = off); only the Owner flips it, behind the legal warning; a Tech save leaves it')

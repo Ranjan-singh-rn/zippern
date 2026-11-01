@@ -45,7 +45,7 @@ const sections = [
     href: '/app-config/lucky-gifts',
     icon: <Sparkles size={22} className="text-pink-400" />,
     title: 'Lucky Gifts',
-    description: 'Combos, the receiver share and the odds table the server rolls over — saved only after the same payout guard the server runs.',
+    description: 'The Owner\'s on/off switch (off until legal clearance), the combos, the receiver share and the odds table the server rolls over — saved only after the same payout guard the server runs.',
     tag: 'appConfig/luckyGifts',
   },
   {

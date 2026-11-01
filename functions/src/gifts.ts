@@ -31,7 +31,7 @@ import { accrueWeeklyEarning } from './payouts'
 import { accrueHostStats, applyHostLevel, getHostLadder } from './hostStats'
 import { assertActiveSession } from './mobileSession'
 import {
-  isLuckyGift, luckyRollHash, luckySettlement, resolveLuckyConfig, rollLuckyMultiplier,
+  assertLuckyGiftsEnabled, isLuckyGift, luckyRollHash, luckySettlement, resolveLuckyConfig, rollLuckyMultiplier,
 } from './luckyGifts'
 
 const db = admin.firestore()
@@ -68,6 +68,12 @@ const db = admin.firestore()
  * diamonds in the same transaction, the multiplier drawn server-side from the
  * configured odds. The configuration, the payout guard and the roll live in
  * `luckyGifts.ts`. A normal gift is settled exactly as before.
+ *
+ * Lucky gifts are OFF unless the Owner has switched them on
+ * (`appConfig/luckyGifts.enabled === true`, after legal clearance under the
+ * Online Gaming Act 2025). While they are off a lucky send is refused
+ * `failed-precondition` / `LUCKY_GIFTS_DISABLED` before any balance is read and
+ * before any write; a normal gift never reads the switch.
  */
 
 const GIFT_CONTEXTS = ['live', 'call', 'dm', 'party'] as const
@@ -103,6 +109,19 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
     const senderUid = context.auth?.uid
     if (!senderUid) {
       throw new HttpsError('unauthenticated', 'Sign in to send a gift.')
+    }
+    /*
+     * The Owner's lucky-gift switch, FIRST for a request in the lucky shape (it
+     * carries `combo`): while lucky gifts are off the send is refused here —
+     * before the account (and with it either balance) is read, and before
+     * anything is written. The transaction checks the switch again under its
+     * own read, which also covers a lucky gift sent without a combo and a
+     * switch turned off between this read and that one. A normal gift carries
+     * no combo and never reads the document.
+     */
+    if (data?.combo !== undefined && data?.combo !== null) {
+      const luckySwitch = await db.collection('appConfig').doc('luckyGifts').get()
+      assertLuckyGiftsEnabled(luckySwitch.data(), luckySwitch.exists)
     }
     // Auth-only guard. See functions/src/mobileSession.ts: refuses when the
     // caller presents a session id that is not the account's active one.
@@ -257,16 +276,23 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       // ── Lucky or normal: the catalogue decides, the request must agree ─────
       //
       // The lucky configuration is read only for a lucky gift, and still
-      // before the first write (Firestore forbids a read after one). The guard
-      // runs inside `resolveLuckyConfig`; a refused table refuses the send.
+      // before the first write (Firestore forbids a read after one). The
+      // Owner's switch is checked on that read before anything else about the
+      // send — the shape, the balance — so while lucky gifts are off every
+      // attempt at one is refused LUCKY_GIFTS_DISABLED with nothing written.
+      // The guard runs inside `resolveLuckyConfig`; a refused table refuses
+      // the send.
       const lucky = isLuckyGift(gift)
+      const luckySnap = lucky ? await tx.get(luckyRef) : null
+      if (luckySnap) {
+        assertLuckyGiftsEnabled(luckySnap.data() as Record<string, unknown> | undefined, luckySnap.exists)
+      }
       if (lucky && combo === null) {
         throw new HttpsError('invalid-argument', 'This is a lucky gift: send it as a combo.')
       }
       if (!lucky && combo !== null) {
         throw new HttpsError('invalid-argument', 'combo is only for lucky gifts; send quantity.')
       }
-      const luckySnap = lucky ? await tx.get(luckyRef) : null
       const luckyCfg = luckySnap
         ? resolveLuckyConfig(luckySnap.data() as Record<string, unknown> | undefined, luckySnap.exists)
         : null

@@ -23,6 +23,7 @@ import * as logger from 'firebase-functions/logger'
  * ── The document: `appConfig/luckyGifts` ─────────────────────────────────────
  *
  *   {
+ *     enabled:     boolean                       // the Owner's switch; OFF unless exactly true
  *     version:     number                        // bumped by the CRM on every save
  *     combos:      number[]                      // integers ≥ 10; default [10, 17, 25, 77]
  *     receiverPct: number                        // 0–100; default 5
@@ -31,8 +32,21 @@ import * as logger from 'firebase-functions/logger'
  *     updatedAt, updatedBy                       // written by the CRM, read by nobody here
  *   }
  *
- * Absent fields take the defaults above. The CRM writes the document; this
- * module only reads it.
+ * On an existing, enabled document, absent fields take the defaults above.
+ * The CRM writes the document; this module only reads it.
+ *
+ * ── The Owner's switch ───────────────────────────────────────────────────────
+ *
+ * A lucky gift is a chance mechanic — diamonds spent on a random reward — and
+ * was deliberately left unshipped pending a legal opinion under India's Online
+ * Gaming Act 2025. It stays OFF until the Owner turns it on in the CRM after
+ * that clearance: a lucky send runs only when the document exists and its
+ * `enabled` is exactly `true`. An absent document, an absent field, `false`,
+ * `"true"` — anything else — refuses the send `failed-precondition`, details
+ * code `LUCKY_GIFTS_DISABLED`, before a balance is read or anything is written
+ * (`settleGift` checks it ahead of the account read, and again under its
+ * transaction). Normal gifts never read the document. The switch is not part
+ * of the table: the payout guard below neither reads nor needs it.
  *
  * ── The payout guard ─────────────────────────────────────────────────────────
  *
@@ -212,41 +226,59 @@ export function validateLuckyConfig(raw: unknown): LuckyValidation {
   return { ok: true, config, expectedMultiplier: e, ceiling }
 }
 
+/** `details.code` of the refusal while the Owner's switch is off. */
+export const LUCKY_GIFTS_DISABLED = 'LUCKY_GIFTS_DISABLED'
+
+/** The sentence that refusal carries; the app shows it as is. */
+export const LUCKY_GIFTS_DISABLED_MESSAGE = 'Lucky gifts are not available right now.'
+
+/**
+ * Is the Owner's switch on? Only an existing document whose `enabled` is
+ * exactly `true` is. Pure.
+ */
+export function luckyGiftsEnabled(data: Record<string, unknown> | null | undefined, exists: boolean): boolean {
+  return exists && !!data && data.enabled === true
+}
+
+/**
+ * Refuse a lucky send unless the switch is on: `failed-precondition`, details
+ * code `LUCKY_GIFTS_DISABLED`. Reads nothing; the caller hands over the
+ * document it read.
+ */
+export function assertLuckyGiftsEnabled(
+  data: Record<string, unknown> | null | undefined,
+  exists: boolean,
+): asserts data is Record<string, unknown> {
+  if (luckyGiftsEnabled(data, exists)) return
+  throw new HttpsError('failed-precondition', LUCKY_GIFTS_DISABLED_MESSAGE, { code: LUCKY_GIFTS_DISABLED })
+}
+
 /**
  * The last configuration this instance accepted. A document that later fails
  * the guard is not used; this is what lucky sends run on instead, with a
  * warning on every read, until the CRM saves a valid one.
  */
 let lastValid: LuckyConfig | null = null
-let warnedMissing = false
 
 /** Test seam: forget the last accepted version. */
 export function resetLuckyConfigCache(): void {
   lastValid = null
-  warnedMissing = false
 }
 
 /**
  * The configuration a lucky send runs on, from the document as read inside
  * the settlement transaction.
  *
- *   document absent          → the defaults (version 0), logged once
- *   document valid           → that document
- *   document invalid         → the last valid version this instance saw, with
+ *   document absent, or `enabled !== true`
+ *                            → refused: LUCKY_GIFTS_DISABLED (the Owner's
+ *                              switch is off — never the defaults)
+ *   document enabled, valid  → that document; absent fields take the defaults
+ *   document enabled, invalid→ the last valid version this instance saw, with
  *                              a warning; or, with none, a `failed-precondition`
  *                              the sender can read. Never a built-in table.
  */
 export function resolveLuckyConfig(data: Record<string, unknown> | undefined, exists: boolean): LuckyConfig {
-  if (!exists || data === undefined) {
-    if (!warnedMissing) {
-      warnedMissing = true
-      logger.warn('luckyGifts: appConfig/luckyGifts is absent; lucky gifts run on the documented defaults (version 0)')
-    }
-    const v = validateLuckyConfig(undefined)
-    if (!v.ok) throw new HttpsError('failed-precondition', 'Lucky gifts are unavailable right now.', { code: v.code })
-    lastValid = v.config
-    return v.config
-  }
+  assertLuckyGiftsEnabled(data, exists)
   const v = validateLuckyConfig(data)
   if (v.ok) {
     lastValid = v.config

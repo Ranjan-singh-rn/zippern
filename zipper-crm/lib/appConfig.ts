@@ -3,7 +3,9 @@ import {
   doc, getDoc, setDoc, getDocs, deleteDoc,
   collection, serverTimestamp, Timestamp,
 } from 'firebase/firestore'
-import { nextVersion, validateLuckyConfig, type LuckyConfig } from '@/lib/luckyGiftsGuard'
+import {
+  enabledToWrite, luckyEnabledOf, nextVersion, validateLuckyConfig, type LuckyConfig,
+} from '@/lib/luckyGiftsGuard'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CURRENCY SETTINGS
@@ -399,18 +401,20 @@ export async function seedHostLevels(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LUCKY GIFTS — the combos, the receiver share and the odds table
+// LUCKY GIFTS — the Owner's switch, the combos, the receiver share and the odds
 // Firestore: appConfig/luckyGifts  (read by functions/src/luckyGifts.ts inside
 // the gift settlement transaction; the CRM is the only writer)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The document as stored, plus the two audit fields. */
+/** The document as stored: the switch, the table, and the two audit fields. */
 export interface LuckyGiftsDoc extends LuckyConfig {
+  /** The Owner's switch. Lucky sends are refused unless this is exactly `true`. */
+  enabled?: boolean
   updatedAt?: Timestamp | null
   updatedBy?: string
 }
 
-/** `null` when the document does not exist (lucky gifts run on the defaults, version 0). */
+/** `null` when the document does not exist — lucky gifts are OFF (the table shown is the defaults). */
 export async function getLuckyGiftsConfig(): Promise<LuckyGiftsDoc | null> {
   const snap = await getDoc(doc(db, 'appConfig', 'luckyGifts'))
   if (!snap.exists()) return null
@@ -422,23 +426,37 @@ export async function getLuckyGiftsConfig(): Promise<LuckyGiftsDoc | null> {
  * server would refuse is never written. `version` is bumped past the server's
  * current one (re-read here, not taken from the form), and the write names the
  * signed-in actor, never a role word.
+ *
+ * The switch: `enabledToWrite` decides, from the actor's role, what the page
+ * loaded and what it asks for. Only the Owner's deliberate flip is written;
+ * any other save carries no `enabled`, and the write MERGES so the stored
+ * switch is left exactly as it is (firestore.rules D15 refuses a non-Owner
+ * write that changes it).
  */
 export async function saveLuckyGiftsConfig(
   draft: Pick<LuckyConfig, 'combos' | 'receiverPct' | 'odds'>,
-  actorUid: string,
-): Promise<{ version: number; expectedMultiplier: number; ceiling: number }> {
+  actor: { uid: string; role: string },
+  lucky: { loaded: boolean; requested: boolean },
+): Promise<{ version: number; expectedMultiplier: number; ceiling: number; enabled: boolean }> {
   const current = await getLuckyGiftsConfig()
   const version = nextVersion(current?.version)
   const v = validateLuckyConfig({ ...draft, version })
   if (!v.ok) throw new Error(v.reason)
-  if (!actorUid) throw new Error('No signed-in actor to record on the write.')
+  if (!actor.uid) throw new Error('No signed-in actor to record on the write.')
+  const enabled = enabledToWrite(actor.role, lucky.loaded, lucky.requested)
   await setDoc(doc(db, 'appConfig', 'luckyGifts'), {
+    ...(enabled === undefined ? {} : { enabled }),
     version: v.config.version,
     combos: v.config.combos,
     receiverPct: v.config.receiverPct,
     odds: v.config.odds,
     updatedAt: serverTimestamp(),
-    updatedBy: actorUid,
-  })
-  return { version: v.config.version, expectedMultiplier: v.expectedMultiplier, ceiling: v.ceiling }
+    updatedBy: actor.uid,
+  }, { merge: true })
+  return {
+    version: v.config.version,
+    expectedMultiplier: v.expectedMultiplier,
+    ceiling: v.ceiling,
+    enabled: enabled ?? luckyEnabledOf(current),
+  }
 }

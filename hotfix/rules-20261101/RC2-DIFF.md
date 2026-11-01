@@ -5,7 +5,7 @@ RC2 = the repository's top-level `firestore.rules`, `storage.rules` and `firesto
 
 | File | sha256 (at time of writing) | Lines |
 |---|---|---|
-| `firestore.rules` (RC2) | `1e0ee32a80b3eb63c08e0da3817061953085ff358e509d2bb6516d5a0807a3eb` | 4529 |
+| `firestore.rules` (RC2) | `bb4984cc23aa43fdb06c6b0598148a6e06a781ea640ebcae5cc00eddeb4800d0` | 4555 |
 | `storage.rules` (RC2) | `2fd706a67381c5e9e385a6d4d2615da5cca3833bab8bfb16b6c861f400639dd8` | 993 |
 | `firestore.indexes.json` (RC2) | `6c4dbc36139214d797e7c937424659c410643ba848dd6084298a0091b28dc5a5` | 66 composite + 3 field overrides |
 | DEPLOYED Firestore (live since 20 Oct, ruleset `b2104a12…`) | `17b8ffee1383716bb784292271c162e22e1e99d860d35d351d0c72ee93694d45` | 4,049 |
@@ -44,7 +44,7 @@ Line numbers are in the RC2 file. "Needs" = what must be live before the rule is
 | D7 | R-6 `appConfig/paymentCredentials` read: staff; a CRM seller whose seller role started; an app seller with a verified contact on the token and a started seller record (BuyCoinScreen). Never a guest / ordinary user / pending applicant. Other `appConfig` docs unchanged | 3932 ff. | none (BuyCoinScreen and CRM BuyInventoryDialog are the only readers) |
 | D8 | R-8 `hostKyc/{hostUid}` read: admins and the host only | 2607 | none (no agency reader exists) |
 | D9 | R-10 `users/{uid}/followers/{followerUid}` write only by the follower; `users/{uid}/giftsReceived` create `if false` | 2502, 2576 | none (`ProfileRepository` writes `followers/{me}`; nothing writes `giftsReceived`) |
-| D10 | `appConfig/luckyGifts`: covered by the existing appConfig rule — no change | — | — |
+| D10 | `appConfig/luckyGifts`: covered by the existing appConfig rule — no change (but see D15 in the addendum) | — | — |
 | D11 | `publicProfiles`: no change | — | — |
 | D12 | `rateLimits/{bucket}` explicit deny-all (`functions/src/rateLimit.ts`, Admin SDK) — same answer as the catch-all | 1038 | none |
 | D13 | `partyRooms/{roomId}/private/{docId}` explicit deny-all — the PIN secret `functions/src/party.ts` keeps at `private/secret`; no rule ever admitted it | 3639 | none |
@@ -119,3 +119,4 @@ The deployed `agents(referralCode, status, __name__)` and `diamondResellers(stat
 ## Addendum (1 Nov, later)
 
 - **D14 Host role suspension:** the `hostSuspended*` fields on `users/{uid}` are server-written only (owner and staff arms refuse them), and go-live is refused while `hostSuspended == true`. Covered by the D14 block in `tests/firestore.rc2.rules.test.mjs`. The rules hash above includes this change; re-run `tests/run-rc2-rules-tests.command` before script 31.
+- **D15 Lucky-gift switch:** `appConfig/luckyGifts.enabled` is the Owner's alone — a Tech write to `luckyGifts` may not add, change or remove it (update `affectedKeys`, create without it), and a delete of `luckyGifts` is the Owner's. The appConfig write arm is split into create / update / delete for this; every other appConfig document is allowed exactly as before. Needs: `settleGift` refusing `LUCKY_GIFTS_DISABLED` and the CRM lucky-gifts page (Owner-only toggle; Tech saves merge without `enabled`). Covered by the D15 check in `tests/firestore.rc2.rules.test.mjs`. The rules hash above includes this change; re-run `tests/run-rc2-rules-tests.command` before script 31.

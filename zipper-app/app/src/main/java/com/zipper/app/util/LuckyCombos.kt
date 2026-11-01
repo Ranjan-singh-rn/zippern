@@ -16,8 +16,37 @@ package com.zipper.app.util
  *
  * Pure. The parsing and the validation are what the tests exercise; the
  * document read is in `LuckyGiftConfigRepository`.
+ *
+ * ── The Owner's switch (`appConfig/luckyGifts.enabled`) ─────────────────────
+ *
+ * A lucky gift lets the sender spend diamonds on a random reward — a chance
+ * mechanic left OFF pending legal clearance under India's Online Gaming Act
+ * 2025. The server refuses every lucky send unless the document exists and
+ * `enabled` is exactly true (`LUCKY_GIFTS_DISABLED`); the sheet shows lucky
+ * gifts as unavailable on the same rule. Off is the default: an absent,
+ * unreadable or not-exactly-true value is off.
  */
 object LuckyCombos {
+
+    /** The server's `details.code` when the Owner's switch is off. */
+    const val DISABLED_CODE = "LUCKY_GIFTS_DISABLED"
+
+    /** What the sheet says for an unavailable lucky gift, and what that refusal reads as — the server's own sentence. */
+    const val UNAVAILABLE_MESSAGE = "Lucky gifts are not available right now."
+
+    /** The switch from the raw document field: on only for a real boolean `true`, as the server reads it. */
+    fun parseEnabled(raw: Any?): Boolean = (raw as? Boolean) == true
+
+    /** Can this gift be sent with the switch as it is? A normal gift always can. */
+    fun sendable(isLucky: Boolean, enabled: Boolean): Boolean = !isLucky || enabled
+
+    /**
+     * The sentence for a refused send when the refusal is the switch
+     * (`details.code == LUCKY_GIFTS_DISABLED`); null for anything else, which
+     * keeps its own handling.
+     */
+    fun refusalMessage(detailCode: String?): String? =
+        if (detailCode?.trim() == DISABLED_CODE) UNAVAILABLE_MESSAGE else null
 
     /** The server's defaults (`LUCKY_DEFAULTS.combos`), used until the document is read. */
     val DEFAULT: List<Int> = listOf(10, 17, 25, 77)

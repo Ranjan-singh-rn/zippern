@@ -97,7 +97,7 @@ rules_version = '2';
 //      row; users/{uid}/giftsReceived create `if false`.         needs: none
 //      (ProfileRepository writes followers/{me}; nothing writes giftsReceived).
 //   D10 appConfig/luckyGifts: confirmed covered by the existing appConfig rule
-//      (signed-in read; Tech + Owner write). No change.
+//      (signed-in read; Tech + Owner write). No change — but see D15.
 //   D11 publicProfiles: no change (the projection omits hostLevel for non-hosts
 //      server-side).
 //   D12 rateLimits/{bucket}: explicit deny-all (functions/src/rateLimit.ts,
@@ -110,6 +110,12 @@ rules_version = '2';
 //      and the `hostSuspended*` / `hostResumed*` stamps on both protected
 //      lists; liveRooms `mayGoLive()` refuses a suspended Host role.
 //                                    needs: backend users.suspend_host / resume_host.
+//   D15 appConfig/luckyGifts.enabled (the lucky-gift switch, off until legal
+//      clearance): Owner only. A Tech write to luckyGifts may not add, change
+//      or remove `enabled`; a delete of luckyGifts is the Owner's. Other
+//      appConfig documents unchanged.   needs: Functions settleGift
+//      LUCKY_GIFTS_DISABLED + the CRM page's Owner-only toggle (Tech saves
+//      merge without `enabled`).
 //
 // ── Indexes (firestore.indexes.json, additive; never accept a deletion) ─────
 //   staffRoster(role, isActive) — needed by C1. The Owner work hub (APK ≥ 20)
@@ -4047,10 +4053,30 @@ service cloud.firestore {
       // transaction) is written by the CRM's lucky-gifts page after the
       // server's own guard (lib/luckyGiftsGuard.ts) — PAGE_ROLES superadmin /
       // tech_admin / tech_member — and read by the app's gift sheet. That is
-      // exactly the `isTech() || isSuperAdmin()` arm below; no special case.
-      allow write: if docId != 'androidUpdate'
-                    && ((docId == 'paymentCredentials' && isSuperAdmin())
-                        || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin())));
+      // exactly the `isTech() || isSuperAdmin()` arm below.
+      //
+      // RC2 D15: EXCEPT `luckyGifts.enabled`, which is the Owner's switch.
+      // Lucky gifts are a chance mechanic left off pending legal clearance
+      // (Online Gaming Act 2025); settleGift refuses every lucky send unless
+      // `enabled` is exactly true. Tech still edits the table, so a write to
+      // `luckyGifts` by anyone but the Owner must leave `enabled` as it is: an
+      // update may not have it among its affected keys (added, changed or
+      // removed), a create may not carry it, and a delete — which would drop a
+      // switch that is on — is the Owner's. Split by method for that alone;
+      // every other appConfig document is allowed exactly as before.
+      function appConfigWriter() {
+        return docId != 'androidUpdate'
+            && ((docId == 'paymentCredentials' && isSuperAdmin())
+                || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin())));
+      }
+      allow create: if appConfigWriter()
+                    && (docId != 'luckyGifts' || isSuperAdmin()
+                        || !request.resource.data.keys().hasAny(['enabled']));
+      allow update: if appConfigWriter()
+                    && (docId != 'luckyGifts' || isSuperAdmin()
+                        || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['enabled']));
+      allow delete: if appConfigWriter()
+                    && (docId != 'luckyGifts' || isSuperAdmin());
     }
 
     match /announcements/{docId} {

@@ -9,6 +9,16 @@
  * sender's reward is `multiplier × unit` drawn over the weights — so a table
  * that pays out more than it takes in loses the business money on every send.
  *
+ * ── THE OWNER'S SWITCH: OFF UNTIL LEGAL CLEARANCE ────────────────────────────
+ *
+ * A lucky gift lets a user spend diamonds on a random reward — a chance
+ * mechanic, deliberately left unshipped pending a legal opinion under India's
+ * Online Gaming Act 2025. `enabled` is OFF by default (an absent document is
+ * off) and the server refuses every lucky send while it is. Only the Owner
+ * may turn it on, after legal clearance, through a confirmation that repeats
+ * the warning; Tech may edit the table but not the switch, and a Tech save
+ * leaves it exactly as it is (`enabledToWrite`, firestore.rules D15).
+ *
  * ── THE SAME GUARD AS THE SERVER, BEFORE THE SAVE ────────────────────────────
  *
  * `functions/src/luckyGifts.ts` refuses a table whose expected multiplier
@@ -16,34 +26,41 @@
  * refused table is never rolled on. `lib/luckyGiftsGuard.ts` is that guard,
  * line for line; this page runs it as you type and again before the write, so
  * a table the server would refuse is never saved. The version is bumped past
- * the server's current one on every save, and the write names you.
+ * the server's current one on every save — the switch included — and the
+ * write names you.
  */
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { AlertTriangle, ArrowLeft, CheckCircle, Loader2, Plus, RefreshCw, Save, Sparkles, Trash2 } from 'lucide-react'
+import {
+  AlertTriangle, ArrowLeft, CheckCircle, Loader2, Plus, RefreshCw, Save, Sparkles, ToggleLeft, ToggleRight, Trash2,
+} from 'lucide-react'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
 import { getLuckyGiftsConfig, saveLuckyGiftsConfig, type LuckyGiftsDoc } from '@/lib/appConfig'
 import {
-  LUCKY_DEFAULTS, LUCKY_LIMITS, comboMargins, nextVersion, oddsShares, validateLuckyConfig,
+  LUCKY_DEFAULTS, LUCKY_ENABLE_WARNING, LUCKY_LIMITS, comboMargins, enabledToWrite, luckyEnabledOf,
+  mayToggleLuckyGifts, nextVersion, oddsShares, validateLuckyConfig,
 } from '@/lib/luckyGiftsGuard'
 
-/** Who may edit: the Owner and Tech (what `firestore.rules` allows on `appConfig/*`). */
+/** Who may edit: the Owner and Tech (what `firestore.rules` allows on `appConfig/*`). The switch is the Owner's alone. */
 const PAGE_ROLES: CrmRole[] = ['superadmin', 'tech_admin', 'tech_member']
 
 const inputCls = 'w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-pink-500'
 
 /** The form holds strings so a half-typed number is not coerced under the cursor. */
 interface Draft {
+  /** The Owner's switch as the form holds it; written only when the Owner flips it. */
+  enabled: boolean
   combos: string[]
   receiverPct: string
   odds: Array<{ multiplier: string; weight: string }>
 }
 
-function toDraft(cfg: { combos: number[]; receiverPct: number; odds: Array<{ multiplier: number; weight: number }> }): Draft {
+function toDraft(cfg: { enabled?: boolean; combos: number[]; receiverPct: number; odds: Array<{ multiplier: number; weight: number }> }): Draft {
   return {
+    enabled: luckyEnabledOf(cfg),
     combos: cfg.combos.map(String),
     receiverPct: String(cfg.receiverPct),
     odds: cfg.odds.map((o) => ({ multiplier: String(o.multiplier), weight: String(o.weight) })),
@@ -80,6 +97,8 @@ export default function LuckyGiftsPage() {
   const [loadError, setLoadError] = useState('')
   const [saving, setSaving] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  /** Turning lucky gifts ON needs the Owner to tick the legal-clearance box in the confirmation. */
+  const [legalOk, setLegalOk] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' } | null>(null)
 
   async function load() {
@@ -88,7 +107,8 @@ export default function LuckyGiftsPage() {
     try {
       const cfg = await getLuckyGiftsConfig()
       setServer(cfg)
-      setDraft(toDraft(cfg ?? LUCKY_DEFAULTS))
+      // Fields the document lacks show as the defaults — what the server runs on for them.
+      setDraft(toDraft(cfg ? { ...LUCKY_DEFAULTS, ...cfg } : LUCKY_DEFAULTS))
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Could not read appConfig/luckyGifts.')
       setServer(null)
@@ -117,6 +137,15 @@ export default function LuckyGiftsPage() {
     return oddsShares(odds)
   }, [draft])
 
+  // The switch: what the server says now, who may flip it, and what this save would write.
+  const serverEnabled = luckyEnabledOf(server)
+  const isOwner = mayToggleLuckyGifts(crmUser?.role)
+  const enabledWrite = enabledToWrite(crmUser?.role, serverEnabled, draft.enabled)
+  const turningOn = enabledWrite === true
+  const turningOff = enabledWrite === false
+  // What lucky gifts will be after this save: the Owner's flip, or the server's state as it stands.
+  const enabledAfterSave = enabledWrite ?? serverEnabled
+
   function showToast(msg: string, type: 'ok' | 'err') {
     setToast({ msg, type })
     setTimeout(() => setToast(null), 4000)
@@ -124,13 +153,19 @@ export default function LuckyGiftsPage() {
 
   async function handleSave() {
     if (!verdict.ok || !crmUser) return
+    if (turningOn && !legalOk) return
     setSaving(true)
     try {
       const out = await saveLuckyGiftsConfig(
         { combos: verdict.config.combos, receiverPct: verdict.config.receiverPct, odds: verdict.config.odds },
-        crmUser.uid,
+        { uid: crmUser.uid, role: crmUser.role },
+        { loaded: serverEnabled, requested: draft.enabled },
       )
-      showToast(`Saved as version ${out.version} — expected multiplier ${out.expectedMultiplier.toFixed(3)} against a ceiling of ${out.ceiling.toFixed(3)}.`, 'ok')
+      showToast(
+        `Saved as version ${out.version} — lucky gifts ${out.enabled ? 'ON' : 'OFF'}; expected multiplier ` +
+        `${out.expectedMultiplier.toFixed(3)} against a ceiling of ${out.ceiling.toFixed(3)}.`,
+        'ok',
+      )
       setConfirming(false)
       await load()
     } catch (err) {
@@ -171,7 +206,7 @@ export default function LuckyGiftsPage() {
           <div>
             <h1 className="text-2xl font-bold text-white">Lucky Gifts</h1>
             <p className="text-slate-400 text-sm mt-0.5">
-              Combos, the receiver&rsquo;s share and the odds table the server rolls over.
+              The Owner&rsquo;s on/off switch, the combos, the receiver&rsquo;s share and the odds table the server rolls over.
             </p>
             <p className="text-slate-600 text-xs mt-1 font-mono">appConfig/luckyGifts</p>
           </div>
@@ -196,10 +231,58 @@ export default function LuckyGiftsPage() {
         </div>
       )}
 
-      {/* The server's current version — the one lucky sends run on right now. */}
+      {/* The Owner's switch — off until legal clearance. Shows the server's state as it is now. */}
+      <section className={`mb-6 border rounded-xl p-5 ${serverEnabled ? 'bg-green-500/5 border-green-500/30' : 'bg-slate-800 border-slate-700'}`}>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-white font-semibold">Enabled</h2>
+            <p className="text-slate-400 text-xs mt-0.5">
+              Off by default. While off, the server refuses every lucky send and the app shows lucky gifts as unavailable.
+              Normal gifts are not affected.
+            </p>
+            <p className="text-sm mt-2">
+              <span className="text-slate-400">On the server now: </span>
+              <span className={`font-semibold ${serverEnabled ? 'text-green-300' : 'text-slate-200'}`}>
+                {serverEnabled ? 'ON — users can send lucky gifts' : 'OFF — lucky sends are refused'}
+              </span>
+              {!server && <span className="text-slate-500"> (document absent)</span>}
+            </p>
+            {enabledWrite !== undefined && (
+              <p className="text-amber-300 text-xs mt-1">
+                Not saved yet: saving turns lucky gifts {turningOn ? 'ON' : 'OFF'}.
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={draft.enabled}
+            aria-label="Lucky gifts enabled"
+            disabled={!isOwner || saving}
+            title={isOwner ? (draft.enabled ? 'Turn lucky gifts off' : 'Turn lucky gifts on') : 'Only the Owner can turn lucky gifts on or off.'}
+            onClick={() => setDraft((d) => ({ ...d, enabled: !d.enabled }))}
+            className="shrink-0 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {draft.enabled
+              ? <ToggleRight size={34} className="text-green-400" />
+              : <ToggleLeft size={34} className="text-slate-500" />}
+          </button>
+        </div>
+        <div className="mt-3 flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-lg px-3 py-2 text-xs">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <p>{LUCKY_ENABLE_WARNING}</p>
+        </div>
+        {!isOwner && (
+          <p className="text-slate-500 text-xs mt-2">
+            Only the Owner can turn lucky gifts on or off. You can edit the table below; your save leaves the switch as it is.
+          </p>
+        )}
+      </section>
+
+      {/* The server's current version — the one lucky sends run on while the switch is on. */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-        <Stat label="Server version" value={server ? String(server.version) : '0 (defaults)'}
-          sub={server ? `saved ${whenOf(server.updatedAt)}` : 'document absent'} />
+        <Stat label="Server version" value={server ? String(server.version ?? 0) : '0 (defaults)'}
+          sub={server ? `saved ${whenOf(server.updatedAt)}` : 'document absent — lucky gifts off'} />
         <Stat label="Next save writes" value={`v${nextVersion(serverVersion)}`} sub={server?.updatedBy ? `last by ${server.updatedBy.slice(0, 8)}…` : ''} />
         <Stat label="Expected multiplier" value={Number.isFinite(e) ? `×${e.toFixed(3)}` : '—'} sub="E = Σ(m×w) / Σw" tone={verdict.ok ? 'green' : 'red'} />
         <Stat label="Ceiling" value={Number.isFinite(ceiling) ? `×${ceiling.toFixed(3)}` : '—'} sub="min combo × (1 − pct/100) × 0.9" />
@@ -377,13 +460,14 @@ export default function LuckyGiftsPage() {
 
       <div className="flex flex-wrap items-center justify-between gap-3 mt-6">
         <button
-          onClick={() => { setDraft(toDraft(LUCKY_DEFAULTS)); showToast('Loaded the documented defaults (not saved yet).', 'ok') }}
+          // The table only: the switch stays where it is in the form.
+          onClick={() => { setDraft((d) => ({ ...toDraft(LUCKY_DEFAULTS), enabled: d.enabled })); showToast('Loaded the documented defaults (not saved yet).', 'ok') }}
           className="text-slate-400 hover:text-white text-sm"
         >
           Load defaults
         </button>
         <button
-          onClick={() => setConfirming(true)}
+          onClick={() => { setLegalOk(false); setConfirming(true) }}
           disabled={!verdict.ok || saving}
           className="flex items-center gap-2 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
         >
@@ -391,29 +475,65 @@ export default function LuckyGiftsPage() {
         </button>
       </div>
 
-      {/* Money-adjacent: a confirmation with the numbers, and the write names the actor. */}
+      {/* Money-adjacent: a confirmation with the numbers, and the write names the actor. Turning lucky gifts ON also asks for the legal clearance. */}
       {confirming && verdict.ok && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => !saving && setConfirming(false)} />
           <div className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4">
-            <h2 className="text-white font-semibold">Save lucky-gift table v{nextVersion(serverVersion)}?</h2>
+            <h2 className="text-white font-semibold">
+              {turningOn
+                ? `Turn lucky gifts ON and save v${nextVersion(serverVersion)}?`
+                : turningOff
+                  ? `Turn lucky gifts OFF and save v${nextVersion(serverVersion)}?`
+                  : `Save lucky-gift table v${nextVersion(serverVersion)}?`}
+            </h2>
             <ul className="text-slate-300 text-sm space-y-1">
+              <li>
+                Lucky gifts: <span className={`font-semibold ${enabledAfterSave ? 'text-green-300' : 'text-slate-200'}`}>{enabledAfterSave ? 'ON' : 'OFF'}</span>
+                {enabledWrite === undefined && <span className="text-slate-500"> (unchanged)</span>}
+              </li>
               <li>Combos: <span className="font-mono">{verdict.config.combos.join(', ')}</span></li>
               <li>Receiver share: <span className="font-mono">{verdict.config.receiverPct}%</span></li>
               <li>Odds: <span className="font-mono">{verdict.config.odds.map((o) => `×${o.multiplier}:${o.weight}`).join('  ')}</span></li>
               <li>Expected multiplier <span className="font-mono">×{verdict.expectedMultiplier.toFixed(3)}</span> against a ceiling of <span className="font-mono">×{verdict.ceiling.toFixed(3)}</span></li>
             </ul>
+            {turningOn && (
+              <div className="space-y-3">
+                <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-lg px-3 py-2 text-sm">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  <p>{LUCKY_ENABLE_WARNING}</p>
+                </div>
+                <label className="flex items-start gap-2 text-slate-200 text-sm cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={legalOk}
+                    onChange={(ev) => setLegalOk(ev.target.checked)}
+                    disabled={saving}
+                    className="mt-0.5 accent-pink-500"
+                  />
+                  <span>I confirm legal clearance (Online Gaming Act 2025) has been obtained for lucky gifts.</span>
+                </label>
+              </div>
+            )}
+            {turningOff && (
+              <p className="text-slate-400 text-sm">
+                From the next settlement every lucky send is refused (&ldquo;Lucky gifts are not available right now.&rdquo;). Normal gifts are not affected.
+              </p>
+            )}
             <p className="text-slate-500 text-xs">
-              Every lucky send from the next settlement onwards rolls on this table. The write is recorded against your account.
+              {enabledAfterSave
+                ? 'Every lucky send from the next settlement onwards rolls on this table.'
+                : 'Lucky gifts stay off: no send rolls on this table until the Owner turns them on.'}
+              {' '}The write is recorded against your account.
             </p>
             <div className="flex gap-3 pt-1">
               <button onClick={() => setConfirming(false)} disabled={saving}
                 className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-2.5 text-sm">
                 Cancel
               </button>
-              <button onClick={() => void handleSave()} disabled={saving}
-                className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/40 text-white font-semibold rounded-lg px-4 py-2.5 text-sm flex items-center justify-center gap-2">
-                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving…</> : 'Save'}
+              <button onClick={() => void handleSave()} disabled={saving || (turningOn && !legalOk)}
+                className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-2.5 text-sm flex items-center justify-center gap-2">
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving…</> : turningOn ? 'Enable and save' : 'Save'}
               </button>
             </div>
           </div>

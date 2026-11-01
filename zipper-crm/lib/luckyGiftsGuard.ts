@@ -17,6 +17,7 @@
  * ── The document: `appConfig/luckyGifts` ─────────────────────────────────────
  *
  *   {
+ *     enabled:     boolean                       // the Owner's switch; OFF unless exactly true
  *     version:     number                        // bumped by the CRM on every save
  *     combos:      number[]                      // integers ≥ 10; default [10, 17, 25, 77]
  *     receiverPct: number                        // 0–100; default 5
@@ -24,6 +25,9 @@
  *                                                // default 5:84, 10:10, 25:4, 50:1.5, 100:0.5
  *     updatedAt, updatedBy                       // written by the CRM
  *   }
+ *
+ * `enabled` is not part of the table and the guard below never reads it; see
+ * "The Owner's switch" at the end of this file.
  *
  * ── The payout guard ─────────────────────────────────────────────────────────
  *
@@ -236,4 +240,51 @@ export function nextVersion(serverVersion: unknown): number {
   const v = typeof serverVersion === 'number' && Number.isFinite(serverVersion) && serverVersion >= 0
     ? Math.floor(serverVersion) : 0
   return v + 1
+}
+
+// ── The Owner's switch ──────────────────────────────────────────────────────
+//
+// A lucky gift is a chance mechanic — diamonds spent on a random reward — and
+// was deliberately left unshipped pending a legal opinion under India's Online
+// Gaming Act 2025. The server (functions/src/luckyGifts.ts) therefore refuses
+// every lucky send, `failed-precondition` / LUCKY_GIFTS_DISABLED, unless the
+// document exists and `enabled` is exactly `true`: an absent document is OFF.
+//
+// Only the Owner (`superadmin`) turns it on or off. Tech edits the table on
+// the same page, and a Tech save writes no `enabled` at all — the write merges,
+// so the stored switch stays as it is (firestore.rules D15 refuses a non-Owner
+// write that changes it). The Owner's own save of the table alone writes no
+// `enabled` either: only a deliberate flip of the toggle is written, so a save
+// never undoes a switch somebody else changed after this page loaded.
+
+/** Shown beside the toggle and again in the confirmation. Verbatim. */
+export const LUCKY_ENABLE_WARNING =
+  'Confirm legal clearance (Online Gaming Act 2025) before enabling. Turning this on lets users spend diamonds on a random reward.'
+
+/** The server's `details.code` while the switch is off, and the sentence the app shows for it. */
+export const LUCKY_GIFTS_DISABLED = 'LUCKY_GIFTS_DISABLED'
+export const LUCKY_GIFTS_DISABLED_MESSAGE = 'Lucky gifts are not available right now.'
+
+/** Is the switch on in this stored document? Exactly `enabled === true`, as the server reads it; absent is off. */
+export function luckyEnabledOf(doc: unknown): boolean {
+  return !!doc && typeof doc === 'object' && (doc as Record<string, unknown>).enabled === true
+}
+
+/** Only the Owner — CRM role `superadmin` — may turn lucky gifts on or off. */
+export function mayToggleLuckyGifts(role: string | null | undefined): boolean {
+  return role === 'superadmin'
+}
+
+/**
+ * What a save writes for `enabled`: the Owner's choice, only when the Owner
+ * flipped it from what the page loaded; otherwise nothing (`undefined`), and
+ * the merge leaves the stored switch as it is.
+ */
+export function enabledToWrite(
+  role: string | null | undefined,
+  loaded: boolean,
+  requested: boolean,
+): boolean | undefined {
+  if (!mayToggleLuckyGifts(role)) return undefined
+  return requested === loaded ? undefined : requested
 }
