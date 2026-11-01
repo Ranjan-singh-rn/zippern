@@ -54,15 +54,234 @@ const db = admin.firestore()
  * Here the server owns the clock. Elapsed time is computed from `startedAt` on
  * the call document, never from a number the caller sends.
  *
+ * ── THE BILLING RULE: WHOLE MINUTES, THE STARTED MINUTE COUNTS ───────────────
+ *
+ * The unit is the minute, priced at `perMinRateDiamonds`. There are no
+ * ten-second increments anywhere any more (the old `TICK_SECONDS` arithmetic
+ * rounded the quoted price up by a third of a percent and is gone).
+ *
+ *   connect   `acceptCall` charges the FIRST FULL MINUTE inside the transaction
+ *             that activates the call: `tickIndex = 1`, `billedThroughMs =
+ *             startedAt + 60 000`. A payer who cannot afford one minute is
+ *             refused and the call is closed with nothing charged.
+ *
+ *   tick      `minutesDue = floor(elapsedSec / 60) + 1` — the minute that has
+ *             started is owed in full. `minutesDue - tickIndex` whole minutes
+ *             are charged, capped by what the payer can afford; if the next
+ *             minute cannot be afforded the call ends at that boundary with
+ *             `endReason: 'insufficient_diamonds'` and the minutes already
+ *             charged stay charged. A tick from the EARNER's device charges
+ *             nothing but refreshes `lastTickAt`, so a payer whose device has
+ *             gone quiet is still billed for the time the earner evidenced.
+ *
+ *   end       `endCall`, the watchdog and a restriction-triggered end all bill
+ *             up to and including the minute in progress at the END INSTANT:
+ *             `max(1, ceil(elapsedSec / 60))`, never a partial minute. The end
+ *             instant is "now" for a hang-up, the moment the gate fired for a
+ *             gated end, and the LAST EVIDENCE OF ACTIVITY (`lastTickAt`, from
+ *             either side) for the watchdog, which closes any call whose last
+ *             tick is older than 120 s.
+ *
+ *   boundary  at exactly 60.000 s a tick owes minute 2 (it has started); an end
+ *             at exactly 60.000 s owes minute 1 only (minute 2 never ran).
+ *
  * ── Idempotency ──────────────────────────────────────────────────────────────
  *
- * `tickIndex` on the call document is the count of ticks already charged. A
- * replayed tick sees its index is behind and charges nothing. Mobile networks
- * drop responses constantly; without this, every dropped response is a double
- * charge on a call that is already costing the user by the minute.
+ * `tickIndex` on the call document is the count of MINUTES already charged. A
+ * replayed tick sees its index is not behind and charges nothing. Mobile
+ * networks drop responses constantly; without this, every dropped response is
+ * a double charge on a call that is already costing the user by the minute.
+ *
+ * Calls connected before this rule shipped carry `tickIndex` in ten-second
+ * ticks and no `billingUnit`; `billedMinutesOf` converts them (rounding up, so
+ * nothing already paid for is charged again) and they finish under this rule.
  */
 
-const TICK_SECONDS = 10
+const MINUTE_MS = 60_000
+
+/** Stamped on every call this code creates or connects. Absent = legacy ticks. */
+const BILLING_UNIT = 'minute'
+
+/** Minutes owed by a tick: the minute that has started counts in full. */
+export function minutesStartedBy(elapsedMs: number): number {
+  const sec = Math.max(0, elapsedMs) / 1000
+  return Math.floor(sec / 60) + 1
+}
+
+/** Minutes owed at an end instant: through the minute in progress, never partial. */
+export function minutesTouchedBy(elapsedMs: number): number {
+  const sec = Math.max(0, elapsedMs) / 1000
+  return Math.max(1, Math.ceil(sec / 60))
+}
+
+/** Minutes already charged on a call document, whichever rule it was connected under. */
+function billedMinutesOf(call: Record<string, any>): number {
+  const index = Math.max(0, Math.floor(Number(call.tickIndex ?? 0)))
+  if (call.billingUnit === BILLING_UNIT) return index
+  // Legacy ten-second ticks. Round UP: the money for a part-minute of ticks
+  // has been taken, so that minute is treated as paid rather than paid twice.
+  return Math.ceil(index / 6)
+}
+
+/** How many of `wanted` whole minutes a balance covers. A free call covers all of them. */
+function affordableMinutes(balance: number, perMin: number, wanted: number): number {
+  if (wanted <= 0) return 0
+  if (perMin <= 0) return wanted
+  return Math.max(0, Math.min(wanted, Math.floor(balance / perMin)))
+}
+
+/** For the payer's screen: further whole minutes the balance covers, or null on a free call. */
+function minutesCoveredBy(balance: number, perMin: number): number | null {
+  return perMin > 0 ? Math.max(0, Math.floor(balance / perMin)) : null
+}
+
+/** Firestore Timestamp → millis, or null when the field is not one. */
+function millisOf(v: unknown): number | null {
+  return v && typeof (v as { toMillis?: unknown }).toMillis === 'function'
+    ? (v as admin.firestore.Timestamp).toMillis()
+    : null
+}
+
+/**
+ * Charge `minutes` whole minutes on a connected call, in the caller's
+ * transaction: payer debited, earner credited, the week bucket and the day's
+ * host stats accrued, the call's counters advanced and the two ledger rows
+ * updated. One function, so `acceptCall`, `tickCall` and settlement cannot
+ * price a minute three different ways.
+ *
+ * ── One ledger row per call per side, not one per minute ─────────────────────
+ *
+ * `users/{uid}/diamondTransactions/call_{callId}` (and the bean twin) is
+ * created when the first minute is charged and MERGED on every later charge:
+ * `amount` increments, `balanceAfter` is replaced, `timestamp` stays the call's
+ * start. The wallet screen streams every row of the collection, so a thirty-
+ * minute call is one row that grows, not thirty rows; and a deterministic id
+ * means a replayed settlement cannot add a second row. The row exists from the
+ * first minute, so a call that dies before settlement still leaves its trail.
+ */
+function chargeMinutes(
+  tx: admin.firestore.Transaction,
+  p: {
+    callId: string
+    call: Record<string, any>
+    callRef: admin.firestore.DocumentReference
+    payerRef: admin.firestore.DocumentReference
+    earnerRef: admin.firestore.DocumentReference
+    payerSnap: admin.firestore.DocumentSnapshot
+    earnerSnap: admin.firestore.DocumentSnapshot
+    startedAt: admin.firestore.Timestamp
+    minutesAlready: number
+    minutes: number
+    /** Extra fields for the call document, written in the same update. */
+    callPatch?: Record<string, any>
+    /**
+     * Settlement only: the closing stamp for the two ledger rows. `totals` is
+     * for a call connected under the old ten-second rule, whose earlier ticks
+     * wrote no row at all — the row is then written with the call's whole
+     * total rather than incremented, so the ledger still equals the balance
+     * change. Firestore applies one write per document per transaction here,
+     * which is why this travels into the same `set` rather than following it.
+     */
+    ledgerFinal?: {
+      durationSeconds: number
+      totals: { diamonds: number; beans: number } | null
+    }
+    /** Settlement only: counters folded into the same day-stats write (e.g. `calls: 1`). */
+    statsExtra?: { calls?: number }
+  },
+): { diamonds: number; beans: number; tickIndex: number; billedThroughMs: number } {
+  const perMin = Math.max(0, Number(p.call.perMinRateDiamonds ?? 0))
+  const pct = Number(p.call.receiverPct ?? 50)
+  const minutes = Math.max(0, Math.floor(p.minutes))
+  const diamonds = minutes * perMin
+  // Floor, not round: never credit a bean that was not paid for.
+  const beans = Math.floor((diamonds * pct) / 100)
+  const tickIndex = p.minutesAlready + minutes
+  const billedThroughMs = p.startedAt.toMillis() + tickIndex * MINUTE_MS
+  const now = admin.firestore.FieldValue.serverTimestamp()
+  const inc = admin.firestore.FieldValue.increment
+
+  tx.update(p.callRef, {
+    tickIndex,
+    billingUnit: BILLING_UNIT,
+    billedThroughMs,
+    diamondsCharged: inc(diamonds),
+    beansCredited: inc(beans),
+    ...(p.callPatch ?? {}),
+  })
+
+  const payerBalanceAfter = Number(p.payerSnap.get('diamonds') ?? 0) - diamonds
+  const earnerBalanceAfter = Number(p.earnerSnap.get('beans') ?? 0) + beans
+  const payerUid = p.payerRef.id
+  const earnerUid = p.earnerRef.id
+
+  if (minutes > 0) {
+    tx.update(p.payerRef, { diamonds: inc(-diamonds) })
+    tx.update(p.earnerRef, {
+      beans: inc(beans),
+      totalBeansEarned: inc(beans),
+      hostCallEarnings: inc(beans),
+    })
+    // Same transaction as the credit — they must not diverge.
+    accrueWeeklyEarning(tx, p.earnerRef, beans, 'call')
+  }
+  // Seconds, not calls: the call is counted once when it ends (`statsExtra`),
+  // but the time has to accumulate as it passes, or a host watching Host Home
+  // during a long call sees nothing move. No `isHost` gate and no level check
+  // here, both deliberately: the level is applied at settlement, which reads
+  // the earner's document for other reasons, and the nightly sweep is the
+  // backstop. One day-stats write per charge, the settlement counter folded in.
+  accrueHostStats(tx, p.earnerRef, {
+    beans, source: 'call', callSeconds: minutes * 60, ...(p.statsExtra ?? {}),
+  })
+
+  // ── Ledger. The gap that loses chargebacks. ──────────────────────────────
+  const totals = p.ledgerFinal?.totals ?? null
+  const ledgerWorthWriting = totals ? totals.diamonds > 0 : (diamonds > 0 || (p.ledgerFinal != null && tickIndex > 0 && perMin > 0))
+  if (!ledgerWorthWriting) return { diamonds, beans, tickIndex, billedThroughMs }
+
+  const label = p.ledgerFinal
+    ? `Video call — ${Math.floor(p.ledgerFinal.durationSeconds / 60)}m ${p.ledgerFinal.durationSeconds % 60}s`
+    : `Video call — ${tickIndex} min`
+  const closing = p.ledgerFinal ? { durationSeconds: p.ledgerFinal.durationSeconds } : {}
+
+  tx.set(p.payerRef.collection('diamondTransactions').doc(`call_${p.callId}`), {
+    type: 'debit',
+    amount: totals ? totals.diamonds : inc(diamonds),
+    balanceAfter: payerBalanceAfter,
+    reason: 'video_call',
+    reasonLabel: label,
+    relatedUid: earnerUid,
+    relatedUserName: p.earnerSnap.get('displayName') ?? p.earnerSnap.get('name') ?? '',
+    callId: p.callId,
+    minutesBilled: tickIndex,
+    ratePerMin: perMin,
+    context: 'call',
+    // The call's start, every time: a merge that re-sets the same value moves
+    // nothing, and the row sorts where the call began.
+    timestamp: p.startedAt,
+    updatedAt: now,
+    ...closing,
+  }, { merge: true })
+  tx.set(p.earnerRef.collection('beanTransactions').doc(`call_${p.callId}`), {
+    type: 'credit',
+    amount: totals ? totals.beans : inc(beans),
+    balanceAfter: earnerBalanceAfter,
+    reason: 'video_call',
+    reasonLabel: label,
+    relatedUid: payerUid,
+    relatedUserName: p.payerSnap.get('displayName') ?? p.payerSnap.get('name') ?? '',
+    callId: p.callId,
+    minutesBilled: tickIndex,
+    receiverPct: pct,
+    context: 'call',
+    timestamp: p.startedAt,
+    updatedAt: now,
+    ...closing,
+  }, { merge: true })
+
+  return { diamonds, beans, tickIndex, billedThroughMs }
+}
 
 interface StartCallRequest {
   peerUid: string
@@ -90,11 +309,12 @@ import {
 } from './mobileSession'
 
 /**
- * P0-6: end reasons decided by the server's tick gate. A call ended for one of
- * these bills NOTHING past the payer's last good tick (no grace), and the
- * reason survives whatever the client sends to `endCall` afterwards.
+ * P0-6: end reasons decided by the server inside `tickCall`. A call ended for
+ * one of these bills through the minute in progress at the moment the server
+ * decided it (`endingAt`), not at whatever later moment the client calls
+ * `endCall`, and the server's reason survives whatever the client sends.
  */
-const GATED_END_REASONS = new Set(['party_restricted', 'session_displaced'])
+const GATED_END_REASONS = new Set(['party_restricted', 'session_displaced', 'insufficient_diamonds'])
 
 
 // ── startCall ────────────────────────────────────────────────────────────────
@@ -168,7 +388,8 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
        * connect-then-drop that reads as a fault in the product.
        *
        * `tickCall` has always debited `payerUid`. This is the same question,
-       * asked before the phone rings instead of sixty seconds after.
+       * asked before the phone rings; `acceptCall` asks it again at pick-up and
+       * answers it by taking the first minute.
        */
       const payerIsCaller = payer === 'caller'
       const payerUser = payerIsCaller ? caller : peer
@@ -204,8 +425,10 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
         // and `tickCall` both derive it that way rather than storing a second
         // field that could drift out of step with this one.
         earner,
-        // Ticks charged so far. The server's only memory of what it has billed.
+        // Minutes charged so far. The server's only memory of what it has billed.
         tickIndex: 0,
+        billingUnit: BILLING_UNIT,
+        billedThroughMs: null,
         diamondsCharged: 0,
         beansCredited: 0,
       })
@@ -232,6 +455,21 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
  *
  * Only the receiver may accept, and only from `ringing`. Accepting twice must
  * not restart the clock and wipe out the time already billed.
+ *
+ * ── The first minute is charged HERE ─────────────────────────────────────────
+ *
+ * The call becomes active and the first full minute is paid in the same
+ * transaction. `startCall` checked that the payer could afford a minute before
+ * the phone rang; this is the same question asked again at the moment it
+ * matters, against the balance as it is now, and answered by taking the money.
+ * A payer who can no longer afford one minute is refused exactly as
+ * `startCall` refuses — `failed-precondition`, the same sentence — and the
+ * ringing call is closed with nothing charged, so neither phone keeps ringing
+ * for a call that cannot happen.
+ *
+ * `startedAt` is the function's clock as a concrete Timestamp rather than the
+ * server-timestamp sentinel: `billedThroughMs` has to be a number the client
+ * can read back, and it is `startedAt + 60 000`.
  */
 export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) => {
     const data = req.data
@@ -244,7 +482,7 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
 
     const callRef = db.collection('calls').doc(callId)
 
-    return db.runTransaction(async (tx) => {
+    const outcome = await db.runTransaction(async (tx) => {
       const snap = await tx.get(callRef)
       if (!snap.exists) throw new HttpsError('not-found', 'That call no longer exists.')
       const call = snap.data() as Record<string, any>
@@ -255,20 +493,108 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
       // Idempotent: a double-tap on Accept returns the existing state rather
       // than resetting startedAt to now and discarding the elapsed time.
       if (call.status === 'connected') {
-        return { callId, status: 'connected', alreadyConnected: true }
+        return {
+          callId, status: 'connected', alreadyConnected: true,
+          minutesBilled: billedMinutesOf(call),
+          billedThroughMs: Number(call.billedThroughMs ?? 0) || null,
+          startedAtMs: millisOf(call.startedAt),
+          perMinRateDiamonds: Number(call.perMinRateDiamonds ?? 0),
+        }
       }
       if (call.status !== 'ringing') {
         throw new HttpsError('failed-precondition', 'This call has already ended.')
       }
 
-      const now = admin.firestore.FieldValue.serverTimestamp()
-      tx.update(callRef, {
-        status:     'connected',
-        startedAt:  now,
-        lastTickAt: now,   // so the watchdog has a baseline from the first second
+      const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
+      const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
+      const payerRef  = db.collection('users').doc(payerUid)
+      const earnerRef = db.collection('users').doc(earnerUid)
+      const [payerSnap, earnerSnap] = await Promise.all([tx.get(payerRef), tx.get(earnerRef)])
+
+      const perMin = Math.max(0, Number(call.perMinRateDiamonds ?? 0))
+      // The receiver is the one accepting; when the receiver is also the payer
+      // the refusal is addressed to them, otherwise it names the caller.
+      const acceptorPays = payerUid === uid
+      const stamp = admin.firestore.FieldValue.serverTimestamp()
+
+      // A ringing call that cannot become a call: closed like a decline, with
+      // the same zero-money history row, and the reason on the document so the
+      // caller's screen learns why it stopped ringing.
+      const closeUnconnected = (endReason: string) => {
+        tx.update(callRef, { status: 'declined', endReason, endedAt: stamp })
+        tx.set(db.collection('callHistory').doc(callId), {
+          ...call,
+          callerUid:   call.callerId,
+          receiverUid: call.receiverId,
+          status: 'declined',
+          endReason,
+          endedAt: stamp,
+          timestamp: stamp,
+          durationSeconds: 0,
+          diamondsCharged: 0,
+          costDiamonds: 0,
+          beansCredited: 0,
+          beansEarned: 0,
+          beneficiaryUid: call.earner ?? null,
+          platformCut: 0,
+        })
+      }
+
+      // Neither side may be restricted at the moment money first moves. The
+      // receiver was checked by the session gate above; the other party was
+      // checked when the call was placed, and a ban in between is rare but is
+      // exactly the case where a first minute must not be taken.
+      const restricted = !payerSnap.exists || !earnerSnap.exists
+        || restrictionVerdict((f) => payerSnap.get(f)) || restrictionVerdict((f) => earnerSnap.get(f))
+      if (restricted) {
+        closeUnconnected('party_restricted')
+        return { refused: new HttpsError('permission-denied', 'This call cannot be connected right now.') }
+      }
+
+      const balance = Number(payerSnap.get('diamonds') ?? 0)
+      if (balance < perMin) {
+        closeUnconnected('insufficient_diamonds')
+        const payerName = payerSnap.get('displayName') ?? payerSnap.get('name') ?? 'They'
+        return {
+          refused: new HttpsError(
+            'failed-precondition',
+            acceptorPays
+              ? `You need ${perMin} diamonds for one minute. You have ${balance}.`
+              : `${payerName} does not have enough diamonds for this call right now.`,
+          ),
+        }
+      }
+
+      const nowMs = Date.now()
+      const startedAt = admin.firestore.Timestamp.fromMillis(nowMs)
+      const charged = chargeMinutes(tx, {
+        callId, call, callRef, payerRef, earnerRef, payerSnap, earnerSnap,
+        startedAt,
+        minutesAlready: 0,
+        minutes: 1,
+        callPatch: {
+          status:     'connected',
+          startedAt,
+          lastTickAt: startedAt,   // so the watchdog has a baseline from the first second
+        },
       })
-      return { callId, status: 'connected', alreadyConnected: false }
+      return {
+        callId,
+        status: 'connected',
+        alreadyConnected: false,
+        startedAtMs: nowMs,
+        minutesBilled: charged.tickIndex,
+        billedThroughMs: charged.billedThroughMs,
+        perMinRateDiamonds: perMin,
+        charged: charged.diamonds,
+        beans: charged.beans,
+      }
     })
+
+    // Thrown after the transaction committed, so the refusal and the closed
+    // call document land together rather than the refusal alone.
+    if ('refused' in outcome) throw outcome.refused
+    return outcome
   })
 
 /** The receiver declines, or lets it ring out. No money moves. */
@@ -360,48 +686,68 @@ export const tickCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) 
         throw new HttpsError('permission-denied', 'Not your call.')
       }
       if (call.status !== 'connected') {
-        return { charged: 0, endNow: call.status === 'ended', status: call.status }
+        // `ending` is the server having already decided: the device should let
+        // go now, and `endCall` is idempotent when it does.
+        return {
+          charged: 0, beans: 0,
+          endNow: call.status === 'ended' || call.status === 'ending',
+          status: call.status,
+          ...(call.endReason ? { endReason: String(call.endReason) } : {}),
+          tickIndex: billedMinutesOf(call),
+          minutesBilled: billedMinutesOf(call),
+        }
       }
 
       const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
       const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
+      const minutesBilled = billedMinutesOf(call)
+      const perMin = Math.max(0, Number(call.perMinRateDiamonds ?? 0))
+      const startedAtMs = millisOf(call.startedAt)
+      const nowMs = Date.now()
+      const stamp = admin.firestore.FieldValue.serverTimestamp()
 
-      // P0-6 (FIN-1): only the PAYER's device vouches for billed time. An
-      // earner's tick used to bill the payer for everything elapsed and keep
-      // `lastTickAt` fresh, so a call stayed billable after the payer's app had
-      // gone. It now moves nothing and refreshes nothing.
+      // The shape every answer shares. Minute fields are additive: `charged`,
+      // `beans`, `endNow`, `status` and `tickIndex` keep their old meaning.
+      const base = {
+        status: call.status,
+        tickIndex: minutesBilled,
+        minutesBilled,
+        perMinRateDiamonds: perMin,
+        startedAtMs,
+        elapsedSeconds: startedAtMs == null ? 0 : Math.max(0, Math.floor((nowMs - startedAtMs) / 1000)),
+        billedThroughMs: startedAtMs == null ? null : startedAtMs + minutesBilled * MINUTE_MS,
+        nextChargeAtMs: startedAtMs == null ? null : startedAtMs + minutesBilled * MINUTE_MS,
+      }
+
+      // A tick from the EARNER's device charges nothing. It does refresh
+      // `lastTickAt`: it is evidence the call is still running, so the watchdog
+      // stays away and, when the call finally ends, settlement bills the quiet
+      // payer through the minute the earner last evidenced (M-8).
       if (uid !== payerUid) {
-        return { charged: 0, endNow: false, status: call.status, tickIndex: Number(call.tickIndex ?? 0) }
+        tx.update(callRef, { lastTickAt: stamp, lastEarnerTickAt: stamp })
+        return { ...base, charged: 0, beans: 0, endNow: false, role: 'earner' }
       }
 
-      const startedAt: admin.firestore.Timestamp | null = call.startedAt ?? null
-      if (!startedAt) return { charged: 0, endNow: false, status: call.status }
-
-      // THE SERVER COMPUTES ELAPSED. Nothing the client sends is used.
-      const elapsedSec = (Date.now() - startedAt.toMillis()) / 1000
-      const ticksDue = Math.floor(elapsedSec / TICK_SECONDS)
-      const ticksCharged = Number(call.tickIndex ?? 0)
-      const outstanding = ticksDue - ticksCharged
-
-      // A replayed tick lands here and charges nothing.
-      if (outstanding <= 0) {
-        return { charged: 0, endNow: false, status: call.status, tickIndex: ticksCharged }
+      if (startedAtMs == null) {
+        return { ...base, charged: 0, beans: 0, endNow: false, role: 'payer' }
       }
 
-      const perMin = Number(call.perMinRateDiamonds ?? 0)
-      const perTick = Math.ceil((perMin * TICK_SECONDS) / 60)
-      const pct = Number(call.receiverPct ?? 50)
+      // THE SERVER COMPUTES ELAPSED. Nothing the client sends is used. The
+      // minute that has started is owed in full.
+      const minutesDue = minutesStartedBy(nowMs - startedAtMs)
+      const outstanding = minutesDue - minutesBilled
 
       const payerRef  = db.collection('users').doc(payerUid)
       const earnerRef = db.collection('users').doc(earnerUid)
 
       const [payerSnap, earnerSnap] = await Promise.all([tx.get(payerRef), tx.get(earnerRef)])
 
-      // P0-6 (FIN-2): a call ends — charging nothing more — when either party
-      // may no longer be on it (banned, suspended, deleting), or when the
-      // payer's sign-in predates the account's cut-off or no longer holds the
-      // session. Ended, not refused: the device can always let go of the call,
-      // and settlement bills only up to the last good tick (see settleAndClose).
+      // P0-6 (FIN-2): a call ends when either party may no longer be on it
+      // (banned, suspended, deleting), or when the payer's sign-in predates the
+      // account's cut-off or no longer holds the session. Ended, not refused:
+      // the device can always let go of the call. The gate instant is stamped
+      // so settlement bills through the minute in progress at THAT moment, not
+      // at whatever later moment the client gets round to calling endCall.
       const restricted = restrictionVerdict((f) => payerSnap.get(f))
         || restrictionVerdict((f) => earnerSnap.get(f))
       const presented = presentedSessionId(data)
@@ -409,65 +755,65 @@ export const tickCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) 
         (payerSnap.get('activeMobileSession') as Record<string, unknown> | undefined)?.sessionId ?? '',
       )
       const displaced = signInPredatesCutoff(
-        payerSnap.get('credentialsValidAfter'), req.auth?.token?.auth_time, Math.floor(Date.now() / 1000),
+        payerSnap.get('credentialsValidAfter'), req.auth?.token?.auth_time, Math.floor(nowMs / 1000),
       ) || (presented !== '' && recordedSession !== '' && presented !== recordedSession)
       if (restricted || displaced) {
         const endReason = restricted ? 'party_restricted' : 'session_displaced'
         logger.warn('tickCall ended a call at the gate', { callId, endReason })
-        tx.update(callRef, { status: 'ending', endReason })
-        return { charged: 0, endNow: true, status: 'ending', tickIndex: ticksCharged, endReason }
+        tx.update(callRef, {
+          status: 'ending', endReason,
+          endingAt: admin.firestore.Timestamp.fromMillis(nowMs),
+          lastTickAt: stamp, lastPayerTickAt: stamp,
+        })
+        return { ...base, charged: 0, beans: 0, endNow: true, status: 'ending', endReason, role: 'payer' }
       }
 
       const payerBalance = Number(payerSnap.get('diamonds') ?? 0)
 
-      // Charge only what they can afford, then end the call.
-      const affordableTicks = Math.min(outstanding, Math.floor(payerBalance / Math.max(perTick, 1)))
-      const endNow = affordableTicks < outstanding
-
-      if (affordableTicks <= 0) {
-        tx.update(callRef, { status: 'ending', endReason: 'diamonds_exhausted' })
-        return { charged: 0, endNow: true, status: 'ending', tickIndex: ticksCharged }
+      // A replayed tick — or simply one inside a minute already paid for —
+      // lands here, charges nothing, and only refreshes the evidence of life.
+      if (outstanding <= 0) {
+        tx.update(callRef, { lastTickAt: stamp, lastPayerTickAt: stamp })
+        return {
+          ...base, charged: 0, beans: 0, endNow: false, role: 'payer',
+          affordableMinutes: minutesCoveredBy(payerBalance, perMin),
+        }
       }
 
-      const diamonds = affordableTicks * perTick
-      const beans = Math.floor((diamonds * pct) / 100)
+      // Charge only the whole minutes they can afford. If that is fewer than
+      // are owed, the call ends at this boundary: the minutes already charged
+      // stay charged, the one that could not be paid for is not started.
+      const affordable = affordableMinutes(payerBalance, perMin, outstanding)
+      const endNow = affordable < outstanding
+      const endPatch = endNow
+        ? {
+            status: 'ending',
+            endReason: 'insufficient_diamonds',
+            endingAt: admin.firestore.Timestamp.fromMillis(nowMs),
+          }
+        : {}
 
-      tx.update(payerRef,  { diamonds: admin.firestore.FieldValue.increment(-diamonds) })
-      tx.update(earnerRef, {
-        beans:            admin.firestore.FieldValue.increment(beans),
-        totalBeansEarned: admin.firestore.FieldValue.increment(beans),
-        hostCallEarnings: admin.firestore.FieldValue.increment(beans),
-      })
-      accrueWeeklyEarning(tx, earnerRef, beans, 'call')
-      // Seconds, not calls: the call is counted once when it ends, but the
-      // time has to accumulate as it passes, or a host watching Host Home
-      // during a long call sees nothing move.
-      //
-      // No `isHost` gate and no level check here, both deliberately. This runs
-      // every ten seconds for every call in progress, and either would mean
-      // reading the earner's user document on each one — a read per tick per
-      // call, to answer a question that does not change during a call. The
-      // level is applied at endCall, which reads that document anyway, and the
-      // nightly sweep is the backstop.
-      accrueHostStats(tx, earnerRef, {
-        beans,
-        source: 'call',
-        callSeconds: affordableTicks * TICK_SECONDS,
-      })
-      tx.update(callRef, {
-        tickIndex:       ticksCharged + affordableTicks,
-        diamondsCharged: admin.firestore.FieldValue.increment(diamonds),
-        beansCredited:   admin.firestore.FieldValue.increment(beans),
-        lastTickAt:      admin.firestore.FieldValue.serverTimestamp(),
-        ...(endNow ? { status: 'ending', endReason: 'diamonds_exhausted' } : {}),
+      const charged = chargeMinutes(tx, {
+        callId, call, callRef, payerRef, earnerRef, payerSnap, earnerSnap,
+        startedAt: admin.firestore.Timestamp.fromMillis(startedAtMs),
+        minutesAlready: minutesBilled,
+        minutes: affordable,
+        callPatch: { lastTickAt: stamp, lastPayerTickAt: stamp, ...endPatch },
       })
 
       return {
-        charged: diamonds,
-        beans,
+        ...base,
+        charged: charged.diamonds,
+        beans: charged.beans,
         endNow,
         status: endNow ? 'ending' : 'connected',
-        tickIndex: ticksCharged + affordableTicks,
+        ...(endNow ? { endReason: 'insufficient_diamonds' } : {}),
+        tickIndex: charged.tickIndex,
+        minutesBilled: charged.tickIndex,
+        billedThroughMs: charged.billedThroughMs,
+        nextChargeAtMs: charged.billedThroughMs,
+        affordableMinutes: minutesCoveredBy(payerBalance - charged.diamonds, perMin),
+        role: 'payer',
       }
     })
   })
@@ -488,8 +834,25 @@ export const endCall = onCall(WARM, async (req: CallableRequest<CallIdRequest & 
 /**
  * Final settlement. Shared by endCall and the watchdog, so a call closed by a
  * crash settles exactly as one closed by a tap.
+ *
+ * Bills through the minute in progress at the END INSTANT, which is:
+ *
+ *   a hang-up            now
+ *   a gated end          `endingAt`, the moment `tickCall` decided it
+ *   the watchdog         `lastTickAt`, the last evidence of activity from
+ *                        either device — two minutes of silence are not billed,
+ *                        but a payer whose device went quiet while the earner's
+ *                        kept ticking is billed for what the earner evidenced
+ *
+ * The amount is capped by the payer's balance: whatever cannot be paid for is
+ * not charged, and the call simply ends.
  */
-async function settleAndClose(callId: string, byUid: string | null, reason: string) {
+async function settleAndClose(
+  callId: string,
+  byUid: string | null,
+  reason: string,
+  opts: { endAt?: 'now' | 'lastTick' } = {},
+) {
   const callRef = db.collection('calls').doc(callId)
   // Outside the transaction: ten-minute-cached config, and a transaction
   // cannot read after its first write.
@@ -504,27 +867,30 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
       throw new HttpsError('permission-denied', 'Not your call.')
     }
     if (call.status === 'ended') {
-      return { alreadyEnded: true, diamondsCharged: call.diamondsCharged ?? 0 }
+      return {
+        alreadyEnded: true,
+        diamondsCharged: call.diamondsCharged ?? 0,
+        beansCredited: call.beansCredited ?? 0,
+        durationSeconds: call.durationSeconds ?? 0,
+        minutesBilled: billedMinutesOf(call),
+      }
     }
 
-    const startedAt: admin.firestore.Timestamp | null = call.startedAt ?? null
+    const startedAtMs = millisOf(call.startedAt)
     const nowMs = Date.now()
-    const durationSeconds = startedAt ? Math.floor((nowMs - startedAt.toMillis()) / 1000) : 0
 
-    // P0-6 (FINANCE-016): bill only time the payer's device vouched for — up
-    // to its last tick plus one tick of grace, never up to "now". The watchdog
-    // runs two minutes after the last tick, and that silence used to be billed
-    // at full rate. A call ended by the tick gate gets no grace at all, and the
-    // server's reason stands over whatever the client sends afterwards.
+    // The server's reason stands over whatever the client sends afterwards,
+    // and the server's end instant stands over "now".
     const gatedEnd = call.status === 'ending' && GATED_END_REASONS.has(String(call.endReason ?? ''))
     const finalReason = gatedEnd ? String(call.endReason) : reason
-    const lastTickMs = typeof call.lastTickAt?.toMillis === 'function'
-      ? call.lastTickAt.toMillis()
-      : (startedAt ? startedAt.toMillis() : nowMs)
-    const billUntilMs = Math.min(nowMs, lastTickMs + (gatedEnd ? 0 : TICK_SECONDS * 1000))
-    const billableSeconds = startedAt
-      ? Math.max(0, Math.floor((billUntilMs - startedAt.toMillis()) / 1000))
-      : 0
+    const lastTickMs = millisOf(call.lastTickAt) ?? startedAtMs ?? nowMs
+    const endingAtMs = millisOf(call.endingAt)
+    let endMs = nowMs
+    if (gatedEnd && endingAtMs != null) endMs = Math.min(endMs, endingAtMs)
+    if (opts.endAt === 'lastTick') endMs = Math.min(endMs, lastTickMs)
+    if (startedAtMs != null) endMs = Math.max(endMs, startedAtMs)
+
+    const durationSeconds = startedAtMs == null ? 0 : Math.max(0, Math.floor((endMs - startedAtMs) / 1000))
 
     const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
     const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
@@ -533,43 +899,54 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
 
     const [payerSnap, earnerSnap] = await Promise.all([tx.get(payerRef), tx.get(earnerRef)])
 
-    // Any whole ticks elapsed but not yet billed. A partial tick is not charged
-    // — billing for time not completed is the kind of thing users screenshot.
-    const perMin  = Number(call.perMinRateDiamonds ?? 0)
-    const perTick = Math.ceil((perMin * TICK_SECONDS) / 60)
-    const pct     = Number(call.receiverPct ?? 50)
-    const ticksDue     = startedAt ? Math.floor(billableSeconds / TICK_SECONDS) : 0
-    const ticksCharged = Number(call.tickIndex ?? 0)
+    // Whole minutes through the one in progress at the end instant, less the
+    // minutes already charged, capped by the balance. Never a partial minute,
+    // and never a minute that was not at least started.
+    const perMin = Math.max(0, Number(call.perMinRateDiamonds ?? 0))
+    const minutesAlready = billedMinutesOf(call)
+    const minutesDue = startedAtMs == null ? 0 : minutesTouchedBy(endMs - startedAtMs)
     const payerBalance = Number(payerSnap.get('diamonds') ?? 0)
-    const finalTicks   = Math.max(0, Math.min(ticksDue - ticksCharged,
-                                               Math.floor(payerBalance / Math.max(perTick, 1))))
-
-    const finalDiamonds = finalTicks * perTick
-    const finalBeans    = Math.floor((finalDiamonds * pct) / 100)
-
-    const totalDiamonds = Number(call.diamondsCharged ?? 0) + finalDiamonds
-    const totalBeans    = Number(call.beansCredited ?? 0) + finalBeans
+    const finalMinutes = affordableMinutes(payerBalance, perMin, minutesDue - minutesAlready)
     const now = admin.firestore.FieldValue.serverTimestamp()
 
-    if (finalDiamonds > 0) {
-      tx.update(payerRef,  { diamonds: admin.firestore.FieldValue.increment(-finalDiamonds) })
-      tx.update(earnerRef, {
-        beans:            admin.firestore.FieldValue.increment(finalBeans),
-        totalBeansEarned: admin.firestore.FieldValue.increment(finalBeans),
-        hostCallEarnings: admin.firestore.FieldValue.increment(finalBeans),
-      })
-      accrueWeeklyEarning(tx, earnerRef, finalBeans, 'call')
+    const finalDiamonds = finalMinutes * perMin
+    const finalBeans    = Math.floor((finalDiamonds * Number(call.receiverPct ?? 50)) / 100)
+    const totalDiamonds = Number(call.diamondsCharged ?? 0) + finalDiamonds
+    const totalBeans    = Number(call.beansCredited ?? 0) + finalBeans
+    // A call connected under the old ten-second rule has no ledger row yet:
+    // its row is written with the whole total, as that rule used to do.
+    const legacy = call.billingUnit !== BILLING_UNIT
+
+    const closingPatch = { status: 'ended', endReason: finalReason, endedAt: now, durationSeconds }
+
+    // One write to the call document: the final minutes, the counters and the
+    // closing fields together. The ledger rows were opened with the first
+    // minute (see chargeMinutes); the same call stamps the final duration on
+    // them.
+    // The call itself is counted once, for a host, whether or not the last
+    // minute earned anything — a call that ended is still a call taken. The
+    // minutes' seconds were accrued as each minute was charged.
+    const earnerIsHost = earnerSnap.get('isHost') === true
+    const charged = startedAtMs == null
+      ? { diamonds: 0, beans: 0, tickIndex: minutesAlready, billedThroughMs: null as number | null }
+      : chargeMinutes(tx, {
+          callId, call, callRef, payerRef, earnerRef, payerSnap, earnerSnap,
+          startedAt: admin.firestore.Timestamp.fromMillis(startedAtMs),
+          minutesAlready,
+          minutes: finalMinutes,
+          callPatch: closingPatch,
+          ledgerFinal: {
+            durationSeconds,
+            totals: legacy ? { diamonds: totalDiamonds, beans: totalBeans } : null,
+          },
+          statsExtra: earnerIsHost ? { calls: 1 } : undefined,
+        })
+    if (startedAtMs == null) {
+      // Never connected (a caller hanging up on a ring): nothing to bill.
+      tx.update(callRef, { ...closingPatch, billingUnit: BILLING_UNIT })
     }
 
-    // The call itself is counted here, once, whether or not the last part-tick
-    // earned anything — a call that ended mid-tick is still a call taken.
-    if (earnerSnap.get('isHost') === true) {
-      accrueHostStats(tx, earnerRef, {
-        beans: finalBeans,
-        source: 'call',
-        callSeconds: finalTicks * TICK_SECONDS,
-        calls: 1,
-      })
+    if (earnerIsHost) {
       applyHostLevel(
         tx,
         earnerRef,
@@ -581,49 +958,6 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
       )
     }
 
-    tx.update(callRef, {
-      status: 'ended',
-      endReason: finalReason,
-      endedAt: now,
-      durationSeconds,
-      diamondsCharged: totalDiamonds,
-      beansCredited: totalBeans,
-      tickIndex: ticksCharged + finalTicks,
-    })
-
-    // ── Ledger. The gap that loses chargebacks. ─────────────────────────────
-    // Calls previously wrote ELEVEN balance changes and not one ledger row.
-    if (totalDiamonds > 0) {
-      tx.set(payerRef.collection('diamondTransactions').doc(), {
-        type: 'debit',
-        amount: totalDiamonds,
-        balanceAfter: payerBalance - finalDiamonds,
-        reason: 'video_call',
-        reasonLabel: `Video call — ${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`,
-        relatedUid: earnerUid,
-        relatedUserName: earnerSnap.get('displayName') ?? earnerSnap.get('name') ?? '',
-        callId,
-        durationSeconds,
-        ratePerMin: perMin,
-        context: 'call',
-        timestamp: now,
-      })
-      tx.set(earnerRef.collection('beanTransactions').doc(), {
-        type: 'credit',
-        amount: totalBeans,
-        balanceAfter: Number(earnerSnap.get('beans') ?? 0) + finalBeans,
-        reason: 'video_call',
-        reasonLabel: `Video call — ${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`,
-        relatedUid: payerUid,
-        relatedUserName: payerSnap.get('displayName') ?? payerSnap.get('name') ?? '',
-        callId,
-        durationSeconds,
-        receiverPct: pct,
-        context: 'call',
-        timestamp: now,
-      })
-    }
-
     // CRM: reports.py:3443 scans platformRevenue for type == 'call'.
     // Field names are the ones it reads — renaming one drops it from the report.
     if (totalDiamonds > 0) {
@@ -632,6 +966,7 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
         callerUid: call.callerId,
         receiverUid: call.receiverId,
         durationSeconds,
+        minutesBilled: charged.tickIndex,
         grossDiamonds: totalDiamonds,
         payoutBeans: totalBeans,
         platformCut: totalDiamonds - totalBeans,
@@ -666,7 +1001,15 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
       platformCut: totalDiamonds - totalBeans,
     })
 
-    return { alreadyEnded: false, durationSeconds, diamondsCharged: totalDiamonds, beansCredited: totalBeans }
+    return {
+      alreadyEnded: false,
+      durationSeconds,
+      diamondsCharged: totalDiamonds,
+      beansCredited: totalBeans,
+      minutesBilled: charged.tickIndex,
+      billedThroughMs: charged.billedThroughMs,
+      endReason: finalReason,
+    }
   })
 }
 
@@ -690,8 +1033,10 @@ const RING_TIMEOUT_SECONDS = 45
  * caller stops being charged and the host is never paid for the time. A
  * force-quit becomes a free call, which is not a bug anyone reports.
  *
- * Two minutes past the last tick is twelve missed ticks — comfortably beyond a
- * tunnel or a lift, and well short of anything a user would notice.
+ * Two minutes past the last tick FROM EITHER SIDE — comfortably beyond a
+ * tunnel or a lift, and well short of anything a user would notice. The call
+ * is then billed through the minute containing that last tick, not through
+ * the silence: `settleAndClose(…, { endAt: 'lastTick' })`.
  *
  * ── THE RINGING HALF, AND THE CHARGE IT PREVENTS ─────────────────────────────
  *
@@ -705,9 +1050,8 @@ const RING_TIMEOUT_SECONDS = 45
  * call re-rings the next time the receiver opens the app — hours or days later.
  * They answer. `acceptCall` accepts any `ringing` call and stamps `startedAt`
  * and `lastTickAt` at that moment. The caller's app is long gone, so nobody
- * ticks — and two minutes later the watchdog above settles the call and charges
- * the caller about twelve ticks for a conversation neither of them had, paying
- * the receiver for it.
+ * ticks — and the first minute is charged at accept, for a conversation
+ * neither of them had, paying the receiver for it.
  *
  * So a ring now expires like a phone: `declineCall`'s own `missed` path, which
  * moves no money and writes the reason, reached from here when nobody picked
@@ -732,7 +1076,7 @@ export const sweepStaleCalls = functions
     let closed = 0
     for (const doc of stale.docs) {
       try {
-        await settleAndClose(doc.id, null, 'watchdog_timeout')
+        await settleAndClose(doc.id, null, 'watchdog_timeout', { endAt: 'lastTick' })
         closed++
       } catch (err) {
         logger.error(`sweepStaleCalls: could not close ${doc.id}`, err)

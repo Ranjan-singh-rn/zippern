@@ -95,7 +95,11 @@ export function project(
     // which day in 2002.
     age: Number(u.age ?? 0),
     level: Number(u.level ?? 0),
-    hostLevel: Number(u.hostLevel ?? 0),
+    // F-16 (LEVEL-003): a host level is a HOST's attribute. For anyone who
+    // does not hold the role it is 0 here — written as 0, not omitted, because
+    // the projection is merged and a stale value would otherwise survive a
+    // revocation.
+    hostLevel: u.isHost === true ? Number(u.hostLevel ?? 0) : 0,
     isHost: u.isHost === true,
     // FX-10 (RF-15): "verified Host" only while they ARE a Host. `revoke_host`
     // clears `isHost` and leaves `isVerifiedHost` (the verification record is
@@ -156,10 +160,14 @@ export function project(
     equippedIdFrame: u.equippedIdFrame ?? '',
     equippedEntrance: u.equippedEntrance ?? '',
     // Feed eligibility. A profile only appears once it is complete, and never
-    // while the account is banned or deleted.
+    // while the account is banned, suspended or deleted. (F-16: a suspension
+    // writes `isSuspended` and `accountState: 'suspended'`; both are checked,
+    // whichever the writer set.)
     isListed:
       u.isProfileComplete === true &&
       u.isBanned !== true &&
+      u.isSuspended !== true &&
+      String(u.accountState ?? '') !== 'suspended' &&
       u.isDeleted !== true,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }
@@ -177,7 +185,7 @@ const WATCHED = [
   'topSupporters', 'topHosts', 'liveRoomId', 'partyRoomId',
   'equippedFrame', 'equippedChatBubble', 'equippedProfileCard',
   'equippedIdFrame', 'equippedEntrance',
-  'isProfileComplete', 'isBanned', 'isDeleted',
+  'isProfileComplete', 'isBanned', 'isSuspended', 'accountState', 'isDeleted',
 ]
 
 export const syncPublicProfile = functions

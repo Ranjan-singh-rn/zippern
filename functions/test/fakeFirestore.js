@@ -127,6 +127,10 @@ class DocRef {
     this.id = id
   }
   get ref() { return this }
+  /** The containing collection (`users/U/weeklyEarnings/W` → `users/U/weeklyEarnings`). */
+  get parent() {
+    return new CollectionRef(this._store, this.path.slice(0, this.path.lastIndexOf('/')))
+  }
   // Subcollections: stored flat under the full path, e.g. 'agencies/A/agencyHosts'.
   collection(name) { return new CollectionRef(this._store, `${this.path}/${name}`) }
   async get() { return new Snapshot(this.id, this._store._docs.get(this.path), this) }
@@ -162,56 +166,106 @@ class DocRef {
   }
 }
 
+/** A comparable scalar: Timestamps by millis, everything else as is. */
+function comparable(v) {
+  return v && typeof v.toMillis === 'function' ? v.toMillis() : v
+}
+
+/** Firestore-style ordering of two scalars (numbers numerically, strings lexically). */
+function compareValues(a, b) {
+  if (a === b) return 0
+  if (a == null) return -1
+  if (b == null) return 1
+  return a < b ? -1 : 1
+}
+
 class Query {
-  constructor(store, collection, filters = [], order = null, limit = null) {
+  constructor(store, collection, filters = [], order = null, limit = null, startAfter = null) {
     this._store = store
     this._collection = collection
     this._filters = filters
     this._order = order
     this._limit = limit
+    this._startAfter = startAfter
   }
   where(field, op, value) {
     // `array-contains` added deliberately (RC invitation clean-up): an array
     // field holding `value` (strict equality), exactly Firestore's semantics
     // for a scalar operand. Anything that is not an array never matches.
-    if (op !== '==' && op !== '<=' && op !== 'array-contains') {
+    // `<` and `in` added deliberately (minute billing): the call watchdog
+    // selects `status in [connected, ending]` and `lastTickAt < cutoff`.
+    if (!['==', '<=', '<', 'in', 'array-contains'].includes(op)) {
       throw new Error(`fakeFirestore: unsupported operator "${op}" — add it deliberately`)
     }
     return new Query(this._store, this._collection,
-      [...this._filters, { field, op, value }], this._order, this._limit)
+      [...this._filters, { field, op, value }], this._order, this._limit, this._startAfter)
   }
   orderBy(field, dir = 'asc') {
-    return new Query(this._store, this._collection, this._filters, { field, dir }, this._limit)
+    return new Query(this._store, this._collection, this._filters, { field, dir }, this._limit,
+      this._startAfter)
   }
   limit(n) {
-    return new Query(this._store, this._collection, this._filters, this._order, n)
+    return new Query(this._store, this._collection, this._filters, this._order, n, this._startAfter)
+  }
+  /**
+   * Cursor by document snapshot (the only form the handlers use). Added
+   * deliberately for the paginated weekly release: rows are skipped through
+   * the cursor's position in the ordering — the order field's value, then the
+   * path as the tie-break, which is what Firestore's implicit `__name__` does.
+   */
+  startAfter(snapshot) {
+    if (!snapshot || !snapshot.ref) {
+      throw new Error('fakeFirestore: startAfter takes a document snapshot — add other forms deliberately')
+    }
+    return new Query(this._store, this._collection, this._filters, this._order, this._limit, snapshot)
   }
   async get() {
-    const prefix = `${this._collection}/`
-    let rows = [...this._store._docs.entries()]
-      // Direct children only — a subcollection doc is not a member of its parent's collection.
-      .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
-      .map(([p, d]) => ({ id: p.slice(prefix.length), data: d, path: p }))
+    const isGroup = typeof this._collection === 'object' && this._collection.group
+    let rows
+    if (isGroup) {
+      // A collection group: every document whose parent collection has this name,
+      // at any depth.
+      const name = this._collection.group
+      rows = [...this._store._docs.entries()]
+        .filter(([p]) => { const s = p.split('/'); return s.length >= 2 && s[s.length - 2] === name })
+        .map(([p, d]) => ({ id: p.split('/').pop(), data: d, path: p }))
+    } else {
+      const prefix = `${this._collection}/`
+      rows = [...this._store._docs.entries()]
+        // Direct children only — a subcollection doc is not a member of its parent's collection.
+        .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
+        .map(([p, d]) => ({ id: p.slice(prefix.length), data: d, path: p }))
+    }
 
     for (const f of this._filters) {
       rows = rows.filter((r) => {
         const v = r.data[f.field]
         if (f.op === '==') return v === f.value
+        if (f.op === 'in') return Array.isArray(f.value) && f.value.includes(v)
         if (f.op === 'array-contains') return Array.isArray(v) && v.includes(f.value)
-        const a = v && typeof v.toMillis === 'function' ? v.toMillis() : v
-        const b = f.value && typeof f.value.toMillis === 'function'
-          ? f.value.toMillis() : f.value
-        return a != null && a <= b
+        const a = comparable(v)
+        const b = comparable(f.value)
+        if (a == null) return false
+        return f.op === '<' ? a < b : a <= b
       })
     }
-    if (this._order) {
-      const { field, dir } = this._order
-      rows.sort((x, y) => {
-        const a = x.data[field], b = y.data[field]
-        const av = a && typeof a.toMillis === 'function' ? a.toMillis() : (a ?? 0)
-        const bv = b && typeof b.toMillis === 'function' ? b.toMillis() : (b ?? 0)
-        return dir === 'desc' ? bv - av : av - bv
-      })
+    const orderField = this._order ? this._order.field : null
+    const dir = this._order ? this._order.dir : 'asc'
+    const sign = dir === 'desc' ? -1 : 1
+    const position = (r) => [orderField ? comparable(r.data[orderField]) : null, r.path]
+    const compareRows = (x, y) => {
+      const [xa, xp] = position(x), [ya, yp] = position(y)
+      const c = compareValues(xa, ya)
+      return c !== 0 ? sign * c : compareValues(xp, yp)
+    }
+    if (this._order) rows.sort(compareRows)
+    if (this._startAfter) {
+      const cursor = {
+        path: this._startAfter.ref.path,
+        data: this._startAfter.data() || {},
+      }
+      if (!this._order) rows.sort(compareRows)
+      rows = rows.filter((r) => compareRows(r, cursor) > 0)
     }
     if (this._limit != null) rows = rows.slice(0, this._limit)
 
@@ -226,6 +280,14 @@ class CollectionRef extends Query {
   constructor(store, name) {
     super(store, name)
     this._name = name
+  }
+  get path() { return this._name }
+  /** The owning document for a subcollection, `null` at the top level — as the SDK. */
+  get parent() {
+    const i = this._name.lastIndexOf('/')
+    if (i < 0) return null
+    const docPath = this._name.slice(0, i)
+    return new DocRef(this._store, docPath, docPath.slice(docPath.lastIndexOf('/') + 1))
   }
   doc(id) {
     const key = id || nextId()
@@ -254,6 +316,8 @@ class FakeFirestore {
     this._forced = []          // [{ prefix, remaining }]
   }
   collection(name) { return new CollectionRef(this, name) }
+  /** Every `{name}` subcollection at any depth. Added deliberately for the weekly release. */
+  collectionGroup(name) { return new Query(this, { group: name }) }
 
   _bump(path) { this._versions.set(path, (this._versions.get(path) || 0) + 1) }
   _version(path) { return this._versions.get(path) || 0 }

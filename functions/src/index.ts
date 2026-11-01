@@ -28,6 +28,8 @@ import { assertActiveSession } from './mobileSession'
 import { activeHostRefusal } from './hostEligibility'
 import { rosterRowIsCurrent } from './roster'
 import { SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
+import { isoWeekLabelUtc } from './time'
+import { deriveAgoraUid } from './agoraUid'
 
 const asiaFirestore = functions.region('asia-south1').firestore
 // The Firestore triggers that send email: the same region, plus the SendGrid
@@ -972,10 +974,10 @@ export const weeklyPayoutReportGenerator = functions
     const weekStartMs = nowMs - 7 * 24 * 60 * 60 * 1000
     const weekStart = admin.firestore.Timestamp.fromMillis(weekStartMs)
 
-    const weekDate = new Date(weekStartMs)
-    const year = weekDate.getUTCFullYear()
-    const weekNum = getISOWeekNumber(weekDate)
-    const weekLabel = `${year}-W${String(weekNum).padStart(2, '0')}`
+    // ISO week AND ISO week-year (F-4 / M-7, FINANCE-009): the year comes from
+    // the week's Thursday, so the run of 10 Jan 2027 labels the closed week
+    // `2026-W53` — a label the commission API accepts — rather than `2027-W53`.
+    const weekLabel = isoWeekLabelUtc(new Date(weekStartMs))
 
     const economy = await readEconomySettings()
 
@@ -2049,9 +2051,20 @@ export const onPayoutApproved = asiaFirestore
  *                               applies)
  *   calls/{channelName}       → only the two parties, both publishing
  *
- * An unknown channel gets SUBSCRIBER. It cannot be a room or a call, so there
- * is nothing there to publish into, and refusing outright would break any
- * channel shape added later before this function learns about it.
+ * A channel that resolves to none of these is REFUSED (`not-found`). It used
+ * to get a SUBSCRIBER token on the theory that there was nothing to publish
+ * into; but a token is a credential, and one for a channel this function
+ * cannot vouch for is one it should not sign. A channel shape added later has
+ * to be taught here first.
+ *
+ * ── The uid is the server's (F-6) ────────────────────────────────────────────
+ *
+ * Never 0, and never the client's number. `uid` is derived from the Firebase
+ * uid (`agoraUid.ts`) and returned, and the app joins with the uid it is
+ * handed. A party seat keeps its seat uid. Re-issuing a token for a room or
+ * call the caller is still in — the renewal before the one-hour expiry — is
+ * just this call again: it reads, it signs, it writes nothing, and the uid is
+ * the same one.
  */
 export const generateAgoraToken = functions
   .region('asia-south1')
@@ -2064,17 +2077,17 @@ export const generateAgoraToken = functions
   await assertActiveSession(callerUid, data, 'generateAgoraToken', context.auth?.token)   // Phase 1A (SESSION-001/003)
   const channelName: string = data.channelName
   /*
-   * Mutable, because for a party seat the SERVER decides the Agora uid.
+   * The SERVER decides the Agora uid, for every channel.
    *
-   * The client used to send it and this function signed whatever arrived. For a
-   * party that is the one number that must not be self-declared: every other
-   * client in the room binds a seat's video tile to `agoraUid`, so a client that
-   * asked for a token on somebody else's seat index would appear in their tile.
-   * The seat document is the authority, and it is read a few lines below.
+   * The client used to send it and this function signed whatever arrived —
+   * `0` from the app, which `agora-access-token` signs as "any uid". For a
+   * party the seat document is the authority: every other client in the room
+   * binds a seat's video tile to `agoraUid`, so the seat index replaces this
+   * a few lines below. Everywhere else the account's derived uid stands.
    */
-  let uid: number = (data.uid as number) || 0
+  let uid: number = deriveAgoraUid(callerUid)
 
-  if (!channelName) {
+  if (!channelName || typeof channelName !== 'string') {
     throw new functions.https.HttpsError('invalid-argument', 'channelName is required.')
   }
 
@@ -2228,10 +2241,12 @@ export const generateAgoraToken = functions
       .get()
     role = seat.empty ? RtcRole.SUBSCRIBER : RtcRole.PUBLISHER
     if (!seat.empty) {
-      // Publish on the seat index, not on 0. Every client binds that seat's tile
-      // to this uid, so a mismatch renders a black rectangle on four other
-      // phones.
-      uid = Number(seat.docs[0].get('agoraUid') ?? seat.docs[0].id) || 0
+      // Publish on the seat index, not on the derived uid. Every client binds
+      // that seat's tile to this uid, so a mismatch renders a black rectangle
+      // on four other phones. A seat whose uid is unusable keeps the derived
+      // one rather than falling to 0 — 0 is never signed.
+      const seatUid = Number(seat.docs[0].get('agoraUid') ?? seat.docs[0].id)
+      if (Number.isInteger(seatUid) && seatUid > 0) uid = seatUid
     }
   } else {
     const callSnap = await db.collection('calls').doc(channelName).get()
@@ -2272,6 +2287,16 @@ export const generateAgoraToken = functions
     }
   }
 
+  if (channelKind === 'unknown') {
+    functions.logger.info('agora: refused an unresolved channel', { channelName, callerUid })
+    throw new functions.https.HttpsError('not-found', 'No such room or call.')
+  }
+  if (!Number.isInteger(uid) || uid <= 0) {
+    // Cannot happen — the derivation and the seat guard above both exclude it —
+    // but a token for uid 0 is the exact thing this function must never sign.
+    throw new functions.https.HttpsError('internal', 'Could not assign a media uid.')
+  }
+
   const currentTs = Math.floor(Date.now() / 1000)
   const privilegeExpiredTs = currentTs + 3600 // 1 hour
 
@@ -2296,20 +2321,21 @@ export const generateAgoraToken = functions
   // Android app carries it in BuildConfig — and returning it means a caller
   // that is not the app (the CRM's moderation player) needs no second channel
   // to configure, and cannot drift onto the wrong project's id.
-  return { token, appId, expiresAt: privilegeExpiredTs * 1000 }
+  //
+  // `uid` is the number the token was signed for: THE CLIENT MUST JOIN WITH
+  // IT. Joining with any other number (0 included) is refused by Agora.
+  return {
+    token,
+    appId,
+    uid,
+    channelName,
+    role: role === RtcRole.PUBLISHER ? 'publisher' : 'subscriber',
+    expiresAt: privilegeExpiredTs * 1000,
+  }
 })
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UTILITY: ISO week number
-// ─────────────────────────────────────────────────────────────────────────────
-
-function getISOWeekNumber(date: Date): number {
-  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
-  const dayNum = d.getUTCDay() || 7
-  d.setUTCDate(d.getUTCDate() + 4 - dayNum)
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
-  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7)
-}
+// The ISO week label (week AND week-year) lives in ./time as `isoWeekLabelUtc`,
+// shared with the payout week key so the two cannot disagree on the year.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. AGENCY REGISTERED — send "Registration received" email

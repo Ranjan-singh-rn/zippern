@@ -29,12 +29,31 @@ export function istDateKey(at: Date = new Date()): string {
  */
 export function istWeekKey(at: Date = new Date()): string {
   const ist = new Date(at.getTime() + IST_OFFSET_MIN * 60 * 1000)
-  const d = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()))
+  return isoWeekLabelUtc(ist)
+}
+
+/**
+ * `2026-W53` — the ISO week of a UTC calendar date, with the ISO WEEK-YEAR.
+ *
+ * The year is taken from the Thursday of the week, not from the date itself.
+ * That is the whole of ISO 8601's rule and the whole of FINANCE-009 / M-7:
+ * the week starting Monday 28 Dec 2026 contains Thursday 31 Dec 2026, so it
+ * is 2026-W53; the week starting Monday 4 Jan 2027 is 2027-W01; and Sunday
+ * 3 Jan 2027 still belongs to 2026-W53. Taking `getUTCFullYear()` of the date
+ * itself labels the first of those `2027-W53` — a week that does not exist,
+ * which the commission API refuses and nothing accrues.
+ *
+ * Shared by `istWeekKey` (payout weeks, cut in IST) and the weekly report's
+ * label in index.ts (cut in UTC), so the two cannot disagree on the year.
+ */
+export function isoWeekLabelUtc(at: Date): string {
+  const d = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()))
   const day = d.getUTCDay() || 7
-  d.setUTCDate(d.getUTCDate() + 4 - day)
-  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+  d.setUTCDate(d.getUTCDate() + 4 - day)          // the Thursday of this ISO week
+  const isoYear = d.getUTCFullYear()               // the week-year is the Thursday's year
+  const yearStart = new Date(Date.UTC(isoYear, 0, 1))
   const week = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
-  return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+  return `${isoYear}-W${String(week).padStart(2, '0')}`
 }
 
 export { IST_OFFSET_MIN }

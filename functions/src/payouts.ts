@@ -78,7 +78,30 @@ export function accrueWeeklyEarning(
  * A week is skipped, not lost, when the host is unverified or has an open
  * dispute. Skipping leaves `released: false`, so the next run picks it up once
  * the block clears and the host is paid everything they earned.
+ *
+ * ── M-3 / F-2 (FINANCE-007): the week document is read INSIDE the transaction
+ *
+ * The amount used to come from the query's snapshot and the transaction read
+ * only the user document, so Firestore had nothing to detect a conflict on:
+ * a second overlapping run (Scheduler delivers at least once; a manual re-run
+ * is one click) released the same week twice, and a `convertBeans` that drew
+ * the week down between the query and the transaction was ignored, releasing
+ * beans the host had already turned into diamonds. `beansAvailable` is exactly
+ * what the withdrawal pays against. Now the week is re-read with `tx.get`,
+ * a week already `released` is left alone, and the FRESH `beans` figure is
+ * what is released. (`convertBeans` decrements `beans` and tracks the amount
+ * in `convertedBeans`, so `beans` is already net of conversions; it is used
+ * as is, and `convertedBeans` goes on the statement.)
+ *
+ * ── Pagination ───────────────────────────────────────────────────────────────
+ *
+ * A single `limit(500)` left the 501st pending week for next Monday. The
+ * query is now walked with a cursor until it comes back empty. Held weeks
+ * stay `released: false` and would be returned again on every page, which is
+ * why the cursor — not "query again" — is what moves the walk forward.
  */
+const RELEASE_PAGE_SIZE = 500
+
 export const releaseBeansForWeek = functions
   .region('asia-south1')
   .runWith({ timeoutSeconds: 540, memory: '512MB' })
@@ -89,12 +112,6 @@ export const releaseBeansForWeek = functions
     // because the host was blocked at the time.
     const cutoff = istWeekKey(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
 
-    const pending = await db.collectionGroup('weeklyEarnings')
-      .where('released', '==', false)
-      .where('weekKey', '<=', cutoff)
-      .limit(500)
-      .get()
-
     // One read for the whole run. Every statement in this batch is settled at
     // the same rate, which is also what makes a week's figure reproducible.
     const cfgSnap = await db.collection('appConfig').doc('economy').get()
@@ -102,137 +119,185 @@ export const releaseBeansForWeek = functions
       (cfgSnap.get('giftRates') as Record<string, any> | undefined)?.beanToInrRate ?? 0.01,
     )
 
-    let released = 0, skipped = 0, beansTotal = 0
+    let released = 0, skipped = 0, beansTotal = 0, seen = 0
+    let cursor: admin.firestore.QueryDocumentSnapshot | null = null
 
-    for (const doc of pending.docs) {
-      const userRef = doc.ref.parent.parent
-      if (!userRef) continue
-      const beans = Number(doc.get('beans') ?? 0)
-      if (beans <= 0) {
-        await doc.ref.update({ released: true, releasedAt: admin.firestore.FieldValue.serverTimestamp() })
-        continue
-      }
+    // Page by cursor until the query comes back empty. Held weeks stay
+    // `released: false` and would be returned again by a plain re-query;
+    // the cursor is what moves past them.
+    for (;;) {
+      let query = db.collectionGroup('weeklyEarnings')
+        .where('released', '==', false)
+        .where('weekKey', '<=', cutoff)
+        .orderBy('weekKey')
+        .limit(RELEASE_PAGE_SIZE)
+      if (cursor) query = query.startAfter(cursor)
+      const page = await query.get()
+      if (page.empty) break
+      cursor = page.docs[page.docs.length - 1]
+      seen += page.size
 
-      try {
-        await db.runTransaction(async (tx) => {
-          const userSnap = await tx.get(userRef)
-          if (!userSnap.exists) return
-
-          // Unverified hosts accrue but are not paid. Sending money to an
-          // identity nobody has confirmed is the exposure India's AML rules
-          // exist for, and it is also the strongest reason to get verified.
-          if (userSnap.get('isVerifiedHost') !== true) {
-            throw new Error('SKIP_UNVERIFIED')
-          }
-          if (userSnap.get('payoutHold') === true) {
-            throw new Error('SKIP_HOLD')
-          }
-
-          tx.update(userRef, {
-            beansAvailable: admin.firestore.FieldValue.increment(beans),
-          })
-          tx.update(doc.ref, {
-            released: true,
-            releasedAt: admin.firestore.FieldValue.serverTimestamp(),
-            skippedReason: admin.firestore.FieldValue.delete(),
-          })
-          tx.set(userRef.collection('beanTransactions').doc(), {
-            type: 'release',
-            amount: beans,
-            reason: 'weekly_release',
-            reasonLabel: `Earnings for ${doc.get('weekKey')} released for withdrawal`,
-            weekKey: doc.get('weekKey'),
-            context: 'payout',
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          })
-
-          // ── The statement ───────────────────────────────────────────────
-          //
-          // `weeklyStatements`, not `hostPayouts`: a top-level `hostPayouts`
-          // collection already exists for the CRM's weekly payout report, and
-          // two different things under one name is how somebody later reads the
-          // wrong rule and grants finance access to a host's own subcollection.
-          //
-          // A host asking "why is this week ₹4,200 and last week ₹5,100" needs
-          // the split, not a total. Gift beans, call beans, and what they
-          // converted away — the converted figure especially, because those
-          // beans left the payout pool by the host's own choice and its
-          // absence is the most common reason a week looks short.
-          //
-          // Written at release rather than assembled on demand: the rate can
-          // change, and a statement that silently revalues a settled week is
-          // worse than no statement.
-          const weekKey = String(doc.get('weekKey'))
-          tx.set(
-            userRef.collection('weeklyStatements').doc(weekKey),
-            {
-              weekKey,
-              status: 'released',
-              beansReleased: beans,
-              giftBeans: Number(doc.get('giftBeans') ?? 0),
-              callBeans: Number(doc.get('callBeans') ?? 0),
-              //: Beans earned this week that the host converted to diamonds.
-              //: They are not payable — see convertBeans — and the statement
-              //: says so rather than leaving an unexplained shortfall.
-              convertedBeans: Number(doc.get('convertedBeans') ?? 0),
-              beanToInrRate: rateInr,
-              amountInr: Math.round(beans * rateInr * 100) / 100,
-              releasedAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true },
-          )
-        })
-        released++
-        beansTotal += beans
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        if (msg.startsWith('SKIP_')) {
+      for (const doc of page.docs) {
+        const outcome = await releaseWeek(doc, rateInr)
+        if (outcome.kind === 'released') {
+          released++
+          beansTotal += outcome.beans
+        } else if (outcome.kind === 'held') {
           skipped++
-          // Outside the transaction, on purpose. The SKIP_ throw is how the
-          // release is abandoned, and it rolls back everything the transaction
-          // did — so a statement written inside it would never survive. The
-          // first version of this did exactly that, and the held weeks would
-          // have been invisible to the host they were being held from.
-          const why = msg === 'SKIP_UNVERIFIED' ? 'unverified' : 'dispute_hold'
-          const weekKey = String(doc.get('weekKey'))
-          try {
-            await Promise.all([
-              doc.ref.update({
-                skippedReason: why,
-                lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
-              }),
-              userRef.collection('weeklyStatements').doc(weekKey).set(
-                {
-                  weekKey,
-                  status: 'held',
-                  heldReason: why,
-                  beansPending: beans,
-                  giftBeans: Number(doc.get('giftBeans') ?? 0),
-                  callBeans: Number(doc.get('callBeans') ?? 0),
-                  convertedBeans: Number(doc.get('convertedBeans') ?? 0),
-                  //: Held, not lost. The next run picks this week up once the
-                  //: block clears, and the host is paid all of it. Saying so
-                  //: is the difference between an instruction and a loss.
-                  willReleaseWhenCleared: true,
-                  lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
-                },
-                { merge: true },
-              ),
-            ])
-          } catch (writeErr) {
-            functions.logger.error(`releaseBeansForWeek: could not mark ${doc.ref.path} held`, writeErr)
-          }
-          continue
         }
-        functions.logger.error(`releaseBeansForWeek: ${doc.ref.path}`, err)
       }
+
+      if (page.size < RELEASE_PAGE_SIZE) break
     }
 
     functions.logger.info(
-      `releaseBeansForWeek: released ${released} week(s) totalling ${beansTotal} beans; ${skipped} skipped`,
+      `releaseBeansForWeek: released ${released} week(s) totalling ${beansTotal} beans; ` +
+      `${skipped} skipped; ${seen} pending week(s) examined`,
     )
     return null
   })
+
+type ReleaseOutcome =
+  | { kind: 'released'; beans: number }
+  | { kind: 'already' | 'no_user' | 'empty' | 'held' | 'failed' }
+
+/**
+ * One week's release, as one transaction. Returns what happened rather than
+ * throwing, so the page loop can count and carry on.
+ */
+async function releaseWeek(
+  doc: admin.firestore.QueryDocumentSnapshot,
+  rateInr: number,
+): Promise<ReleaseOutcome> {
+  const userRef = doc.ref.parent.parent
+  if (!userRef) return { kind: 'no_user' }
+
+  try {
+    return await db.runTransaction(async (tx): Promise<ReleaseOutcome> => {
+      // The week document itself, fresh: this is what makes the release
+      // transactional. Anything that changed it since the query — another run
+      // of this job, a conversion — is seen here, or aborts the commit.
+      const [userSnap, weekSnap] = await Promise.all([tx.get(userRef), tx.get(doc.ref)])
+      if (!weekSnap.exists || weekSnap.get('released') === true) return { kind: 'already' }
+      if (!userSnap.exists) return { kind: 'no_user' }
+
+      const beans = Number(weekSnap.get('beans') ?? 0)
+      if (beans <= 0) {
+        tx.update(doc.ref, { released: true, releasedAt: admin.firestore.FieldValue.serverTimestamp() })
+        return { kind: 'empty' }
+      }
+
+      // Unverified hosts accrue but are not paid. Sending money to an
+      // identity nobody has confirmed is the exposure India's AML rules
+      // exist for, and it is also the strongest reason to get verified.
+      if (userSnap.get('isVerifiedHost') !== true) {
+        throw new Error('SKIP_UNVERIFIED')
+      }
+      if (userSnap.get('payoutHold') === true) {
+        throw new Error('SKIP_HOLD')
+      }
+
+      tx.update(userRef, {
+        beansAvailable: admin.firestore.FieldValue.increment(beans),
+      })
+      tx.update(doc.ref, {
+        released: true,
+        releasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        skippedReason: admin.firestore.FieldValue.delete(),
+      })
+      tx.set(userRef.collection('beanTransactions').doc(), {
+        type: 'release',
+        amount: beans,
+        reason: 'weekly_release',
+        reasonLabel: `Earnings for ${weekSnap.get('weekKey')} released for withdrawal`,
+        weekKey: weekSnap.get('weekKey'),
+        context: 'payout',
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      })
+
+      // ── The statement ─────────────────────────────────────────────────────
+      //
+      // `weeklyStatements`, not `hostPayouts`: a top-level `hostPayouts`
+      // collection already exists for the CRM's weekly payout report, and
+      // two different things under one name is how somebody later reads the
+      // wrong rule and grants finance access to a host's own subcollection.
+      //
+      // A host asking "why is this week ₹4,200 and last week ₹5,100" needs
+      // the split, not a total. Gift beans, call beans, and what they
+      // converted away — the converted figure especially, because those
+      // beans left the payout pool by the host's own choice and its
+      // absence is the most common reason a week looks short.
+      //
+      // Written at release rather than assembled on demand: the rate can
+      // change, and a statement that silently revalues a settled week is
+      // worse than no statement.
+      const weekKey = String(weekSnap.get('weekKey'))
+      tx.set(
+        userRef.collection('weeklyStatements').doc(weekKey),
+        {
+          weekKey,
+          status: 'released',
+          beansReleased: beans,
+          giftBeans: Number(weekSnap.get('giftBeans') ?? 0),
+          callBeans: Number(weekSnap.get('callBeans') ?? 0),
+          //: Beans earned this week that the host converted to diamonds.
+          //: They are not payable — see convertBeans — and the statement
+          //: says so rather than leaving an unexplained shortfall.
+          convertedBeans: Number(weekSnap.get('convertedBeans') ?? 0),
+          beanToInrRate: rateInr,
+          amountInr: Math.round(beans * rateInr * 100) / 100,
+          releasedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      )
+      return { kind: 'released', beans }
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!msg.startsWith('SKIP_')) {
+      functions.logger.error(`releaseBeansForWeek: ${doc.ref.path}`, err)
+      return { kind: 'failed' }
+    }
+    // Outside the transaction, on purpose. The SKIP_ throw is how the
+    // release is abandoned, and it rolls back everything the transaction
+    // did — so a statement written inside it would never survive. The
+    // first version of this did exactly that, and the held weeks would
+    // have been invisible to the host they were being held from.
+    const why = msg === 'SKIP_UNVERIFIED' ? 'unverified' : 'dispute_hold'
+    const weekKey = String(doc.get('weekKey'))
+    try {
+      // Re-read rather than reuse the query's figure: the hold statement
+      // says what is pending NOW, and the week may have moved since.
+      const fresh = await doc.ref.get()
+      await Promise.all([
+        doc.ref.update({
+          skippedReason: why,
+          lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }),
+        userRef.collection('weeklyStatements').doc(weekKey).set(
+          {
+            weekKey,
+            status: 'held',
+            heldReason: why,
+            beansPending: Number(fresh.get('beans') ?? 0),
+            giftBeans: Number(fresh.get('giftBeans') ?? 0),
+            callBeans: Number(fresh.get('callBeans') ?? 0),
+            convertedBeans: Number(fresh.get('convertedBeans') ?? 0),
+            //: Held, not lost. The next run picks this week up once the
+            //: block clears, and the host is paid all of it. Saying so
+            //: is the difference between an instruction and a loss.
+            willReleaseWhenCleared: true,
+            lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        ),
+      ])
+    } catch (writeErr) {
+      functions.logger.error(`releaseBeansForWeek: could not mark ${doc.ref.path} held`, writeErr)
+    }
+    return { kind: 'held' }
+  }
+}
 
 /**
  * What a host may withdraw right now, and why the rest is not available yet.

@@ -30,6 +30,9 @@ const HOT = { region: 'asia-south1' as const, minInstances: MIN_INSTANCES }
 import { accrueWeeklyEarning } from './payouts'
 import { accrueHostStats, applyHostLevel, getHostLadder } from './hostStats'
 import { assertActiveSession } from './mobileSession'
+import {
+  isLuckyGift, luckyRollHash, luckySettlement, resolveLuckyConfig, rollLuckyMultiplier,
+} from './luckyGifts'
 
 const db = admin.firestore()
 
@@ -54,6 +57,17 @@ const db = admin.firestore()
  * showcases, the pair aggregate and the fan total. If any subset could land
  * without the others, the public totals would drift from the ledger and there
  * would be no way to tell which was right. They commit together or not at all.
+ *
+ * ── Lucky gifts ──────────────────────────────────────────────────────────────
+ *
+ * A gift whose catalogue entry is `category: 'lucky'` is sent as a COMBO, not
+ * a quantity: the request carries `combo` (one of `appConfig/luckyGifts
+ * .combos`), the sender pays `unit × combo`, the receiver earns
+ * `floor(unit × combo × receiverPct / 100)` through exactly the paths a normal
+ * gift uses, and the sender is credited a REWARD of `multiplier × unit`
+ * diamonds in the same transaction, the multiplier drawn server-side from the
+ * configured odds. The configuration, the payout guard and the roll live in
+ * `luckyGifts.ts`. A normal gift is settled exactly as before.
  */
 
 const GIFT_CONTEXTS = ['live', 'call', 'dm', 'party'] as const
@@ -62,7 +76,10 @@ type GiftContext = typeof GIFT_CONTEXTS[number]
 interface SettleGiftRequest {
   giftId: string
   receiverUid: string
-  quantity: number
+  /** Normal gifts: how many. Omitted (or 1, or equal to `combo`) for a lucky combo. */
+  quantity?: number
+  /** Lucky gifts only: one of the configured combos. The server rejects any other value. */
+  combo?: number
   context: GiftContext
   roomId?: string
   /**
@@ -91,7 +108,9 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
     // caller presents a session id that is not the account's active one.
     await assertActiveSession(senderUid, data, 'settleGift', context.auth?.token)
 
-    const { giftId, receiverUid, quantity, context: giftContext, roomId, idempotencyKey } = data ?? {}
+    const { giftId, receiverUid, context: giftContext, roomId, idempotencyKey } = data ?? {}
+    const quantityRaw = data?.quantity
+    const comboRaw = data?.combo
 
     if (!giftId || typeof giftId !== 'string') {
       throw new HttpsError('invalid-argument', 'giftId is required.')
@@ -104,9 +123,25 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       // percentage, which is a slow but real way to convert spend into payout.
       throw new HttpsError('invalid-argument', 'You cannot gift yourself.')
     }
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 9999) {
+    /*
+     * `combo` is the lucky shape, `quantity` the normal one. Which of the two
+     * the GIFT needs is only known once the catalogue entry is read inside the
+     * transaction; here the shapes are checked, there the match is enforced.
+     * A combo value is checked against the configured list in the transaction
+     * too — nothing about its size is trusted from here.
+     */
+    const comboGiven = comboRaw !== undefined && comboRaw !== null
+    if (comboGiven) {
+      if (!Number.isInteger(comboRaw) || (comboRaw as number) < 1 || (comboRaw as number) > 9999) {
+        throw new HttpsError('invalid-argument', 'combo must be a whole number.')
+      }
+      if (quantityRaw !== undefined && quantityRaw !== null && quantityRaw !== 1 && quantityRaw !== comboRaw) {
+        throw new HttpsError('invalid-argument', 'A lucky combo is sent as combo alone; quantity is the combo.')
+      }
+    } else if (!Number.isInteger(quantityRaw) || (quantityRaw as number) < 1 || (quantityRaw as number) > 9999) {
       throw new HttpsError('invalid-argument', 'quantity must be 1–9999.')
     }
+    const combo: number | null = comboGiven ? (comboRaw as number) : null
     if (!GIFT_CONTEXTS.includes(giftContext)) {
       throw new HttpsError('invalid-argument', `context must be one of ${GIFT_CONTEXTS.join(', ')}.`)
     }
@@ -118,6 +153,7 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
     const receiverRef = db.collection('users').doc(receiverUid)
     const giftRef     = db.collection('gifts').doc(giftId)
     const configRef   = db.collection('appConfig').doc('economy')
+    const luckyRef    = db.collection('appConfig').doc('luckyGifts')
     const claimRef    = db.collection('giftIdempotency').doc(`${senderUid}_${idempotencyKey}`)
     /*
      * Which collection the room lives in — decided by CONTEXT, not by hope.
@@ -217,6 +253,34 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       if (!Number.isFinite(unitPrice) || unitPrice < 0) {
         throw new HttpsError('internal', `Gift ${giftId} has no usable price.`)
       }
+
+      // ── Lucky or normal: the catalogue decides, the request must agree ─────
+      //
+      // The lucky configuration is read only for a lucky gift, and still
+      // before the first write (Firestore forbids a read after one). The guard
+      // runs inside `resolveLuckyConfig`; a refused table refuses the send.
+      const lucky = isLuckyGift(gift)
+      if (lucky && combo === null) {
+        throw new HttpsError('invalid-argument', 'This is a lucky gift: send it as a combo.')
+      }
+      if (!lucky && combo !== null) {
+        throw new HttpsError('invalid-argument', 'combo is only for lucky gifts; send quantity.')
+      }
+      const luckySnap = lucky ? await tx.get(luckyRef) : null
+      const luckyCfg = luckySnap
+        ? resolveLuckyConfig(luckySnap.data() as Record<string, unknown> | undefined, luckySnap.exists)
+        : null
+      if (luckyCfg && !luckyCfg.combos.includes(combo as number)) {
+        throw new HttpsError(
+          'invalid-argument',
+          `Lucky gifts are sent as a combo of ${luckyCfg.combos.join(', ')}.`,
+        )
+      }
+
+      // For a lucky gift the quantity IS the combo. Everything below that
+      // counts gifts — showcases, pair counts, the room ticker — counts combo
+      // units, exactly as a normal gift sent `quantity` times.
+      const quantity: number = luckyCfg ? (combo as number) : (quantityRaw as number)
       const totalCost = unitPrice * quantity
 
       // ── Receiver share ─────────────────────────────────────────────────────
@@ -226,13 +290,18 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       // margin on the same screen. That per-gift number is the decision that
       // was actually made, so it wins. The category rate in appConfig is the
       // fallback for gifts seeded before the field existed.
+      //
+      // A LUCKY gift's share is `appConfig/luckyGifts.receiverPct` — the one
+      // number the payout guard is computed against — not the per-gift rate.
       const cfg = (configSnap.data() ?? {}) as Record<string, any>
       const rates = (cfg.giftRates ?? {}) as Record<string, any>
       const category: string = gift.category ?? 'normal'
       const perGiftRate = Number(gift.earningRate)
-      const pct = Number.isFinite(perGiftRate) && perGiftRate > 0 && perGiftRate <= 100
-        ? perGiftRate
-        : receiverPctFor(category, rates)
+      const pct = luckyCfg
+        ? luckyCfg.receiverPct
+        : Number.isFinite(perGiftRate) && perGiftRate > 0 && perGiftRate <= 100
+          ? perGiftRate
+          : receiverPctFor(category, rates)
 
       const senderData = senderSnap.data() as Record<string, any>
 
@@ -249,6 +318,35 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
 
       const now     = admin.firestore.FieldValue.serverTimestamp()
       const txRef   = db.collection('giftTransactions').doc()
+
+      // ── The roll, for a lucky gift ─────────────────────────────────────────
+      //
+      // Drawn here, after every check has passed and before any write, so a
+      // refusal rolls nothing and a roll is always followed by its credit in
+      // the same commit. The reward is `multiplier × unit`, whatever the combo.
+      const luckyOutcome = luckyCfg
+        ? (() => {
+            const roll = rollLuckyMultiplier(luckyCfg.odds)
+            const money = luckySettlement({
+              unit: unitPrice, combo: quantity, receiverPct: luckyCfg.receiverPct, multiplier: roll.multiplier,
+            })
+            return {
+              combo: quantity,
+              unit: unitPrice,
+              multiplier: roll.multiplier,
+              reward: money.reward,
+              receiverPct: luckyCfg.receiverPct,
+              configVersion: luckyCfg.version,
+              roll: roll.roll,
+              rollTotal: roll.total,
+              rollSeedHash: luckyRollHash({
+                transactionId: txRef.id, configVersion: luckyCfg.version, roll: roll.roll, total: roll.total,
+              }),
+              platformCut: money.platformCut,
+            }
+          })()
+        : null
+      const reward = luckyOutcome ? luckyOutcome.reward : 0
       const pairRef = db.collection('giftPairs').doc(pairIdOf(senderUid, receiverUid))
         .collection('gifts').doc(giftId)
       const senderShowcaseRef   = senderRef.collection('giftShowcase').doc(giftId)
@@ -259,9 +357,13 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
 
       // ── Writes ─────────────────────────────────────────────────────────────
 
+      // The charge and, for a lucky gift, the reward: ONE increment, so the
+      // balance can never show the charge without the reward or the reward
+      // without the charge.
       tx.update(senderRef, {
-        diamonds:       admin.firestore.FieldValue.increment(-totalCost),
+        diamonds:       admin.firestore.FieldValue.increment(-totalCost + reward),
         totalGemsSpent: admin.firestore.FieldValue.increment(totalCost),
+        ...(luckyOutcome ? { luckyRewardsWon: admin.firestore.FieldValue.increment(reward) } : {}),
       })
       tx.update(receiverRef, {
         beans:                admin.firestore.FieldValue.increment(beansCredited),
@@ -307,6 +409,20 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         context:       giftContext,
         roomId:        roomId ?? null,
         createdAt:     now,
+        // The roll, in full, beside the money it decided.
+        ...(luckyOutcome ? {
+          lucky: {
+            combo: luckyOutcome.combo,
+            unit: luckyOutcome.unit,
+            multiplier: luckyOutcome.multiplier,
+            reward: luckyOutcome.reward,
+            receiverPct: luckyOutcome.receiverPct,
+            configVersion: luckyOutcome.configVersion,
+            roll: luckyOutcome.roll,
+            rollTotal: luckyOutcome.rollTotal,
+            rollSeedHash: luckyOutcome.rollSeedHash,
+          },
+        } : {}),
       })
 
       // PUBLIC, anonymous. Counts only — no uid, no timestamp, nothing that
@@ -365,7 +481,9 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         amount: totalCost,
         balanceAfter: senderDiamonds - totalCost,
         reason: 'gift_sent',
-        reasonLabel: `Gift sent — ${gift.name ?? gift.displayName ?? giftId} x${quantity}`,
+        reasonLabel: luckyOutcome
+          ? `Lucky gift sent — ${gift.name ?? gift.displayName ?? giftId} ×${quantity}`
+          : `Gift sent — ${gift.name ?? gift.displayName ?? giftId} x${quantity}`,
         relatedUid: receiverUid,
         relatedUserName: receiverSnap.get('displayName') ?? receiverSnap.get('name') ?? '',
         giftId,
@@ -375,6 +493,35 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         transactionId: txRef.id,
         timestamp: now,
       })
+
+      // The reward is its own row: a credit the sender can see and a dispute
+      // file can tie to the roll, rather than a debit that mysteriously
+      // charged less than the gift cost.
+      if (luckyOutcome) {
+        tx.set(senderRef.collection('diamondTransactions').doc(), {
+          type: 'credit',
+          amount: luckyOutcome.reward,
+          balanceAfter: senderDiamonds - totalCost + luckyOutcome.reward,
+          reason: 'lucky_gift_reward',
+          reasonLabel: `Lucky gift ×${luckyOutcome.multiplier} — ${gift.name ?? gift.displayName ?? giftId}`,
+          relatedUid: receiverUid,
+          relatedUserName: receiverSnap.get('displayName') ?? receiverSnap.get('name') ?? '',
+          giftId,
+          quantity,
+          context: giftContext,
+          roomId: roomId ?? null,
+          transactionId: txRef.id,
+          lucky: {
+            combo: luckyOutcome.combo,
+            unit: luckyOutcome.unit,
+            multiplier: luckyOutcome.multiplier,
+            reward: luckyOutcome.reward,
+            configVersion: luckyOutcome.configVersion,
+            rollSeedHash: luckyOutcome.rollSeedHash,
+          },
+          timestamp: now,
+        })
+      }
 
       tx.set(receiverRef.collection('beanTransactions').doc(), {
         type: 'credit',
@@ -423,6 +570,11 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         lottieAsset: gift.lottieAsset ?? '',
         roomId:     roomId ?? '',
         timestamp:  now,
+        // The win, for the room to celebrate. No roll internals here: this
+        // row is public inside a room.
+        ...(luckyOutcome ? {
+          lucky: { combo: luckyOutcome.combo, multiplier: luckyOutcome.multiplier, reward: luckyOutcome.reward },
+        } : {}),
       })
 
       // Room mirror — the live ticker and the in-room gift leaderboard read
@@ -470,9 +622,12 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         }
       }
 
-      // Zipper's cut is what the sender paid minus what the receiver earned.
-      // Derived here rather than trusted from anywhere, so the ledger and the
-      // revenue line can never disagree.
+      // Zipper's cut is what the sender paid minus what the receiver earned —
+      // and, for a lucky gift, minus the reward paid back to the sender, which
+      // on a big win makes the line negative. Recorded as it is: the table is
+      // tuned on the aggregate, and a row that hid the loss would hide the
+      // thing the guard exists to bound. Derived here rather than trusted from
+      // anywhere, so the ledger and the revenue line can never disagree.
       tx.set(db.collection('platformRevenue').doc(), {
         type:          'gift',
         subType:       category,
@@ -480,7 +635,8 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         perGiftCost:   unitPrice,
         grossDiamonds: totalCost,
         payoutBeans:   beansCredited,
-        platformCut:   totalCost - beansCredited,
+        ...(luckyOutcome ? { luckyReward: luckyOutcome.reward, luckyMultiplier: luckyOutcome.multiplier } : {}),
+        platformCut:   totalCost - beansCredited - reward,
         senderUid, receiverUid,
         roomId:        roomId ?? '',
         transactionId: txRef.id,
@@ -493,6 +649,15 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         beansCredited,
         receiverPct: pct,
         quantity,
+        ...(luckyOutcome ? {
+          lucky: {
+            combo: luckyOutcome.combo,
+            unit: luckyOutcome.unit,
+            multiplier: luckyOutcome.multiplier,
+            reward: luckyOutcome.reward,
+            configVersion: luckyOutcome.configVersion,
+          },
+        } : {}),
       }
 
       // Claim last, so a crash mid-transaction leaves nothing claimed.
