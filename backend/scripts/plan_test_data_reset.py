@@ -1,4 +1,16 @@
-"""DRY-RUN plan for the production test-data reset. READ ONLY — CANNOT DELETE.
+"""SUPERSEDED (2026-11-01) by scripts/reset/ — see scripts/reset/RESET-RUNBOOK.md.
+
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  Do not plan a reset with this script. Its plan is an allowlist-based    ║
+    ║  classification with no frozen ids, no backup gate and no target in the  ║
+    ║  output (docs/phase-1a/RESET-RECONCILIATION-2026-10-15.md §2, §6). The   ║
+    ║  replacement is scripts/reset/plan.py, which writes a FROZEN MANIFEST    ║
+    ║  of exact ids that scripts/reset/execute.py deletes and nothing else.    ║
+    ║  This file has no --apply and never had a write path; it stays read-only ║
+    ║  and is kept only for its pure helpers, which tests still pin.           ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+
+DRY-RUN plan for the production test-data reset. READ ONLY — CANNOT DELETE.
 
     cd backend && .venv/bin/python -m scripts.plan_test_data_reset \
         --owner-uid UID1 --owner-uid UID2 --owner-uid UID3 \
@@ -579,6 +591,11 @@ async def gather_and_plan(owner_uids: list[str], fresh: bool = False) -> dict:
 
 
 def main() -> int:
+    print("NOTE: plan_test_data_reset is SUPERSEDED by scripts/reset/plan.py (see scripts/reset/RESET-RUNBOOK.md). "
+          "Its output is not a manifest scripts/reset/execute.py accepts.")
+    if "--apply" in sys.argv:
+        print("REFUSED: this script has no --apply and never writes; use scripts/reset/.")
+        return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--owner-uid", action="append", default=[], required=True,
                     help="an Owner uid, exactly three times")

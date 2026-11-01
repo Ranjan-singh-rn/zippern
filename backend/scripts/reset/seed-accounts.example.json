@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to seed-accounts.json (gitignored) and replace EVERY value with the Owner's exact list. Phones are E.164. These placeholder addresses (.invalid, RFC 2606) are refused by seed.py on purpose.",
+  "observer": {
+    "name": "Observer Placeholder",
+    "email": "observer@placeholder.invalid",
+    "phone": ""
+  },
+  "owners": [
+    {"name": "Owner One Placeholder", "email": "owner-one@placeholder.invalid", "phone": "+10000000001"},
+    {"name": "Owner Two Placeholder", "email": "owner-two@placeholder.invalid", "phone": "+10000000002"},
+    {"name": "Owner Three Placeholder", "email": "owner-three@placeholder.invalid", "phone": "+10000000003"}
+  ]
+}

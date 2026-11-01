@@ -1,4 +1,19 @@
-"""Execute the FRESH production reset. DRY RUN unless --apply. IRREVERSIBLE with --apply.
+"""SUPERSEDED (2026-11-01) by scripts/reset/ — see scripts/reset/RESET-RUNBOOK.md.
+
+    ╔══════════════════════════════════════════════════════════════════════════╗
+    ║  THIS SCRIPT NO LONGER EXECUTES. `--apply` is REFUSED unconditionally.   ║
+    ║  It re-planned live and deleted whatever qualified at that moment, with  ║
+    ║  no frozen manifest, no target in its log, no backup gate and recursive  ║
+    ║  (uncounted) subcollection deletes — see docs/phase-1a/                   ║
+    ║  RESET-RECONCILIATION-2026-10-15.md §6. The replacement is                ║
+    ║  scripts/reset/{backup,plan,execute,seed,postcheck}.py.                   ║
+    ╚══════════════════════════════════════════════════════════════════════════╝
+
+Kept for its pure helpers (`guard`, `owner_users_patch`, `owner_crm_patch`,
+`check_plan_file`), which tests/test_reset_plan.py still pins. The original
+docstring follows for the record.
+
+Execute the FRESH production reset. DRY RUN unless --apply. IRREVERSIBLE with --apply.
 
     cd backend
     # 1. plan (read-only) — must be a --fresh plan with no blockers
@@ -308,12 +323,24 @@ async def execute(owner_uids: list[str], plan_path: str, apply: bool) -> int:
     return 0
 
 
+SUPERSEDED_BY = "scripts/reset/ (python -m scripts.reset.execute) — see scripts/reset/RESET-RUNBOOK.md"
+
+
 def main() -> int:
+    # SUPERSEDED: a run that would write is refused before anything is parsed,
+    # connected or read. The dry-run path is left so the old plan files can
+    # still be rehearsed against, but nothing in this file deletes any more.
+    if "--apply" in sys.argv:
+        print(f"REFUSED: execute_test_data_reset is superseded by {SUPERSEDED_BY}. "
+              "--apply no longer does anything.")
+        return 2
+    print(f"NOTE: this script is superseded by {SUPERSEDED_BY}; it runs read-only.")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--owner-uid", action="append", default=[], required=True)
     ap.add_argument("--plan", required=True, help="the reviewed --fresh plan JSON")
-    ap.add_argument("--apply", action="store_true", help="EXECUTE. Irreversible.")
+    ap.add_argument("--apply", action="store_true", help="REFUSED — superseded (see the banner above)")
     args = ap.parse_args()
+    args.apply = False
     try:
         return asyncio.run(execute(args.owner_uid, args.plan, args.apply))
     except (RefusedError, P.AllowlistError) as exc:

@@ -99,6 +99,14 @@ backend/backups/
 backend/reset-plan*.json
 backend/reset-postcheck*.json
 
+# scripts/reset (spec §14): every run's artifacts — backup manifests, Mongo
+# dumps, Storage inventories, frozen manifests, execute logs, seed results —
+# name production records and people. Operator's disk only.
+backend/reset-runs/
+# The Owner-supplied Observer/Owner list (names, emails, phones). Never committed;
+# ship seed-accounts.example.json instead.
+backend/scripts/reset/seed-accounts.json
+
 # Build output — never commit.
 # zipper-crm/out held a stale bundle containing a removed superadmin bootstrap
 # and real bank details long after both were deleted from source. A single
