@@ -94,7 +94,8 @@ fun WorkHubScreen(nav: WorkNav, viewModel: WorkHubViewModel = hiltViewModel()) {
                     item {
                         Column(Modifier.fillMaxWidth().padding(bottom = Space.sm)) {
                             Text(caps.name.ifBlank { caps.email.ifBlank { "Signed in" } }, style = ZipperTheme.type.headingM, color = c.textPrimary)
-                            Text(caps.label + (caps.team?.let { " · $it" } ?: ""), style = ZipperTheme.type.bodyS, color = c.textSecondary)
+                            // Every live role, each named — a dual-role partner reads both (see Caps.roleSummary).
+                            Text(caps.roleSummary, style = ZipperTheme.type.bodyS, color = c.textSecondary)
                             if (caps.isPendingPartner) Text(
                                 "Your application is still being reviewed — your work screens open once it is approved.",
                                 style = ZipperTheme.type.bodyS, color = c.statusWarning,
@@ -389,7 +390,12 @@ private fun ActionButtons(actions: List<WorkAction>, onClick: (WorkAction) -> Un
     FlowRow(horizontalArrangement = Arrangement.spacedBy(Space.sm), verticalArrangement = Arrangement.spacedBy(Space.sm)) {
         actions.forEach { a ->
             ZipperButton(a.label, { onClick(a) },
-                style = if (a.danger) ButtonStyle.Danger else if (a.kind == ActionKind.Navigate || a.method == "GET") ButtonStyle.Secondary else ButtonStyle.Primary,
+                style = when {
+                    a.danger -> ButtonStyle.Danger
+                    a.kind == ActionKind.Info -> ButtonStyle.Ghost
+                    a.kind == ActionKind.Navigate || a.method == "GET" -> ButtonStyle.Secondary
+                    else -> ButtonStyle.Primary
+                },
                 size = ButtonSize.Small)
         }
     }
@@ -452,7 +458,7 @@ private fun InputField(i: Input, value: String, onChange: (String) -> Unit) {
             }
             InputType.Int -> PlainField(i.label + if (!i.required) " (optional)" else "", value, KeyboardType.Number, onChange = onChange)
             InputType.Rupees -> PlainField(i.label, value, KeyboardType.Decimal, onChange = onChange)
-            InputType.LongText -> PlainField(i.label, value, singleLine = false, onChange = onChange)
+            InputType.LongText, InputType.Lines -> PlainField(i.label + if (!i.required) " (optional)" else "", value, singleLine = false, onChange = onChange)
             else -> PlainField(i.label, value, onChange = onChange)
         }
         if (i.help.isNotBlank()) Text(i.help, style = ZipperTheme.type.caption, color = c.textMuted)

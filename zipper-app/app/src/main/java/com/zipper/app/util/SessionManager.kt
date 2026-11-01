@@ -64,6 +64,22 @@ class SessionManager @Inject constructor(
         private val KEY_REQUIRES_EMAIL = booleanPreferencesKey("session_requires_email")
 
         /**
+         * APK 20 / spec §8: the CRM role the SERVER answered for this account
+         * (`resolveIdentity.crmRole` — `superadmin` for an Owner, a department
+         * role, `agency` / `seller`, or "" for an ordinary user), written at
+         * every sign-in and every cold start, right before Main is entered.
+         *
+         * A PRE-FILTER only: `OwnerMfaGateHost` reads it to decide whether to
+         * ask the work API who this is, so an ordinary user's launch costs no
+         * API sign-in (which the server would refuse and audit as a failed
+         * login). It grants nothing — the gate's decision is `GET /api/auth/me`
+         * (`role == "owner"`), and every Owner route is refused server-side
+         * until the code is verified. Never a role flag for a work screen:
+         * those come from `/api/auth/me` alone (`data/work/Caps`).
+         */
+        private val KEY_CRM_ROLE = stringPreferencesKey("session_crm_role")
+
+        /**
          * LEGACY (UGP-C): where 1.2.3 kept the address an email sign-in LINK
          * was sent to. The link flow is gone — binding is a code typed into
          * the app — so nothing writes this any more. The key is kept only so
@@ -103,6 +119,14 @@ class SessionManager @Inject constructor(
      */
     val requiresPhone: Flow<Boolean> = dataStore.data.map { it[KEY_REQUIRES_PHONE] ?: false }
     val requiresEmail: Flow<Boolean> = dataStore.data.map { it[KEY_REQUIRES_EMAIL] ?: false }
+
+    /** The server's last answer for this account's CRM role, "" when none. See [KEY_CRM_ROLE]. */
+    val crmRole: Flow<String> = dataStore.data.map { it[KEY_CRM_ROLE] ?: "" }
+
+    /** Record the server's answer (`resolveIdentity.crmRole`). Written beside [setGuest]. */
+    suspend fun setCrmRole(crmRole: String) {
+        dataStore.edit { prefs -> prefs[KEY_CRM_ROLE] = crmRole.trim() }
+    }
 
     /**
      * Phase 1A (SESSION-001): [payload] with this device's active mobile session
@@ -165,6 +189,7 @@ class SessionManager @Inject constructor(
             // the next one on this phone.
             prefs.remove(KEY_REQUIRES_PHONE)
             prefs.remove(KEY_REQUIRES_EMAIL)
+            prefs.remove(KEY_CRM_ROLE)
             // An address left by an older build's email-link flow (see
             // KEY_PENDING_EMAIL) — somebody's email has no reason to outlive it.
             prefs.remove(KEY_PENDING_EMAIL)

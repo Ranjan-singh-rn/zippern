@@ -404,37 +404,50 @@ fun ZipperNavGraph(
         }
 
         // ── Main shell ────────────────────────────────────────────────────
+        //
+        // APK 20 / spec §8: an Owner presents an authenticator code before Main
+        // renders, whichever way they arrived (OwnerMfaGateHost). Everyone else
+        // passes after one local read. A refusal (the Observer, a server that
+        // cannot run the step, "Sign out") ends the app session with the
+        // reason shown on Login — the same forced sign-out Splash uses.
         composable(Screen.Main.route) {
-            MainScreen(
-                onNavigateToEditProfile  = { navController.navigate(Screen.EditProfile.route) },
-                onNavigateToSettings     = { navController.navigate(Screen.Settings.route) },
-                onNavigateToDiamondShop  = { navController.navigate(Screen.DiamondShop.route) },
-                onNavigateToBeansCenter  = { navController.navigate(Screen.BeansCenter.route) },
-                onNavigateToProfile      = { navController.navigate(Screen.OwnProfile.route) },
-                onNavigateToUserProfile  = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
-                onNavigateToGoLive       = { navController.navigate(Screen.LiveBroadcast.route) },
-                onNavigateToWatchLive    = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
-                onNavigateToPartyRooms   = { navController.navigate(Screen.PartyList.route) },
-                onNavigateToMyBag        = { navController.navigate(Screen.MyBag.route) },
-                onNavigateToEarnings     = { navController.navigate(Screen.Earnings.route) },
-                onNavigateToCallHistory  = { navController.navigate(Screen.CallHistory.route) },
-                onNavigateToLikes        = { tab -> navController.navigate(Screen.LikesScreen.createRoute(tab)) },
-                onNavigateToLevel        = { navController.navigate(Screen.LevelScreen.route) },
-                onNavigateToDailyRewards = { navController.navigate(Screen.DailyRewards.route) },
-                onNavigateToIncomingCall = { callId -> navController.navigate(Screen.IncomingCall.createRoute(callId)) { launchSingleTop = true } },
-                onNavigateToChat             = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
-                onNavigateToAgencyDashboard  = { navController.navigate(Screen.AgencyDashboard.route) },
-                onNavigateToSellerDashboard  = { navController.navigate(Screen.SellerDashboard.route) },
-                onNavigateToWork             = { navController.navigate(Screen.Work.route) },
-                onNavigateToFeedback         = { navController.navigate(Screen.Feedback.route) },
-                // Not popUpTo(0) here: this host is already using the app, and
-                // the capture is skippable — Back must return them to Me.
-                onNavigateToFaceVerification = { gender ->
-                    navController.navigate(Screen.FaceVerification.createRoute(gender))
+            com.zipper.app.ui.screens.auth.OwnerMfaGateHost(
+                onRefused = { reason ->
+                    reason?.let { com.zipper.app.ui.screens.auth.ForcedSignOut.raise(it) }
+                    signOutAndGoToLogin()
                 },
-                onNavigateToPartnerHub = { navController.navigate(Screen.PartnerHub.route) },
-                onLogout = signOutAndGoToLogin,
-            )
+            ) {
+                MainScreen(
+                    onNavigateToEditProfile  = { navController.navigate(Screen.EditProfile.route) },
+                    onNavigateToSettings     = { navController.navigate(Screen.Settings.route) },
+                    onNavigateToDiamondShop  = { navController.navigate(Screen.DiamondShop.route) },
+                    onNavigateToBeansCenter  = { navController.navigate(Screen.BeansCenter.route) },
+                    onNavigateToProfile      = { navController.navigate(Screen.OwnProfile.route) },
+                    onNavigateToUserProfile  = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
+                    onNavigateToGoLive       = { navController.navigate(Screen.LiveBroadcast.route) },
+                    onNavigateToWatchLive    = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
+                    onNavigateToPartyRooms   = { navController.navigate(Screen.PartyList.route) },
+                    onNavigateToMyBag        = { navController.navigate(Screen.MyBag.route) },
+                    onNavigateToEarnings     = { navController.navigate(Screen.Earnings.route) },
+                    onNavigateToCallHistory  = { navController.navigate(Screen.CallHistory.route) },
+                    onNavigateToLikes        = { tab -> navController.navigate(Screen.LikesScreen.createRoute(tab)) },
+                    onNavigateToLevel        = { navController.navigate(Screen.LevelScreen.route) },
+                    onNavigateToDailyRewards = { navController.navigate(Screen.DailyRewards.route) },
+                    onNavigateToIncomingCall = { callId -> navController.navigate(Screen.IncomingCall.createRoute(callId)) { launchSingleTop = true } },
+                    onNavigateToChat             = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
+                    onNavigateToAgencyDashboard  = { navController.navigate(Screen.AgencyDashboard.route) },
+                    onNavigateToSellerDashboard  = { navController.navigate(Screen.SellerDashboard.route) },
+                    onNavigateToWork             = { navController.navigate(Screen.Work.route) },
+                    onNavigateToFeedback         = { navController.navigate(Screen.Feedback.route) },
+                    // Not popUpTo(0) here: this host is already using the app, and
+                    // the capture is skippable — Back must return them to Me.
+                    onNavigateToFaceVerification = { gender ->
+                        navController.navigate(Screen.FaceVerification.createRoute(gender))
+                    },
+                    onNavigateToPartnerHub = { navController.navigate(Screen.PartnerHub.route) },
+                    onLogout = signOutAndGoToLogin,
+                )
+            }
         }
 
         // ── Becoming a partner ────────────────────────────────────────────

@@ -138,7 +138,14 @@ class SplashViewModel @Inject constructor(
             val res = withTimeoutOrNull(8_000) { money.resolveIdentity(deviceId) }
             if (res is MoneyFunctions.Result.Ok) { last = res.value; break }
         }
-        return SplashGate.decide(last)
+        val verdict = SplashGate.decide(last)
+        // APK 20 / spec §8: remember the server's CRM role for the Owner
+        // two-step gate on the way into Main (see SessionManager.setCrmRole).
+        // Only on a Continue — a refused account never reaches the gate.
+        if (verdict == SplashVerdict.Continue && last != null) {
+            try { sessionManager.setCrmRole(last.crmRole) } catch (_: Exception) { }
+        }
+        return verdict
     }
 
     /**

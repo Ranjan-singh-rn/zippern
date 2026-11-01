@@ -59,7 +59,11 @@ data class Field(
 
 data class Link(val moduleId: String, val param: String)
 
-enum class InputType { Text, LongText, Int, Rupees, Choice, Bool, DateTime, Lookup }
+enum class InputType {
+    Text, LongText, Int, Rupees, Choice, Bool, DateTime, Lookup,
+    /** One entry per line, sent as a JSON array of strings ([Input.max] = most entries). */
+    Lines,
+}
 
 data class LookupSpec(
     /** API route returning a bare array of candidates. */
@@ -105,6 +109,13 @@ enum class ActionKind {
     Navigate,
     /** Open a URL from the row (signed document links). */
     OpenUrl,
+    /**
+     * A read-only marker: the button opens a dialog that shows [WorkAction.help]
+     * and sends NOTHING. For decisions that exist on the server but stay in
+     * the CRM on purpose (Owner governance — "Decide in the CRM"), so the
+     * screen says where the decision is made instead of hiding that it exists.
+     */
+    Info,
 }
 
 data class WorkAction(
@@ -160,6 +171,15 @@ sealed interface Source {
         val limitParam: String? = "limit",
         /** `skip`-paged routes (the audit log). */
         val skipParam: String? = null,
+        /**
+         * An envelope holding SEVERAL row arrays (`/partner-ops/held-items`:
+         * `cards`, `recharges`, `sales`, `subagency_payouts`). Rows are the
+         * concatenation, each tagged with [arrayTagKey] = its array's name, so
+         * an action can name the type in its route. Takes precedence over
+         * [arrayKey] when non-empty.
+         */
+        val arrayKeys: List<String> = emptyList(),
+        val arrayTagKey: String = "__from",
     ) : Source
 
     data class Firestore(
@@ -239,6 +259,12 @@ data class WorkModule(
     val hide: Set<String> = emptySet(),
     /** Keep only rows this accepts (a type filter over a shared route). */
     val clientFilter: ((Item) -> Boolean)? = null,
+    /**
+     * A pure, per-row derivation applied after loading (never a computation of
+     * money): adds display keys such as a session's client label. Must be
+     * total — it is also what the JVM tests run on sample rows.
+     */
+    val rowTransform: ((Item) -> Item)? = null,
 )
 
 // ── Templates ────────────────────────────────────────────────────────────────
@@ -320,6 +346,13 @@ object WorkForm {
                 InputType.Choice -> if (i.options.none { it.first == v }) errors[i.key] = "Choose ${i.label.lowercase()}."
                 InputType.Bool -> if (v != "true" && v != "false") errors[i.key] = "Choose yes or no."
                 InputType.DateTime -> if (ApiTime.parseIsoMillis(normaliseDate(v)) == null) errors[i.key] = "${i.label}: use YYYY-MM-DD."
+                InputType.Lines -> {
+                    val items = lines(v)
+                    when {
+                        i.max != null && items.size > i.max -> errors[i.key] = "${i.label}: at most ${i.max} entries."
+                        i.maxLen > 0 && items.any { it.length > i.maxLen } -> errors[i.key] = "${i.label}: each entry at most ${i.maxLen} characters."
+                    }
+                }
             }
         }
         return errors
@@ -350,8 +383,12 @@ object WorkForm {
         InputType.Rupees -> rupeesToPaise(raw)
         InputType.Bool -> raw == "true"
         InputType.DateTime -> normaliseDate(raw)
+        InputType.Lines -> lines(raw)
         else -> raw
     }
+
+    /** "a\n b \n\nc" → ["a", "b", "c"]. */
+    fun lines(raw: String): List<String> = raw.lines().map { it.trim() }.filter { it.isNotEmpty() }
 
     @Suppress("UNCHECKED_CAST")
     private fun put(into: MutableMap<String, Any?>, key: String, value: Any?) {
@@ -406,6 +443,21 @@ object WorkRows {
         return arr?.mapNotNull { it.jsonMap() } ?: emptyList()
     }
 
+    /**
+     * The rows of an envelope with several arrays, in the order the keys are
+     * given, each row tagged with `tagKey` = the array it came from. A missing
+     * or non-array key contributes nothing.
+     */
+    fun rows(body: Any?, arrayKeys: List<String>, tagKey: String): List<Item> =
+        arrayKeys.flatMap { key -> rows(body, key).map { it + (tagKey to key) } }
+
+    /** [Source.Api] → its rows, whichever shape it declares. */
+    fun rows(body: Any?, src: Source.Api): List<Item> = when {
+        src.arrayKey == "__none__" -> emptyList()
+        src.arrayKeys.isNotEmpty() -> rows(body, src.arrayKeys, src.arrayTagKey)
+        else -> rows(body, src.arrayKey)
+    }
+
     fun title(item: Item, paths: List<String>): String =
         paths.firstNotNullOfOrNull { p -> item.jsonPath(p).jsonText()?.takeIf { it.isNotBlank() } } ?: "—"
 
@@ -429,6 +481,8 @@ object WorkDisplay {
     private val hidden = setOf(
         "token", "id_token", "jti", "password", "secret", "set_password_link",
         "idempotency_key", "gateAnswers", "headers_sent", "provider_error_body", "_id", "__columns",
+        // The envelope tag `WorkRows` adds (`Source.Api.arrayTagKey`) — plumbing, not a field.
+        "__from",
     )
 
     /** Shown masked to the last four characters. */

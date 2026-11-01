@@ -28,6 +28,42 @@ internal fun stat(item: Item, path: String = "status"): String = item.jsonPath(p
 
 internal fun statusIn(vararg s: String): (Item, Caps) -> Boolean = { item, _ -> stat(item) in s }
 
+// ── §5 ban: reason + scope + category + evidence (routers/users.py `Ban`) ─────
+
+/** The server bounds these only by length; the labels are the CRM's working vocabulary. */
+internal val banCategories = arrayOf(
+    "" to "Not stated", "spam" to "Spam", "fraud" to "Fraud / scam", "harassment" to "Harassment or abuse",
+    "sexual_content" to "Sexual content", "underage" to "Underage", "impersonation" to "Impersonation",
+    "payment_abuse" to "Payment abuse", "other" to "Other",
+)
+
+/**
+ * The inputs of `POST /users/{uid}/ban` as the server reads them: `reason`
+ * (3–1000), `scope` (`account` | `account_and_devices`, default the latter —
+ * what a ban has always done), `category` (≤ 80) and `evidence` (≤ 10
+ * references: report ids, storage paths, links — never files).
+ */
+internal fun banInputs(): List<Input> = listOf(
+    reason(),
+    choice("scope", "Scope", "account_and_devices" to "Account and every device it used", "account" to "Account only",
+        help = "Barring the handsets locks out every account on them — the point, and the cost."),
+    choice("category", "Category", *banCategories, default = "").copy(required = false),
+    Input("evidence", "Evidence references (one per line, optional)", InputType.Lines, required = false, max = 10, maxLen = 500,
+        help = "Report ids, storage paths or links. Recorded on the account and the audit entry."),
+)
+
+/**
+ * A decision that exists on the server but is the Owner's, made in the CRM
+ * (spec: Owner / Observer governance stays CRM-focused). Shown as a
+ * read-only marker so the screen says where it happens rather than hiding
+ * that it exists; nothing is sent.
+ */
+internal fun crmOnly(id: String, label: String, why: String, showFor: (Item, Caps) -> Boolean = { _, _ -> true }) = WorkAction(
+    // `method = "GET"`: a marker is a read in every count (it sends nothing at all).
+    id = id, label = label, kind = ActionKind.Info, method = "GET", gate = { c -> c.isInternal }, showFor = showFor,
+    help = "$why Decide in the CRM.",
+)
+
 // ── Money cards (/api/cards + the per-type execute routes) ──────────────────
 
 internal object CardActions {
@@ -211,13 +247,18 @@ internal object PartnerActions {
             showFor = { i, _ -> kind(i) in setOf("agency", "sub_agency") },
             inputs = listOf(Input("period", "Period (e.g. 2026-W42)", minLen = 1, maxLen = 64, asQuery = true)),
             help = "Read-only: what the server would compute. Nothing is credited."),
-        WorkAction("partner.grant", "Add second capability", "/api/partner-ops/partners/{item:id}/grant-capability",
-            gate = { c -> approver(c) && c.requireTeamAdmin },
+        // Spec §4 (CRM `requestSecondRole`): a second role begins with the PARTNER
+        // applying from their own dashboard; staff only bring that application
+        // into the review queue, where it is approved like any first one.
+        // `grant-capability` — staff filing a role nobody asked for — was taken
+        // out of the CRM as a role-grant control and is not offered here either.
+        WorkAction("partner.secondRole", "File their second-role application", "/api/partner-ops/partners/{item:id}/second-role",
+            gate = approver,
             showFor = statusIn("approved"),
-            inputs = listOf(choice("kind", "Capability", "agency" to "Agency", "seller" to "Coin Seller"),
-                Input("name", "Business name", minLen = 1, maxLen = 200),
-                Input("phone", "Phone (optional)", required = false, maxLen = 40), reason()),
-            confirm = "File a second-capability application for this partner's login?"),
+            inputs = listOf(
+                Input("new_partner_id", "Application ID (the agencies / sellers document they filed)", minLen = 1, maxLen = 200),
+                reason()),
+            confirm = "Put this partner's second-role application into the review queue? It creates a pending record holding nothing; approving it is a separate decision."),
         WorkAction("partner.documents", "Documents", "/api/documents/{item:kind}/{item:id}", method = "GET",
             gate = { c -> c.isInternal && (c.readsAll || c.has(Perm.VIEW_AGENCIES) || c.has(Perm.VIEW_SELLERS)) },
             showFor = { i, _ -> kind(i) in setOf("agency", "seller") },

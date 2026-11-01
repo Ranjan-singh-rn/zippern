@@ -71,6 +71,29 @@ data class Caps(
         else -> "No role"
     }
 
+    /**
+     * Every LIVE partner capability this login holds, by name — a dual-role
+     * login reads "Agency, Coin Seller". The server grants a capability only
+     * for an approved, active record (`security._partner_login`), so a revoked
+     * Agency is simply absent here and never hides an active Coin Seller.
+     * Each live record is listed with its own status on "My partner records"
+     * (`partner.records`), one waiting on contacts on "Contact verification";
+     * staff see every role of an account, revoked ones included, each with its
+     * own status, on "User record" (`GET /users/{uid}/roles`).
+     */
+    val heldPartnerRoles: List<String> get() = listOfNotNull(
+        if (!agencyId.isNullOrBlank()) "Agency" else null,
+        if (!sellerId.isNullOrBlank()) "Coin Seller" else null,
+    )
+
+    /** The hub's second line: role(s) and, for a partner, the status the server put on the session. */
+    val roleSummary: String get() = when {
+        isExternal && heldPartnerRoles.isNotEmpty() ->
+            heldPartnerRoles.joinToString(", ") + (partnerStatus?.takeIf { it.isNotBlank() }?.let { " · ${WorkDisplay.status(it)}" } ?: "")
+        isExternal -> label + (partnerStatus?.takeIf { it.isNotBlank() }?.let { " · ${WorkDisplay.status(it)}" } ?: "")
+        else -> label + (team?.let { " · $it" } ?: "")
+    }
+
     companion object {
         /** From the `/api/auth/me` body. Unknown or missing keys give the narrowest reading. */
         fun from(body: Any?): Caps {

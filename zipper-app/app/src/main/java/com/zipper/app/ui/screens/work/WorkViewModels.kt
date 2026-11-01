@@ -68,6 +68,11 @@ abstract class WorkActionHost(protected val repo: WorkRepository) : ViewModel() 
     fun open(action: WorkAction, item: Item) {
         val caps = currentCaps() ?: return
         val mod = module ?: return
+        if (action.kind == ActionKind.Info) {
+            // Nothing to fill in and nothing to send: straight to the sentence.
+            _action.value = ActionUi(action, item, emptyMap(), stage = ActionUi.Stage.Done, result = action.help)
+            return
+        }
         val values = LinkedHashMap<String, String>()
         for (i in action.inputs) {
             val pre = i.prefillPath?.let { item.jsonPath(it).jsonText() }

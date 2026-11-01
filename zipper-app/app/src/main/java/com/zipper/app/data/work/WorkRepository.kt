@@ -87,7 +87,7 @@ class WorkRepository @Inject constructor(
             is ApiResult.Failure -> Outcome.Failed(r.error)
             is ApiResult.Ok -> {
                 val root = r.body.jsonMap() ?: emptyMap()
-                var rows = if (src.arrayKey == "__none__") emptyList() else WorkRows.rows(r.body, src.arrayKey)
+                var rows = WorkRows.rows(r.body, src)
                 // Report envelopes: each row carries the server's columns so it can be read on its own.
                 module.columnsPath?.let { cp ->
                     val columns = r.body.jsonPath(cp)
@@ -95,6 +95,7 @@ class WorkRepository @Inject constructor(
                 }
                 val fetched = rows.size
                 module.clientFilter?.let { f -> rows = rows.filter(f) }
+                module.rowTransform?.let { t -> rows = rows.map(t) }
                 Outcome.Ok(Loaded(rows, root, more = src.limitParam != null && fetched >= limit))
             }
         }
@@ -132,6 +133,7 @@ class WorkRepository @Inject constructor(
         }
         var out = rows
         module.clientFilter?.let { f -> out = out.filter(f) }
+        module.rowTransform?.let { t -> out = out.map(t) }
         Outcome.Ok(Loaded(out, emptyMap(), more = docName == null && search.isEmpty() && rows.size >= limit))
     } catch (e: FirebaseFirestoreException) {
         Outcome.Failed(firestoreError(e))
@@ -223,6 +225,8 @@ class WorkRepository @Inject constructor(
             ActionKind.Api -> runApi(module, action, item, params, values, caps)
             ActionKind.FirestoreUpdate, ActionKind.FirestoreCreate -> runFirestore(module, action, item, values, caps)
             ActionKind.Navigate, ActionKind.OpenUrl -> Outcome.Ok(ActionResult("", null))
+            // Read-only marker: nothing is sent; the dialog shows the sentence.
+            ActionKind.Info -> Outcome.Ok(ActionResult(action.help, null))
         }
     }
 

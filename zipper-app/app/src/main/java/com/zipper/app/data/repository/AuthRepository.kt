@@ -2171,6 +2171,15 @@ class AuthRepository @Inject constructor(
          */
         sessionManager.setGuest(id.isGuest)
 
+        /*
+         * APK 20 / spec §8: the server's CRM role, for the Owner two-step gate
+         * on the way into Main (`OwnerMfaGateHost`). A pre-filter only — the
+         * gate decides on `GET /api/auth/me`; this just spares every ordinary
+         * user an API sign-in the server would refuse. Written on the carry-on
+         * path for the same reason the guest flag is.
+         */
+        sessionManager.setCrmRole(id.crmRole)
+
         return null
     }
 

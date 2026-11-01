@@ -8,7 +8,7 @@ package com.zipper.app.data.work
 object WorkModules {
 
     val all: List<WorkModule> by lazy {
-        partnerModules + queueModules + peopleModules + partnersModules + moneyModules +
+        partnerModules + sessionModules + queueModules + peopleModules + partnersModules + moneyModules +
             reportModules + opsModules + chanceModules
     }
 

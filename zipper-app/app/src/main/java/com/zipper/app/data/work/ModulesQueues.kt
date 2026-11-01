@@ -42,11 +42,16 @@ internal val queueModules: List<WorkModule> = listOf(
         source = Source.Api("/api/cards"),
         filters = listOf(stageFilter),
         titlePaths = listOf("title", "type"), statusPath = "stage",
-        subtitle = cardSubtitle, detail = cardDetail,
-        actions = CardActions.all,
+        subtitle = cardSubtitle + Field("Held", "held.reason", FieldKind.Status), detail = cardDetail,
+        // §8 `owner-fast-path` (one Owner takes a card review → verify → sign →
+        // execute) is Owner-only and stays in the CRM: a marker, never a call.
+        actions = CardActions.all + crmOnly("card.fastPath", "Owner fast path (CRM)",
+            "One Owner can take a card through review, verification, signature and execution in a single step; every stage is still written and audited.",
+            showFor = { i, c -> c.isOwner && stat(i, "stage") in setOf("requested", "under_review", "awaiting_signoff") }),
         pageSize = 100, maxSize = 500,
         searchPaths = listOf("title", "type", "reason", "subject.id", "requested_by.name", "payload.payment_ref"),
-        note = "Raisers cannot verify or sign their own card; the verifier cannot sign; nobody signs a card that pays them.",
+        note = "Raisers cannot verify or sign their own card; the verifier cannot sign; nobody signs a card that pays them. " +
+            "A card marked Held belongs to a revoked partner and waits for Finance on the Held items screen.",
     ),
     WorkModule(
         id = "cards.toSign", title = "Awaiting my signature", group = Group.Queues,
@@ -116,10 +121,19 @@ internal val queueModules: List<WorkModule> = listOf(
         source = Source.Api("/api/partner-ops/transfers", arrayKey = "requests", limitParam = null),
         filters = listOf(Filter("status", "Show", listOf("open" to "Open", "all" to "All"))),
         titlePaths = listOf("kind"),
-        subtitle = listOf(Field("Subject", "subject_id"), Field("To agency", "to_agency_id")),
+        subtitle = listOf(Field("Subject", "subject_id"), Field("To agency", "to_agency_id"),
+            Field("Hold", "hold.status", FieldKind.Status)),
+        // §6: the request IS the Operations recommendation (`recommendation`),
+        // and `hold` is the freeze placed on the subject's unsettled earnings
+        // at the move — both served by the route, shown as served.
         detail = listOf(Field("Kind", "kind"), Field("Subject", "subject_id"),
             Field("From agency", "from_agency_id"), Field("To agency", "to_agency_id"),
-            Field("Note", "note", FieldKind.LongText), Field("Status", "status", FieldKind.Status),
+            Field("Status", "status", FieldKind.Status),
+            // `transfer_requests.view`: `recommendation.by` is `{uid, role}` of whoever filed it.
+            Field("Recommended by", "recommendation.by.uid", FieldKind.Uid), Field("Recommender's role", "recommendation.by.role"),
+            Field("Recommendation", "recommendation.note", FieldKind.LongText),
+            Field("Recommended", "recommendation.at", FieldKind.Date),
+            Field("Hold on unsettled earnings", "hold", FieldKind.Json), Field("Hold placed", "hold.at", FieldKind.Date),
             Field("Requested", "requested_at", FieldKind.Date), Field("Decision", "decision", FieldKind.Json)),
         actions = listOf(WorkAction("transfer.decide", "Decide", "/api/partner-ops/transfers/{item:id}/decide",
             gate = { c -> c.isOwner && c.requireWrite }, showFor = statusIn("pending"),
@@ -187,31 +201,55 @@ internal val queueModules: List<WorkModule> = listOf(
                 confirm = "Record this verification decision? A verified host can withdraw."),
         ),
     ),
+    // §5: "reviewer recommendation → Owner for lifting". A reviewer holding
+    // `can_ban_users` RECOMMENDS here (`/recommend`, note ≥ 10); the DECISION
+    // (`/decide`) is the Owner's, in the CRM — shown as a read-only marker so
+    // the screen says so rather than hiding that the step exists. Each row
+    // carries `restriction`: the ban or suspension the account is under NOW,
+    // who decided it, its category, scope and evidence references.
     WorkModule(
         id = "accountAppeals", title = "Ban & suspension appeals", group = Group.Queues,
-        summary = "Appeals against bans, suspensions and report outcomes, oldest first.",
+        summary = "Appeals against bans, suspensions and report outcomes, oldest first. Reviewers recommend; the Owner decides in the CRM.",
         crm = "/operations/appeals",
         gate = { c -> c.isInternal },
         source = Source.Api("/api/users/appeals"),
         filters = listOf(Filter("status", "Status", listOf("pending" to "Pending", "upheld" to "Upheld",
             "overturned" to "Overturned", "resolved" to "Resolved", "" to "All"))),
         titlePaths = listOf("subjectName", "subjectUid"), nameUidPaths = listOf("subjectUid"),
-        subtitle = listOf(Field("Kind", "kind"), Field("Raised", "createdAt", FieldKind.Date)),
+        subtitle = listOf(Field("Kind", "kind"), Field("Under", "restriction.state", FieldKind.Status),
+            Field("Recommended", "recommendation.outcome", FieldKind.Status), Field("Raised", "createdAt", FieldKind.Date)),
         detail = listOf(Field("Account", "subjectUid", FieldKind.Uid, link = Link("users.record", "uid")),
             Field("Kind", "kind"), Field("Raised by", "raisedByRole"), Field("Status", "status", FieldKind.Status),
             Field("Statement", "statement", FieldKind.LongText), Field("Reference", "reference"),
-            Field("Decision reason", "decisionReason", FieldKind.LongText), Field("Decided by", "decidedByName"),
-            Field("Decided", "decidedAt", FieldKind.Date), Field("Reversed", "reversed", FieldKind.Json),
+            // The restriction as it stands now (read from the account when the queue is listed).
+            Field("Restriction now", "restriction.state", FieldKind.Status),
+            Field("Restriction reason", "restriction.reason", FieldKind.LongText),
+            Field("Ban category", "restriction.category"), Field("Ban scope", "restriction.scope", FieldKind.Status),
+            Field("Ban evidence", "restriction.evidence", FieldKind.Json),
+            Field("Decided by", "restriction.decidedByName"), Field("Decided by (role)", "restriction.decidedByRole"),
+            Field("Decided", "restriction.decidedAt", FieldKind.Date),
+            Field("Suspended until", "restriction.suspendedUntil", FieldKind.Date),
+            // The reviewer's recommendation, when one has been recorded
+            // (`appeals.recommend_appeal`: outcome, note, byUid, byName, byRole, at).
+            Field("Recommendation", "recommendation.outcome", FieldKind.Status),
+            Field("Recommendation note", "recommendation.note", FieldKind.LongText),
+            Field("Recommended by", "recommendation.byName"), Field("Recommender's role", "recommendation.byRole"),
+            Field("Recommended", "recommendation.at", FieldKind.Date),
+            Field("Decision reason", "decisionReason", FieldKind.LongText), Field("Appeal decided by", "decidedByName"),
+            Field("Appeal decided", "decidedAt", FieldKind.Date), Field("Reversed", "reversed", FieldKind.Json),
             Field("Still outstanding", "outstanding", FieldKind.Json), Field("Raised", "createdAt", FieldKind.Date)),
-        hide = setOf("evidence", "evidenceUrls"),
+        hide = setOf("evidence", "evidenceUrls", "recommendationHistory"),
         actions = listOf(
             WorkAction("appeal.evidence", "View evidence", "/api/users/appeals/{item:id}/evidence", method = "GET",
                 gate = { c -> c.has(Perm.BAN_USERS) }, help = "Signed links valid for 15 minutes."),
-            WorkAction("appeal.decide", "Decide", "/api/users/appeals/{item:id}/decide",
+            WorkAction("appeal.recommend", "Recommend", "/api/users/appeals/{item:id}/recommend",
                 gate = { c -> c.has(Perm.BAN_USERS) }, showFor = statusIn("pending"),
-                inputs = listOf(choice("verdict", "Verdict", "upheld" to "Uphold the decision", "overturned" to "Overturn it"),
-                    reason(10, 2000)),
-                confirm = "Decide this appeal? Overturning reverses the ban, suspension or report outcome. You cannot decide an appeal against your own decision."),
+                inputs = listOf(choice("outcome", "Recommendation", "uphold" to "Uphold the restriction", "overturn" to "Overturn it"),
+                    noteInput(10, 2000, help = "The record the Owner reads. Not the person who made the decision being appealed (four eyes).")),
+                confirm = "Record this recommendation? It lifts nothing: the appeal stays pending, the Owners are notified and decide it in the CRM."),
+            crmOnly("appeal.decide", "Decide (CRM)",
+                "Only the Owner decides a ban or suspension appeal, on the recommendation recorded here; an overturn lifts the restriction.",
+                showFor = statusIn("pending")),
         ),
     ),
     WorkModule(

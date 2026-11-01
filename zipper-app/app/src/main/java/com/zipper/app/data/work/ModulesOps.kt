@@ -29,8 +29,10 @@ internal val opsModules: List<WorkModule> = listOf(
 
     // P1-A3 — an Owner's API session is limited to this until a code is
     // verified (the server refuses every other Owner route with 403).
-    // `ApiClient` adopts the session the verify route returns. Setting up the
-    // authenticator is done once, on the CRM, where the setup key is shown.
+    // `ApiClient` adopts the session the verify route returns. APK 20: the
+    // app's own door (OwnerMfaGateHost) asks for the code — and runs the
+    // set-up when there is none — before Main; this screen is for a session
+    // that was renewed or re-minted while the app was open.
     WorkModule(
         id = "owner.mfa", title = "Two-step sign-in", group = Group.Mine,
         summary = "Enter the code from your authenticator app to unlock Owner screens.",
@@ -56,8 +58,8 @@ internal val opsModules: List<WorkModule> = listOf(
         ),
         // P1-A3b: the code also unlocks Owner screens that read Firestore and
         // stored documents for THIS app sign-in (ApiClient sends its token).
-        note = "Not set up yet? Sign in to the CRM on a computer once to add your authenticator app. " +
-            "Lost your phone and codes? The Observer can reset it.",
+        note = "Not set up yet? Sign out and sign in again — the app walks you through adding your authenticator app " +
+            "(the CRM does the same). Lost your phone and codes? The Observer can reset it.",
     ),
 
     WorkModule(
@@ -326,11 +328,16 @@ internal val opsModules: List<WorkModule> = listOf(
         source = Source.Api("/api/staff", limitParam = null),
         filters = listOf(Filter("include_inactive", "Show", listOf("false" to "Active", "true" to "Everyone"))),
         idPath = "uid", titlePaths = listOf("name", "email"), statusPath = "status",
-        subtitle = listOf(Field("Team", "team"), Field("Since", "created_at", FieldKind.Date)),
+        subtitle = listOf(Field("Team", "team"), Field("Reports to", "reports_to_resolved.label"), Field("Since", "created_at", FieldKind.Date)),
+        // §9: "Reports to" is RESOLVED by the server from positions and the
+        // department's vacancy state — a member of a department with no Admin
+        // reads "Owner (vacancy)" — never the uid of whoever invited them.
         detail = listOf(Field("Name", "name"), Field("Email", "email"), Field("Phone", "phone"), Field("Role", "role"),
             Field("Team", "team"), Field("Access", "status", FieldKind.Status), Field("Active", "is_active", FieldKind.Bool),
             Field("Field / charge", "field_charge"),
-            Field("Reports to", "reports_to"), Field("Employment ID", "employment_id"), Field("Joined", "joined_at"),
+            Field("Reports to", "reports_to_resolved.label"), Field("Department Admin seat vacant", "reports_to_resolved.vacancy", FieldKind.Bool),
+            Field("Reports to (account)", "reports_to_resolved.uid"),
+            Field("Employment ID", "employment_id"), Field("Joined", "joined_at"),
             Field("Salary (minor units)", "salary_minor", FieldKind.Count, visibleTo = { c -> c.readsAll }),
             Field("Salary currency", "salary_currency", visibleTo = { c -> c.readsAll }),
             Field("Since", "created_at", FieldKind.Date)),
@@ -376,6 +383,47 @@ internal val opsModules: List<WorkModule> = listOf(
             WorkAction("staff.overview", "Headcount by department", "/api/staff/overview", method = "GET",
                 gate = { c -> c.readsAll }),
             WorkAction("staff.me", "My staff profile", "/api/staff/me", method = "GET", gate = { c -> c.isInternal }),
+            // The module takes no parameter; the link value only has to be non-blank to be followed.
+            WorkAction("staff.departments", "Departments", kind = ActionKind.Navigate, gate = { c -> c.isInternal },
+                target = Link("departments", "all")),
         ),
     ),
+    // §9 — every department's Admin seat: who holds it, or that it is VACANT
+    // (members report to the Owner until a replacement is appointed).
+    WorkModule(
+        id = "departments", title = "Departments", group = Group.Team,
+        summary = "Each department's Admin: who holds the seat, or that it is vacant and since when.",
+        crm = "/team (departments)",
+        gate = { c -> c.isInternal },
+        source = Source.Api("/api/staff/departments", arrayKey = "departments", limitParam = null),
+        idPath = "team", titlePaths = listOf("label", "team"), statusPath = null,
+        rowTransform = Departments::transform,
+        subtitle = listOf(Field("Admin", "admin_label"), Field("Seat", "seat_label")),
+        detail = listOf(Field("Department", "label"), Field("Admin", "admin_label"), Field("Seat", "seat_label"),
+            Field("Admins", "admins", FieldKind.Json), Field("Vacant since", "vacancy_since", FieldKind.Date),
+            Field("Why vacant", "vacancy_cause", FieldKind.LongText)),
+        note = "A member of a department with no Admin reports to the Owner (\"Owner (vacancy)\") until one is appointed. Written only by the staff lifecycle.",
+    ),
 )
+
+/** §9 department rows → the two sentences a row shows. Pure; pinned by the JVM test. */
+object Departments {
+    const val VACANT = "Vacant — members report to the Owner"
+
+    /** `staff.REPORTS_TO_OWNER_VACANCY` — what a member of a department with no Admin reports to. */
+    const val OWNER_VACANCY = "Owner (vacancy)"
+
+    fun transform(item: Item): Item {
+        // An Admin is named by name, or by account id when the row has none.
+        val admins = (item["admins"] as? List<*>).orEmpty().mapNotNull { a ->
+            val m = a as? Map<*, *> ?: return@mapNotNull null
+            (m["name"] as? String)?.takeIf { it.isNotBlank() } ?: (m["uid"] as? String)?.takeIf { it.isNotBlank() }
+        }
+        // The server's `vacancy` is the authority; no Admin on the row reads the same way.
+        val vacant = item["vacancy"] == true || admins.isEmpty()
+        return item + mapOf(
+            "admin_label" to (if (vacant) OWNER_VACANCY else admins.joinToString(", ")),
+            "seat_label" to (if (vacant) VACANT else "Filled"),
+        )
+    }
+}

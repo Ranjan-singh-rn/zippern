@@ -1,5 +1,7 @@
 package com.zipper.app.data.work
 
+import com.zipper.app.util.jsonText
+
 /*
  * Finance: host withdrawals and agency salary requests (Firestore queues the
  * CRM reads, with the decision written exactly as the CRM writes it and the
@@ -27,6 +29,45 @@ private val expenseCategories = arrayOf(
     "gateway_fees" to "Gateway fees", "binance_fees" to "Binance fees", "taxes" to "Taxes",
     "refunds_to_users" to "Refunds to users", "other" to "Other",
 )
+
+/**
+ * B1 / spec §5 §11 — items of a revoked partner held for Finance review.
+ * `GET /partner-ops/held-items` answers `{cards, recharges, sales,
+ * subagency_payouts, total}`; the release route names the item's TYPE
+ * (`card | recharge | sale | subagency_payout`), which is the array's name
+ * without its plural. Pure, so the JVM test pins the mapping.
+ */
+object HeldItems {
+    val arrays = listOf("cards", "recharges", "sales", "subagency_payouts")
+
+    fun typeOf(arrayName: String): String = when (arrayName) {
+        "cards" -> "card"
+        "recharges" -> "recharge"
+        "sales" -> "sale"
+        "subagency_payouts" -> "subagency_payout"
+        else -> arrayName.removeSuffix("s")
+    }
+
+    fun label(type: String): String = when (type) {
+        "card" -> "Money card"
+        "recharge" -> "Recharge"
+        "sale" -> "Coin sale"
+        "subagency_payout" -> "Sub-agency payout"
+        else -> type
+    }
+
+    /** Adds `held_type` and `held_label` from the array the row came from; a row's own `title` is kept. */
+    fun transform(item: Item): Item {
+        val type = typeOf(item["__from"].jsonText().orEmpty())
+        val title = item["title"].jsonText()?.takeIf { it.isNotBlank() }
+            ?: listOfNotNull(label(type), item["seller_name"].jsonText() ?: item["sub_name"].jsonText() ?: item["buyer_uid"].jsonText())
+                .joinToString(" · ")
+        return item + mapOf("held_type" to type, "held_label" to label(type), "held_title" to title)
+    }
+
+    /** Finance's admin or an Owner — `money_freeze.can_decide_held`, which the route re-checks. */
+    fun mayRelease(c: Caps): Boolean = c.has(Perm.PROCESS_PAYOUT) && (c.isOwner || c.role == "finance_admin")
+}
 
 internal val moneyModules: List<WorkModule> = listOf(
 
@@ -180,5 +221,54 @@ internal val moneyModules: List<WorkModule> = listOf(
                 Input("method", "Method", required = false, default = "bank", maxLen = 40),
                 Input("reference", "Bank reference (UTR)", minLen = 1, maxLen = 200), reason()),
             confirm = "Raise a capital card? An owner cannot sign their own movement; it settles after signature.")),
+    ),
+
+    // ── B1 money integrity (Finance / Owner) ─────────────────────────────────
+    WorkModule(
+        id = "heldItems", title = "Held items", group = Group.Money,
+        summary = "Pending cards, recharges, sales and sub-agency payouts of a revoked partner, held for Finance review.",
+        crm = "/frozen-money (held items), /board (held)",
+        // `require_internal` + `enforce_permission(CAN_PROCESS_PAYOUT)` on the route.
+        gate = { c -> c.has(Perm.PROCESS_PAYOUT) },
+        source = Source.Api("/api/partner-ops/held-items", arrayKeys = HeldItems.arrays),
+        filters = listOf(Filter("include_released", "Show", listOf("false" to "Still held", "true" to "Including released"))),
+        rowTransform = HeldItems::transform,
+        titlePaths = listOf("held_title"), statusPath = "held.reason",
+        subtitle = listOf(Field("Type", "held_label"), Field("Partner", "held.partner_id"),
+            Field("Held since", "held.at", FieldKind.Date), Field("Released", "held.released_at", FieldKind.Date)),
+        detail = listOf(Field("Type", "held_label"), Field("Record ID", "id"), Field("Why held", "held.reason", FieldKind.Status),
+            Field("Partner kind", "held.partner_kind"), Field("Partner ID", "held.partner_id"),
+            Field("Note", "held.note", FieldKind.LongText), Field("Held", "held.at", FieldKind.Date), Field("Held by", "held.by.name"),
+            // `money_freeze.release_hold` writes `released_at`, `released_by` and `release_reason`.
+            Field("Released", "held.released_at", FieldKind.Date), Field("Released by", "held.released_by.name"),
+            Field("Release reason", "held.release_reason", FieldKind.LongText),
+            Field("Stage", "stage", FieldKind.Status), Field("Status", "status", FieldKind.Status),
+            Field("Amount", "amount", FieldKind.Count), Field("Diamonds", "diamonds", FieldKind.Count),
+            Field("Amount (₹)", "amount_minor", FieldKind.Money), Field("Subject", "subject", FieldKind.Json),
+            Field("Raised", "created_at", FieldKind.Date)),
+        actions = listOf(WorkAction("held.release", "Release hold", "/api/partner-ops/held-items/{item:held_type}/{item:id}/release",
+            gate = HeldItems::mayRelease, showFor = { i, _ -> stat(i, "held.released_at").isBlank() },
+            inputs = listOf(reason(5, 1000, help = "Kept on the item with who released it and when.")),
+            confirm = "Lift this hold? The item can then be decided through its ordinary route; nothing is approved or executed here.")),
+        note = "Nothing on this list is approved, cancelled or executed by the machine. Finance's admin or an Owner releases a hold; the item is then decided where it normally is.",
+        searchPaths = listOf("held_title", "held.partner_id", "held_label"),
+    ),
+    WorkModule(
+        id = "replicaDrift", title = "Replica drift", group = Group.Money,
+        summary = "Balances whose last Firestore sync failed — Mongo is right, the app's copy is stale.",
+        crm = "/finance (replica drift)",
+        gate = { c -> c.has(Perm.PROCESS_PAYOUT) },
+        source = Source.Api("/api/partner-ops/money/replica-drift", arrayKey = "balances"),
+        header = listOf(Field("Stale balances", "count", FieldKind.Count)),
+        // A `balances` row as stored: holder_type / holder_id / currency / amount,
+        // plus `replica_stale_at` and the `replica_pending` deltas still owed.
+        titlePaths = listOf("holder_id", "id"), statusPath = null,
+        subtitle = listOf(Field("Holder", "holder_type"), Field("Currency", "currency"),
+            Field("Stale since", "replica_stale_at", FieldKind.Date)),
+        detail = listOf(Field("Balance row", "id"), Field("Holder type", "holder_type"), Field("Holder ID", "holder_id"),
+            Field("Currency", "currency"), Field("Balance (Mongo, authoritative)", "amount", FieldKind.Count),
+            Field("Pending deltas", "replica_pending", FieldKind.Json), Field("Stale since", "replica_stale_at", FieldKind.Date),
+            Field("Updated", "updated_at", FieldKind.Date)),
+        note = "Read-only here. The sweep replays every pending delta every 15 minutes; the manual repair (`replica-drift/repair`) is an Owner / Finance action in the CRM.",
     ),
 )

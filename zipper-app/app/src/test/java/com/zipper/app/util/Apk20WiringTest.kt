@@ -91,13 +91,20 @@ class Apk20WiringTest {
         assertTrue(chat.contains("doc.getString(\"body\") ?: doc.getString(\"message\")"))
     }
 
-    @Test fun `owner TOTP on the app login is a documented TODO, not wired`() {
+    @Test fun `owner TOTP on the app login is wired at the Main door (APK 20 part 2)`() {
         val gate = src("ui/screens/auth/OwnerMfaGate.kt")
-        assertTrue(gate.contains("TODO(APK 20"))
-        assertTrue(gate.contains("/api/auth/mfa/status"))
-        assertFalse(com.zipper.app.ui.screens.auth.OwnerMfaGate.enforced("owner"))
+        assertFalse("no longer a TODO", gate.contains("TODO(APK 20"))
+        assertTrue(gate.contains("STATUS_PATH = \"/api/auth/mfa/status\""))
+        assertTrue(com.zipper.app.ui.screens.auth.OwnerMfaGate.enforced("owner"))
         assertTrue(com.zipper.app.ui.screens.auth.OwnerMfaGate.appliesTo("Owner"))
+        assertTrue("the CRM directory's spelling of an Owner", com.zipper.app.ui.screens.auth.OwnerMfaGate.appliesTo("superadmin"))
         assertFalse(com.zipper.app.ui.screens.auth.OwnerMfaGate.appliesTo("observer"))
-        assertFalse("nothing consults the gate yet", src("ui/screens/auth/SplashScreen.kt").contains("OwnerMfaGate"))
+        assertFalse(com.zipper.app.ui.screens.auth.OwnerMfaGate.appliesTo("ops_admin"))
+        // Every way into Main passes the host; the pre-filter is the server's role, cached at both gates.
+        val graph = src("navigation/ZipperNavGraph.kt")
+        assertTrue(graph.contains("OwnerMfaGateHost("))
+        assertTrue(Regex("""composable\(Screen\.Main\.route\) \{\s*com\.zipper\.app\.ui\.screens\.auth\.OwnerMfaGateHost\(""").containsMatchIn(graph))
+        assertTrue(src("ui/screens/auth/SplashViewModel.kt").contains("sessionManager.setCrmRole(last.crmRole)"))
+        assertTrue(src("data/repository/AuthRepository.kt").contains("sessionManager.setCrmRole(id.crmRole)"))
     }
 }

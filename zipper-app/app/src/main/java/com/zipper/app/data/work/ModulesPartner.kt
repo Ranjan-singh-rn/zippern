@@ -211,14 +211,20 @@ internal val partnerModules: List<WorkModule> = listOf(
     ),
     WorkModule(
         id = "partner.records", title = "My partner records", group = Group.Mine,
-        summary = "Your agency / seller records, their status, credit and balances.",
+        summary = "Every live agency / seller record of this login, each with its own status, credit and balances.",
         crm = "/profile, /agency-pending, /seller-pending",
         gate = { c -> c.isExternal },
         source = Source.Api("/api/partner-ops/partners"),
-        subtitle = listOf(Field("Kind", "kind"), Field("Since", "created_at", FieldKind.Date)),
+        subtitle = listOf(Field("Kind", "kind"), Field("Status", "status", FieldKind.Status),
+            Field("Revoked for", "revocation_reason"), Field("Since", "created_at", FieldKind.Date)),
         detail = partnerDetail,
         detailPath = "/api/partner-ops/partners/{id}",
         hide = setOf("approved_by", "rejected_by", "created_by", "deactivated_by", "reactivated_by", "revoked_by", "activated_by"),
+        // `GET /partner-ops/partners` answers a partner with the records on its
+        // session — the approved, active ones (`security._partner_login`). A
+        // revoked or suspended second record therefore never hides a live one.
+        note = "One row per live record, each with its own status. A record waiting on your phone and email is under Contact verification; " +
+            "a revoked or suspended record is not reachable from this login and never hides a live one.",
     ),
     WorkModule(
         id = "partner.verification", title = "Contact verification", group = Group.Mine,

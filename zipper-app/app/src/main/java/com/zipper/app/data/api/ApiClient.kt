@@ -38,7 +38,9 @@ import javax.inject.Singleton
  *
  * ── RETRIES ─────────────────────────────────────────────────────────────────
  * A 401 means the server refused the credential before running the route, so
- * one fresh sign-in and one retry is safe for every method. Nothing else is
+ * one fresh sign-in and one retry is safe for every method — except on the
+ * two-step CODE routes, where a 401 is the verdict on the code and a replay
+ * would be counted as a second wrong one ([CODE_ROUTES]). Nothing else is
  * retried: a POST that reached the server is never sent twice from here.
  */
 @Singleton
@@ -99,6 +101,21 @@ class ApiClient @Inject constructor(
         }
         val first = send(method, path, query, withFirebaseSignIn(method, path, body), token)
         if (first is ApiResult.Failure && first.error.status == 401) {
+            // A 401 from a two-step CODE route is, almost always, the server
+            // judging the code (wrong or reused) — not refusing the session.
+            // Replaying it would be charged as a second wrong code (five lock
+            // sign-in for 15 minutes), so it goes back to the screen as it is.
+            // Only when the session itself is gone (the server refuses it on
+            // `/auth/me` too) is it dropped, so the next code is checked on a
+            // fresh one — and the person is told the code was never checked.
+            if (method == "POST" && path in CODE_ROUTES) {
+                if (!sessionRefused(token)) return first
+                if (session?.token == token) {
+                    session = null
+                    sessionUser = emptyMap()
+                }
+                return ApiResult.Failure(first.error.copy(message = CODE_NOT_CHECKED))
+            }
             // Refused before the route ran — mint a new session once and retry.
             session = null
             val again = when (val s = ensureSession(forceNew = true)) {
@@ -129,6 +146,12 @@ class ApiClient @Inject constructor(
         return first
     }
 
+    /** Is [token] itself refused (401 on `GET /auth/me`, which every session — pending ones included — may call)? */
+    private suspend fun sessionRefused(token: String): Boolean {
+        val probe = send("GET", "/api/auth/me", emptyMap(), null, token)
+        return probe is ApiResult.Failure && probe.error.status == 401
+    }
+
     private suspend fun settleOwnerBinding(path: String, result: ApiResult.Ok, uid: String): ApiResult {
         val body = result.body.jsonMap() ?: return result
         val minted: Map<String, Any?>? = when (path) {
@@ -140,10 +163,12 @@ class ApiClient @Inject constructor(
         sessionUser["mfa"].jsonMap()?.let { mfa ->
             sessionUser = sessionUser + ("mfa" to (mfa + ("firestore_binding" to settled)))
         }
+        // The session token was adopted above; it is a credential and does not
+        // travel on to a screen or a view-model (same rule as the custom token).
         val clean: Map<String, Any?> = when (path) {
             MFA_BIND -> settled
-            MFA_VERIFY -> body + ("user" to sessionUser)
-            else -> body + ("session" to ((body["session"].jsonMap() ?: emptyMap()) + ("user" to sessionUser)))
+            MFA_VERIFY -> (body - "token") + ("user" to sessionUser)
+            else -> body + ("session" to (((body["session"].jsonMap() ?: emptyMap()) - "token") + ("user" to sessionUser)))
         }
         return ApiResult.Ok(result.status, clean)
     }
@@ -245,7 +270,10 @@ class ApiClient @Inject constructor(
             return@withLock SessionOutcome.Failed(ApiError.network(e.message))
         }
         if (idToken.isNullOrBlank()) return@withLock SessionOutcome.Failed(ApiError.signedOut())
-        when (val r = send("POST", "/api/auth/signin", emptyMap(), mapOf("id_token" to idToken), null)) {
+        // B3: `client` names this session on `GET /auth/sessions` and is what the
+        // Owner MFA binding is minted for; it grants nothing. An Owner's answer
+        // is a PENDING session (`user.mfa.verified == false`) — see OwnerMfaGate.
+        when (val r = send("POST", "/api/auth/signin", emptyMap(), mapOf("id_token" to idToken, "client" to "android"), null)) {
             is ApiResult.Ok -> if (adopt(r.body, user.uid)) SessionOutcome.Ok(session!!.token)
                 else SessionOutcome.Failed(ApiError(0, "The server's sign-in answer could not be read.", ApiError.Kind.Server))
             is ApiResult.Failure -> SessionOutcome.Failed(
@@ -350,5 +378,12 @@ class ApiClient @Inject constructor(
         const val MFA_ENROL_CONFIRM = "/api/auth/mfa/enrol/confirm"
         const val MFA_BIND = "/api/auth/mfa/bind"
         const val MFA_BIND_CONFIRM = "/api/auth/mfa/bind/confirm"
+        const val MFA_RECOVERY_CODES = "/api/auth/mfa/recovery-codes"
+
+        /** The routes whose 401 is a verdict on a CODE, never replayed (see [call]). */
+        val CODE_ROUTES = setOf(MFA_VERIFY, MFA_ENROL_CONFIRM, MFA_RECOVERY_CODES)
+
+        const val CODE_NOT_CHECKED =
+            "Your sign-in to the work server had ended, so that code was not checked. Enter a new code."
     }
 }

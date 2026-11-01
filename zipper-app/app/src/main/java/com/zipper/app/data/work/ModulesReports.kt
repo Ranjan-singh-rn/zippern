@@ -98,6 +98,19 @@ internal val reportModules: List<WorkModule> = listOf(
                 yesNo("force", "Store a new revision", "Yes", "No").copy(default = "false")),
             confirm = "Re-build and email the weekly business report?")),
     ),
+    // M-5: the hold between a week closing and its beans becoming withdrawable,
+    // published in one place for the CRM, the app and the Function.
+    WorkModule(
+        id = "reports.payoutPolicy", title = "Payout policy", group = Group.Reports,
+        summary = "How long a closed week is held before hosts can withdraw it (an open Owner decision).",
+        crm = "/finance/payouts (policy)",
+        gate = { c -> c.isInternal },
+        source = Source.Api("/api/reports/payout-policy", arrayKey = "__none__", limitParam = null),
+        header = listOf(Field("Weeks in arrears", "release_arrears_weeks", FieldKind.Count),
+            Field("Current behaviour", "current_behaviour", FieldKind.LongText),
+            Field("Setting", "setting"), Field("Owner decision pending", "owner_decision_pending", FieldKind.Bool),
+            Field("Applies to", "applies_to"), Field("Note", "note", FieldKind.LongText)),
+    ),
     WorkModule(
         id = "reports.definitions", title = "Report definitions", group = Group.Reports,
         summary = "What each figure means, the units and the rate fallbacks.",
