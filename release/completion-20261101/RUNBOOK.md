@@ -109,6 +109,11 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
   12 itself pins back to BASE if a step is not live within 120 s.
 - **Note (Observer):** the completion backend requires the Observer's TOTP as soon as it serves 100% (no flag gates it), and
   the CRM with the Observer TOTP step only arrives at step 6 — run step 6 promptly after step 4 reaches 100% (`12 100`).
+- **Re-run after a failed check:** 11 records nothing when a check fails, and the revision it created stays at 0%,
+  untagged. Re-running 11 (after a fix, at the new HEAD) creates a new revision; its gate accepts the template only when
+  it is exactly the revision an earlier run of 11 created and verified (environment = that run's `env-new.txt`). The
+  e-mail check reads the revision's mail log lines every 15 s for up to 3 min (1 Nov: one read after 25 s, and the
+  Observer-code path logged no line on success — fixed in the backend).
 - **Rollback:** any `RESULT: STOP`, or at will: `./19-rollback-backend.command` (ROLLBACK) or `./12-canary-backend.command back` (BACK).
   After step 6 a backend rollback must go together with the CRM rollback (the new CRM calls routes BASE lacks).
 
@@ -119,6 +124,9 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
   e-mail functions (`WAVE_2A_MAIL`) + the 82 others whose code changed (`WAVE_2A_HYGIENE`). Wave 2b (8) is step 8.
   `NOT_REDEPLOYED`: onHostInvitationWithdrawn (unchanged; keeps its 20 Oct deployment).
 - **Precondition:** not within Sunday 16:29–21:00 UTC (refused); `functions/.env` equals what the functions run with.
+- **Deploy folder:** the whole commit is unpacked (20, 21 and 29 alike) because the functions tests read files outside
+  `functions/` (`firestore.rules`, `setup-email-and-deploy.command`, `deleteUsers.js`, an Android source); only `functions/`
+  is deployed. On 1 Nov, with `functions/` alone, 4 tests failed and 20 refused — the rollback 29 would have refused too.
 - **Do:** `./20-deploy-functions-wave2a.command` (DEPLOY2A): fresh tree from HEAD, npm ci, tsc, every test; then the exports
   of the built `lib/index.js` (node, empty environment) must be exactly WAVE_2A + WAVE_2B + NOT_REDEPLOYED — each name in one
   list, each function in the region the scripts describe it in (9 schedulers in us-central1) — or it refuses; then deploy by name.

@@ -320,7 +320,8 @@ if a[:3] == ["run", "revisions", "describe"]:
 if a[:2] == ["run", "deploy"]:
     assert "--no-traffic" in a and flag("--source") == ".", "deploy without --no-traffic/--source"
     assert os.path.exists("Dockerfile"), "not run from the backend source"
-    new = "zipper-api-00049-new"; tag = flag("--tag")
+    # a re-run of 11 (after a run that created 00049 and stopped on a check) gets its own name, as Cloud Run would
+    new = "zipper-api-00049-new" if "zipper-api-00049-new" not in state["revisions"] else "zipper-api-00051-rer"; tag = flag("--tag")
     env = [e for e in svc["template_env"]]
     for pair in (flag("--update-secrets") or "").split(","):
         n, ref = pair.split("="); sname, ver = ref.split(":")
@@ -650,7 +651,9 @@ NODE_STUB = '''#!/bin/bash
 [ -n "${STUB_LOG:-}" ] && echo "node $*" >> "$STUB_LOG"
 case "$1" in
   --version) echo v22.11.0;;
-  --test) printf 'TAP version 13\\nok 1 - a\\n# tests 3\\n# suites 0\\n# pass 3\\n# fail 0\\n';;
+  --test) # like the real suite, some tests read ../firestore.rules (the 1 Nov run of 20 had functions/ alone: 4 failed)
+      if [ ! -f ../firestore.rules ]; then printf 'TAP version 13\\nnot ok 1 - reads ../firestore.rules\\n# tests 3\\n# suites 0\\n# pass 2\\n# fail 1\\n'; exit 1; fi
+      printf 'TAP version 13\\nok 1 - a\\n# tests 3\\n# suites 0\\n# pass 3\\n# fail 0\\n';;
   -e) # the export enumeration of check_exports: "name region" per export, from the harness's control file
       echo "node -e cwd=$PWD home=$HOME stublog=${STUB_LOG:-unset} gcloud_project=${GCLOUD_PROJECT:-unset}" >> "@EXPORTS@.calls"
       [ -f lib/index.js ] || { echo "Error: Cannot find module './lib/index.js'" >&2; exit 1; }
@@ -1017,6 +1020,39 @@ ok("10 re-run: nothing to do, no prompt, PASS", rc == 0 and "ABOUT TO" not in o 
 # ── 11 backend no-traffic ──
 rc, o = run(C11, "NO\n")
 ok("11 refuses without DEPLOY (exit 4), no deploy", rc == 4 and "run deploy" not in calls(), o[-400:])
+
+# The 1 Nov sequence: a run whose e-mail check finds no 'accepted' line creates a revision at 0% and records nothing;
+# a re-run must accept that revision as the template (and only that one). Afterwards the state is put back as it was,
+# so the normal run below starts from the same production state as before.
+SNAP = st()
+BS11 = RELC / "production" / "backend-revision.txt"
+s = st(); s["log_counts"] = {}; put(s)
+rc, o = run(C11, "DEPLOY\nEMAIL\nUNTAG\n")
+ok("11 with no mail log line: polls up to 3 min, then 1 check fails, nothing recorded, traffic and tag as before",
+   rc == 1 and "after 180 s: mail log lines: 0; accepted: 0" in o and "FAIL  SendGrid accepted the message" in o
+   and "NOT recorded" in o and not BS11.exists() and st()["service"]["traffic"] == [{"revisionName": SERVING, "percent": 100}]
+   and not st()["service"]["tags"], o[-1500:])
+s = st(); s["log_counts"] = {"accepted (": 1}; put(s)
+rc, o = run(C11, "DEPLOY\nEMAIL\nUNTAG\n")
+ok("11 re-run: the template is the revision the failed run created and verified -> accepted; a new revision, PASS, recorded",
+   rc == 0 and "RESULT: PASS" in o and "this is a re-run of 11" in o and "after 15 s: mail log lines: 1; accepted: 1" in o
+   and BS11.exists() and "name=zipper-api-00051-rer\n" in BS11.read_text() and "head=%s\n" % HEAD in BS11.read_text(), o[-2500:])
+ok("11 re-run: environment = template + the SendGrid settings, each name once", "environment = template + SENDGRID_API_KEY" in o, o[-1500:])
+put(SNAP)
+if BS11.exists():
+    BS11.unlink()
+s = st(); s["log_counts"] = {"FAILED (HTTP": 1}; put(s)
+rc, o = run(C11, "DEPLOY\nEMAIL\nUNTAG\n")
+ok("11: a FAILED mail line for the revision fails the e-mail check at the first read, nothing recorded",
+   rc == 1 and "after 15 s: mail log lines: 1; accepted: 0" in o and "FAIL  no failed or unsent mail line" in o and not BS11.exists(), o[-1500:])
+put(SNAP)
+s = st(); s["service"]["template_env"] = s["service"]["template_env"] + [{"name": "SOMETHING_ELSE", "value": "x"}]; put(s)
+rc, o = run(C11, "DEPLOY\n")
+ok("11 refuses a template with other changes that no earlier run of 11 created", rc == 3 and "no earlier run of 11 created" in o and "run deploy" not in calls(), o[-600:])
+put(SNAP)
+for d in (RELC / "production").glob("11-deploy-backend-*Z"):
+    shutil.rmtree(d)
+
 rc, o = run(C11, "DEPLOY\nEMAIL\nUNTAG\n")
 c = calls()
 ok("11 deploys at 0%, smoke-tests, sends one e-mail, untags: PASS", rc == 0 and "RESULT: PASS" in o, o[-2500:])
@@ -1233,6 +1269,8 @@ ok("20 deployed the RELEASE tree (functions v2) to the 95, nothing to wave 2b or
    all(st()["functions"][n]["source"].startswith("// functions v2") for n in WAVE_2A)
    and all(st()["functions"][n]["source"] == PROD_SRC for n in WAVE_2B + NOT_REDEPLOYED))
 ok("20 left no .env copy and no node_modules", not list((RELC / "production").glob("20-*/deploy/functions/.env")) and not list((RELC / "production").glob("20-*/deploy/functions/node_modules")))
+ok("20's deploy folder holds the whole commit (the functions tests read ../firestore.rules)",
+   (newest("20-functions-2a-") / "deploy" / "firestore.rules").exists() and (newest("20-functions-2a-") / "deploy" / "functions" / "package.json").exists())
 ok("20 output shows no environment value", not leaks(o), leaks(o))
 s = st(); s2 = json.loads(json.dumps(s)); s2["functions"]["releaseBeansForWeek"]["environmentVariables"]["API_BASE"] = "https://other.example"; put(s2)
 rc, o = run(C20, "DEPLOY2A\n")
@@ -1252,6 +1290,8 @@ ok("29 2a redeploys the production tree refs/heads/prod-live-20261030 (BASE_COMM
    and "firebase deploy --only %s --project zipper-83816 --non-interactive" % WAVE_2A_ONLY in calls()
    and all(st()["functions"][n]["source"] == PROD_SRC for n in WAVE_2A), o[-1500:])
 ok("29 removed its worktree", git("worktree", "list").count("\n") == 0, git("worktree", "list"))
+ok("29's deploy folder holds the whole BASE commit, so its tests (which read ../firestore.rules) ran",
+   (newest("29-rollback-functions-2a-") / "deploy" / "firestore.rules").exists() and "node --test on the exact tree: 3/3" in o, o[-800:])
 time.sleep(1.1)
 run(C20, "DEPLOY2A\n")
 

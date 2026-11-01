@@ -6,7 +6,8 @@
 #   hygiene: the 82 other functions whose code changed (WAVE_2A_HYGIENE)
 # Production change (after you type DEPLOY2A), exactly:
 #   firebase deploy --only functions:<name>,functions:<name>,... --project zipper-83816 --non-interactive
-# from a fresh folder = functions/ exactly as committed at the release HEAD (git archive) + a firebase.json holding only
+# from a fresh folder = the repository exactly as committed at the release HEAD (git archive; the tests read files
+# outside functions/, only functions/ is deployed) + a firebase.json holding only
 # the repository's functions section + your functions/.env (copied, never displayed). npm ci, tsc and EVERY test file
 # run on that exact tree first; then the exports of its compiled lib/index.js must be exactly WAVE_2A + WAVE_2B +
 # NOT_REDEPLOYED, each name in one list, each function in the region the scripts describe it in (check_exports).

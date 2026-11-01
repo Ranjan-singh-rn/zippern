@@ -8,13 +8,17 @@ fn_only() {
   printf '%s' "$out"
 }
 
-# build_fn_tree <commit>: a fresh deploy folder = functions/ exactly as committed at <commit> (git archive: the working
-# tree is never deployed), plus a firebase.json holding only the functions section of the repository's firebase.json at
-# that commit (its predeploy build and ignore list, verbatim). Sets DEPLOY. Records the tree hash of what was unpacked.
+# build_fn_tree <commit>: a fresh deploy folder = the repository exactly as committed at <commit> (git archive: the
+# working tree is never deployed), plus a firebase.json holding only the functions section of the repository's
+# firebase.json at that commit (its predeploy build and ignore list, verbatim). The whole commit is unpacked because the
+# functions tests read files outside functions/ (firestore.rules, setup-email-and-deploy.command, an Android source) —
+# the 1 Nov run with functions/ alone failed 4 of them. Only functions/ is deployed (firebase.json names it; the CLI
+# packages that folder alone). Sets DEPLOY. Records the tree hash of functions/.
 build_fn_tree() {
   local commit="$1"
   DEPLOY="$OUT/deploy"; mkdir -p "$DEPLOY" || stop "cannot create $DEPLOY"
-  ( git -C "$REPO" archive --format=tar "$commit" functions | tar -x -C "$DEPLOY" ) 2>>"$ERR" || stop "git archive of functions/ at $commit failed"
+  ( git -C "$REPO" archive --format=tar "$commit" | tar -x -C "$DEPLOY" ) 2>>"$ERR" || stop "git archive of $commit failed"
+  [ -f "$DEPLOY/firestore.rules" ] || stop "the unpacked commit has no firestore.rules (the functions tests read it)"
   [ -f "$DEPLOY/functions/package.json" ] && [ -f "$DEPLOY/functions/package-lock.json" ] || stop "the unpacked functions/ tree has no package.json / package-lock.json"
   git -C "$REPO" show "$commit:firebase.json" 2>>"$ERR" | python3 -I -c '
 import json, sys

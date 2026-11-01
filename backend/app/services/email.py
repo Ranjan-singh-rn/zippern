@@ -2761,7 +2761,14 @@ def _deliver_blocking(
             **_attempt_fields(result),
         },
     )
-    if not result.ok:
+    if result.ok:
+        # The same line `deliver()` writes for an accepted message: kind, masked
+        # address and the provider's status — never the code or link itself.
+        # Without it a delivered code left no trace in the logs at all, and the
+        # release check (11-deploy-backend-no-traffic.command) could not confirm
+        # that the backend's key works.
+        log.info("Email '%s' → %s accepted (%s).", kind, _masked(doc["to"]), result.status)
+    else:
         log.error(
             "Email '%s' → %s FAILED (HTTP %s)%s: %s",
             kind, _masked(doc["to"]), result.status,

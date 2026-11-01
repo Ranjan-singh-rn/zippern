@@ -51,8 +51,22 @@ grep '^ENV ' "$OUT/revision-serving.txt" | sort > "$OUT/env-serving.txt"
 $H env-diff "$OUT/env-serving.txt" "$OUT/env-template.txt" > "$OUT/env-diff-template.txt"
 sed 's/^/   template vs serving: /' "$OUT/env-diff-template.txt" | tee -a "$OUT/SUMMARY.txt"
 EXTRA="$(grep -vE '^(\+ ENV OWNER_MFA_REQUIRED \(plain\)|\+ ENV OWNER_MFA_ENCRYPTION_KEY <- secret OWNER_MFA_ENCRYPTION_KEY:1|DIFF )' "$OUT/env-diff-template.txt" | grep -c .)"
-[ "$EXTRA" = 0 ] || stop "the template's environment differs from the serving revision by more than the two Owner-MFA names (env-diff-template.txt)"
-check ok "template = serving revision + OWNER_MFA_REQUIRED + OWNER_MFA_ENCRYPTION_KEY:1 (names only)"
+if [ "$EXTRA" = 0 ]; then
+  check ok "template = serving revision + OWNER_MFA_REQUIRED + OWNER_MFA_ENCRYPTION_KEY:1 (names only)"
+else
+  # A re-run: an earlier run of 11 created the template revision (at 0%) and stopped on a check before recording it, so
+  # the template now also carries the SendGrid settings that run added. Accepted only when the template is exactly the
+  # revision that run created and verified — its environment equal to that run's env-new.txt, line for line.
+  PREV=""
+  for d in "$HERE"/production/11-deploy-backend-*Z; do
+    [ -d "$d" ] && [ "$d" != "$OUT" ] && [ -f "$d/revision-new.txt" ] && [ -f "$d/env-new.txt" ] || continue
+    grep -q "^REV name=$TEMPLATE_REV " "$d/revision-new.txt" && PREV="$d"
+  done
+  [ -n "$PREV" ] || stop "the template's environment differs from the serving revision by more than the two Owner-MFA names (env-diff-template.txt), and no earlier run of 11 created $TEMPLATE_REV"
+  diff "$PREV/env-new.txt" "$OUT/env-template.txt" > "$OUT/env-template-vs-previous.txt" 2>&1 \
+    || stop "the template $TEMPLATE_REV was created by $(basename "$PREV"), but its environment is no longer what that run verified (env-template-vs-previous.txt)"
+  check ok "template $TEMPLATE_REV = the revision $(basename "$PREV") created and verified (environment = its env-new.txt); this is a re-run of 11"
+fi
 grep -q "^ENV OWNER_MFA_ENCRYPTION_KEY <- secret $MFA_SECRET:1\$" "$OUT/env-template.txt" || stop "the template does not carry $MFA_SECRET:1 (Observer TOTP needs it)"
 
 gcloud secrets versions list "$SG_SECRET" --project "$P" --format=json 2>>"$ERR" | $H versions - > "$OUT/secret-versions.txt"  #RO
@@ -135,7 +149,7 @@ DIG="$(printf '%s' "$REVLINE" | sed -n 's/.* digest=\([^ ]*\) .*/\1/p')"
 grep '^ENV ' "$OUT/revision-new.txt" | sort > "$OUT/env-new.txt"
 { grep -v '^ENV SENDGRID_API_KEY ' "$OUT/env-template.txt"
   echo "ENV SENDGRID_API_KEY <- secret ZIPPER_SENDGRID_API_KEY:1"
-  echo "ENV EMAIL_PROVIDER (plain)"; echo "ENV SENDGRID_FROM_EMAIL (plain)"; echo "ENV SENDGRID_FROM_NAME (plain)"; } | sort > "$OUT/env-expected.txt"
+  echo "ENV EMAIL_PROVIDER (plain)"; echo "ENV SENDGRID_FROM_EMAIL (plain)"; echo "ENV SENDGRID_FROM_NAME (plain)"; } | sort -u > "$OUT/env-expected.txt"
 if diff "$OUT/env-expected.txt" "$OUT/env-new.txt" > "$OUT/env-unexpected.txt"; then
   check ok "environment = template + SENDGRID_API_KEY->ZIPPER_SENDGRID_API_KEY:1 + EMAIL_PROVIDER/SENDGRID_FROM_EMAIL/SENDGRID_FROM_NAME ($(grep -c . "$OUT/env-new.txt") names)"
 else
@@ -203,12 +217,20 @@ if [ -n "$TAGURL" ]; then
     EC="$(curl -sS --max-time 40 -o "$OUT/request-code.txt" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "$TAGURL/api/auth/observer/request-code" 2>>"$ERR")"  #MUT-EMAIL
     [ "$EC" = 200 ] && grep -q 'A sign-in code has been sent' "$OUT/request-code.txt" && check ok "request-code -> 200, 'A sign-in code has been sent' (no code in the response)" || check "HTTP $EC" "request-code -> 200"
     grep -Eq '"code"' "$OUT/request-code.txt" && check "a code field is in the response" "the response carries no code" || check ok "the response carries no code"
-    say "   waiting 25 s for the delivery log"; sleep 25
-    SINCE="$(since_utc 5)"
-    gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.revision_name=\"$NEW\" AND timestamp>=\"$SINCE\" AND (textPayload:\"accepted (\" OR textPayload:\"FAILED (HTTP\" OR textPayload:\"not sent\")" --project "$P" --limit 50 --format='value(timestamp,severity)' > "$OUT/mail-log.tsv" 2>>"$ERR"  #RO
-    gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.revision_name=\"$NEW\" AND timestamp>=\"$SINCE\" AND textPayload:\"accepted (\"" --project "$P" --limit 50 --format='value(timestamp)' > "$OUT/mail-accepted.tsv" 2>>"$ERR"  #RO
-    say "   mail log lines: $(grep -c . "$OUT/mail-log.tsv"); accepted: $(grep -c . "$OUT/mail-accepted.tsv") (content not read)"
-    [ "$(grep -c . "$OUT/mail-accepted.tsv")" -ge 1 ] 2>/dev/null && check ok "SendGrid accepted the message (key usable by the backend)" || check "no 'accepted' line yet" "SendGrid accepted the message"
+    # Log entries can take a while to arrive: read every 15 s for up to 3 min, until the accepted line or a failure line
+    # for this revision shows up (the 1 Nov run read once after 25 s). Timestamps and severities only — no content.
+    SINCE="$(since_utc 5)"; WAITED=0; NALL=0; NACC=0; NFAIL=0
+    say "   reading this revision's mail log lines every 15 s, for up to 3 min (timestamps only)"
+    while [ "$WAITED" -lt 180 ]; do
+      sleep 15; WAITED=$((WAITED + 15))
+      gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.revision_name=\"$NEW\" AND timestamp>=\"$SINCE\" AND (textPayload:\"accepted (\" OR textPayload:\"FAILED (HTTP\" OR textPayload:\"not sent\" OR textPayload:\"could not be delivered\")" --project "$P" --limit 50 --format='value(timestamp,severity)' > "$OUT/mail-log.tsv" 2>>"$ERR"  #RO
+      gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.revision_name=\"$NEW\" AND timestamp>=\"$SINCE\" AND textPayload:\"accepted (\"" --project "$P" --limit 50 --format='value(timestamp)' > "$OUT/mail-accepted.tsv" 2>>"$ERR"  #RO
+      NALL="$(grep -c . "$OUT/mail-log.tsv")"; NACC="$(grep -c . "$OUT/mail-accepted.tsv")"; NFAIL=$((NALL - NACC))
+      if [ "$NACC" -ge 1 ] || [ "$NFAIL" -ge 1 ]; then break; fi
+    done
+    say "   after ${WAITED} s: mail log lines: $NALL; accepted: $NACC (content not read)"
+    [ "$NFAIL" -le 0 ] && check ok "no failed or unsent mail line for this revision" || check "$NFAIL line(s): FAILED / not sent / could not be delivered (mail-log.tsv)" "no failed or unsent mail line for this revision"
+    [ "$NACC" -ge 1 ] && check ok "SendGrid accepted the message (key usable by the backend)" || check "no 'accepted' line within ${WAITED} s" "SendGrid accepted the message"
     say "   NOW CHECK THE DELIVERY MAILBOX (Show original): From 'ZIPPER Live <no-reply@zipperlive.org>', SPF/DKIM/DMARC pass, no tracking links."
   elif [ "$ans" = SKIP ]; then
     say "E-mail test skipped by you (SKIP). Record the reason in the runbook."

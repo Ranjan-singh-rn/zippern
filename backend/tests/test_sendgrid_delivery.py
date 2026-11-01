@@ -587,9 +587,19 @@ for environment in ("development", "production"):
         reset_provider()
         code = next(CODES)
         PROVIDER.queue[:] = list(script)
+        mark = len(LOGS.lines)
         mail.send_observer_otp(code, 10)
         ok(f"{environment} / {case}: the observer code is in no log record",
            not any(code in line for line in LOGS.lines))
+        # The synchronous path logs an accepted message exactly like `deliver()`
+        # ("Email '<kind>' → ***@domain accepted (202)."); the release check of
+        # 11-deploy-backend-no-traffic.command reads that line. Only when it
+        # was accepted, once, masked.
+        accepted = [line for line in LOGS.lines[mark:] if "accepted (" in line]
+        check(f"{environment} / {case}: logged as accepted only when SendGrid took it",
+              len(accepted), 1 if case in ("delivered", "refused then delivered") else 0)
+        ok(f"{environment} / {case}: …that line names the kind and the masked mailbox only",
+           all("Email 'observer.otp' → ***@zipper.example accepted (202)." in line for line in accepted))
     # No key at all — the path that used to print the code outside production.
     reset_provider()
     settings.sendgrid_api_key = ""

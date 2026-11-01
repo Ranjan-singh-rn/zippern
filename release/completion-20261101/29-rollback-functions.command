@@ -75,6 +75,10 @@ ROLL="$EXISTING"
 git -C "$REPO" worktree add --detach "$WT" "$BASE_COMMIT" > "$OUT/worktree.log" 2>&1 || stop "git worktree add failed (worktree.log)"  #LOCAL-GIT
 [ -d "$WT/functions/src" ] || stop "the worktree has no functions/src"
 DEPLOY="$OUT/deploy"; mkdir -p "$DEPLOY" || exit 2
+# The rest of BASE_COMMIT next to functions/: the functions tests read files outside functions/ (firestore.rules,
+# setup-email-and-deploy.command, deleteUsers.js, an Android source) — with functions/ alone 4 of them fail and the
+# rollback would refuse. Only functions/ is deployed (the generated firebase.json names it).
+( git -C "$REPO" archive --format=tar "$BASE_COMMIT" | tar -x -C "$DEPLOY" ) 2>>"$ERR" || stop "git archive of BASE_COMMIT failed"
 ( cd "$WT" && tar -cf - functions ) | ( cd "$DEPLOY" && tar -xf - ) || stop "copying functions/ out of the worktree failed"
 rm -rf "$DEPLOY/functions/node_modules" "$DEPLOY/functions/lib" "$DEPLOY/functions/.env" "$DEPLOY/functions/.env."* 2>/dev/null
 WANT_TREE="$($H tree-sha "$REPO" "$BASE_COMMIT" functions)"
