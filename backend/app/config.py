@@ -162,8 +162,47 @@ class Settings(BaseSettings):
 
     # Email
     sendgrid_api_key: str = ""
-    mail_from: str = "no-reply@zipper.app"
+    #: Spec §12: `no-reply@zipperlive.org` is the sender for OTP, verification,
+    #: password reset, security and transactional mail — and, until the owner
+    #: confirms that info@ / support@ are real mailboxes, for everything else
+    #: too (see the identity switches below). The default is the domain
+    #: SendGrid is authenticated for; SENDGRID_FROM_EMAIL / MAIL_FROM override.
+    mail_from: str = "no-reply@zipperlive.org"
     mail_from_name: str = "Zipper"
+
+    # ── Spec §12 sender identities, and the two switches ────────────────────
+    #
+    # The identity table (`email.IDENTITY_TABLE`) names three streams:
+    #
+    #     auth | security | transactional  →  no-reply@<domain>   (always on)
+    #     info                             →  info@<domain>       (switchable)
+    #     support                          →  support@<domain>    (switchable)
+    #
+    # Q8 in the owner questions is open: info@ and support@ are NOT confirmed
+    # to be mailboxes, aliases or forwarders. Until they are, every identity
+    # resolves to `mail_from` (no-reply) and NO Reply-To is set — a reply to a
+    # no-reply address is a known dead end, a reply to a support@ that nobody
+    # reads is a silent one. Flipping a switch to true needs no code change:
+    # the identity then leaves from its own address. No Reply-To is ever set,
+    # switch or no switch (§12). The Functions side reads the same two names
+    # from its environment (`functions/src/mail.ts`).
+    #:
+    #: `info@` leaves as itself (reports, general platform information).
+    email_identity_info_enabled: bool = False
+    #: `support@` leaves as itself (support mail only; never a Reply-To).
+    email_identity_support_enabled: bool = False
+    #: The address each switchable identity uses once enabled. Empty derives
+    #: `info@` / `support@` on the `mail_from` domain (the legacy MAIL_FROM_BULK
+    #: and MAIL_FROM_SUPPORT / SUPPORT_EMAIL values are honoured first).
+    mail_from_info: str = ""
+    mail_from_name_info: str = ""
+    #: How many sweeps re-attempt a failed, retryable delivery before it is
+    #: left for a person (`email.retry_failed`). The gaps double each time
+    #: from one sweep interval (15 min) up to a day.
+    email_retry_max_sweeps: int = 6
+    #: A delivery still `queued` after this many minutes is a process that died
+    #: between recording and the provider answering; it is retried like a failure.
+    email_stale_queued_minutes: int = 30
 
     # Where partner-facing mail points people. Used in links only; no figure is
     # ever derived from it.

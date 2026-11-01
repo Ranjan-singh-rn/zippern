@@ -105,6 +105,9 @@ FIRESTORE_DELETE: dict[str, str] = {
     "hostPayouts": "host payouts",
     "weeklyPayoutReports": "weekly payout reports (money history)",
     "platformRevenue": "platform revenue rows (money history)",
+    "platformRevenueDaily": "daily revenue roll-ups derived from platformRevenue (money history)",
+    "rateLimits": "abuse token buckets keyed by device/IP for unauthenticated callables (activity-derived)",
+    "mailLog": "partner-email delivery markers (who was mailed what; activity-derived)",
     "platformStats": "aggregated stats derived from user activity",
     "giftEvents": "gift events (money movements)",
     "giftTransactions": "gift transactions (money movements)",
@@ -148,10 +151,11 @@ FIRESTORE_SUBCOLLECTIONS: dict[str, frozenset[str]] = {
     "agencies": frozenset({"agencyHosts", "commissionLedger"}),
     "sellers": frozenset({"rechargeHistory", "diamondLending"}),
     "liveRooms": frozenset({"comments", "gifts", "viewers"}),
-    "partyRooms": frozenset({"seats", "listeners", "messages", "seatRequests", "seatInvites", "gifts"}),
+    "partyRooms": frozenset({"seats", "listeners", "messages", "seatRequests", "seatInvites", "gifts", "private"}),
     "conversations": frozenset({"messages"}),
     "calls": frozenset({"messages"}),
     "giftPairs": frozenset({"gifts"}),
+    "weeklyPayoutReports": frozenset({"hostPayouts"}),
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -183,6 +187,8 @@ MONGO_DELETE: dict[str, str] = {
     "weekly_business_reports": "weekly business reports (money history)",
     "reconciliation": "ledger reconciliation rows",
     "owner_notices": "Owner money-notification delivery state (names Owners; money history)",
+    "department_vacancies": "department Admin vacancy state (names staff; re-derived after re-seed)",
+    "notice_outbox": "in-app notices parked after a failed Firestore write (names users; activity-derived)",
     "email_deliveries": "email delivery records (audit data; name recipients)",
     "report_subscriptions": "report subscriptions keyed by staff email",
     "public_appeal_rate": "public appeal form rate counters",

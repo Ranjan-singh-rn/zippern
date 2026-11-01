@@ -32,11 +32,11 @@ configured minutes (`ALERT_OWNER_NOTICE_PENDING_MINUTES`).
 
 Who is told: every **active** staff account holding the Owner role except the
 actor, resolved from the staff record by `notify.staff_with_roles` — the same
-source every alert uses, and never a constant. The email goes out through
-`email.deliver` (the recorded, role-gated, retrying path) with
-`Sensitivity.BUSINESS_MONEY`; the in-app notice through `notices.deliver`.
-This module adds no template file: the body is built from `email.facts` and
-`email.callout`, which is enough for a four-line fact sheet.
+source every alert uses, and never a constant. The email is the §12 catalogue
+template `owner.money_action` (`email.send_template`: recorded, role-gated,
+`Sensitivity.BUSINESS_MONEY`, identity `transactional`); the in-app notice
+goes through `notices.deliver`, the one writer, with the same sentence and
+facts. The notice's `delivery.email` state is kept in step on every attempt.
 """
 
 from __future__ import annotations
@@ -248,16 +248,22 @@ async def _attempt(db, doc: dict) -> dict:
         return {"event_key": key, "status": "no_recipients", "recipients": 0, "deliveries": deliveries}
 
     subject, body, rows = _sentence(doc)
-    html = mail.page(
-        title=subject,
-        preheader=body[:180],
-        body=mail.callout(body, "warning", heading="Owner money action") + mail.facts(rows) + (
-            '<p style="margin:16px 0 0;line-height:1.6;font-size:13px;color:#52525b">'
+    # §12: the email is the catalogue's `owner.money_action` template — same
+    # identity, tracking and shape as every other notice email — built from
+    # the same sentence and facts the in-app notice carries.
+    params = {
+        "title": subject.replace("Zipper — ", ""),
+        "subject": subject,
+        "body": body,
+        "rows": [[str(label), ("" if value is None else str(value))] for label, value in rows
+                 if value not in (None, "")],
+        "footnote": (
             "You are receiving this because one Owner may now take a money card through every "
             "stage alone (master spec §8) and every other Owner is told of each step. "
-            "The full trail is in the CRM audit log under the reference above.</p>"
+            "The full trail is in the CRM audit log under the reference above."
         ),
-    )
+        "related_id": str(doc.get("reference") or ""),
+    }
 
     errors: list[str] = []
     for person in recipients:
@@ -269,6 +275,7 @@ async def _attempt(db, doc: dict) -> dict:
                 type=NOTICE_TYPE,
                 title=subject.replace("Zipper — ", ""),
                 body=body,
+                related_id=str(doc.get("reference") or ""),
                 meta={"eventKey": key, "action": str(doc.get("action") or ""),
                       "reference": str(doc.get("reference") or ""),
                       "referenceType": str(doc.get("reference_type") or ""),
@@ -279,27 +286,28 @@ async def _attempt(db, doc: dict) -> dict:
             if not state["in_app"]:
                 errors.append(f"in-app notice for {uid} not written")
         if str(state.get("email") or "") not in _EMAIL_OK:
-            try:
-                row = await mail.deliver(
-                    kind=email_kind(str(doc.get("action") or "")),
-                    spec=SPEC,
-                    recipient=person,
-                    subject=subject,
-                    html=html,
-                    sensitivity=mail.Sensitivity.BUSINESS_MONEY,
-                    dedupe_key=f"{key}:{uid}:a{attempt}",
-                    meta={"event_key": key, "action": str(doc.get("action") or ""),
-                          "reference": str(doc.get("reference") or ""),
-                          "amount": doc.get("amount"), "currency": str(doc.get("currency") or ""),
-                          "actor_uid": str(actor.get("uid") or ""), "attempt": attempt},
-                )
-                state["email"] = str(row.get("outcome") or "")
-                if state["email"] not in _EMAIL_OK:
-                    errors.append(f"email to {uid}: {state['email']} — {row.get('error') or ''}".strip())
-            except Exception as exc:  # noqa: BLE001 — recorded, retried later
-                log.exception("Owner notification email %s → %s failed", key, uid)
-                state["email"] = "error"
-                errors.append(f"email to {uid}: {type(exc).__name__}: {exc}")
+            # `send_template` never raises; this module keeps its own retry
+            # (per-attempt dedupe keys), so no recipe is stored on the row.
+            row = await mail.send_template(
+                "owner.money_action", person, params,
+                related_id=str(doc.get("reference") or ""),
+                recipient_key=uid,
+                dedupe_key=f"{key}:{uid}:a{attempt}",
+                kind=email_kind(str(doc.get("action") or "")),
+                retry_recipe=False,
+                meta={"event_key": key, "action": str(doc.get("action") or ""),
+                      "reference": str(doc.get("reference") or ""),
+                      "amount": doc.get("amount"), "currency": str(doc.get("currency") or ""),
+                      "actor_uid": str(actor.get("uid") or ""), "attempt": attempt},
+                notice={"userId": str(person.uid or ""), "eventKey": f"{key}:{person.uid}"},
+            )
+            state["email"] = str(row.get("outcome") or "")
+            if state["email"] not in _EMAIL_OK:
+                errors.append(f"email to {uid}: {state['email']} — {row.get('error') or ''}".strip())
+            await notices.mark_email_state(
+                str(person.uid or ""), f"{key}:{person.uid}", notices.email_state_of(row),
+                error=str(row.get("error") or "") if state["email"] not in _EMAIL_OK else "",
+            )
         state["name"] = person.name
         deliveries[uid] = state
 

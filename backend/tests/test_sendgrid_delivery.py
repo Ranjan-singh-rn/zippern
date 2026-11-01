@@ -549,10 +549,26 @@ ok("get_settings() applies the SENDGRID_* names before anything reads the sender
 reset_provider()
 from_row = send(dedupe_key="sg:from")
 check("mail leaves from no-reply@zipperlive.org", PROVIDER.sent[-1]["from"], "no-reply@zipperlive.org")
-check("…with no support@ Reply-To: it falls back to the From address", PROVIDER.sent[-1]["reply_to"],
-      "no-reply@zipperlive.org")
+check("…with NO Reply-To while support@ is not a confirmed mailbox (spec §12, Q8)",
+      PROVIDER.sent[-1]["reply_to"], None)
 check("…and the row records the aligned sender", from_row["sender"]["from"], "no-reply@zipperlive.org")
 check("…on one domain", from_row["sender"]["domain"], "zipperlive.org")
+check("…and the identity it left under", from_row["identity"], "transactional")
+
+# The support switch, once the owner confirms the mailbox: support mail leaves
+# as itself. No code change — a setting. Still no Reply-To anywhere (§12).
+settings.email_identity_support_enabled = True
+reset_provider()
+switched = send(dedupe_key="sg:from-support-on", identity=mail.SenderIdentity.SUPPORT)
+check("support@ switched on: a support message leaves from support@", PROVIDER.sent[-1]["from"],
+      "support@zipperlive.org")
+check("…with no Reply-To", PROVIDER.sent[-1]["reply_to"], None)
+reset_provider()
+send(dedupe_key="sg:from-support-on-tx")
+check("…and a transactional message still leaves from no-reply", PROVIDER.sent[-1]["from"],
+      "no-reply@zipperlive.org")
+check("…and still carries no Reply-To", PROVIDER.sent[-1]["reply_to"], None)
+settings.email_identity_support_enabled = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════

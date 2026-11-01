@@ -758,6 +758,12 @@ settings.mail_from_name_bulk = "Zipper reports"
 settings.support_email = "support@zipper.example"
 settings.unsubscribe_url = "https://api.zipper.example/api/notifications/unsubscribe"
 settings.jwt_secret = "a-test-signing-secret"
+# Spec §12: info@ and support@ leave as themselves only once the owner has
+# confirmed the mailboxes (the two switches). This section tests the separate
+# streams, so both are on here; `tests/test_email_identities.py` covers the
+# default (both off → everything from no-reply, no Reply-To).
+settings.email_identity_info_enabled = True
+settings.email_identity_support_enabled = True
 
 # ── A plain-text alternative on everything ───────────────────────────────────
 
@@ -870,16 +876,16 @@ check(
     "notifications@zipper.example",
 )
 check(
-    "and every one of them replies to a mailbox a person reads",
+    "and none of them sets a Reply-To, even with support@ switched on (spec §12)",
     [mail.sender_for(i)[2] for i in mail.SenderIdentity],
-    ["support@zipper.example"] * 3,
+    [""] * len(list(mail.SenderIdentity)),
 )
 check(
     "the visible From on a bulk send is the bulk identity, not a shared mailbox",
     PROVIDER.sent[-1]["from"],
     "reports@zipper.example",
 )
-check("…and Reply-To reaches support", PROVIDER.sent[-1]["reply_to"], "support@zipper.example")
+check("…and carries no Reply-To", PROVIDER.sent[-1]["reply_to"], None)
 ok("all three identities are on one domain, so one DKIM key aligns them all",
    len({mail._domain_of(mail.sender_for(i)[0]) for i in mail.SenderIdentity}) == 1)
 
@@ -908,6 +914,8 @@ unaligned_row = send(
 check("it still sends — this is a warning, not a gate", unaligned_row["outcome"], str(mail.Outcome.SENT))
 ok("…but it is never silent", "sender_not_aligned" in unaligned_row["meta"])
 settings.mail_from_bulk = "reports@zipper.example"
+settings.email_identity_info_enabled = False
+settings.email_identity_support_enabled = False
 
 # ── Nothing in the catalogue reads as a mailshot ─────────────────────────────
 

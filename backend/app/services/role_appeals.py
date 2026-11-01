@@ -430,7 +430,18 @@ async def submit(uid: str, kind: str, statement: str, actor: dict) -> dict[str, 
         after={"status": "pending", "kind": kind, "record_id": revoked["record_id"]},
         meta={"uid": uid, "kind": kind, "record_id": revoked["record_id"]},
     )
-    return {"appeal": public_view(doc), "existing": False}
+    # §12 "reinstatement requested": the person gets a receipt, the Owners a
+    # notice that a request is waiting. Best effort, after the record.
+    notified = await notices.role_appeal_requested(uid, kind, appeal_id, revoked["record_id"])
+    owners = await email_owners(
+        kind="role_appeal.requested",
+        subject=f"Reinstatement requested: {label}",
+        title=f"A {label} reinstatement request is waiting for review",
+        body=f"A {label} reinstatement request has been filed and is waiting for a recommendation and your decision.",
+        rows=[("Request", appeal_id), ("Role", label), ("Record", revoked["record_id"])],
+        dedupe_key=f"role_appeal.requested:{appeal_id}",
+    )
+    return {"appeal": public_view(doc), "existing": False, "notified": notified, "owner_notified": owners}
 
 
 async def list_of(uid: str) -> dict[str, Any]:
@@ -459,41 +470,48 @@ async def list_for_staff(actor: dict, status: str = "open", limit: int = 200) ->
 
 async def email_owners(
     *, kind: str, subject: str, title: str, rows: list[tuple[str, Any]], dedupe_key: str,
+    body: str = "", related_id: str = "",
 ) -> dict[str, Any]:
-    """Tell the Owners by email, through the existing delivery path. Never raises.
+    """Tell the Owners — in-app AND by email — through the one notice writer.
+    Never raises.
 
-    Recipients are the active Owner staff records (`notify.staff_with_roles`),
-    the mail goes through `email.deliver` — recorded in the delivery log,
-    gated by role, deduplicated on `dedupe_key` — and what happened is
-    returned so the caller can say so. The audit entry the caller writes is
-    the notification of record; this is the nudge.
+    Spec §12: `notices.notify_owners` writes one notice per active Owner
+    (keyed `{dedupe_key}:{uid}`) and sends the matching catalogue template
+    (`kind` when it names one, else `owner.alert`) through the recorded,
+    role-gated, retryable email path. The audit entry the caller writes is
+    the notification of record; this is the telling. The return keeps the
+    shape callers already read (`sent`, `outcomes`).
     """
     try:
-        from app.core.roles import Role
         from app.services import email as email_svc
-        from app.services import notify
+        from app.services import notices
 
-        owners = await notify.staff_with_roles([Role.OWNER])
-        if not owners:
-            return {"sent": 0, "outcomes": [], "note": "No active Owner record carries an email address."}
-        html = email_svc.page(title=title, preheader=title, body=email_svc.facts(rows))
-        outcomes = []
-        for recipient in owners:
-            row = await email_svc.deliver(
-                kind=kind,
-                spec="C2/C3",
-                recipient=recipient,
-                subject=subject,
-                html=html,
-                sensitivity=email_svc.Sensitivity.OPERATIONAL,
-                dedupe_key=f"{dedupe_key}:{recipient.uid or recipient.email}",
-                meta={"dedupe": dedupe_key},
-            )
-            outcomes.append(str(row.get("outcome") or ""))
-        return {"sent": sum(1 for o in outcomes if o == "sent"), "outcomes": outcomes}
+        template = kind if kind in email_svc.TEMPLATES else "owner.alert"
+        if not related_id and ":" in dedupe_key:
+            # `transfer.requested:tr_123` → the request id is the related record.
+            related_id = dedupe_key.split(":", 2)[1]
+        result = await notices.notify_owners(
+            dedupe_key,
+            type=str(kind).replace(".", "_"),
+            title=title,
+            body=body or subject,
+            template=template,
+            related_id=related_id,
+            rows=list(rows),
+            meta={"kind": kind},
+        )
+        outcomes = list((result.get("email") or {}).values())
+        out: dict[str, Any] = {
+            "sent": sum(1 for o in outcomes if o == notices.EMAIL_SENT),
+            "outcomes": outcomes,
+            "in_app": list(result.get("notified") or []),
+        }
+        if result.get("note"):
+            out["note"] = result["note"]
+        return out
     except Exception as exc:  # noqa: BLE001 — the audit entry stands on its own
-        log.warning("Owner email for %s was not sent: %s", dedupe_key, exc)
-        return {"sent": 0, "outcomes": [], "note": f"Owner email not sent: {exc}"}
+        log.warning("Owner notice for %s was not delivered: %s", dedupe_key, exc)
+        return {"sent": 0, "outcomes": [], "note": f"Owner notice not delivered: {exc}"}
 
 
 # ── Recommending ──────────────────────────────────────────────────────────────

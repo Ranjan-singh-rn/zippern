@@ -65,10 +65,26 @@ async def _stub_deliver(**kw):
 
 
 email_stub.deliver = _stub_deliver
+
+
+# Spec §12 — the notices writer sends the access-change email through the
+# template catalogue (`send_template`, kind overridden to `staff.<change>`).
+async def _stub_send_template(name, recipient, params, **kw):
+    sent_mail.append({"kind": kw.get("kind") or name, "dedupe_key": kw.get("dedupe_key") or f"{name}:{kw.get('related_id', '')}",
+                      "html": str(params.get("body", "")), "template": name})
+    return {"outcome": "sent"}
+
+
+email_stub.send_template = _stub_send_template
 email_stub.Recipient = lambda **kw: types.SimpleNamespace(**kw)
 email_stub.Sensitivity = types.SimpleNamespace(OPERATIONAL="operational")
+email_stub.Outcome = types.SimpleNamespace(SENT="sent", DELIVERED="delivered", DUPLICATE="duplicate",
+                                           FAILED="failed", NOT_CONFIGURED="not_configured", QUEUED="queued")
+email_stub.RETRYABLE_OUTCOMES = frozenset({"failed", "not_configured", "queued"})
+email_stub.TEMPLATES = {}
 email_stub.page = lambda **kw: kw.get("body", "")
 email_stub.esc = lambda v: str(v)
+email_stub.when = lambda v, **kw: str(v)
 sys.modules["app.services.email"] = email_stub
 
 from app.core import audit as audit_mod  # noqa: E402

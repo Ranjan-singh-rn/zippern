@@ -1018,6 +1018,9 @@ async def ban_user(
             **(meta or {}),
         },
     )
+    # §5 / §12: the person is told, with the reason — in-app and by email —
+    # after the ban and its audit entry are committed. Never raises.
+    await _notify_restriction(uid, "banned", reason, audit_id)
     return _result(
         uid,
         before,
@@ -1196,6 +1199,7 @@ async def unban_user(
             **(meta or {}),
         },
     )
+    await _notify_restriction(uid, "unbanned", reason, audit_id)
     return _result(
         uid, before, after, audit_id,
         device_unbanned=bool(released),
@@ -1369,6 +1373,7 @@ async def suspend_user(
             **(meta or {}),
         },
     )
+    await _notify_restriction(uid, "suspended", reason, audit_id, until=until)
     return _result(
         uid,
         before,
@@ -1522,6 +1527,7 @@ async def resume_user(
             **(meta or {}),
         },
     )
+    await _notify_restriction(uid, "resumed", reason, audit_id)
     return _result(
         uid,
         before,
@@ -1536,6 +1542,19 @@ async def resume_user(
             "device barred for another reason stays barred."
         ),
     )
+
+
+async def _notify_restriction(
+    uid: str, change: str, reason: str, audit_id: Any, *, until: datetime | None = None,
+) -> None:
+    """§12: tell the person of a suspension / resume / ban / unban. Never raises,
+    and runs AFTER the authoritative patch and its audit entry."""
+    from app.services import notices
+
+    try:
+        await notices.account_restriction(uid, change, reason, str(audit_id or ""), until=until)
+    except Exception:  # noqa: BLE001 — a delivery problem, never a reason to unwind
+        log.exception("account %s: the '%s' notice was not delivered", uid, change)
 
 
 async def lift_expired_suspensions(actor: dict, limit: int = 200) -> dict:
@@ -2060,14 +2079,9 @@ async def _deliver_warning_notice(
     # generalised rather than copied.
     from app.services import notices
 
-    await notices.deliver(
-        uid,
-        f"warning_{warning_id}",
-        type="warning",
-        title="Official warning",
-        body=reason,
-        now=now,
-    )
+    # §12: the same writer carries the email (`user.warning`, to the person's
+    # verified address only; skipped — not failed — when there is none).
+    await notices.official_warning(uid, warning_id, reason, issued_at=now)
 
 
 async def grant_host(

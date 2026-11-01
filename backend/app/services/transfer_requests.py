@@ -356,6 +356,12 @@ async def request(
         kind="transfer.requested",
         subject=f"Transfer waiting for your decision: {_label(kind)} to {plan['to_name'] or plan['to_agency_id']}",
         title=f"A {_label(kind)} transfer is waiting for your decision",
+        body=(
+            f"A request to move {plan['subject'].get('name') or subject_id} from "
+            f"{plan['from_name'] or plan['from_agency_id']} to {plan['to_name'] or plan['to_agency_id']} "
+            "is waiting for your decision."
+        ),
+        related_id=request_id,
         rows=[
             ("Request", request_id),
             (_label(kind), plan["subject"].get("name") or subject_id),
@@ -366,7 +372,11 @@ async def request(
         ],
         dedupe_key=f"transfer.requested:{request_id}",
     )
-    return {"request": view(doc), "owner_notified": {"audit": Act.REQUESTED, "email": email}}
+    # §6 / §12 "transfer requested": the affected person and both agencies are
+    # told a transfer is waiting. Best effort, after the record and its audit.
+    notified = await _notify_parties(doc, plan, decision="requested")
+    return {"request": view(doc), "owner_notified": {"audit": Act.REQUESTED, "email": email},
+            "notified": notified}
 
 
 async def list_requests(actor: dict, status: str = "open", limit: int = 200) -> dict[str, Any]:
@@ -617,41 +627,68 @@ async def decide(request_id: str, approve: bool, note: str, actor: dict) -> dict
               "hold": ({**hold, "at": _iso(hold.get("at"))} if isinstance(hold, dict) else None),
               "settlement_policy": "OWNER_DECISION_PENDING" if approve else None},
     )
-    # §6: "notify source/target/affected". The affected person was told by the
-    # move itself (`_execute` / `_record_landed_move`); the two agencies' owners
-    # are told here. Best effort and last: the decision is made and recorded.
-    notified = await _notify_agencies(req, plan, moved) if approve else {}
+    # §6: "notify source/target/affected". On an approval the affected person
+    # was told by the move itself (`_execute` / `_record_landed_move`) and the
+    # two agencies' owners are told here; on a rejection all three are told
+    # here. Best effort and last: the decision is made and recorded.
+    notified = (await _notify_agencies(req, plan, moved) if approve
+                else await _notify_parties(req, None, decision="rejected", note=text))
     return {"request": view(updated), "moved": moved, "hold": view(updated)["hold"], "notified": notified}
 
 
 async def _notify_agencies(req: dict, plan: dict | None, moved: dict | None) -> dict:
     """Tell the source and target agencies' owners about an approved move. Never raises."""
+    if not moved:
+        return {"source": False, "target": False}
+    return await _notify_parties(req, plan, decision="approved")
+
+
+async def _notify_parties(req: dict, plan: dict | None, *, decision: str, note: str = "") -> dict:
+    """§6 / §12 — the source and target agencies' owners, and (for a request or a
+    refusal) the affected person. `decision` is `requested`, `approved` or
+    `rejected`. Never raises; the request or the decision stands."""
     from app.services import partner_applications as apps  # local: apps imports partner_ops
     from app.services import partner_roles
 
-    out = {"source": False, "target": False}
-    if not moved:
-        return out
+    out: dict[str, Any] = {"source": False, "target": False}
     kind = str(req.get("kind") or "")
     from_id = str(req.get("from_agency_id") or "")
     to_id = str(req.get("to_agency_id") or "")
+    subject_id = str(req.get("subject_id") or "")
     subject_name = str(((plan or {}).get("subject") or {}).get("name") or "")
+    request_id = str(req.get("_id") or "")
     try:
         names = (
             {from_id: (plan or {}).get("from_name"), to_id: (plan or {}).get("to_name")}
             if plan else await asyncio.to_thread(apps._current_agency_names, [from_id, to_id])
         )
+        from_name = str(names.get(from_id) or from_id)
+        to_name = str(names.get(to_id) or to_id)
         for side, agency_id in (("source", from_id), ("target", to_id)):
             if not agency_id:
                 continue
             row = await get_db()[C.PARTNERS].find_one({"_id": agency_id})
             owner = await partner_roles.owner_uid_of(row, db=get_db()) if row else ""
-            if not owner or owner == str(req.get("subject_id") or ""):
+            if not owner or owner == subject_id:
                 continue
             out[side] = await notices.transfer_agency_notice(
-                owner, str(req.get("_id") or ""), side=side, kind=kind, subject_name=subject_name,
-                from_name=str(names.get(from_id) or from_id), to_name=str(names.get(to_id) or to_id),
+                owner, request_id, side=side, kind=kind, subject_name=subject_name,
+                from_name=from_name, to_name=to_name, decision=decision,
+                agency_id=agency_id, agency_kind=str((row or {}).get("kind") or "agency"),
             )
+        if decision != "approved":
+            # The affected person: a host is their own uid; a sub-agency is told
+            # through its owner's login.
+            person = subject_id
+            if kind != "host":
+                row = await get_db()[C.PARTNERS].find_one({"_id": subject_id})
+                person = await partner_roles.owner_uid_of(row, db=get_db()) if row else ""
+            if person:
+                out["person"] = (
+                    await notices.transfer_requested_person(person, kind, request_id, from_name, to_name)
+                    if decision == "requested"
+                    else await notices.transfer_refused(person, kind, request_id, to_name, note)
+                )
     except Exception as exc:  # noqa: BLE001 — the decision stands
-        log.warning("transfer %s: the agencies could not be notified: %s", req.get("_id"), exc)
+        log.warning("transfer %s: the parties could not all be notified: %s", request_id, exc)
     return out

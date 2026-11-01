@@ -264,6 +264,12 @@ user("u-suspend", devices=("phone-a", "phone-b"))
 # Suspending must not so much as read it, and resuming must not delete it.
 device_ban("phone-a", manualBan=True, reason="Device farm — Ops.")
 
+import time as _time  # noqa: E402
+
+# The moment of suspension, taken BEFORE the call: the cut-off must move past
+# it. (Comparing with the clock after the call raced the second boundary
+# whenever the call — which now also delivers the §12 notice — crossed one.)
+_suspended_at = _time.time()
 result = run(users_router.suspend_user("u-suspend", suspend_body(days=7), OPS))
 
 check("the account is suspended", stored("u-suspend")["accountState"], "suspended")
@@ -313,9 +319,8 @@ ok("the response says no device was barred", "No device was barred" in result["n
 # Phase 1A (SESSION-003): a suspension ends the live sessions — the rules
 # cut-off moves past now and the refresh tokens are revoked — without
 # disabling the login (they must still be able to sign in and see why).
-import time as _time  # noqa: E402
 ok("Phase 1A — the session cut-off moves past now",
-   int(stored("u-suspend").get("credentialsValidAfter", 0)) > int(_time.time()))
+   int(stored("u-suspend").get("credentialsValidAfter", 0)) > _suspended_at)
 from app.db import firebase as _fb  # noqa: E402
 _rev = []
 _orig_revoke = _fb.revoke_sessions

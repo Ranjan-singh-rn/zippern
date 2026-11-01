@@ -108,6 +108,12 @@ settings.mail_from_support = "support@zipper.app"
 settings.mail_from_transactional = "hello@zipper.app"
 settings.unsubscribe_url = "https://api.zipper.app/api/notifications/unsubscribe"
 settings.environment = "test"
+# Spec §12: the bulk (info) and support identities leave as themselves only
+# once the owner confirms those mailboxes. This suite is about the streams
+# being separate, so both switches are on; the off-by-default behaviour is
+# pinned in `tests/test_email_identities.py`.
+settings.email_identity_info_enabled = True
+settings.email_identity_support_enabled = True
 
 # Small and fast. The waves have to be small enough that a throttle test does
 # not need six hundred fake users to produce three of them.
@@ -858,7 +864,7 @@ result = send("all_users", confirm_recipients=3)
 
 check("a mass send goes out as bulk", result["sender_identity"], str(mail.SenderIdentity.BULK))
 check("…from the bulk address", PROVIDER.sent[0]["from"], "news@zipper.app")
-check("…with a Reply-To that reaches a person", PROVIDER.sent[0]["reply_to"], "support@zipper.app")
+check("…and no Reply-To (spec §12: never set, on any identity)", PROVIDER.sent[0]["reply_to"], None)
 
 headers = PROVIDER.sent[0]["headers"]
 ok("a broadcast carries List-Unsubscribe", "List-Unsubscribe" in headers)

@@ -286,8 +286,10 @@ from app.services import notices as notices_mod  # noqa: E402
 
 delivery_src = inspect.getsource(svc._deliver_warning_notice)
 ok("the warning helper delegates to the shared notice writer",
-   "notices.deliver(" in delivery_src)
-writer_src = inspect.getsource(notices_mod.deliver)
+   "notices.official_warning(" in delivery_src or "notices.deliver(" in delivery_src)
+# §12: `deliver` is the public entry; `deliver_notice` builds the document and
+# `_write_in_app` is the one Firestore write — the failure handling lives there.
+writer_src = inspect.getsource(notices_mod.deliver_notice) + inspect.getsource(notices_mod._write_in_app)
 ok("the shared writer swallows its own failures", "except Exception" in writer_src)
 ok("…and logs them rather than discarding them", "log.exception" in writer_src)
 ok("…and addresses on userId", '"userId": uid' in writer_src)
@@ -306,7 +308,8 @@ ok("firestore.rules still has a /notifications block", block is not None)
 if block:
     body = block.group(1)
     ok("the read rule still tests `userId`",
-       "resource.data.userId == request.auth.uid" in body,
+       "resource.data.userId == request.auth.uid" in body
+       or "resource.data.get('userId', '') == request.auth.uid" in body,
        "if this rule changed, this whole design changed with it")
     ok("it does not test `targetUid`", "targetUid" not in body)
 

@@ -456,12 +456,14 @@ async def recommend_appeal(
             "owner_decision_pending": "whether a recommendation must precede the Owner's decision",
         },
     )
-    from app.services import role_appeals  # local: the shared Owner-email helper
+    from app.services import role_appeals  # local: the shared Owner notice helper (§12 writer)
 
     email = await role_appeals.email_owners(
         kind="appeal.recommended",
         subject=f"Appeal recommendation: {outcome} — {appeal.get('subjectName') or subject_uid}",
         title="A ban or suspension appeal is waiting for your decision",
+        body=f"A reviewer recommends '{outcome}' on appeal {appeal_id}. The decision is yours.",
+        related_id=appeal_id,
         rows=[
             ("Appeal", appeal_id),
             ("Account", subject_uid),
@@ -835,6 +837,16 @@ async def _decide_under_lease(
         if other:
             also_resolved = [other["appeal_id"], *other.get("also_resolved", [])]
 
+    # §12 "appeals decided": the person is told the outcome and the reason —
+    # in-app and by email — after the verdict and its audit entry. Never raises.
+    from app.services import notices  # local: notices imports email, which imports nothing of ours
+
+    try:
+        notified = await notices.appeal_decided(subject_uid, appeal_id, str(verdict_enum), reason)
+    except Exception:  # noqa: BLE001 — the decision stands
+        log.exception("appeal %s: the decision notice was not delivered", appeal_id)
+        notified = False
+
     return {
         "appeal_id": appeal_id,
         "status": str(verdict_enum),
@@ -842,6 +854,7 @@ async def _decide_under_lease(
         "reversed": reversed_acts,
         "outstanding": outstanding,
         "audit_id": audit_id,
+        "notified": notified,
         **({"also_resolved": also_resolved} if also_resolved else {}),
     }
 

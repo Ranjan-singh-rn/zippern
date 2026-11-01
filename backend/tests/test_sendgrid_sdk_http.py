@@ -227,8 +227,8 @@ check("tracking is off — click (and text), open, subscription and Google Analy
           "subscription_tracking": {"enable": False},
           "ganalytics": {"enable": False},
       })
-check("Reply-To falls back to the From address (no support@ configured)",
-      sent.get("reply_to"), {"email": "no-reply@zipperlive.org"})
+check("no Reply-To on the wire (spec §12: never set, on any identity)",
+      sent.get("reply_to"), None)
 check("the message id SendGrid returned is kept", auth.message_id, "srv-1")
 
 SERVER.reset(ok_step())

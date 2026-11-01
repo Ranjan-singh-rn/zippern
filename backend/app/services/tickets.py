@@ -536,8 +536,12 @@ async def _notify(kind: str, ticket_id: str, before: dict, after: dict, events: 
             await send(uid, "routed", "A ticket was routed to your team", f"“{title}” needs an owner.")
     if kind in ("feedback", "support") and "answered" in events:
         user = str(after.get("userId") or "")
-        await send(user, "answered", "Zipper replied to your ticket",
-                   "Open Messages → Feedback to read the reply.")
+        if user:
+            # §12 "support": the same writer, with the `support.ticket_reply`
+            # email (identity `support`, switchable) to the person's verified address.
+            out[f"answered:{user}"] = await notices.ticket_reply(
+                user, ticket_id, title, key=f"{key}_answered_{user}"[:1400],
+            )
     return out
 
 

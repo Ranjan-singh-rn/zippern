@@ -985,14 +985,23 @@ class FakeFsCollection:
         wrong rather than loudly broken.
 
         The id is sequential rather than random so a test can assert on the
-        document that was written without having to find it first.
+        document that was written without having to find it first — and
+        unique across the whole fake database, as a real auto-id is: two
+        users' first warnings are `auto-1` and `auto-2`, never both `auto-1`,
+        because the notice writer keys `notifications/warning_{id}` on it and
+        refuses to overwrite a document that already exists.
         """
-        doc_id = f"auto-{len(self.docs) + 1}"
+        FakeFsCollection._auto_ids += 1
+        doc_id = f"auto-{FakeFsCollection._auto_ids}"
         while doc_id in self.docs:                     # pragma: no cover
-            doc_id = f"auto-{doc_id}"
+            FakeFsCollection._auto_ids += 1
+            doc_id = f"auto-{FakeFsCollection._auto_ids}"
         ref = self.document(doc_id)
         ref.set(data)
         return (None, ref)
+
+    #: Database-wide counter for `add()` ids.
+    _auto_ids = 0
 
     def where(self, filter: Any = None, **kw) -> FakeQuery:  # noqa: A002
         return FakeQuery(self, list(self.docs.items())).where(filter, **kw)

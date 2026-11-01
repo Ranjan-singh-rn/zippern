@@ -179,8 +179,17 @@ eq("…requested by the admin", filed["request"]["requested_by"]["uid"], "ops-1"
 eq("…holding the one-per-subject lock", DB["transfer_locks"].docs[0]["_id"], "host:h1")
 ok("…the Owners are told on the audit log",
    any(e["action"] == "transfer.requested" and e["subject_id"] == T1 for e in AUDIT))
-eq("…and by email", [d["to"] for d in DB[C.EMAIL_DELIVERIES].docs if d["kind"] == "transfer.requested"],
-   ["owner@zipper.test"])
+_requested_rows = [d for d in DB[C.EMAIL_DELIVERIES].docs if d["kind"] == "transfer.requested"]
+ok("…and by email", "owner@zipper.test" in [d["to"] for d in _requested_rows], str(_requested_rows))
+# §12 "transfer requested": the affected person and both agencies are told
+# too — the host at their verified address, the agencies on their records
+# (which, in this fixture, carry no address: recorded as a gap, not skipped).
+ok("…the Host is told as well (§12: affected person)", "h1@x.test" in [d["to"] for d in _requested_rows],
+   str([d["to"] for d in _requested_rows]))
+eq("…and the agencies' owners get an in-app notice of the pending transfer, one per side",
+   sorted((k, d["userId"]) for k, d in fs.collection("notifications").docs.items()
+          if k in (f"transfer_{T1}_source_requested", f"transfer_{T1}_target_requested")),
+   [(f"transfer_{T1}_source_requested", "o-main1"), (f"transfer_{T1}_target_requested", "o-main2")])
 eq("…and NOTHING has moved yet", fs.collection("users").docs["h1"]["agencyId"], "MAIN1")
 refused("a second open transfer for the same Host is refused",
         svc.request("host", "h1", "SUB2", NOTE, ADMIN), kind=svc.TransferConflict)

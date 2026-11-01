@@ -1550,6 +1550,28 @@ async def _sweep_owner_notices() -> list[dict]:
     return await owner_mail.retry_pending(max_attempts=OWNER_NOTICE_SWEEP_MAX_ATTEMPTS)
 
 
+async def _sweep_email_retries() -> list[dict]:
+    """Spec §12: re-send every failed, retryable template delivery that is due.
+
+    Each `email_deliveries` row written by `email.send_template` carries its
+    recipe; `email.retry_failed` rebuilds and re-sends it in place, with the
+    gaps doubling from one sweep interval up to a day and a cap on attempts
+    (`EMAIL_RETRY_MAX_SWEEPS`), and updates the in-app notice's delivery state.
+    Rows not yet due are reported as `not_due`, never counted as failures.
+    """
+    rows = await mail.retry_failed(limit=200)
+    return [r for r in rows if r.get("outcome") != "not_due"]
+
+
+async def _sweep_notice_retries() -> list[dict]:
+    """Spec §12: write every parked in-app notice (a Firestore write that failed
+    when the business action ran) through the one notice writer. Rows are
+    `in_app_written` / `failed` / `gave_up` — never counted as emails sent."""
+    from app.services import notices  # local: notices imports email, as this module does
+
+    return await notices.retry_parked(limit=200)
+
+
 async def _sweep_replica_repair() -> list[dict]:
     """B1 / M-1: replay CRM balance deltas that never reached Firestore.
 
@@ -1581,6 +1603,10 @@ SWEEPS: tuple[tuple[str, str, Callable[[], Awaitable[list[dict]]]], ...] = (
     # B1 — not email owed by a record, but the same shape of job: something
     # the record says is still owed, retried until it is not.
     ("owner_notices", "§8 owner-alone", _sweep_owner_notices),
+    # §12 — every template email that failed and may be sent again.
+    ("email_retries", "§12", _sweep_email_retries),
+    # §12 — in-app notices whose Firestore write failed, parked for retry.
+    ("notice_retries", "§12", _sweep_notice_retries),
     ("replica_drift_repair", "M-1", _sweep_replica_repair),
 )
 

@@ -67,9 +67,9 @@ import re
 import time
 import urllib.error
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.config import settings
 from app.core import roles as R
@@ -945,6 +945,20 @@ def _record_doc(
         "headers_sent": [],
         "meta": dict(meta or {}),
         "events": [],
+        #: Spec §12 — which identity this left under and whether it was tracked.
+        #: Filled by `deliver()`; a withheld row keeps the defaults.
+        "identity": None,
+        "tracking": None,
+        #: How many sweep retries have been made, and when the next may run.
+        "retry_count": 0,
+        "retry_after": None,
+        "last_attempt_at": None,
+        #: The recipe a sweep re-renders from (`template` + safe `params`),
+        #: present only for retryable template sends; never for a code.
+        "retry": None,
+        #: `{"userId", "eventKey"}` of the in-app notice this email belongs to,
+        #: so a retry can update that notice's delivery state.
+        "notice": None,
     }
 
 
@@ -1052,25 +1066,61 @@ async def record_withheld(
 # DKIM, DMARC, a domain that is actually ours — is written down for the owner in
 # DEPLOYMENT.md §"Email deliverability", because only they can publish a record.
 # The half that is ours is here: a plain-text alternative, the unsubscribe
-# headers a bulk sender is required to carry, a Reply-To that reaches a person,
-# and three sender identities on one authenticated domain instead of everything
-# leaving from one mailbox.
+# headers a bulk sender is required to carry, no Reply-To (spec §12), and the
+# sender identities on one authenticated domain instead of everything leaving
+# from one mailbox.
 
 
 class SenderIdentity(StrEnum):
-    """Which visible From an email leaves from.
+    """Which visible From an email leaves from. Spec §12, the identity table.
 
-    Three streams, deliberately separable at the domain level, because their
-    reputations are earned differently and must be allowed to fail separately: a
-    daily report nobody opens must not be able to stop a payout receipt.
+        auth | security | transactional  →  no-reply@<domain>   always
+        info                             →  info@<domain>       switchable
+        support                          →  support@<domain>    switchable
+        bulk                             →  the `info` stream   (legacy name)
+
+    The three no-reply streams share one address and differ in what they are
+    allowed to carry and how they are sent: `auth` and `security` mail is
+    never tracked (a click-tracked reset link is a live token routed through a
+    third party's redirect) and `auth` mail is never re-rendered by a retry
+    sweep (a code is minted once). `info` and `support` are separable at the
+    address level so their reputations can fail separately — but only once the
+    owner has confirmed those mailboxes exist (`EMAIL_IDENTITY_*_ENABLED`),
+    because a From that nobody can reply to is worse than no-reply.
     """
 
-    #: One person's own event — an approval, a receipt, a one-time code.
+    #: OTP, verification, password reset. Untracked, never re-rendered.
+    AUTH = "auth"
+    #: Sign-in notices, MFA changes, access changes. Untracked.
+    SECURITY = "security"
+    #: One person's own event — an approval, a receipt, a decision.
     TRANSACTIONAL = "transactional"
-    #: Scheduled reports. Machine-generated, repeated, unsubscribable.
-    BULK = "bulk"
-    #: A mailbox a human reads. Used as Reply-To on everything.
+    #: General platform information: scheduled reports, platform news.
+    INFO = "info"
+    #: Support communications — a ticket reply, a conversation.
     SUPPORT = "support"
+    #: Legacy name for the `info` stream. Kept so `identity=BULK` call sites
+    #: (reports, alerts, broadcasts) keep working; it resolves exactly as INFO.
+    BULK = "bulk"
+
+
+#: identity → (stream, local part, the settings switch that turns it on).
+#: A switch of `None` means the identity is always its stream. This table is
+#: what `sender_for`, the delivery row and `scripts/email_identity_check.py`
+#: all read, so there is one answer to "which address does X leave from".
+IDENTITY_TABLE: dict[str, tuple[str, str, str | None]] = {
+    str(SenderIdentity.AUTH): ("no-reply", "no-reply", None),
+    str(SenderIdentity.SECURITY): ("no-reply", "no-reply", None),
+    str(SenderIdentity.TRANSACTIONAL): ("no-reply", "no-reply", None),
+    str(SenderIdentity.INFO): ("info", "info", "email_identity_info_enabled"),
+    str(SenderIdentity.BULK): ("info", "info", "email_identity_info_enabled"),
+    str(SenderIdentity.SUPPORT): ("support", "support", "email_identity_support_enabled"),
+}
+
+#: Identities whose mail is never tracked (click, open, subscription, GA).
+UNTRACKED_IDENTITIES: frozenset[str] = frozenset(
+    {str(SenderIdentity.AUTH), str(SenderIdentity.SECURITY)}
+)
 
 
 #: Sending "as" one of these can never be aligned: nobody outside the provider
@@ -1100,30 +1150,118 @@ def _masked(address: str) -> str:
     return f"***@{_domain_of(address) or '?'}"
 
 
-def sender_for(identity: SenderIdentity | str) -> tuple[str, str, str]:
-    """`(from_email, from_name, reply_to)` for one stream.
+def _switch_on(name: str | None) -> bool:
+    return bool(name) and bool(getattr(settings, str(name), False))
 
-    Every fallback lands on `mail_from`, so a deployment that configures none of
-    the new settings sends exactly what it sent before they existed.
-    """
-    identity = str(identity)
-    support = (
-        settings.mail_from_support or settings.support_email or settings.mail_from
+
+def _no_reply_address() -> tuple[str, str]:
+    """The always-on stream: MAIL_FROM_TRANSACTIONAL, else MAIL_FROM."""
+    address = str(settings.mail_from_transactional or settings.mail_from or "").strip()
+    name = settings.mail_from_name_transactional or settings.mail_from_name
+    return address, name
+
+
+def _info_address() -> tuple[str, str]:
+    """The `info` stream once its switch is on: MAIL_FROM_INFO, else the legacy
+    MAIL_FROM_BULK, else `info@<the mail_from domain>`."""
+    domain = _domain_of(settings.mail_from)
+    address = str(
+        getattr(settings, "mail_from_info", "") or settings.mail_from_bulk
+        or (f"info@{domain}" if domain else "")
     ).strip()
+    name = (
+        getattr(settings, "mail_from_name_info", "") or settings.mail_from_name_bulk
+        or settings.mail_from_name
+    )
+    return address, name
 
-    if identity == str(SenderIdentity.BULK):
-        address = (settings.mail_from_bulk or settings.mail_from).strip()
-        name = settings.mail_from_name_bulk or settings.mail_from_name
-    elif identity == str(SenderIdentity.SUPPORT):
-        address = support or settings.mail_from
-        name = settings.mail_from_name
+
+def _support_address() -> tuple[str, str]:
+    """The `support` stream once its switch is on: MAIL_FROM_SUPPORT (which
+    SENDGRID_REPLY_TO populates), else SUPPORT_EMAIL, else `support@<domain>`."""
+    domain = _domain_of(settings.mail_from)
+    address = str(
+        settings.mail_from_support or settings.support_email
+        or (f"support@{domain}" if domain else "")
+    ).strip()
+    return address, settings.mail_from_name
+
+
+def identity_resolution(identity: SenderIdentity | str) -> dict:
+    """Everything about how one identity leaves, as a record. No secret in it.
+
+    `{"identity", "stream", "switch", "enabled", "from", "from_name",
+      "reply_to", "tracking", "fallback"}` — `fallback` says why the From is
+    not the identity's own address (its switch is off), so the delivery row and
+    the identity check script can both show the owner what actually happened.
+    """
+    key = str(identity or SenderIdentity.TRANSACTIONAL)
+    stream, _local, switch = IDENTITY_TABLE.get(key, IDENTITY_TABLE[str(SenderIdentity.TRANSACTIONAL)])
+    enabled = switch is None or _switch_on(switch)
+    fallback = ""
+    if stream == "info" and enabled:
+        address, name = _info_address()
+    elif stream == "support" and enabled:
+        address, name = _support_address()
     else:
-        address = (settings.mail_from_transactional or settings.mail_from).strip()
-        name = settings.mail_from_name_transactional or settings.mail_from_name
+        address, name = _no_reply_address()
+        if switch is not None:
+            fallback = (
+                f"{switch.upper()} is off, so the '{key}' identity leaves from the "
+                "no-reply address until the owner confirms its mailbox (Q8)."
+            )
+    # Spec §12: no Reply-To, on any identity, switch or no switch. A reply goes
+    # to the From — and once support@ is switched on, support mail's From IS
+    # support@, so replies to support reach it without a header that could
+    # point at a mailbox nobody reads (Q8).
+    reply_to = ""
+    return {
+        "identity": key,
+        "stream": stream,
+        "switch": switch,
+        "enabled": bool(enabled),
+        "from": address,
+        "from_name": name,
+        "reply_to": reply_to,
+        "tracking": "off" if key in UNTRACKED_IDENTITIES else "default",
+        "fallback": fallback,
+    }
 
-    # Reply-To always reaches a person. A partner replying to a no-reply address
-    # and hearing nothing back is the failure this line exists to stop.
-    return address, name, (support or address)
+
+def sender_for(identity: SenderIdentity | str) -> tuple[str, str, str]:
+    """`(from_email, from_name, reply_to)` for one identity — spec §12.
+
+    Resolved through `IDENTITY_TABLE`: the three no-reply streams always leave
+    from `mail_from` (or MAIL_FROM_TRANSACTIONAL); `info` and `support` leave
+    from their own address only when their switch is on, and otherwise fall
+    back to no-reply. `reply_to` is always empty (spec §12: no Reply-To) and
+    is kept in the tuple only so existing callers keep their shape.
+    """
+    resolved = identity_resolution(identity)
+    return resolved["from"], resolved["from_name"], resolved["reply_to"]
+
+
+def identity_for_kind(kind: str, sensitivity: Sensitivity | str = "") -> SenderIdentity:
+    """The identity a send of this `kind` belongs to when the caller named none.
+
+    Callers that this module owns name their identity on the template. The
+    legacy callers that do not (`owner_mfa`, `staff`, `alerts`, `broadcast`)
+    are classified from the kind: a credential is `auth`, an access or MFA
+    change is `security`, everything else is `transactional`.
+    """
+    kind = str(kind or "")
+    if str(sensitivity) == str(Sensitivity.CREDENTIAL) or kind in _CREDENTIAL_KINDS:
+        return SenderIdentity.AUTH
+    if kind in _SECURITY_KINDS or kind.startswith(_SECURITY_KIND_PREFIXES):
+        return SenderIdentity.SECURITY
+    return SenderIdentity.TRANSACTIONAL
+
+
+def tracking_for(identity: SenderIdentity | str, kind: str = "", sensitivity: Sensitivity | str = "") -> str:
+    """`"off"` for auth and security mail (and any credential), else `"default"`."""
+    if str(identity) in UNTRACKED_IDENTITIES or _is_auth_mail(kind, sensitivity):
+        return "off"
+    return "default"
 
 
 def sender_alignment(identity: SenderIdentity | str = SenderIdentity.TRANSACTIONAL) -> dict:
@@ -1902,8 +2040,14 @@ def _send_via_provider(
 #: through SendGrid's redirect and click logs, an open pixel serves nobody, and
 #: an unsubscribe link — if clicked — would make SendGrid suppress every later
 #: code sent to that address.
-_AUTH_KINDS = frozenset({"observer.otp", "staff.invitation", "staff.access_added"})
-_AUTH_KIND_PREFIXES = ("owner_mfa.",)
+#: Kinds that carry a credential — a code, a set-password link. Identity `auth`.
+_CREDENTIAL_KINDS = frozenset({"observer.otp", "staff.invitation"})
+#: Kinds that change or report who may sign in. Identity `security`.
+_SECURITY_KINDS = frozenset({"staff.access_added", "staff.suspended", "staff.deactivated",
+                             "staff.active", "staff.role_changed"})
+_SECURITY_KIND_PREFIXES = ("owner_mfa.", "security.")
+_AUTH_KINDS = _CREDENTIAL_KINDS | _SECURITY_KINDS
+_AUTH_KIND_PREFIXES = _SECURITY_KIND_PREFIXES
 
 
 def _is_auth_mail(kind: str, sensitivity: Sensitivity | str) -> bool:
@@ -1941,6 +2085,85 @@ def _attempt_fields(result: ProviderResult) -> dict[str, Any]:
     return extra
 
 
+#: Outcomes a sweep may re-attempt. `queued` only once stale (the process died
+#: between recording and the answer), and `failed` only when the provider
+#: provably did not take the message (`provider_outcome_unknown` unset).
+RETRYABLE_OUTCOMES: frozenset[str] = frozenset(
+    {str(Outcome.FAILED), str(Outcome.NOT_CONFIGURED), str(Outcome.QUEUED)}
+)
+
+#: The sweep runs every fifteen minutes; a retry waits this long after the
+#: first failure and twice as long after each later one, up to a day.
+_RETRY_BASE_MINUTES = 15
+_RETRY_CAP_MINUTES = 24 * 60
+
+
+def retry_eligibility(row: Mapping[str, Any], *, now: datetime | None = None) -> tuple[bool, str]:
+    """May this delivery row be sent again, and if not, why not.
+
+    Pure, so the sweep and the tests agree on the rule:
+
+      * `sent`, `delivered`, a bounce, a withholding — never;
+      * `failed` / `not_configured` — yes, unless the provider may already have
+        taken it (`provider_outcome_unknown`), which a second send could
+        duplicate;
+      * `queued` — only once older than EMAIL_STALE_QUEUED_MINUTES;
+      * never more than EMAIL_RETRY_MAX_SWEEPS times, and never before
+        `retry_after`.
+    """
+    now = now or _now()
+    outcome = str(row.get("outcome") or "")
+    if outcome not in RETRYABLE_OUTCOMES:
+        return False, f"outcome '{outcome}' is not retryable"
+    if row.get("provider_outcome_unknown"):
+        return False, "the provider may already have accepted it; a second send could duplicate"
+    if outcome == str(Outcome.QUEUED):
+        queued_at = row.get("queued_at")
+        stale_after = timedelta(minutes=int(getattr(settings, "email_stale_queued_minutes", 30)))
+        if not isinstance(queued_at, datetime):
+            return False, "queued with no timestamp"
+        if queued_at.tzinfo is None:
+            queued_at = queued_at.replace(tzinfo=timezone.utc)
+        if queued_at > now - stale_after:
+            return False, "still queued — the send may be in progress"
+    limit = int(getattr(settings, "email_retry_max_sweeps", 6))
+    if int(row.get("retry_count") or 0) >= limit:
+        return False, f"retried {limit} times already; left for a person"
+    after = row.get("retry_after")
+    if isinstance(after, datetime):
+        if after.tzinfo is None:
+            after = after.replace(tzinfo=timezone.utc)
+        if after > now:
+            return False, f"not due until {when(after)}"
+    return True, ""
+
+
+def _next_retry_at(retry_count: int, now: datetime) -> datetime:
+    minutes = min(_RETRY_BASE_MINUTES * (2 ** max(0, retry_count - 1)), _RETRY_CAP_MINUTES)
+    return now + timedelta(minutes=minutes)
+
+
+def _safe_params(values: Mapping[str, Any] | None) -> dict:
+    """Only what a retry may store: strings, numbers, booleans, None, and flat
+    lists of those (fact rows become `[label, value]` pairs). Never an object,
+    never a code — a template that carries a credential is not retryable at all."""
+    out: dict[str, Any] = {}
+    for key, value in (values or {}).items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[str(key)] = value
+        elif isinstance(value, datetime):
+            out[str(key)] = value.isoformat()
+        elif isinstance(value, (list, tuple)):
+            rows = []
+            for item in value:
+                if isinstance(item, (list, tuple)):
+                    rows.append([("" if v is None else str(v)) for v in item])
+                elif isinstance(item, (str, int, float, bool)) or item is None:
+                    rows.append(item)
+            out[str(key)] = rows
+    return out
+
+
 async def deliver(
     *,
     kind: str,
@@ -1952,8 +2175,10 @@ async def deliver(
     dedupe_key: str | None = None,
     meta: Mapping[str, Any] | None = None,
     attachments: Sequence[Attachment] = (),
-    identity: SenderIdentity | str = SenderIdentity.TRANSACTIONAL,
+    identity: SenderIdentity | str | None = None,
     unsubscribe: Unsubscribe | None = None,
+    retry: Mapping[str, Any] | None = None,
+    notice: Mapping[str, Any] | None = None,
 ) -> dict:
     """Record, gate, send, record the outcome. Returns the delivery row.
 
@@ -1968,20 +2193,36 @@ async def deliver(
          and named in the body — a report that arrives without one CSV is far
          better than a report that does not arrive (see `prepare_attachments`).
       4. **Insert the row**, with the unique `dedupe_key`. A collision means
-         this event was already sent; nothing is sent twice.
+         this event was already recorded: if that earlier row is a failure a
+         sweep may retry (`retry_eligibility`), the same row is sent again in
+         place; otherwise nothing is sent twice.
       5. **Send**, off the event loop.
       6. **Close the row** with the provider's message id and status, or with
          the error *and the provider's own words for it*. Either way there is a
          row, and the row says why.
 
+    `identity` names the §12 sender identity. Callers this module owns always
+    pass one; a caller that passes none gets `identity_for_kind`, so an MFA
+    notice is `security` and a code is `auth` without those files changing.
+    Tracking is off for `auth` and `security` whatever the account default is.
+
     `unsubscribe` marks the message as bulk: it carries `List-Unsubscribe`, a
     `List-Id` and `Auto-Submitted`. Leave it None for transactional mail, which
     must not advertise an unsubscribe it would not honour.
+
+    `retry` is the recipe (`{"template", "params"}`) a sweep re-renders from
+    when this send fails; `notice` is `{"userId", "eventKey"}` of the in-app
+    notice the email belongs to. Both are stored on the row and nowhere else.
 
     Raises `DeliveryNotRecorded` only when step 4 fails — in which case nothing
     was sent, deliberately.
     """
     import asyncio
+
+    if identity is None:
+        identity = identity_for_kind(kind, sensitivity)
+    identity = str(identity)
+    tracking = tracking_for(identity, kind, sensitivity)
 
     attachments = list(attachments)
     doc = _record_doc(
@@ -1994,6 +2235,12 @@ async def deliver(
         meta=meta,
         attachments=attachments,
     )
+    doc["identity"] = identity
+    doc["tracking"] = tracking
+    if retry and retry.get("template"):
+        doc["retry"] = {"template": str(retry["template"]), "params": _safe_params(retry.get("params"))}
+    if notice and notice.get("userId") and notice.get("eventKey"):
+        doc["notice"] = {"userId": str(notice["userId"]), "eventKey": str(notice["eventKey"])}
 
     address = doc["to"]
     if not address or "@" not in address:
@@ -2045,13 +2292,25 @@ async def deliver(
     text = text_alternative(html)
 
     record_id, duplicate = await _insert_record(doc)
+    resend_of: dict | None = None
     if duplicate:
-        log.info("'%s' → %s already sent (dedupe %s).", kind, _masked(address), dedupe_key)
-        doc["outcome"] = str(Outcome.DUPLICATE)
-        doc["error"] = "Already sent for this event; nothing re-sent."
-        return doc
+        # The event was recorded before. If that earlier attempt failed in a
+        # way a sweep may retry, this call IS the retry: the same row is sent
+        # again in place. Otherwise nothing is sent twice.
+        existing, eligible = await _existing_row(dedupe_key)
+        if not eligible:
+            log.info("'%s' → %s already recorded (dedupe %s).", kind, _masked(address), dedupe_key)
+            doc["outcome"] = str(Outcome.DUPLICATE)
+            doc["error"] = "Already sent for this event; nothing re-sent."
+            doc["existing_outcome"] = str((existing or {}).get("outcome") or "")
+            return doc
+        resend_of = existing
+        record_id = resend_of["_id"]
+        doc = {**resend_of, "subject": subject, "identity": identity, "tracking": tracking}
+        doc.pop("_id", None)
 
     doc["id"] = str(record_id)
+    attempt_patch = _retry_bookkeeping(resend_of)
 
     problem = _provider_problem()
     if problem is not None:
@@ -2059,6 +2318,7 @@ async def deliver(
             "outcome": str(Outcome.NOT_CONFIGURED),
             "attempts": 1,
             "error": problem,
+            **attempt_patch,
         }
         await _close_record(record_id, patch)
         doc.update(patch)
@@ -2074,6 +2334,7 @@ async def deliver(
                 "was delivered. The record is kept: this is a configuration "
                 "failure, not an email that was never owed."
             ),
+            **attempt_patch,
         }
         await _close_record(record_id, patch)
         doc.update(patch)
@@ -2090,8 +2351,9 @@ async def deliver(
         text=text,
         identity=identity,
         headers=headers,
-        # Codes, set-password links and access changes go out untracked.
-        track=not _is_auth_mail(kind, sensitivity),
+        # Codes, set-password links, access changes and every `auth` /
+        # `security` identity go out untracked.
+        track=tracking != "off",
         # Bulk mail (reports, broadcasts) keeps exactly one attempt: a broadcast
         # stops on the first 429 by design, and pacing is its job, not ours.
         retry=unsubscribe is None,
@@ -2105,6 +2367,7 @@ async def deliver(
         # what the provider said at the moment it accepted the message.
         "provider_reason": result.reason or None,
         "provider_headers": result.headers or {},
+        **attempt_patch,
     }
     patch.update(_attempt_fields(result))
     if result.ok:
@@ -2113,6 +2376,7 @@ async def deliver(
         patch["error"] = None
         patch["provider_error_body"] = None
         patch["provider_error_fields"] = []
+        patch["retry_after"] = None
         log.info("Email '%s' → %s accepted (%s).", kind, _masked(address), result.status)
     else:
         patch["outcome"] = str(Outcome.FAILED)
@@ -2132,6 +2396,38 @@ async def deliver(
     await _close_record(record_id, patch)
     doc.update(patch)
     return doc
+
+
+async def _existing_row(dedupe_key: str | None) -> tuple[dict | None, bool]:
+    """`(the earlier row for this key, whether it may be sent again now)`."""
+    from pymongo.errors import PyMongoError
+
+    if not dedupe_key:
+        return None, False
+    try:
+        existing = await _deliveries().find_one({"dedupe_key": dedupe_key})
+    except (PyMongoError, RuntimeError):
+        return None, False
+    if not existing:
+        return None, False
+    eligible, _why = retry_eligibility(existing)
+    return dict(existing), eligible
+
+
+def _retry_bookkeeping(resend_of: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The retry counters for the patch that closes this attempt.
+
+    A first send schedules its first retry (`retry_after`) in case it fails; a
+    re-send counts itself and pushes the next window out. A send that succeeds
+    clears `retry_after` in the caller.
+    """
+    now = _now()
+    count = int((resend_of or {}).get("retry_count") or 0) + (1 if resend_of is not None else 0)
+    return {
+        "retry_count": count,
+        "retry_after": _next_retry_at(count + 1, now),
+        "last_attempt_at": now,
+    }
 
 
 async def deliver_many(
@@ -2394,7 +2690,12 @@ def _close_blocking(record_id: Any, patch: dict) -> None:
 def _deliver_blocking(
     *, kind: str, spec: str, recipient: Recipient, subject: str, html: str,
     sensitivity: Sensitivity, meta: Mapping[str, Any] | None = None,
+    identity: SenderIdentity | str | None = None,
 ) -> bool:
+    if identity is None:
+        identity = identity_for_kind(kind, sensitivity)
+    identity = str(identity)
+    tracking = tracking_for(identity, kind, sensitivity)
     doc = _record_doc(
         kind=kind,
         spec=spec,
@@ -2405,6 +2706,10 @@ def _deliver_blocking(
         meta=meta,
         attachments=(),
     )
+    doc["identity"] = identity
+    doc["tracking"] = tracking
+    # A code or a set-password link is minted once: never a retry recipe.
+    doc["retry"] = None
     if not doc["to"] or "@" not in doc["to"]:
         doc["outcome"] = str(Outcome.NO_ADDRESS)
         doc["error"] = "No usable address on the record."
@@ -2430,14 +2735,14 @@ def _deliver_blocking(
     result = _send_via_provider(
         to_email=doc["to"], to_name=recipient.name, subject=subject, html=html,
         attachments=(),
-        # An invitation and a sign-in code are one person's own event, and a
-        # reply to either must reach a human. Never bulk: neither carries an
-        # unsubscribe, because neither is optional mail.
-        identity=SenderIdentity.TRANSACTIONAL,
+        # A code and a set-password link are `auth`; an access change is
+        # `security`. All three leave from no-reply. Never bulk: none carries
+        # an unsubscribe, because none is optional mail.
+        identity=identity,
         # All three senders here are a code, a set-password link or an access
         # change: untracked. A refusal SendGrid provably did not act on is
         # retried; anything that may have been accepted is not.
-        track=not _is_auth_mail(kind, sensitivity),
+        track=tracking != "off",
         retry=True,
     )
     _close_blocking(
@@ -2489,6 +2794,7 @@ def send_staff_invitation(
         ),
         sensitivity=Sensitivity.CREDENTIAL,
         meta={"role_label": role_label},
+        identity=SenderIdentity.AUTH,
     )
 
 
@@ -2530,6 +2836,7 @@ def send_staff_access_added(
         ),
         sensitivity=Sensitivity.OPERATIONAL,
         meta={"role_label": role_label},
+        identity=SenderIdentity.SECURITY,
     )
 
 
@@ -2559,6 +2866,7 @@ def send_observer_otp(code: str, ttl_minutes: int) -> bool:
         ),
         sensitivity=Sensitivity.CREDENTIAL,
         meta={"ttl_minutes": ttl_minutes},
+        identity=SenderIdentity.AUTH,
     )
 
     # The code is never written to a log either — in no environment. (A
@@ -2616,6 +2924,7 @@ async def send_partner_application_received(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"partner.application_received:{partner_id}",
         meta={"partner_id": partner_id, "kind": kind},
     )
@@ -2649,6 +2958,7 @@ async def send_partner_approved(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"partner.approved:{partner_id}:{when(approved_at)}",
         meta={"partner_id": partner_id, "kind": kind},
     )
@@ -2728,6 +3038,7 @@ async def send_partner_rejected(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"partner.rejected:{partner_id}:{when(rejected_at)}",
         meta={"partner_id": partner_id, "kind": kind, "may_reapply": may_reapply},
     )
@@ -2780,6 +3091,7 @@ async def send_account_deactivated(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"partner.deactivated:{partner_id}:{when(deactivated_at)}",
         meta={"partner_id": partner_id, "kind": kind},
     )
@@ -2825,6 +3137,7 @@ async def send_payout_approved(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"payout.approved:{card_id}",
         meta={
             "card_id": card_id,
@@ -2893,6 +3206,7 @@ async def send_payout_paid(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"payout.paid:{card_id}",
         meta={
             "card_id": card_id,
@@ -2942,6 +3256,7 @@ async def send_credit_due(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=f"credit.due_soon:{seller_id}:{when(due_at, with_time=False)}",
         meta={"seller_id": seller_id, "outstanding_coins": outstanding_coins},
     )
@@ -2997,6 +3312,7 @@ async def send_credit_overdue_to_seller(
             body=body,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
+        identity=SenderIdentity.TRANSACTIONAL,
         dedupe_key=None,   # repeat suppression handles cadence, not the key
         meta={
             "seller_id": seller_id,
@@ -3077,6 +3393,349 @@ def build_scheduled_report(
         definitions_url=f"{settings.portal_url.rstrip('/')}/api/reports/definitions",
         unsubscribe_note=unsubscribe_note,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Spec §12 — the template catalogue, one identity and one dedupe key each
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Every message in §12's list is one entry here: what it is about (`spec`),
+# which identity it leaves under, whether it is tracked, whether a sweep may
+# re-render it, and how its dedupe key is formed. The wording of the message
+# itself arrives in `params` — the same safe `title` / `body` the in-app notice
+# shows, plus fact rows — so an email and its notice can never say different
+# things, and nothing here needs a new HTML file: the body is built from
+# `page`, `callout`, `facts` and `button`.
+#
+# What a template never carries: a code, a secret, a recovery code, another
+# person's contact details, or who on staff took the decision. `_safe_params`
+# keeps the retry recipe to plain values, and a template that would have to
+# carry a credential (`observer.otp`, `staff.invitation`) is `retryable=False`
+# and is not re-rendered by any sweep.
+
+
+@dataclass(frozen=True)
+class Template:
+    """One §12 message. `trigger` and `audience` are documentation the check
+    script prints; the rest decides how the email is built and sent."""
+
+    name: str
+    spec: str
+    identity: SenderIdentity
+    sensitivity: Sensitivity
+    audience: str
+    trigger: str
+    tone: str = "neutral"
+    heading: str = ""
+    retryable: bool = True
+    #: None → the generic builder (`_notice_body`). A builder returns the inner
+    #: HTML; `page()` wraps it.
+    build: Callable[[Mapping[str, Any]], str] | None = None
+
+    @property
+    def tracking(self) -> str:
+        return "off" if str(self.identity) in UNTRACKED_IDENTITIES else "default"
+
+
+def _t(name: str, spec: str, identity: SenderIdentity, audience: str, trigger: str, *,
+       sensitivity: Sensitivity = Sensitivity.PARTNER_OWN, tone: str = "neutral",
+       heading: str = "", retryable: bool = True) -> Template:
+    return Template(name=name, spec=spec, identity=identity, sensitivity=sensitivity,
+                    audience=audience, trigger=trigger, tone=tone, heading=heading,
+                    retryable=retryable)
+
+
+_TX = SenderIdentity.TRANSACTIONAL
+_SEC = SenderIdentity.SECURITY
+
+#: name → Template. Order is the order the check script prints them in.
+TEMPLATES: dict[str, Template] = {t.name: t for t in (
+    # ── auth / security: built by their own senders above; listed so the
+    #    identity check and the catalogue tests see them. Never re-rendered.
+    _t("observer.otp", "2.2", SenderIdentity.AUTH, "observer",
+       "POST /auth/observer/request-code", sensitivity=Sensitivity.CREDENTIAL, retryable=False),
+    _t("staff.invitation", "8A.2.1", SenderIdentity.AUTH, "new staff member",
+       "staff.invite — set-password link", sensitivity=Sensitivity.CREDENTIAL, retryable=False),
+    _t("staff.access_added", "8A.2.2", _SEC, "existing user given CRM access",
+       "staff.invite on an existing account", sensitivity=Sensitivity.OPERATIONAL, retryable=False),
+    _t("security.notice", "P1-A3", _SEC, "staff / owner",
+       "owner_mfa.* and staff.* access changes (classified by kind)",
+       sensitivity=Sensitivity.OPERATIONAL),
+    # ── partner applications (§12 "partner applications")
+    # Agency / sub-agency / seller receipts and approvals are mailed by the
+    # Functions triggers (mailLog marker), their rejections by the 8A.2.5 sweep;
+    # the backend sends these three for a Host application (one email per event).
+    _t("partner.application_received", "8A.2.3", _TX, "applicant",
+       "host application submitted (agency/seller: Functions onAgencyRegistered, onSellerRegistered)"),
+    _t("partner.approved", "8A.2.4", _TX, "partner",
+       "host application approved (agency/seller: Functions onAgencyApproved, onSellerApproved)",
+       tone="neutral", heading="Approved"),
+    _t("partner.rejected", "8A.2.5", _TX, "applicant",
+       "host application rejected (agency/seller: the 8A.2.5 rejection sweep)",
+       tone="warning", heading="Not approved"),
+    _t("partner.awaiting_verification", "RC D15", _TX, "partner",
+       "partner_ops.approve_partner with an unverified contact", tone="warning",
+       heading="Verify to start"),
+    _t("partner.held", "RC D17", _TX, "partner", "partner_ops: active legacy role paused for verification",
+       tone="warning", heading="Role paused"),
+    # ── role changes, per role (§12 "role changes")
+    _t("role.suspended", "§4", _TX, "role holder",
+       "a non-partner role suspended (agency/seller deactivation: the 8A.2.13 sweep)",
+       tone="warning", heading="Role suspended"),
+    _t("role.resumed", "§4", _TX, "role holder", "partner_ops.reactivate_partner", heading="Role active again"),
+    _t("role.revoked", "§4 / C1", _TX, "role holder", "partner_ops.revoke_partner / users.revoke_host",
+       tone="critical", heading="Role revoked"),
+    _t("agency.host_changed", "§5", _TX, "agency owner",
+       "users.revoke_host / restore_host — the host's agency is told", heading="Your roster changed"),
+    # ── warning / suspension / ban (§12 "warning/suspension/ban")
+    _t("user.warning", "UGP", _TX, "user", "users.warn_user", tone="warning", heading="Official warning"),
+    _t("account.suspended", "§5", _SEC, "user", "users.suspend_user", tone="critical",
+       heading="Account suspended"),
+    _t("account.resumed", "§5", _SEC, "user", "users.resume_user / expired suspension sweep",
+       heading="Account active again"),
+    _t("account.banned", "§5", _SEC, "user", "users.ban_user", tone="critical", heading="Account banned"),
+    _t("account.unbanned", "§5", _SEC, "user", "users.unban_user", heading="Ban lifted"),
+    # ── appeals (§12 "appeals")
+    _t("appeal.received", "§5", _TX, "appellant", "appeal filed (public form / app)", heading="Appeal received"),
+    _t("appeal.recommended", "§5", _TX, "owners", "appeals.recommend_appeal",
+       sensitivity=Sensitivity.OPERATIONAL, heading="Decision needed"),
+    _t("appeal.decided", "§5", _TX, "appellant", "appeals.decide_appeal", heading="Appeal decided"),
+    # ── reinstatement (§12 "appeals" — role reinstatement)
+    _t("role_appeal.requested", "C2", _TX, "requester + owners", "role_appeals.submit",
+       heading="Reinstatement requested"),
+    _t("role_appeal.recommended", "C2", _TX, "owners", "role_appeals.recommend",
+       sensitivity=Sensitivity.OPERATIONAL, heading="Decision needed"),
+    _t("role_appeal.decided", "C2", _TX, "requester", "role_appeals.decide", heading="Reinstatement decided"),
+    # ── transfers (§12 "transfers": source, target, affected person)
+    # PARTNER_OWN, not OPERATIONAL: the Host and the two agency owners are
+    # external accounts, and OPERATIONAL mail would be withheld from them. The
+    # message names one transfer and no business-wide figure.
+    _t("transfer.requested", "§6", _TX, "owners + source + target + affected person",
+       "transfer_requests.request", heading="Transfer requested"),
+    _t("transfer.decided", "§6", _TX, "source + target + affected person",
+       "transfer_requests.decide", heading="Transfer decided"),
+    # ── recharge / refund (§12 "recharge/refund")
+    _t("recharge.approved", "M", _TX, "buyer + seller", "recharges.approve", heading="Recharge approved"),
+    _t("recharge.refunded", "M", _TX, "buyer + seller", "recharges.refund", tone="warning",
+       heading="Recharge refunded"),
+    # ── Owner alert (§12 "Owner alerts")
+    _t("owner.money_action", "§8", _TX, "other owners", "owner_mail.notify_other_owners",
+       sensitivity=Sensitivity.BUSINESS_MONEY, tone="warning", heading="Owner money action"),
+    _t("owner.alert", "§12", _TX, "owners", "role_appeals.email_owners — an Owner alert outside the catalogue",
+       sensitivity=Sensitivity.OPERATIONAL, tone="warning", heading="Owner alert"),
+    # ── support (§12 "support")
+    _t("support.ticket_reply", "WP-D", SenderIdentity.SUPPORT, "ticket author",
+       "tickets: a reply on a support / feedback ticket", heading="Zipper replied"),
+    # ── department vacancy (§9)
+    _t("department.vacancy", "§9", _TX, "owners", "staff: a department loses / regains its Admin",
+       sensitivity=Sensitivity.OPERATIONAL, tone="warning", heading="Department"),
+)}
+
+
+def template_dedupe_key(name: str, related_id: str, recipient_key: str = "") -> str:
+    """Deterministic: the template, the thing it is about, and — for a fan-out —
+    who it went to. A retried business action produces the same key, so the
+    unique index on `email_deliveries.dedupe_key` sends it once."""
+    key = f"{name}:{str(related_id or '').strip()}"
+    if recipient_key:
+        key += f":{str(recipient_key).strip()}"
+    return key
+
+
+def _rows_of(value: Any) -> list[tuple[str, Any]]:
+    out: list[tuple[str, Any]] = []
+    for item in value or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), item[1]))
+    return out
+
+
+def _notice_body(template: Template, params: Mapping[str, Any]) -> str:
+    """The generic §12 body: the notice's sentence in a callout, the facts, what
+    to do next, a button when there is somewhere to go, and a footnote."""
+    body = str(params.get("body") or "")
+    parts = [callout(body, template.tone, heading=template.heading)]
+    rows = _rows_of(params.get("rows"))
+    if rows:
+        parts.append(facts(rows))
+    if params.get("reason"):
+        parts.append(callout(str(params["reason"]), "neutral", heading="Reason"))
+    if params.get("next_steps"):
+        parts.append(
+            '<p style="margin:16px 0 0;line-height:1.6;font-size:14px">'
+            + esc(params["next_steps"]) + "</p>"
+        )
+    if params.get("button_url"):
+        parts.append(
+            '<p style="margin:18px 0 0">'
+            + button(str(params.get("button_label") or "Open Zipper"), str(params["button_url"]))
+            + "</p>"
+        )
+    if params.get("footnote"):
+        parts.append(
+            '<p style="margin:16px 0 0;font-size:12px;color:#71717a;line-height:1.6">'
+            + esc(params["footnote"]) + "</p>"
+        )
+    return "".join(parts)
+
+
+@dataclass(slots=True)
+class BuiltMessage:
+    template: str
+    identity: str
+    tracking: str
+    subject: str
+    html: str
+    text: str
+    dedupe_key: str
+
+
+def build_template(name: str, params: Mapping[str, Any], *, related_id: str = "",
+                   recipient_key: str = "") -> BuiltMessage:
+    """Render one catalogue template with `params`. Pure; nothing is sent."""
+    template = TEMPLATES.get(str(name))
+    if template is None:
+        raise TemplateError(f"'{name}' is not a §12 template. Known: {', '.join(sorted(TEMPLATES))}.")
+    title = str(params.get("title") or template.heading or "Zipper")
+    subject = str(params.get("subject") or title)
+    inner = (template.build or (lambda p: _notice_body(template, p)))(params)
+    html = page(
+        title=title,
+        preheader=str(params.get("preheader") or params.get("body") or title)[:180],
+        body=inner,
+        footer=str(params.get("footer") or (
+            "Sent automatically by Zipper. This message was also placed in your "
+            "Zipper inbox (Messages → Official)."
+        )),
+    )
+    return BuiltMessage(
+        template=template.name,
+        identity=str(template.identity),
+        tracking=template.tracking,
+        subject=subject,
+        html=html,
+        text=text_alternative(html),
+        dedupe_key=template_dedupe_key(template.name, related_id or str(params.get("related_id") or ""),
+                                       recipient_key),
+    )
+
+
+async def send_template(
+    name: str,
+    recipient: Recipient,
+    params: Mapping[str, Any],
+    *,
+    related_id: str = "",
+    recipient_key: str = "",
+    meta: Mapping[str, Any] | None = None,
+    notice: Mapping[str, Any] | None = None,
+    dedupe_key: str | None = None,
+    kind: str | None = None,
+    retry_recipe: bool = True,
+) -> dict:
+    """Send one catalogue template through `deliver()`. **Never raises.**
+
+    This is the one email path the notice writer and every §12 call site use.
+    A failure — a template error, a provider refusal, a database that would
+    not take the delivery row — comes back as a dict with `outcome` set, is
+    logged without the body, and never reaches the business action that asked
+    for it. A provider failure leaves a `failed` row carrying the recipe, and
+    `retry_failed()` sends it again on a later sweep.
+
+    `kind` overrides the delivery row's `kind` for callers that filter the log
+    by action (`owner_money.card_signed`); `retry_recipe=False` is for a caller
+    that runs its own retries (`owner_mail`) and must not be retried twice.
+    """
+    try:
+        built = build_template(name, params, related_id=related_id, recipient_key=recipient_key)
+    except Exception as exc:  # noqa: BLE001 — a template bug is a recorded failure
+        log.error("Template '%s' could not be built: %s", name, exc)
+        return {"outcome": str(Outcome.FAILED), "error": f"template: {exc}", "template": str(name),
+                "retryable": False}
+    template = TEMPLATES[str(name)]
+    related = related_id or str(params.get("related_id") or "")
+    try:
+        return await deliver(
+            kind=kind or template.name,
+            spec=template.spec,
+            recipient=recipient,
+            subject=built.subject,
+            html=built.html,
+            sensitivity=template.sensitivity,
+            dedupe_key=dedupe_key or built.dedupe_key,
+            meta={**dict(meta or {}), "template": template.name, "related_id": related},
+            identity=template.identity,
+            retry=(
+                {"template": template.name, "params": {**_safe_params(params), "related_id": related}}
+                if template.retryable and retry_recipe else None
+            ),
+            notice=notice,
+        )
+    except DeliveryNotRecorded as exc:
+        log.error("Template '%s' → %s not recorded, so not sent: %s", name, _masked(recipient.email), exc)
+        return {"outcome": "not_recorded", "error": str(exc), "template": template.name, "retryable": False}
+    except Exception as exc:  # noqa: BLE001 — the business action stands
+        log.exception("Template '%s' → %s failed unexpectedly", name, _masked(recipient.email))
+        return {"outcome": str(Outcome.FAILED), "error": f"{type(exc).__name__}: {exc}",
+                "template": template.name, "retryable": False}
+
+
+async def retry_failed(limit: int = 100) -> list[dict]:
+    """Re-send every failed, retryable template delivery that is due. Spec §12.
+
+    Run by the transactional sweep. Each row is rebuilt from its own recipe —
+    the template name and the safe params it was first built from — and sent
+    again through `deliver()`, which recognises the row by its dedupe key and
+    sends it in place (`retry_eligibility` decides). Never raises; returns one
+    row per attempt in the sweep's vocabulary.
+    """
+    from pymongo.errors import PyMongoError
+
+    now = _now()
+    try:
+        cursor = _deliveries().find(
+            {"retry.template": {"$exists": True}, "outcome": {"$in": sorted(RETRYABLE_OUTCOMES)}}
+        ).sort("queued_at", 1).limit(max(1, min(int(limit), 500)))
+        candidates = [row async for row in cursor]
+    except (PyMongoError, RuntimeError) as exc:
+        log.error("Failed deliveries could not be listed for retry: %s", exc)
+        return [{"outcome": str(Outcome.FAILED), "error": f"list: {exc}"}]
+
+    out: list[dict] = []
+    for row in candidates:
+        eligible, why = retry_eligibility(row, now=now)
+        if not eligible:
+            out.append({"dedupe_key": row.get("dedupe_key"), "outcome": "not_due", "reason": why})
+            continue
+        recipe = row.get("retry") or {}
+        recipient = Recipient(
+            email=str(row.get("to") or ""), name=str(row.get("to_name") or ""),
+            role=row.get("to_role"), uid=row.get("to_uid"), authorised_by=row.get("authorised_by"),
+        )
+        params = dict(recipe.get("params") or {})
+        result = await send_template(
+            str(recipe.get("template")), recipient, params,
+            related_id=str(params.get("related_id") or ""),
+            dedupe_key=row.get("dedupe_key"),
+            meta=row.get("meta"),
+            notice=row.get("notice"),
+        )
+        state = {"dedupe_key": row.get("dedupe_key"), "template": recipe.get("template"),
+                 "outcome": result.get("outcome"), "error": result.get("error")}
+        out.append(state)
+        notice = row.get("notice") or {}
+        if notice.get("userId") and notice.get("eventKey"):
+            try:
+                from app.services import notices  # local: notices imports this module
+
+                await notices.mark_email_state(
+                    str(notice["userId"]), str(notice["eventKey"]),
+                    notices.email_state_of(result),
+                    error=str(result.get("error") or "")[:300],
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("notice %s: email state not updated after retry", notice.get("eventKey"))
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════

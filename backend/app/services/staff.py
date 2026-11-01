@@ -1795,27 +1795,46 @@ async def _notify_owners_of_vacancy(team: str, record: dict, *, opened: bool, ac
     except Exception as exc:  # noqa: BLE001
         log.warning("vacancy of %s: the Owners could not be listed: %s", team, exc)
         owners = []
+    # §12: one writer carries both halves — the in-app notice and the
+    # `department.vacancy` email — keyed on the vacancy and the Owner, so a
+    # retried deactivation delivers once per Owner. Never raises.
+    email: dict = {"outcomes": []}
     for owner in owners:
-        if owner.uid and await notices.department_vacancy(owner.uid, team, label, opened=opened, since_epoch=epoch):
+        if not owner.uid:
+            continue
+        try:
+            state = await notices.deliver_notice(
+                owner.uid,
+                (f"department_vacancy_{team}_{epoch}_{owner.uid}" if opened
+                 else f"department_vacancy_closed_{team}_{epoch}_{owner.uid}"),
+                type="department_vacancy" if opened else "department_vacancy_closed",
+                title=f"{label} has no Admin" if opened else f"{label} has an Admin again",
+                body=(
+                    f"{label} has no active department Admin. Its members report to the "
+                    "Owner until a replacement Admin is appointed."
+                    if opened else
+                    f"A department Admin is in place for {label}. Its members report to that Admin again."
+                ),
+                meta={"team": team, "vacancy": bool(opened)},
+                related_id=f"{team}:{epoch}",
+                email=notices.EmailLeg(
+                    template="department.vacancy", recipient=owner, recipient_key=owner.uid, required=True,
+                    kind_override="department.vacancy_opened" if opened else "department.vacancy_closed",
+                    rows=[
+                        ("Department", label),
+                        ("Members report to", "Owner (vacancy)" if opened else "the department Admin"),
+                        ("Cause", str(record.get("cause") or record.get("closed_cause") or "")),
+                        ("By", str(actor.get("name") or actor.get("uid") or "")),
+                    ],
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("vacancy of %s: Owner %s was not notified: %s", team, owner.uid, exc)
+            continue
+        if state["inApp"]:
             delivered.append(owner.uid)
-    email: dict = {}
-    try:
-        from app.services import role_appeals  # local: the shared Owner-email helper
-
-        email = await role_appeals.email_owners(
-            kind="department.vacancy_opened" if opened else "department.vacancy_closed",
-            subject=f"{label} has no Admin" if opened else f"{label} has an Admin again",
-            title=(f"{label} has no department Admin" if opened else f"{label} has a department Admin again"),
-            rows=[
-                ("Department", label),
-                ("Members report to", "Owner (vacancy)" if opened else "the department Admin"),
-                ("Cause", str(record.get("cause") or record.get("closed_cause") or "")),
-                ("By", str(actor.get("name") or actor.get("uid") or "")),
-            ],
-            dedupe_key=f"department.vacancy:{team}:{epoch}:{'opened' if opened else 'closed'}",
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("vacancy of %s: the Owner email was not sent: %s", team, exc)
+        email["outcomes"].append(state["email"])
+    email["sent"] = sum(1 for o in email["outcomes"] if o == notices.EMAIL_SENT)
     return {"in_app": delivered, "email": email}
 
 
@@ -2019,29 +2038,29 @@ async def notify_access_change(*, person: Mapping, change: str, actor: dict, aud
     body = body.format(role=role_label)
     key = f"staff_{change}_{audit_id or uid}"
 
-    in_app = await notices.deliver(uid, key, type="staff_access", title=title, body=body,
-                                   meta={"change": change, "role": new_role or str(person.get("role", ""))})
-    mailed = False
+    # §12: one writer, both halves. The email is the `security.notice`
+    # template (identity `security`: untracked, from no-reply), keyed on the
+    # same audit id, to the address on the staff record.
     try:
-        row = await email_service.deliver(
-            kind=f"staff.{change}",
-            spec="P1-F",
-            recipient=email_service.Recipient(
-                email=str(person.get("email", "")), name=str(person.get("name", "")),
-                role=new_role or str(person.get("role", "")), uid=uid,
-            ),
-            subject=title,
-            html=email_service.page(title=title, preheader=body,
-                                    body=f'<p style="line-height:1.6">{email_service.esc(body)}</p>'),
-            sensitivity=email_service.Sensitivity.OPERATIONAL,
-            dedupe_key=f"staff.{change}:{audit_id or uid}",
-            meta={"change": change},
+        recipient = email_service.Recipient(
+            email=str(person.get("email", "")), name=str(person.get("name", "")),
+            role=new_role or str(person.get("role", "")), uid=uid,
         )
-        mailed = str((row or {}).get("outcome", "")) in ("sent", "delivered", "queued", "duplicate")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("staff notice email failed for %s", uid)
-        mailed = False
-        row = {"error": str(exc)}
+        state = await notices.deliver_notice(
+            uid, key, type="staff_access", title=title, body=body,
+            meta={"change": change, "role": new_role or str(person.get("role", ""))},
+            related_id=str(audit_id or uid),
+            email=notices.EmailLeg(
+                template="security.notice", recipient=recipient,
+                rows=[("Change", change.replace("_", " ")), ("Role", role_label)],
+                required=True, kind_override=f"staff.{change}",
+            ),
+        )
+        in_app = bool(state["inApp"])
+        mailed = state["email"] in (notices.EMAIL_SENT, notices.EMAIL_PENDING)
+    except Exception:  # noqa: BLE001 — a delivery problem, never a reason to unwind
+        log.exception("staff notice failed for %s", uid)
+        in_app, mailed = False, False
     if not in_app or not mailed:
         try:
             await audit.record(
