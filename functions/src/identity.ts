@@ -1775,6 +1775,27 @@ export const startMobileSession = functions
   .https.onCall(async (data: { deviceId?: string; platform?: string; deviceName?: string }, context) => {
     const uid = requireAuth(context)
 
+    /*
+     * ── B3 (spec §8): THE OBSERVER NEVER HOLDS A MOBILE SESSION ─────────────
+     *
+     * `resolveIdentity` refuses the observer, but a client that skips the
+     * gate — a modified build, or an old one — could come straight here and
+     * hold the account's one mobile session on a device, with the backend
+     * (`/api/auth/signin`) refusing it separately. The same reading as
+     * `resolveIdentity`'s first check, before anything is read or written:
+     * the address on the token. A phone sign-in carries no email and the
+     * observer has no phone on any account, so the token is the whole test.
+     */
+    const observerEmail = emailKey((context.auth?.token as Record<string, unknown> | undefined)?.['email'])
+    if (observerEmail !== '' && isObserverEmail(observerEmail)) {
+      logger_warnObserver(uid, observerEmail)
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        'The Observer account is CRM-only and cannot sign in on a phone.',
+        { code: OBSERVER_DENIED, reason: 'observer' },
+      )
+    }
+
     const sessionId = crypto.randomBytes(16).toString('base64url')
     const deviceId = String(data?.deviceId ?? '').slice(0, 128)
     const platform = String(data?.platform ?? 'android').slice(0, 32)
@@ -1989,6 +2010,14 @@ export const endMobileSession = functions
 
 /** `HttpsError.details.code` when a session is refused for the device (C6). */
 export const DEVICE_BARRED = 'DEVICE_BARRED'
+
+/**
+ * `HttpsError.details.code` when a mobile session is refused because the token
+ * names the observer (B3, spec §8). The same word the backend answers on
+ * `/api/auth/signin` (`detail.code === 'observer_denied'`) and `resolveIdentity`
+ * returns as its decision, so one client branch covers all three.
+ */
+export const OBSERVER_DENIED = 'OBSERVER_DENIED'
 
 /**
  * Is this device barred? The reason to show, or null when it is not.

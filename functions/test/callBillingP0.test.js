@@ -128,9 +128,11 @@ describe('the payer tick ends the call — and charges nothing at that tick — 
 
 describe('settlement bills to the last evidence of activity, never into the silence', () => {
   test('payer went silent 200 s ago, the earner hangs up now: the hang-up instant is the end instant', async () => {
-    seedCall({ startedSecAgo: 300, lastTickSecAgo: 200, tickIndex: 2 })
+    // 290 s, not 300: an exact minute boundary would flip to 6 the moment the clock
+    // ticks past it during the test.
+    seedCall({ startedSecAgo: 290, lastTickSecAgo: 200, tickIndex: 2 })
     const r = await end(EARNER, 'receiver_ended')
-    expect(r.minutesBilled).toBe(5)             // ceil(300 / 60): a hang-up is a live decision by a party
+    expect(r.minutesBilled).toBe(5)             // ceil(290 / 60): a hang-up is a live decision by a party
     expect(r.diamondsCharged).toBe(300)
     expect(diamonds()).toBe(1000 - 180)
   })
