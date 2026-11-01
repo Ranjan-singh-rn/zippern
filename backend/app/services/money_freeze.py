@@ -66,6 +66,22 @@ log = logging.getLogger(__name__)
 
 FREEZES = "money_freezes"
 
+#: The two collections `partner_ops` owns, named here so a hold can reach them
+#: without importing that module (which imports this one).
+SALES = "partner_sales"
+SUBAGENCY_PAYOUTS = "subagency_payouts"
+
+#: B1 (spec §5 "Pending cards/requests go to Finance/Owner review; do not
+#: auto-approve, cancel or execute"): the freeze causes that also put every
+#: pending item of the subject on the held-for-review list.
+REVOCATION_CAUSES = frozenset({"role_revoked", "host_revoked", "seller_revoked",
+                               "agency_revoked", "sub_agency_revoked"})
+HELD_ROLE_REVOKED = "role_revoked"
+
+#: Statuses of a recharge / sale / sub-agency payout that are still undecided.
+PENDING_RECHARGE_STATUSES = ("pending", "approving", "refund_pending", "refunding")
+PENDING_SALE_STATUSES = ("pending", "approving", "failed")
+
 #: Statuses that still block money.
 BLOCKING = frozenset({"frozen", "withheld"})
 
@@ -224,11 +240,16 @@ async def freeze_user(
     db=None,
 ) -> list[dict]:
     """Freeze a person's Host earnings — and, when the whole ACCOUNT is
-    restricted, the money of every partner record they own."""
+    restricted, the money of every partner record they own.
+
+    A revocation cause also puts the person's pending cards on the
+    held-for-review list (`hold_pending_items_for_revoked_role`)."""
     db = _db(db)
     out = [await freeze("user", uid, kinds=[HOST_EARNINGS, PENDING_TRANSFERS], cause=cause, label=label,
                         reason=reason, actor=actor, owner_uid=uid,
                         snapshot=await _snapshot_user(uid, db), db=db)]
+    if cause in REVOCATION_CAUSES:
+        out[0]["held_items"] = await _hold_best_effort("host", uid, reason, actor, db)
     if include_partners:
         from app.services import partner_roles  # local: partner_roles is a leaf
 
@@ -244,7 +265,10 @@ async def freeze_partner(
     partner_id: str, *, cause: str, label: str, reason: str, actor: dict, row: dict | None = None,
     db=None,
 ) -> dict:
-    """Freeze one partner record's money (its kind decides which of the four)."""
+    """Freeze one partner record's money (its kind decides which of the four).
+
+    A revocation cause also puts the record's pending cards, recharges, sales
+    and sub-agency payouts on the held-for-review list."""
     db = _db(db)
     if row is None:
         row = await db[C.PARTNERS].find_one({"_id": partner_id}) or {}
@@ -252,8 +276,244 @@ async def freeze_partner(
     kinds = [SELLER_MONEY if kind == "seller" else AGENCY_MONEY, PENDING_TRANSFERS]
     snapshot = {"cards": await _pending_cards("partner", partner_id, db),
                 "balance": row.get("balance"), "kind": kind}
-    return await freeze("partner", partner_id, kinds=kinds, cause=cause, label=label, reason=reason,
-                        actor=actor, owner_uid=str(row.get("owner_crm_uid") or ""), snapshot=snapshot, db=db)
+    doc = await freeze("partner", partner_id, kinds=kinds, cause=cause, label=label, reason=reason,
+                       actor=actor, owner_uid=str(row.get("owner_crm_uid") or ""), snapshot=snapshot, db=db)
+    if cause in REVOCATION_CAUSES:
+        doc["held_items"] = await _hold_best_effort(kind or "partner", partner_id, reason, actor, db)
+    return doc
+
+
+async def _hold_best_effort(partner_kind: str, partner_id: str, reason: str, actor: dict, db) -> dict:
+    """The hold never fails the revocation it rides on: the freeze is the
+    control, the hold is the Finance board's visibility. A failure is
+    recorded (log + audit) and the revoke response carries it."""
+    try:
+        return await hold_pending_items_for_revoked_role(partner_kind, partner_id, reason, actor, db=db)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("pending items of %s:%s could not be put on hold", partner_kind, partner_id)
+        try:
+            await audit.record(
+                actor=actor, action=audit.Action.MONEY_ITEM_HELD,
+                subject_type="partner" if partner_kind != "host" else "user", subject_id=str(partner_id),
+                reason=f"Pending items could NOT be put on hold after revocation: {type(exc).__name__}: {exc}",
+                after={"held": 0, "error": str(exc)},
+                meta={"partner_kind": partner_kind, "held_reason": HELD_ROLE_REVOKED, "failed": True},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("…and the failure could not be audited")
+        return {"held": 0, "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ── Held for review (B1, spec §5 / §11) ──────────────────────────────────────
+#
+# "Pending cards/requests go to Finance/Owner review; do not auto-approve,
+#  cancel or execute."
+#
+# A hold is a MARKER on the item itself — `held: {reason: 'role_revoked', …}`
+# on the card, the recharge, the sale or the sub-agency payout — never a copy
+# in a second collection, so the board shows the same document the decision
+# will be taken on. Nothing about the item's stage or status changes: the
+# freeze (above) is what stops money moving; the hold is what puts the item in
+# front of Finance and the Owner with the reason it is waiting. They decide it
+# through the ordinary routes — reject it, or release the freeze and execute
+# it — and `release_hold` lifts the marker when an item should proceed.
+
+
+def _held_marker(partner_kind: str, partner_id: str, reason: str, actor: dict, now: datetime) -> dict:
+    return {
+        "reason": HELD_ROLE_REVOKED,
+        "partner_kind": str(partner_kind or ""),
+        "partner_id": str(partner_id or ""),
+        "note": str(reason or ""),
+        "at": now,
+        "by": _who(actor),
+    }
+
+
+async def _hold_in(db, collection: str, queries: list[dict], item_type: str, marker: dict, actor: dict,
+                   label_of) -> list[dict]:
+    """Mark every item matching any of `queries` (one query per field — plain
+    equality queries, so both the database and every fake of it answer them
+    the same way). Idempotent: an item already held is skipped."""
+    held: list[dict] = []
+    seen: set[str] = set()
+    for query in queries:
+        async for item in db[collection].find(query):
+            item_id = item.get("_id")
+            if str(item_id) in seen:
+                continue
+            seen.add(str(item_id))
+            if isinstance(item.get("held"), dict):
+                # Already on the list — or RELEASED from it by Finance / an
+                # Owner, whose decision a replay of the same revocation must
+                # not undo. (A later revocation of a reinstated partner finds
+                # its pending items without a marker, because an item decided
+                # in the meantime is no longer pending.)
+                continue
+            res = await db[collection].update_one(
+                {"_id": item_id},
+                {"$set": {"held": marker, "updated_at": marker["at"]}},
+            )
+            if getattr(res, "matched_count", 1) != 1:
+                continue
+            await _audit_hold(item, item_id, item_type, marker, actor, label_of)
+            held.append({"item_type": item_type, "id": str(item_id), "label": label_of(item)})
+    return held
+
+
+async def _audit_hold(item: dict, item_id, item_type: str, marker: dict, actor: dict, label_of) -> None:
+    await audit.record(
+        actor=actor, action=audit.Action.MONEY_ITEM_HELD, subject_type=item_type,
+        subject_id=str(item_id),
+        reason=f"Held for Finance/Owner review after a role revocation. {marker['note']}".strip(),
+        before={"held": False}, after={"held": True, "held_reason": HELD_ROLE_REVOKED},
+        card_id=str(item_id) if item_type == "card" else str(item.get("card_id") or "") or None,
+        meta={"item_type": item_type, "partner_kind": marker["partner_kind"],
+              "partner_id": marker["partner_id"], "label": label_of(item)},
+    )
+
+
+async def hold_pending_items_for_revoked_role(
+    partner_kind: str, partner_id: str, reason: str, actor: dict, *, db=None,
+) -> dict:
+    """Put every pending money item of a revoked partner on the Finance board.
+
+    `partner_kind` is `seller` / `agency` / `sub_agency` (then `partner_id` is
+    the partner record id) or `host` (then it is the user's uid). Cards whose
+    subject or payload names the partner, recharges through a seller, a
+    seller's sales and the sub-agency payouts the partner is a party to are
+    all marked `held.reason = 'role_revoked'`. Nothing is approved, cancelled
+    or executed; each item is decided by Finance or an Owner. Idempotent — an
+    item already held is left as it is.
+    """
+    from app.services.cards import PENDING_STAGES  # local: cards is a leaf of this module's graph
+
+    db = _db(db)
+    pid = str(partner_id or "").strip()
+    if not pid:
+        raise ValueError("A hold needs the partner it is for.")
+    now = _now()
+    marker = _held_marker(partner_kind, pid, reason, actor, now)
+    held: list[dict] = []
+
+    pending = {"stage": {"$in": sorted(PENDING_STAGES)}}
+    card_queries = [{**pending, field: pid} for field in (
+        "subject.id", "payload.host_id", "payload.seller_id", "payload.agency_id",
+        "payload.sub_id", "payload.parent_id", "payload.uid",
+    )]
+    held += await _hold_in(db, C.CARDS, card_queries, "card", marker, actor,
+                           lambda c: f"{c.get('type')} {c.get('amount')} {c.get('currency')} ({c.get('stage')})")
+
+    if str(partner_kind) != "host":
+        held += await _hold_in(
+            db, C.RECHARGES,
+            [{"seller_id": pid, "status": {"$in": list(PENDING_RECHARGE_STATUSES)}}],
+            "recharge", marker, actor,
+            lambda r: f"recharge {r.get('diamonds')} diamonds for {r.get('buyer_uid')} ({r.get('status')})",
+        )
+        held += await _hold_in(
+            db, SALES,
+            [{"seller_id": pid, "status": {"$in": list(PENDING_SALE_STATUSES)}}],
+            "sale", marker, actor,
+            lambda s: f"sale {s.get('diamonds')} diamonds to {s.get('buyer_uid')} ({s.get('status')})",
+        )
+        held += await _hold_in(
+            db, SUBAGENCY_PAYOUTS,
+            [{"status": {"$ne": "closed"}, "parent_id": pid}, {"status": {"$ne": "closed"}, "sub_id": pid}],
+            "subagency_payout", marker, actor,
+            lambda p: f"sub-agency payout {p.get('amount_minor')} paise ({p.get('status')})",
+        )
+
+    return {"held": len(held), "items": held, "partner_kind": str(partner_kind), "partner_id": pid}
+
+
+async def list_held_items(limit: int = 200, *, db=None, include_released: bool = False) -> dict:
+    """Everything on the held-for-review list, newest hold first, by kind."""
+    from app.services.cards import PENDING_STAGES
+
+    db = _db(db)
+    lim = max(1, min(int(limit), 500))
+
+    def _live(doc: dict) -> bool:
+        held = doc.get("held")
+        if not isinstance(held, dict):
+            return False
+        return include_released or not held.get("released_at")
+
+    def _rows(collection: str, extra: dict) -> Any:
+        return db[collection].find({"held": {"$exists": True}, **extra}).sort("updated_at", -1).limit(lim)
+
+    out: dict[str, list] = {"cards": [], "recharges": [], "sales": [], "subagency_payouts": []}
+    async for c in _rows(C.CARDS, {"stage": {"$in": sorted(PENDING_STAGES)}}):
+        if _live(c):
+            c["id"] = str(c.pop("_id"))
+            out["cards"].append(c)
+    async for r in _rows(C.RECHARGES, {"status": {"$in": list(PENDING_RECHARGE_STATUSES)}}):
+        if _live(r):
+            r["id"] = str(r.pop("_id"))
+            out["recharges"].append(r)
+    async for s in _rows(SALES, {"status": {"$in": list(PENDING_SALE_STATUSES)}}):
+        if _live(s):
+            s["id"] = str(s.pop("_id"))
+            out["sales"].append(s)
+    async for p in _rows(SUBAGENCY_PAYOUTS, {"status": {"$ne": "closed"}}):
+        if _live(p):
+            p["id"] = str(p.pop("_id"))
+            out["subagency_payouts"].append(p)
+    out["total"] = sum(len(v) for v in out.values())
+    return out
+
+
+_HELD_COLLECTIONS = {"card": C.CARDS, "recharge": C.RECHARGES, "sale": SALES,
+                     "subagency_payout": SUBAGENCY_PAYOUTS}
+
+
+def can_decide_held(actor: dict | None) -> bool:
+    """Finance (its admin) or an Owner — the two the spec names."""
+    role = str((actor or {}).get("role") or "")
+    return R.is_owner_value(role) or role == str(R.Role.FINANCE_ADMIN)
+
+
+async def release_hold(item_type: str, item_id: str, reason: str, actor: dict, *, db=None) -> dict:
+    """Finance or an Owner lifts a hold so the item can be decided normally.
+
+    The marker is kept with `released_at/by/reason` — history, never deleted.
+    """
+    if not can_decide_held(actor):
+        raise PermissionError("Only Finance or an Owner may release a held item.")
+    collection = _HELD_COLLECTIONS.get(str(item_type or ""))
+    if collection is None:
+        raise ValueError("item_type must be one of card, recharge, sale, subagency_payout.")
+    reason = str(reason or "").strip()
+    if len(reason) < 5:
+        raise ValueError("Say why — the note is the record of this decision.")
+    db = _db(db)
+    now = _now()
+    lookup: Any = str(item_id or "").strip()
+    if collection == C.CARDS or collection in (SALES, SUBAGENCY_PAYOUTS):
+        from bson import ObjectId
+
+        try:
+            lookup = ObjectId(lookup)
+        except Exception as exc:  # noqa: BLE001
+            raise LookupError("No held item with that id.") from exc
+    res = await db[collection].find_one_and_update(
+        {"_id": lookup, "held": {"$exists": True}, "held.released_at": {"$exists": False}},
+        {"$set": {"held.released_at": now, "held.released_by": _who(actor),
+                  "held.release_reason": reason, "updated_at": now}},
+    )
+    if res is None:
+        raise LookupError("No held item with that id, or it was already released.")
+    await audit.record(
+        actor=actor, action=audit.Action.MONEY_ITEM_RELEASED, subject_type=str(item_type),
+        subject_id=str(item_id), reason=reason,
+        before={"held": True}, after={"held": False},
+        card_id=str(item_id) if item_type == "card" else None,
+        meta={"item_type": str(item_type), "held_reason": (res.get("held") or {}).get("reason")},
+    )
+    doc = await db[collection].find_one({"_id": lookup}) or {}
+    doc["id"] = str(doc.pop("_id", item_id))
+    return doc
 
 
 def hold_fields(label: str) -> dict:
@@ -352,7 +612,26 @@ async def decide(
         before={"status": status_now}, after={"status": new_status},
         meta={"decision": decision, **({"adjustment": adj} if adj else {})},
     )
-    return {**(await db[FREEZES].find_one({"_id": key}) or {}), "id": key}
+    out = {**(await db[FREEZES].find_one({"_id": key}) or {}), "id": key}
+    # §8: a frozen-money decision is one Owner's; the others are told. Best
+    # effort and last — the decision above is committed and audited.
+    try:
+        from app.services import owner_mail  # local: keeps the import graph acyclic
+
+        snapshot = doc.get("snapshot") or {}
+        amount = adj.get("amount") if adj else snapshot.get("beansAvailable", snapshot.get("beans"))
+        out["owner_notice"] = await owner_mail.notify_other_owners(
+            actor=actor, action=f"freeze_{decision}", reference=key, reference_type="money_freeze",
+            amount=amount if isinstance(amount, int) else None,
+            currency=(adj.get("currency") if adj else ("beans" if subject.get("type") == "user" else "")),
+            title=f"Frozen money of {subject.get('type')} {subject.get('id')}",
+            subject=dict(subject), reason=note,
+            rows=[("Decision", new_status), ("Kinds", ", ".join(doc.get("kinds") or []))],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Owner notification for freeze decision %s failed", key)
+        out["owner_notice"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
 async def _lift_hold(uid: str, db=None) -> None:

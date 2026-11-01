@@ -50,6 +50,25 @@ from app.db import firebase as firebase_mod  # noqa: E402
 fs = FakeFirestore()
 firebase_mod.firestore_client = lambda: fs  # type: ignore[assignment]
 
+# §5 (B2): the public appeal must name the phone number or email ON the account —
+# read from the Firebase Auth record, never the client-written profile. Every
+# fixture account gets a deterministic record (`harness.verified_auth`), and the
+# helper below is the matching contact a legitimate appellant would type.
+from tests import harness as _h  # noqa: E402
+
+firebase_mod.get_user = _h.verified_auth  # type: ignore[assignment]
+
+
+def C(uid: str) -> str:
+    """The email on `uid`'s auth record."""
+    return f"{uid}@x.test"
+
+
+def P(uid: str) -> str:
+    """The phone on `uid`'s auth record, as a person might type it (spaces, no +)."""
+    digits = _h.verified_auth(uid).phone_number[3:]
+    return f"0{digits[:5]} {digits[5:]}"
+
 AUDIT: list[dict] = []
 
 
@@ -162,28 +181,51 @@ users()[LONG_UID] = {"name": "Guest yrfdp", "isBanned": True, "accountState": "b
                      "banReason": "spam", "bannedBy": "staff-ban-1", "email": "secret@x.test"}
 users()["FREEaaaa1111bbbb2222cccc33"] = {"name": "Free user", "accountState": "active"}
 
-r = run(pub.lookup(LONG_UID, "", "203.0.113.5"))
+r = run(pub.lookup(LONG_UID, "", "203.0.113.5", contact=C(LONG_UID)))
 eq("a banned account by full ID → appealable", r["state"], "appealable")
 eq("…with a MASKED name only", r["name_hint"], "G**** y****")
 ok("…and no private field", "secret" not in str(r) and "spam" not in str(r) and "staff-ban-1" not in str(r))
-r_free = run(pub.lookup("FREEaaaa1111bbbb2222cccc33", "", "203.0.113.5"))
-r_none = run(pub.lookup("NOPEaaaa1111bbbb2222cccc33", "", "203.0.113.5"))
+r_free = run(pub.lookup("FREEaaaa1111bbbb2222cccc33", "", "203.0.113.5", contact=C("FREEaaaa1111bbbb2222cccc33")))
+r_none = run(pub.lookup("NOPEaaaa1111bbbb2222cccc33", "", "203.0.113.5", contact=C("NOPEaaaa1111bbbb2222cccc33")))
 eq("an UNRESTRICTED account answers exactly like a missing one", r_free, r_none)
 eq("…not_found", r_free["state"], "not_found")
 
 eq("name + 8-character profile ID finds it",
-   run(pub.lookup(LONG_UID[:8].upper(), "Guest yrfdp", "203.0.113.5"))["state"], "appealable")
+   run(pub.lookup(LONG_UID[:8].upper(), "Guest yrfdp", "203.0.113.5", contact=C(LONG_UID)))["state"], "appealable")
 eq("an 8-character ID without the name is not enough",
-   run(pub.lookup(LONG_UID[:8].upper(), "", "203.0.113.5"))["state"], "not_found")
+   run(pub.lookup(LONG_UID[:8].upper(), "", "203.0.113.5", contact=C(LONG_UID)))["state"], "not_found")
 users()[LONG_UID[:8] + "ZZZZZZZZZZZZZZZZZZZZ"] = {"name": "Guest yrfdp", "isBanned": True}
 eq("an AMBIGUOUS name + prefix is not a match",
-   run(pub.lookup(LONG_UID[:8].upper(), "Guest yrfdp", "203.0.113.5"))["state"], "not_found")
+   run(pub.lookup(LONG_UID[:8].upper(), "Guest yrfdp", "203.0.113.5", contact=C(LONG_UID)))["state"], "not_found")
 del users()[LONG_UID[:8] + "ZZZZZZZZZZZZZZZZZZZZ"]
+
+# §5 (B2): account-matching contact verification, with its own mismatch error.
+msg = refuses("§5: a restricted account with NO contact given is refused (contact required)",
+              pub.lookup(LONG_UID, "", "203.0.113.6"))
+eq("…with the contact-required sentence", msg, pub.CONTACT_REQUIRED)
+msg = refuses("§5: a WRONG contact is refused with the mismatch error",
+              pub.lookup(LONG_UID, "", "203.0.113.6", contact="someone-else@x.test"))
+eq("…distinct from not-found", msg, pub.CONTACT_MISMATCH)
+ok("…and the mismatch error says nothing about the restriction",
+   "ban" not in msg.lower() and "suspend" not in msg.lower())
+eq("§5: the account's PHONE, typed loosely, matches too",
+   run(pub.lookup(LONG_UID, "", "203.0.113.6", contact=P(LONG_UID)))["state"], "appealable")
+eq("§5: an unrestricted account answers not_found whatever the contact (no enumeration)",
+   run(pub.lookup("FREEaaaa1111bbbb2222cccc33", "", "203.0.113.6", contact="wrong@x.test"))["state"], "not_found")
+eq("§5: filing with a wrong contact is refused and files nothing",
+   refuses("…refused", pub.submit(LONG_UID, "", STATEMENT, [], "203.0.113.6", contact="wrong@x.test")),
+   pub.CONTACT_MISMATCH)
+eq("…nothing filed", len(appeals()), 0)
+ok("pure: phone forms compare on their last ten digits",
+   pub.contact_matches("+91 98765 43210", "+919876543210", "") and pub.contact_matches("09876543210", "+919876543210", "")
+   and not pub.contact_matches("9876543211", "+919876543210", ""))
+ok("pure: an email compares case-insensitively", pub.contact_matches(" A@X.Test ", "", "a@x.test"))
+ok("pure: an empty contact never matches", not pub.contact_matches("", "+919876543210", "a@x.test"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 print("3. Filing — the existing appeals collection, nothing lifted")
 
-out = run(pub.submit(LONG_UID, "", STATEMENT, [U("s.jpg", JPEG), U("v.mp4", MP4)], "203.0.113.5"))
+out = run(pub.submit(LONG_UID, "", STATEMENT, [U("s.jpg", JPEG), U("v.mp4", MP4)], "203.0.113.5", contact=C(LONG_UID)))
 eq("filed as pending", out["status"], "pending")
 ok("…with a reference", out["reference"].startswith("ZA-"))
 eq("one appeal written", len(appeals()), 1)
@@ -205,11 +247,10 @@ ok("audited as appeal.submitted", any(e["action"] == "appeal.submitted" and e["s
                                       for e in AUDIT))
 
 eq("a second appeal while one is pending: lookup says so",
-   run(pub.lookup(LONG_UID, "", "198.51.100.9"))["state"], "appeal_pending")
-refuses("…and filing is refused", pub.submit(LONG_UID, "", STATEMENT, [], "198.51.100.9"))
+   run(pub.lookup(LONG_UID, "", "198.51.100.9", contact=C(LONG_UID)))["state"], "appeal_pending")
+refuses("…and filing is refused", pub.submit(LONG_UID, "", STATEMENT, [], "198.51.100.9", contact=C(LONG_UID)))
 eq("…still one appeal", len(appeals()), 1)
-refuses("an unrestricted account cannot be appealed", pub.submit(
-    "FREEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "198.51.100.9"))
+refuses("an unrestricted account cannot be appealed", pub.submit("FREEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "198.51.100.9", contact=C("FREEaaaa1111bbbb2222cccc33")))
 
 # ══════════════════════════════════════════════════════════════════════════════
 print("4. A failed upload leaves nothing behind")
@@ -217,8 +258,7 @@ print("4. A failed upload leaves nothing behind")
 users()["BAN2aaaa1111bbbb2222cccc33"] = {"name": "Second", "isBanned": True, "accountState": "banned"}
 UPLOADED.clear()
 FAIL_UPLOAD_AT.append(1)
-refuses("an upload failure refuses the appeal", pub.submit(
-    "BAN2aaaa1111bbbb2222cccc33", "", STATEMENT, [U("a.png", PNG), U("b.png", PNG)], "192.0.2.10"))
+refuses("an upload failure refuses the appeal", pub.submit("BAN2aaaa1111bbbb2222cccc33", "", STATEMENT, [U("a.png", PNG), U("b.png", PNG)], "192.0.2.10", contact=C("BAN2aaaa1111bbbb2222cccc33")))
 FAIL_UPLOAD_AT.clear()
 ok("…no appeal for that account", all(d["subjectUid"] != "BAN2aaaa1111bbbb2222cccc33" for d in appeals().values()))
 eq("…and the object already uploaded was removed", len(DELETED), 1)
@@ -229,15 +269,15 @@ print("5. Rate limits")
 for i in range(pub.SUBMITS_PER_HOUR_PER_CLIENT - 1):   # one submit already counted for 192.0.2.10
     uid = f"RATE{i:04d}aaaa1111bbbb2222cc"
     users()[uid] = {"name": f"r{i}", "isBanned": True, "accountState": "banned"}
-    run(pub.submit(uid, "", STATEMENT, [], "192.0.2.10"))
+    run(pub.submit(uid, "", STATEMENT, [], "192.0.2.10", contact=C(uid)))
 users()["RATEXXXXaaaa1111bbbb2222cc"] = {"name": "rx", "isBanned": True, "accountState": "banned"}
-refuses("a client over its hourly submits is refused", pub.submit(
-    "RATEXXXXaaaa1111bbbb2222cc", "", STATEMENT, [], "192.0.2.10"), kind=pub.RateLimited)
+refuses("a client over its hourly submits is refused", pub.submit("RATEXXXXaaaa1111bbbb2222cc", "", STATEMENT, [], "192.0.2.10", contact=C("RATEXXXXaaaa1111bbbb2222cc")), kind=pub.RateLimited)
 
 for i in range(pub.LOOKUPS_PER_HOUR_PER_CLIENT):
-    run(pub.lookup("NOPEaaaa1111bbbb2222cccc33", "", "192.0.2.99"))
+    run(pub.lookup("NOPEaaaa1111bbbb2222cccc33", "", "192.0.2.99", contact=C("NOPEaaaa1111bbbb2222cccc33")))
 refuses("a client over its hourly lookups is refused", pub.lookup(
-    "NOPEaaaa1111bbbb2222cccc33", "", "192.0.2.99"), kind=pub.RateLimited)
+    "NOPEaaaa1111bbbb2222cccc33", "", "192.0.2.99", contact=C(
+    "NOPEaaaa1111bbbb2222cccc33")), kind=pub.RateLimited)
 ok("no client address is stored in clear",
    all("192.0.2" not in str(row) and "203.0.113" not in str(row) for row in DB[mongo.C.PUBLIC_APPEAL_RATE].docs))
 
@@ -264,10 +304,10 @@ print("7. Review fixes")
 # 7.1 The lookup says whether an appeal can be filed — and nothing more.
 users()["BAN7aaaa1111bbbb2222cccc33"] = {"name": "Seven Person", "isSuspended": True, "accountState": "suspended",
                                          "suspendedBy": "staff-sus-7"}
-r7 = run(pub.lookup("BAN7aaaa1111bbbb2222cccc33", "", "203.0.113.70"))
+r7 = run(pub.lookup("BAN7aaaa1111bbbb2222cccc33", "", "203.0.113.70", contact=C("BAN7aaaa1111bbbb2222cccc33")))
 eq("appealable carries ONLY the state and a masked name", sorted(r7), ["name_hint", "state"])
 ok("…not ban versus suspension", "suspend" not in str(r7).lower() and "ban" not in str(r7).lower())
-r7p = run(pub.lookup(LONG_UID, "", "203.0.113.70"))
+r7p = run(pub.lookup(LONG_UID, "", "203.0.113.70", contact=C(LONG_UID)))
 eq("an account with an appeal pending says so", r7p["state"], "appeal_pending")
 ok("…without the pending appeal's reference", "reference" not in r7p and "ZA-" not in str(r7p))
 
@@ -290,8 +330,8 @@ users()["RACEaaaa1111bbbb2222cccc33"] = {"name": "Race Person", "isBanned": True
 
 async def _two():
     return await asyncio.gather(
-        pub.submit("RACEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.81"),
-        pub.submit("RACEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.82"),
+        pub.submit("RACEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.81", contact=C("RACEaaaa1111bbbb2222cccc33")),
+        pub.submit("RACEaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.82", contact=C("RACEaaaa1111bbbb2222cccc33")),
         return_exceptions=True,
     )
 
@@ -310,7 +350,7 @@ users()["LOCKaaaa1111bbbb2222cccc33"] = {"name": "Lock Person", "isBanned": True
 DB[mongo.C.PUBLIC_APPEAL_RATE].docs.append({"_id": "lock_LOCKaaaa1111bbbb2222cccc33",
                                             "at": _dt.now(_tz.utc) - _td(minutes=5)})
 eq("a stale filing lock does not block the account for ever",
-   run(pub.submit("LOCKaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.90"))["status"], "pending")
+   run(pub.submit("LOCKaaaa1111bbbb2222cccc33", "", STATEMENT, [], "203.0.113.90", contact=C("LOCKaaaa1111bbbb2222cccc33")))["status"], "pending")
 
 # …and only its holder can release it: a slow holder whose lock was taken over
 # cannot free the new holder's lock for a third request.
@@ -362,10 +402,10 @@ users()[RA_UID] = {"name": "Guest reapp", "isBanned": True, "accountState": "ban
 fs.collection("appeals").docs["decided-1"] = {"subjectUid": RA_UID, "kind": "ban", "status": "upheld",
                                               "statement": STATEMENT, "source": "public_web"}
 msg = refuses("RC: the public form refuses the decided statement again (no new files)",
-              pub.submit(RA_UID, "", STATEMENT, [], "203.0.113.77"))
+              pub.submit(RA_UID, "", STATEMENT, [], "203.0.113.77", contact=C(RA_UID)))
 ok("RC: …saying what is needed", "new evidence" in msg, msg)
 again = run(pub.submit(RA_UID, "", "Since the decision I found proof the messages were sent by someone else.",
-                       [], "203.0.113.78"))
+                       [], "203.0.113.78", contact=C(RA_UID)))
 eq("RC: …a NEW reason is filed", again["status"], "pending")
 eq("RC: …the decided appeal is untouched", fs.collection("appeals").docs["decided-1"]["status"], "upheld")
 

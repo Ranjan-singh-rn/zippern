@@ -1534,6 +1534,43 @@ async def _sweep_credit_overdue() -> list[dict]:
     return out
 
 
+#: The sweep stops re-attempting an Owner notice after this many attempts —
+#: three hours at one every fifteen minutes. The row stays `pending`, the
+#: `owner_notice_failed` alert keeps naming it, and an Owner can retry it by
+#: hand from the CRM once the cause (usually a missing address on the staff
+#: record) is fixed. Without a cap a permanently failing address would add a
+#: delivery row every fifteen minutes for ever.
+OWNER_NOTICE_SWEEP_MAX_ATTEMPTS = 12
+
+
+async def _sweep_owner_notices() -> list[dict]:
+    """B1 / §8: re-attempt every Owner money notification still pending."""
+    from app.services import owner_mail
+
+    return await owner_mail.retry_pending(max_attempts=OWNER_NOTICE_SWEEP_MAX_ATTEMPTS)
+
+
+async def _sweep_replica_repair() -> list[dict]:
+    """B1 / M-1: replay CRM balance deltas that never reached Firestore.
+
+    One row per stale balance, in the sweep's own vocabulary: `sent` when the
+    replica is back in step, `failed` when it is still behind (the alert
+    `replica_drift` then names it)."""
+    from app.services import money
+
+    summary = await money.repair_replica_drift(limit=200)
+    return [
+        {
+            "holder": f"{d.get('holder_type')}/{d.get('holder_id')}/{d.get('currency')}",
+            "outcome": str(mail.Outcome.SENT) if d.get("ok") else str(mail.Outcome.FAILED),
+            "replayed": d.get("replayed", 0),
+            "already_applied": d.get("already_applied", 0),
+            "error": d.get("error"),
+        }
+        for d in summary.get("details", [])
+    ]
+
+
 SWEEPS: tuple[tuple[str, str, Callable[[], Awaitable[list[dict]]]], ...] = (
     ("rejections", "8A.2.5", _sweep_rejections),
     ("deactivations", "8A.2.13", _sweep_deactivations),
@@ -1541,6 +1578,10 @@ SWEEPS: tuple[tuple[str, str, Callable[[], Awaitable[list[dict]]]], ...] = (
     ("payouts_paid", "8A.2.8", _sweep_payouts_paid),
     ("credit_due", "8A.2.10", _sweep_credit_due),
     ("credit_overdue", "8A.2.11", _sweep_credit_overdue),
+    # B1 — not email owed by a record, but the same shape of job: something
+    # the record says is still owed, retried until it is not.
+    ("owner_notices", "§8 owner-alone", _sweep_owner_notices),
+    ("replica_drift_repair", "M-1", _sweep_replica_repair),
 )
 
 

@@ -47,6 +47,13 @@ ROLE_LABELS = {
     "seller": "Coin Seller",
 }
 
+#: OWNER_DECISION_PENDING (spec §5, B2): the master specification defines
+#: partner role revocation as "permanent removal of one partner capability",
+#: with no exception for a person who holds exactly one. The accepted flow
+#: (UGP-B, below and in `users.revoke_host` / `partner_ops.
+#: _refuse_single_role_revocation`) refuses to revoke a person's ONLY role and
+#: points at an account suspension instead. Kept as the accepted flow; lifting
+#: it is the Owner's call, and a one-line change at each of the two guards.
 SINGLE_ROLE_REFUSAL = (
     "{label} is this person's only active role. A single role is not revoked "
     "on its own — suspend the account instead."

@@ -186,6 +186,12 @@ async def mark_settled(card_id: str, actor: Mapping) -> dict:
             f"This card is {card.get('stage')}, not approved. An owner has to "
             "sign it before the money moves."
         )
+    # M-12: claimed like every other executor — a reject racing the
+    # settlement loses, and two settlements of one card record one outcome.
+    try:
+        await card_svc.claim_execution(card_id, dict(actor))
+    except card_svc.CardError as exc:
+        raise CapitalError(str(exc)) from exc
 
     out = await card_svc.mark_executed(
         card_id,
@@ -290,3 +296,14 @@ async def totals() -> dict:
             "what the business still owes its owners."
         ),
     }
+
+
+# ── §8: registered for the owner fast path ──────────────────────────────────
+
+
+async def _exec_capital(card_id: str, actor: Mapping, *, payment_ref: str = "") -> dict:
+    return await mark_settled(card_id, actor)
+
+
+card_svc.register_executor(CardType.OWNER_CAPITAL_IN, _exec_capital)
+card_svc.register_executor(CardType.OWNER_DRAWINGS, _exec_capital)

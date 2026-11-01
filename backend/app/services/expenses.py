@@ -500,6 +500,13 @@ async def execute_expense(card_id: str, payment_ref: str, actor: dict) -> dict:
     """
     ref = _require_text(payment_ref, "A payment reference (UTR, transaction id)")
     card = await _card_ready(card_id)
+    # M-12: claimed before the first write, like every other executor, so a
+    # reject racing this payment loses and two payments of one card record
+    # one outcome.
+    try:
+        await card_svc.claim_execution(card_id, actor)
+    except CardError as exc:
+        raise ExpenseError(str(exc)) from exc
 
     payload = card.get("payload") or {}
     category = str(payload.get("category") or "")
@@ -630,3 +637,13 @@ async def recurring_worklist(period: str) -> dict:
             "should be signing."
         ),
     }
+
+
+# ── §8: registered for the owner fast path ──────────────────────────────────
+
+
+async def _exec_expense(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_expense(card_id, payment_ref, actor)
+
+
+card_svc.register_executor(CardType.OPERATING_EXPENSE, _exec_expense)

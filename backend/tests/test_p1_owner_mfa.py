@@ -208,7 +208,15 @@ for m, p in mfa.MFA_PENDING_ROUTES:
 ok("pending Owner cannot regenerate recovery codes", not gate(pending, "POST", "/api/auth/mfa/recovery-codes"))
 ok("verified Owner passes", gate({**OWNER, "mfa_verified": True}, "GET", "/api/reports/cash-position"))
 ok("a team member is not affected", gate({"uid": "tm1", "role": Role.TECH_MEMBER}, "GET", "/api/reports/cash-position"))
-ok("the observer is not affected", gate(OBSERVER, "GET", "/api/audit"))
+# B3: the Observer carries the same factor (spec §8) — a pending Observer
+# session is confined exactly as a pending Owner's; a verified one passes.
+# `tests/test_observer_mfa.py` holds the whole of that; this is the pin.
+ok("a pending Observer is gated like a pending Owner", not gate(OBSERVER, "GET", "/api/audit"))
+ok("a verified Observer passes", gate({**OBSERVER, "mfa_verified": True}, "GET", "/api/audit"))
+settings.owner_mfa_required = False
+ok("the Owner switch does not reach the Observer (no bypass flag)", not gate(OBSERVER, "GET", "/api/audit"))
+ok("…while it does switch the Owner gate off", gate(pending, "GET", "/api/reports/cash-position"))
+settings.owner_mfa_required = True
 try:
     deps._refuse_owner_without_mfa(req("GET", "/api/users"), pending)
 except deps.HTTPException as exc:
@@ -294,6 +302,12 @@ tm_tok, _ = run(security.issue_session(uid="tm1", email="t@x.test", name="T", ro
 ok("a team member's token has no mfa claim", "mfa" not in _jwt.decode(tm_tok, settings.jwt_secret, algorithms=["HS256"], issuer=settings.jwt_issuer))
 
 # ── Observer reset ────────────────────────────────────────────────────────────
+# B3: a reset is a SECURITY RESET — it also ends the Owner's mobile credentials
+# (Firebase refresh tokens, quick-login) through `security.revoke_sessions_for_uid`.
+# Firebase is not initialised here; stand the two Firebase calls in and record them.
+mobile_revoked: list[tuple[str, str]] = []
+security.firebase.revoke_sessions = lambda uid: (mobile_revoked.append(("firebase", uid)), "")[1]
+security.firebase.revoke_quick_login = lambda uid: (mobile_revoked.append(("quick_login", uid)), "")[1]
 refused("an Owner cannot reset another Owner's MFA", mfa.reset_by_observer(OWNER2, "own1", "lost phone, verified by call"), 403)
 refused("a reset needs a real reason", mfa.reset_by_observer(OBSERVER, "own1", "lost"), 400)
 refused("only Owners can be reset", mfa.reset_by_observer(OBSERVER, "tm1", "lost phone, verified by call"), 404)
@@ -302,6 +316,11 @@ ok("the factor is removed", run(db[C.OWNER_MFA].find_one({"uid": "own1"})) is No
 ok("every session of that Owner is revoked",
    all(s.get("revoked") for s in db[C.SESSIONS].docs.values() if s.get("uid") == "own1"))
 ok("…and not anyone else's", not any(s.get("revoked") for s in db[C.SESSIONS].docs.values() if s.get("uid") == "tm1"))
+ok("…and the Owner's mobile credentials went with them (refresh tokens and quick login)",
+   ("firebase", "own1") in mobile_revoked and ("quick_login", "own1") in mobile_revoked)
+ok("the bulk revocation is on the audit log, by the Observer, with no problems",
+   any(e["action"] == audit_mod.Action.SESSIONS_REVOKED and e["subject_id"] == "own1"
+       and e["actor"].get("uid") == OBSERVER["uid"] and e["meta"].get("problems") == [] for e in audit_log))
 ok("the reset is audited with the reason", audit_log[-1]["action"] == audit_mod.Action.OWNER_MFA_RESET
    and "video call" in audit_log[-1]["reason"])
 ok("the Owner is told in-app and by email",

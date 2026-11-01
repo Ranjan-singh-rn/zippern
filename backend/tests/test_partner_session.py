@@ -480,11 +480,16 @@ observer_refused = refuses_sign_in(
     "some-fresh-google-uid",
     "watch@zipper.test",
 )
+# B3 (spec §8): refused BY NAME — `security.ObserverDenied`, code
+# `observer_denied` — so the app and the CRM can say "this account is CRM-only"
+# instead of a dead end, and the router audits it as `auth.observer_denied`.
+# The caller already proved control of the address, so naming it costs nothing.
 check(
-    "…and is told so without naming why",
+    "…and is told so by name (B3: observer_denied)",
     observer_refused,
-    "This account cannot sign in here.",
+    sec.OBSERVER_DENIED_MESSAGE,
 )
+check("…with a machine-readable code", sec.ObserverDenied.code, "observer_denied")
 
 # ── The email fallback, as it is now ─────────────────────────────────────────
 #
@@ -905,11 +910,21 @@ for route in ALL_ROUTES:
     key = (route["method"], route["path"])
     if key not in deps.PARTNER_REACHABLE:
         continue
-    if route["method"] == "GET" or route["path"].endswith("/signout"):
+    if (route["method"] == "GET" or route["path"].endswith("/signout")
+            or route["path"].endswith("/sessions/revoke-all")):
+        # Sign-out and "sign out everywhere" (B3 / §13) are the two writes a
+        # plain session makes about ITSELF: no record is named, nothing of the
+        # business moves, and the Observer — refused by `require_write` — must
+        # be able to make both. The scope is `own_session_uid`, asserted below.
         ok(
             f"{route['endpoint']} is allowlisted and takes a plain session",
             route["guards"] == {"current_user"},
         )
+        if route["path"].endswith("/sessions/revoke-all"):
+            ok(
+                f"{route['endpoint']} acts on the session's own uid and names nobody",
+                route["self_scoped"] and "{" not in route["path"] and not route["request_ids"],
+            )
     else:
         ok(
             f"{route['endpoint']} is an allowlisted write and says so in its signature",
@@ -1024,9 +1039,14 @@ reachable = [row for row in table if row[2] == "scoped"]
 # {agency_id}/sub-agencies/reapply`, a parent agency filing a FRESH Sub-agency
 # application for a person whose earlier one was rejected. Scoped to the
 # caller's own agency id (asserted above), pending, holding nothing.
-check("exactly twenty-six routes are partner-reachable", len(reachable), 26)
+# Twenty-eight since B3 (spec §13, B-21): `GET /api/auth/sessions` and
+# `POST /api/auth/sessions/revoke-all` — the sessions a login holds and "sign
+# out everywhere". Both act on the session's OWN uid and take no id (asserted
+# above); an agency that sees a session it does not recognise is exactly who
+# needs to be able to end it. Nothing of the business is read or moved.
+check("exactly twenty-eight routes are partner-reachable", len(reachable), 28)
 check(
-    "and they are the twenty-six named in PARTNER_REACHABLE",
+    "and they are the twenty-eight named in PARTNER_REACHABLE",
     {(row[0], row[1]) for row in reachable},
     set(deps.PARTNER_REACHABLE),
 )
@@ -1058,6 +1078,8 @@ check(
         # The seven below scope on team, or on nothing at all.
         ("GET", "/api/staff"),
         ("GET", "/api/staff/assignable-roles"),
+        # §9 (B2): the department Admin vacancy state — internal only.
+        ("GET", "/api/staff/departments"),
         # The caller's own staff record, for /profile — salary and employment
         # id included, which is precisely why it is not on the allowlist. A
         # partner has no staff row and nothing to read here; more to the point,
@@ -1160,7 +1182,12 @@ writes = {(row[0], row[1]) for row in table if "require_write" in row[3].split("
 # 59 since P1-D: `POST /tickets/team`, `POST /tickets/{kind}/{id}/update` and
 # `POST /tickets/support/{id}/route` — the server-authoritative ticket writes
 # that replace direct client Firestore writes. Staff only; never partner-reachable.
-check("require_write guards fifty-nine routes", len(writes), 59)
+# 60 since B2 (spec §5): `POST /users/appeals/{id}/recommend` — a reviewer's
+# written recommendation on a ban / suspension appeal, for the Owner to decide.
+# It lifts nothing, but it is a moderation write about an account, so it is
+# staff-only like `/decide` beside it: no agency may recommend on its own host's
+# appeal.
+check("require_write guards sixty routes", len(writes), 60)
 # The four moderation operations are four distinct routes on this guard. Named
 # rather than counted, so that collapsing resume back into unban — which is the
 # defect this pins shut — is a diff somebody reads rather than a number that
@@ -1213,6 +1240,10 @@ partner_writes = sorted(
     (row[0], row[1])
     for row in reachable
     if row[0] != "GET" and not row[1].endswith("/signout")
+    # B3: "sign out everywhere" is a write about the session itself, like
+    # sign-out, and is held to the sign-out shape above (plain session,
+    # `own_session_uid`, no id anywhere). It is not a business write.
+    and not row[1].endswith("/sessions/revoke-all")
 )
 check(
     "the only five writes a partner may make",
@@ -1590,6 +1621,11 @@ ok(
 
 # ── 7.4  POST /partner-ops/sales — spec 4.3.8 ────────────────────────────────
 
+# M-11: a sale is filed only against a buyer whose `users/{uid}` document
+# exists. The buyer here does; Firestore itself is not what 7.4 is about.
+firebase_mod.read_host_wallet = lambda uid: {  # type: ignore[assignment]
+    "beans": 0, "beans_available": 0, "agency_id": "", "is_verified_host": False, "name": "Buyer",
+}
 own_sale = run(ops_router.record_sale(sale(), SELLER_S))
 check("a seller files their own sale", own_sale["seller_id"], "seller-live")
 check("…at pending, moving nothing", str(own_sale["status"]), "pending")

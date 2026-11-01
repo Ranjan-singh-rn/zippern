@@ -1306,6 +1306,253 @@ def _sigma_text(milli: Any) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  B1 — money integrity: replica drift, Owner notices, stuck claims, holds,
+#  reconciliation. Every new failure path in the money services ends in one
+#  of these, so `scheduledAlertScan` (which runs `scan()`) raises it even when
+#  the code path that failed could not.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _find_replica_drift() -> list[Finding]:
+    """M-1: a balance whose Firestore replica never received a CRM delta."""
+    from app.db.mongo import C
+
+    out: list[Finding] = []
+    cutoff = _now() - timedelta(minutes=int(settings.alert_replica_stale_minutes))
+    cursor = _c(C.BALANCES).find({"replica_stale": True}).limit(200)
+    async for row in cursor:
+        stale_at = row.get("replica_stale_at")
+        if isinstance(stale_at, datetime):
+            if stale_at.tzinfo is None:
+                stale_at = stale_at.replace(tzinfo=timezone.utc)
+            if stale_at > cutoff:
+                continue  # the sweep's repair has not had its turn yet
+        pending = [p for p in (row.get("replica_pending") or []) if isinstance(p, dict)]
+        owed = sum(int(p.get("delta") or 0) for p in pending)
+        holder = f"{row.get('holder_type')}/{row.get('holder_id')}/{row.get('currency')}"
+        out.append(
+            Finding(
+                key=f"replica_drift:{row.get('holder_type')}:{row.get('holder_id')}:{row.get('currency')}",
+                fingerprint=f"{len(pending)}:{owed}:{row.get('replica_repair_last_error') or ''}",
+                headline=(
+                    f"The app's balance for {holder} is {owed:+,} {row.get('currency')} behind the "
+                    "ledger — a CRM movement never reached Firestore."
+                ),
+                rows=[
+                    ("Holder", holder),
+                    ("Pending deltas", len(pending)),
+                    ("Owed to the live balance", f"{owed:+,} {row.get('currency')}"),
+                    ("Stale since", stale_at),
+                    ("Last repair error", row.get("replica_repair_last_error") or "no repair attempted yet"),
+                    ("Ledger ids", ", ".join(str(p.get("ledger_id") or "") for p in pending[:5])),
+                ],
+                action=(
+                    "The ledger is right and the app is behind. The transactional sweep retries the "
+                    "repair every 15 minutes; run POST /api/partner-ops/money/replica-drift/repair "
+                    "once Firestore is reachable to replay the pending deltas now (keyed on the "
+                    "ledger ids, so it cannot double-credit). If the holder is a buyer who paid "
+                    "cash, they are waiting on this."
+                ),
+                meta={"holder_type": row.get("holder_type"), "holder_id": row.get("holder_id"),
+                      "currency": row.get("currency"), "pending": len(pending), "owed": owed},
+            )
+        )
+    return out
+
+
+async def _find_owner_notice_failed() -> list[Finding]:
+    """§8: the other Owners were not all told of a money action."""
+    from app.db.mongo import C
+
+    out: list[Finding] = []
+    cutoff = _now() - timedelta(minutes=int(settings.alert_owner_notice_pending_minutes))
+    cursor = _c(C.OWNER_NOTICES).find({"status": "pending", "created_at": {"$lt": cutoff}}).limit(200)
+    async for row in cursor:
+        deliveries = row.get("deliveries") or {}
+        failed = [
+            uid for uid, d in deliveries.items()
+            if not (d or {}).get("in_app") or str((d or {}).get("email") or "") not in ("sent", "delivered", "duplicate")
+        ]
+        out.append(
+            Finding(
+                key=f"owner_notice_failed:{row.get('_id')}",
+                fingerprint=f"{row.get('attempts')}:{row.get('last_error') or ''}",
+                headline=(
+                    f"The other Owners have not all been told that {(row.get('actor') or {}).get('name') or 'an Owner'} "
+                    f"{row.get('action', '').replace('_', ' ')} ({row.get('reference_type')} {row.get('reference')})."
+                ),
+                rows=[
+                    ("Event", row.get("_id")),
+                    ("Actor", f"{(row.get('actor') or {}).get('name')} ({(row.get('actor') or {}).get('role')})"),
+                    ("Amount", f"{row.get('amount')} {row.get('currency')}"),
+                    ("Attempts", row.get("attempts")),
+                    ("Owners not yet told", ", ".join(failed) or "unknown"),
+                    ("Last error", row.get("last_error") or "—"),
+                    ("Created", row.get("created_at")),
+                ],
+                action=(
+                    "The money action itself stands and is audited. The sweep retries this notice "
+                    "every 15 minutes; an Owner can retry it now from the CRM (POST "
+                    "/api/partner-ops/owner-notices/retry). An Owner with no email address on the "
+                    "staff record cannot be told by email until one is added."
+                ),
+                meta={"event_key": row.get("_id"), "action": row.get("action"),
+                      "reference": row.get("reference"), "attempts": row.get("attempts")},
+            )
+        )
+    return out
+
+
+async def _find_money_claim_stale() -> list[Finding]:
+    """M-11 / M-14: a recharge or sale a process claimed and never finished."""
+    from app.db.mongo import C
+
+    out: list[Finding] = []
+    cutoff = _now() - timedelta(minutes=int(settings.alert_money_claim_stale_minutes))
+    cursor = _c(C.RECHARGES).find({"status": {"$in": ["approving", "refunding"]}}).limit(200)
+    async for row in cursor:
+        claimed = row.get("claimed_at") or row.get("updated_at")
+        if isinstance(claimed, datetime):
+            if claimed.tzinfo is None:
+                claimed = claimed.replace(tzinfo=timezone.utc)
+            if claimed > cutoff:
+                continue
+        out.append(
+            Finding(
+                key=f"recharge_stuck:{row.get('_id')}",
+                fingerprint=f"{row.get('status')}:{claimed}",
+                headline=(
+                    f"Recharge {row.get('_id')} ({row.get('diamonds')} diamonds for {row.get('buyer_uid')}) "
+                    f"has been '{row.get('status')}' since {claimed} — a decision that did not finish."
+                ),
+                rows=[
+                    ("Recharge", row.get("_id")),
+                    ("Status", row.get("status")),
+                    ("Buyer", row.get("buyer_uid")),
+                    ("Seller", row.get("seller_id")),
+                    ("Diamonds", row.get("diamonds")),
+                    ("Claimed", claimed),
+                ],
+                action=(
+                    "Approve (or decide the refund on) the same request again: the claim is stale "
+                    "and is re-taken, every money step is keyed on the request, and nothing is "
+                    "moved twice. Do not reject it — the seller's coins may already be debited."
+                ),
+                meta={"recharge_id": row.get("_id"), "status": row.get("status")},
+            )
+        )
+    cursor = _c("partner_sales").find({"status": {"$in": ["approving", "failed"]}}).limit(200)
+    async for row in cursor:
+        claimed = row.get("claimed_at") or row.get("updated_at")
+        if row.get("status") == "approving" and isinstance(claimed, datetime):
+            if claimed.tzinfo is None:
+                claimed = claimed.replace(tzinfo=timezone.utc)
+            if claimed > cutoff:
+                continue
+        out.append(
+            Finding(
+                key=f"sale_stuck:{row.get('_id')}",
+                fingerprint=f"{row.get('status')}:{row.get('updated_at')}",
+                headline=(
+                    f"Sale {row.get('_id')} ({row.get('diamonds')} diamonds to {row.get('buyer_uid')}) is "
+                    f"'{row.get('status')}': the seller may be debited and the buyer not credited."
+                ),
+                rows=[
+                    ("Sale", row.get("_id")),
+                    ("Status", row.get("status")),
+                    ("Seller", row.get("seller_id")),
+                    ("Buyer", row.get("buyer_uid")),
+                    ("Diamonds", row.get("diamonds")),
+                    ("Failure", row.get("failure") or "—"),
+                ],
+                action=(
+                    "Approve the sale again: the debit is keyed on the sale and is not repeated; "
+                    "the credit is retried with its history row. If the buyer account is gone, "
+                    "raise a balance card to restore the seller's coins instead."
+                ),
+                meta={"sale_id": str(row.get("_id")), "status": row.get("status")},
+            )
+        )
+    return out
+
+
+async def _find_money_items_held() -> list[Finding]:
+    """Spec §5: items of a revoked partner waiting on Finance/Owner review."""
+    from app.services import money_freeze
+
+    held = await money_freeze.list_held_items(limit=200)
+    out: list[Finding] = []
+    for kind in ("cards", "recharges", "sales", "subagency_payouts"):
+        for item in held.get(kind) or []:
+            marker = item.get("held") or {}
+            label = (
+                f"{item.get('type')} {item.get('amount')} {item.get('currency')} ({item.get('stage')})"
+                if kind == "cards" else
+                f"{item.get('diamonds')} diamonds ({item.get('status')})" if kind in ("recharges", "sales") else
+                f"{item.get('amount_minor')} paise ({item.get('status')})"
+            )
+            out.append(
+                Finding(
+                    key=f"money_item_held:{kind}:{item.get('id')}",
+                    fingerprint=f"{marker.get('at')}",
+                    headline=(
+                        f"A {kind[:-1].replace('_', ' ')} of revoked {marker.get('partner_kind')} "
+                        f"{marker.get('partner_id')} is waiting on Finance/Owner review: {label}."
+                    ),
+                    rows=[
+                        ("Item", f"{kind[:-1]} {item.get('id')}"),
+                        ("Detail", label),
+                        ("Partner", f"{marker.get('partner_kind')} {marker.get('partner_id')}"),
+                        ("Held since", marker.get("at")),
+                        ("Held because", marker.get("note") or marker.get("reason")),
+                    ],
+                    action=(
+                        "Decide it: reject it with a reason, or — if it should proceed — release the "
+                        "frozen money on /frozen-money, release the hold (POST /api/partner-ops/"
+                        "held-items/{type}/{id}/release) and execute it. Nothing is approved, cancelled "
+                        "or executed by the machine."
+                    ),
+                    audience=(FINANCE, OWNERS),
+                    meta={"item_type": kind[:-1], "item_id": item.get("id"),
+                          "partner_kind": marker.get("partner_kind"), "partner_id": marker.get("partner_id")},
+                )
+            )
+    return out
+
+
+async def _find_reconciliation_disagreement() -> list[Finding]:
+    """M-4: a reconciled day that did not agree, re-raised under the same key
+    `reconcile_day` uses — so the scheduled scan says what the nightly job
+    said, and a day whose findings change says so again."""
+    from app.services import reconcile
+
+    out: list[Finding] = []
+    for day in await reconcile.days_not_agreeing(_lookback()):
+        counts = day.get("findingCounts") or {}
+        out.append(
+            Finding(
+                key=f"reconciliation:{day.get('dayKey')}",
+                fingerprint=f"{day.get('dayKey')}:{day.get('gapInr')}:{day.get('findingsTotal', 0)}:"
+                            + ",".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                headline=(
+                    f"App economy and ledger disagree for {day.get('dayKey')}: "
+                    f"₹{abs(float(day.get('gapInr') or 0)):,.2f} gap, {day.get('findingsTotal', 0)} finding(s)"
+                ),
+                rows=[
+                    ("Day (IST)", day.get("dayKey")),
+                    ("Difference", f"₹{float(day.get('gapInr') or 0):,.2f}"),
+                    ("Findings", ", ".join(f"{k}×{v}" for k, v in sorted(counts.items())) or "—"),
+                    ("Checked", day.get("checkedAt")),
+                ],
+                action="Open the reconciliation panel for that day; each finding names both records.",
+                meta={"dayKey": day.get("dayKey"), "gapInr": day.get("gapInr"),
+                      "findings": day.get("findingsTotal", 0)},
+            )
+        )
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  The register
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1555,6 +1802,74 @@ DETECTORS: tuple[Detector, ...] = (
             f"{settings.chance_player_min_round_gap_ms} ms"
         ),
         find=_find_chance_player_anomaly,
+    ),
+    # ── B1 — money integrity ─────────────────────────────────────────────────
+    Detector(
+        id="replica_drift",
+        spec="M-1",
+        watches="A CRM balance movement that never reached the app's live balance (replica_stale).",
+        audience=(FINANCE, OWNERS),
+        severity="critical",
+        sensitivity=str(mail.Sensitivity.BUSINESS_MONEY),
+        threshold_setting="ALERT_REPLICA_STALE_MINUTES",
+        threshold_text=lambda: (
+            f"any balance still marked replica_stale {settings.alert_replica_stale_minutes} "
+            "minutes after the sync failed — the sweep's repair runs every 15 minutes first"
+        ),
+        find=_find_replica_drift,
+    ),
+    Detector(
+        id="owner_notice_failed",
+        spec="§8 owner-alone",
+        watches="A money action the other Owners have not all been told about (in-app and email).",
+        audience=(OWNERS,),
+        severity="warning",
+        sensitivity=str(mail.Sensitivity.BUSINESS_MONEY),
+        threshold_setting="ALERT_OWNER_NOTICE_PENDING_MINUTES",
+        threshold_text=lambda: (
+            f"any Owner notification still pending {settings.alert_owner_notice_pending_minutes} "
+            "minutes after the action"
+        ),
+        find=_find_owner_notice_failed,
+    ),
+    Detector(
+        id="money_claim_stale",
+        spec="M-11 / M-14",
+        watches="A recharge or sale claimed by a decision that never finished (approving/refunding/failed).",
+        audience=(FINANCE, OWNERS),
+        severity="critical",
+        sensitivity=str(mail.Sensitivity.BUSINESS_MONEY),
+        threshold_setting="ALERT_MONEY_CLAIM_STALE_MINUTES",
+        threshold_text=lambda: (
+            f"any claim older than {settings.alert_money_claim_stale_minutes} minutes, and any "
+            "failed sale immediately"
+        ),
+        find=_find_money_claim_stale,
+    ),
+    Detector(
+        id="money_items_held",
+        spec="§5 / §11 — pending money on role revocation",
+        watches="A pending card, recharge, sale or sub-agency payout of a revoked partner awaiting review.",
+        audience=(FINANCE, OWNERS),
+        severity="warning",
+        sensitivity=str(mail.Sensitivity.BUSINESS_MONEY),
+        threshold_setting="ALERT_REPEAT_HOURS",
+        threshold_text=lambda: "every held item, once per repeat window until it is decided",
+        find=_find_money_items_held,
+    ),
+    Detector(
+        id="reconciliation_disagreement",
+        spec="M-4",
+        watches="A reconciled day whose app economy and ledgers did not agree.",
+        audience=(FINANCE, OWNERS),
+        severity="critical",
+        sensitivity=str(mail.Sensitivity.BUSINESS_MONEY),
+        threshold_setting="RECONCILIATION_TOLERANCE_INR",
+        threshold_text=lambda: (
+            f"a day's platform cut more than ₹{float(settings.reconciliation_tolerance_inr):,.2f} from "
+            "its own event records, or any missing / duplicate / mismatched entry"
+        ),
+        find=_find_reconciliation_disagreement,
     ),
 )
 

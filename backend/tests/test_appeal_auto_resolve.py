@@ -90,6 +90,10 @@ def run(coro):
 
 ADMIN = {"uid": "admin1", "name": "Ops Admin", "role": "ops_admin"}
 OTHER = {"uid": "admin2", "name": "Second Admin", "role": "ops_admin"}
+#: §5 (B2): a ban / suspension appeal is DECIDED by the Owner — a reviewer
+#: recommends. Two Owners, so the four-eyes rule can be exercised on them too.
+OWNER = {"uid": "owner1", "name": "Owner One", "role": "owner"}
+OWNER2 = {"uid": "owner2", "name": "Owner Two", "role": "owner"}
 #: The sweep runs as the system, not as a person.
 SYSTEM = {"uid": "system", "name": "Scheduled sweep", "role": "system"}
 
@@ -302,10 +306,10 @@ print("── reviewer decisions ───────────────�
 reset()
 seed_user("u9", isBanned=True, accountState="banned", banReason="spam")
 seed_appeal("a9", "u9")
-run(appeals_svc.decide_appeal("a9", "overturned", "Reviewed, the ban was wrong.", ADMIN))
+run(appeals_svc.decide_appeal("a9", "overturned", "Reviewed, the ban was wrong.", OWNER))
 check("6. an overturn is recorded as overturned", appeal("a9")["status"], "overturned")
 ok("6. NOT as resolved", appeal("a9")["status"] != "resolved")
-check("6. and the reviewer is named", appeal("a9")["decidedBy"], "admin1")
+check("6. and the deciding Owner is named", appeal("a9")["decidedBy"], "owner1")
 ok("6. audited as an overturn", "appeal.overturned" in audit_actions())
 ok(
     "6. the reversal did not also auto-resolve it",
@@ -315,7 +319,7 @@ ok(
 reset()
 seed_user("u10", isBanned=True, accountState="banned")
 seed_appeal("a10", "u10")
-run(appeals_svc.decide_appeal("a10", "upheld", "The original decision stands.", ADMIN))
+run(appeals_svc.decide_appeal("a10", "upheld", "The original decision stands.", OWNER))
 check("7. an uphold is recorded as upheld", appeal("a10")["status"], "upheld")
 check("7. and the reason reaches the record",
       appeal("a10")["decisionReason"], "The original decision stands.")
@@ -341,18 +345,18 @@ seed_user("u11", isBanned=True, accountState="banned")
 seed_appeal("a11", "u11")
 msg = refused(
     "8. a reviewer cannot submit 'resolved'",
-    lambda: run(appeals_svc.decide_appeal("a11", "resolved", "trying it on", ADMIN)),
+    lambda: run(appeals_svc.decide_appeal("a11", "resolved", "trying it on", OWNER)),
 )
 ok("8. and is told what a verdict must be", "upheld" in msg and "overturned" in msg)
 check("8. the appeal is untouched", appeal("a11")["status"], "pending")
 
 refused(
     "8. 'pending' is still refused as a verdict",
-    lambda: run(appeals_svc.decide_appeal("a11", "pending", "trying it on", ADMIN)),
+    lambda: run(appeals_svc.decide_appeal("a11", "pending", "trying it on", OWNER)),
 )
 refused(
     "8. and so is anything else",
-    lambda: run(appeals_svc.decide_appeal("a11", "dismissed", "trying it on", ADMIN)),
+    lambda: run(appeals_svc.decide_appeal("a11", "dismissed", "trying it on", OWNER)),
 )
 ok(
     "8. RESOLVED is in the enum but not in VERDICTS",
@@ -371,14 +375,28 @@ print("── four eyes ──────────────────�
 
 reset()
 seed_user("u12", isBanned=True, accountState="banned")
-seed_appeal("a12", "u12", originalDecidedBy="admin1")
+seed_appeal("a12", "u12", originalDecidedBy="owner1")
 msg = refused(
-    "11. the original decider still cannot decide their own appeal",
-    lambda: run(appeals_svc.decide_appeal("a12", "overturned", "Changed my mind.", ADMIN)),
+    "11. the original decider still cannot decide their own appeal — an Owner included",
+    lambda: run(appeals_svc.decide_appeal("a12", "overturned", "Changed my mind.", OWNER)),
 )
 ok("11. and is told why", "cannot decide" in msg.lower())
-run(appeals_svc.decide_appeal("a12", "overturned", "Reviewed by a second pair of eyes.", OTHER))
-check("11. a different reviewer may", appeal("a12")["status"], "overturned")
+# §5 (B2): a reviewer does not decide at all — they recommend, and the Owners are told.
+msg = refused(
+    "11. a reviewer cannot decide a ban appeal (the Owner does)",
+    lambda: run(appeals_svc.decide_appeal("a12", "overturned", "Reviewed by a second pair of eyes.", OTHER)),
+)
+ok("11. …and is told to recommend instead", "recommend" in msg.lower())
+check("11. …nothing was decided", appeal("a12")["status"], "pending")
+rec = run(appeals_svc.recommend_appeal("a12", "overturn", "The ban rested on a report that was withdrawn.", OTHER))
+check("11. the reviewer's recommendation is recorded on the appeal", appeal("a12")["recommendation"]["outcome"], "overturn")
+check("11. …by whom", appeal("a12")["recommendation"]["byUid"], "admin2")
+check("11. …and the appeal is still pending (nothing lifted)", appeal("a12")["status"], "pending")
+ok("11. …audited as a recommendation, Owners told", "appeal.recommended" in audit_actions())
+run(appeals_svc.decide_appeal("a12", "overturned", "Reviewed by a second pair of eyes.", OWNER2))
+check("11. a different Owner may decide", appeal("a12")["status"], "overturned")
+check("11. …and the decision records the recommendation it followed",
+      appeal("a12")["decidedOnRecommendation"], {"outcome": "overturn", "byUid": "admin2", "followed": True})
 
 # ── Auto-resolution does not create a reviewer who could later self-approve ──
 
@@ -428,7 +446,7 @@ reset()
 seed_user("u16", isBanned=True, accountState="banned", bannedBy="staff-ban-16")
 seed_appeal("a16-app", "u16")
 seed_appeal("a16-web", "u16", source="public_web", raisedByUid="", raisedByRole="public")
-out16 = run(appeals_svc.decide_appeal("a16-app", "overturned", "The evidence shows it was not them.", OTHER))
+out16 = run(appeals_svc.decide_appeal("a16-app", "overturned", "The evidence shows it was not them.", OWNER))
 check("the overturned appeal is overturned", appeal("a16-app")["status"], "overturned")
 check("…the other pending appeal is resolved", appeal("a16-web")["status"], "resolved")
 check("…as triggered by the overturn", appeal("a16-web").get("resolvedTrigger"), "appeal_overturned")

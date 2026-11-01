@@ -8,16 +8,22 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.core import audit
-from app.core.deps import current_user, require_owner_provisioner
+from app.core.deps import current_user, own_session_uid, require_owner_provisioner
 from app.core.roles import Role, capability_profile
 from app.core.security import (
+    SESSION_CLIENTS,
     AuthError,
     DirectoryUnavailable,
+    ObserverCodeProofFailed,
+    ObserverCodeRateLimited,
+    ObserverDenied,
     issue_session,
+    list_sessions,
     renew_at,
     renew_session,
     request_observer_code,
     revoke_session,
+    revoke_sessions_for_uid,
     sign_in_with_firebase,
     verify_observer_code,
 )
@@ -27,8 +33,50 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _client_address(request: Request | None) -> str | None:
+    """The caller's address, for the session record and the code rate limit.
+
+    BEST EFFORT, and the same reading `routers/public_appeals.py` uses: the
+    left-most `X-Forwarded-For` entry is whatever the caller sent first, so a
+    forged header buys a fresh per-address budget — which is why the GLOBAL
+    code-request limit is the binding one. Never the connecting peer alone:
+    on Cloud Run that is Google's proxy, shared by everyone.
+    """
+    if request is None:
+        return None
+    headers = getattr(request, "headers", None) or {}
+    forwarded = str(headers.get("x-forwarded-for", "") or "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64] or None
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    return str(host)[:64] if host else None
+
+
+def _user_agent(request: Request | None) -> str:
+    headers = getattr(request, "headers", None) or {}
+    return str(headers.get("user-agent", "") or "")
+
+
+def _session_client(value: str) -> str:
+    """`crm` or `android`, read off the body; anything else is the CRM."""
+    value = str(value or "").strip().lower()
+    return value if value in SESSION_CLIENTS else "crm"
+
+
 class FirebaseSignIn(BaseModel):
     id_token: str = Field(min_length=10)
+    #: B3 — which client this session is for (`crm` | `android`). Recorded on
+    #: the session (for `GET /auth/sessions`) and used by the Owner MFA binding;
+    #: it grants nothing.
+    client: str = Field(default="crm", max_length=16)
+
+
+class ObserverCodeRequest(BaseModel):
+    """B-4: proof of a code the requester already holds, to replace it at once.
+    Optional; an empty body is the ordinary request."""
+
+    previous_code: str = Field(default="", max_length=10)
 
 
 class ObserverCodeVerify(BaseModel):
@@ -73,9 +121,33 @@ def session_response(token: str, expires, profile: dict) -> SessionResponse:
 @router.post("/signin", response_model=SessionResponse)
 async def signin(body: FirebaseSignIn, request: Request):
     """Staff, owners and partners. The client authenticates with Firebase and
-    sends the resulting ID token."""
+    sends the resulting ID token.
+
+    An Owner's session comes back PENDING (`user.mfa.verified == false`) on
+    the CRM and on Android alike; the client then runs the `/mfa/*` steps
+    below. The Observer is refused here by name (`observer_denied`) — it has
+    no Android access at all and signs in only at `/observer/*`.
+    """
+    ip = _client_address(request)
+    client = _session_client(body.client)
     try:
-        token, expires, profile = await sign_in_with_firebase(body.id_token)
+        token, expires, profile = await sign_in_with_firebase(
+            body.id_token, client=client, ip=ip, user_agent=_user_agent(request))
+    except ObserverDenied as exc:
+        # B3 / spec §8: audited by name so an attempt to reach the Observer
+        # through Google-on-Android (or any provider) is visible on /audit.
+        await audit.record(
+            actor={"uid": "", "name": "", "role": ""},
+            action=audit.Action.AUTH_OBSERVER_DENIED,
+            subject_type="auth",
+            subject_id="observer",
+            reason=str(exc),
+            meta={"ip": ip, "client": client},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": ObserverDenied.code, "message": str(exc)},
+        ) from exc
     except DirectoryUnavailable as exc:
         # NOT a failed login, and deliberately not recorded as one.
         #
@@ -95,7 +167,7 @@ async def signin(body: FirebaseSignIn, request: Request):
             subject_type="auth",
             subject_id="firebase",
             reason=str(exc),
-            meta={"ip": request.client.host if request.client else None},
+            meta={"ip": ip, "client": client},
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
@@ -107,9 +179,9 @@ async def signin(body: FirebaseSignIn, request: Request):
         subject_type="auth",
         subject_id=profile["uid"],
         reason="Signed in",
-        meta={"method": "firebase", "ip": request.client.host if request.client else None},
+        meta={"method": "firebase", "ip": ip, "client": client},
     )
-    return session_response(token, expires, await _with_mfa(profile))
+    return session_response(token, expires, await _with_mfa(profile, token))
 
 
 @router.post("/refresh", response_model=SessionResponse)
@@ -143,9 +215,9 @@ async def refresh(body: SessionRefresh, request: Request):
     Every refusal is a 401 with the reason on it, and the CRM's response to one
     is to ask for a password. It never retries a refusal.
     """
-    ip = request.client.host if request.client else None
+    ip = _client_address(request)
     try:
-        token, expires, profile = await renew_session(body.token)
+        token, expires, profile = await renew_session(body.token, ip=ip)
     except AuthError as exc:
         # Recorded, because a refused renewal is the interesting one: it is a
         # deactivated account still holding a token, a revoked session being
@@ -179,18 +251,34 @@ async def refresh(body: SessionRefresh, request: Request):
 
 
 @router.post("/observer/request-code")
-async def observer_request_code(request: Request):
+async def observer_request_code(request: Request, body: ObserverCodeRequest | None = None):
     """Start observer sign-in.
 
     Generates a one-time code and emails it to the delivery mailbox — which is
     deliberately not the observer's own address, so holding the account is not
     enough to sign in. The code is never returned in the response.
+
+    B-4: a request no longer voids the codes already out there (every live one
+    stays valid for its TTL), the caller may prove the previous code to replace
+    it at once, and requests are limited per address and globally — see
+    `security.request_observer_code`. A limit answers 429; a wrong proof 401.
     """
+    previous = str(getattr(body, "previous_code", "") or "") if body is not None else ""
     try:
         result = await request_observer_code(
-            requested_by_ip=request.client.host if request.client else None
+            requested_by_ip=_client_address(request), previous_code=previous
         )
+    except ObserverCodeRateLimited as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
+        ) from exc
+    except ObserverCodeProofFailed as exc:
+        # A wrong `previous_code` is a failed guess, charged as one: 401.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
+        ) from exc
     except AuthError as exc:
+        # The resend cooldown — 429, as before.
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
         ) from exc
@@ -199,13 +287,19 @@ async def observer_request_code(request: Request):
         "message": "A sign-in code has been sent.",
         "sent_to": result["sent_to"],
         "expires_in_minutes": result["expires_in_minutes"],
+        "outstanding": result.get("outstanding", 1),
     }
 
 
 @router.post("/observer/verify-code", response_model=SessionResponse)
 async def observer_verify_code(body: ObserverCodeVerify, request: Request):
+    """The first factor. Answers with a PENDING session (`user.mfa.verified ==
+    false`): the Observer then enrols or verifies at `/mfa/*` exactly as an
+    Owner does, and only the upgraded session reaches anything else."""
+    ip = _client_address(request)
     try:
-        token, expires, profile = await verify_observer_code(body.code)
+        token, expires, profile = await verify_observer_code(
+            body.code, ip=ip, user_agent=_user_agent(request))
     except AuthError as exc:
         await audit.record(
             actor={"uid": "", "name": "Observer", "role": "observer"},
@@ -213,7 +307,7 @@ async def observer_verify_code(body: ObserverCodeVerify, request: Request):
             subject_type="auth",
             subject_id="observer",
             reason=str(exc),
-            meta={"ip": request.client.host if request.client else None},
+            meta={"ip": ip},
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
@@ -224,13 +318,14 @@ async def observer_verify_code(body: ObserverCodeVerify, request: Request):
         action=audit.Action.LOGIN_SUCCEEDED,
         subject_type="auth",
         subject_id=profile["uid"],
-        reason="Observer signed in",
-        meta={"method": "otp", "ip": request.client.host if request.client else None},
+        reason="Observer passed the emailed code (first factor)",
+        meta={"method": "otp", "ip": ip, "client": "crm"},
     )
     # The observer's session is `observer_session_ttl_minutes` — twelve hours,
     # unchanged — and `renew_session` refuses to renew it, so `renew_at` here
     # is the moment their browser will discover that and offer a new code.
-    return session_response(token, expires, profile)
+    # B3: the `mfa` block tells the screen whether to enrol or to verify.
+    return session_response(token, expires, await _with_mfa(profile, token))
 
 
 @router.get("/me")
@@ -242,14 +337,16 @@ async def me(user: dict = Depends(current_user)):
     computed from `roles.PERMISSIONS` and the session itself, grant nothing, and
     every route keeps its own check.
     """
+    from app.services.owner_mfa import uses_mfa
+
     return {
         "uid": user["uid"],
         "email": user["email"],
         "name": user["name"],
         "role": str(user["role"]),
         "team": user["team"],
-        # P1-A3: present on an Owner session only.
-        **({"mfa_verified": bool(user.get("mfa_verified"))} if user["role"] == Role.OWNER else {}),
+        # P1-A3 / B3: present on an Owner's or the Observer's session only.
+        **({"mfa_verified": bool(user.get("mfa_verified"))} if uses_mfa(user["role"]) else {}),
         **capability_profile(
             user["role"], user.get("partner_ids"), user.get("partner_status")
         ),
@@ -283,7 +380,7 @@ async def signout(request: Request, user: dict = Depends(current_user)):
             from app.services import owner_mfa
 
             await owner_mfa.unbind_session(jti, actor=user)
-        await revoke_session(jti)
+        await revoke_session(jti, "Signed out")
 
     await audit.record(
         actor=user,
@@ -294,10 +391,80 @@ async def signout(request: Request, user: dict = Depends(current_user)):
         meta={
             "method": "signout",
             "session": jti[:8],
-            "ip": request.client.host if request.client else None,
+            "ip": _client_address(request),
         },
     )
     return {"message": "Signed out"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B3 / §13 (B-21) — the sessions a person holds, and "sign out everywhere"
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A seven-day token that renews itself for three more days is a credential a
+# person could not see and could not end from anywhere but the device it was
+# on. These two routes close that: the list shows every live session of the
+# caller's own uid (client, address, user agent, when), and revoke-all ends
+# them. Both are self-scoped — `own_session_uid(user)`, no id in the request —
+# so an agency or a seller can use them exactly as staff can, and nobody can
+# name anybody else. A pending Owner/Observer session cannot reach either
+# (`deps` confines it to the MFA routes).
+
+
+class RevokeAllBody(BaseModel):
+    #: Also end the session making the call. Off by default: "sign out
+    #: everywhere ELSE" is what a person who just noticed a stray session
+    #: wants, and the current device stays signed in to confirm it worked.
+    include_current: bool = Field(default=False)
+
+
+@router.get("/sessions")
+async def my_sessions(user: dict = Depends(current_user)):
+    """Every live session of the caller, newest first; the current one is
+    flagged. Fingerprints only — never a token, never a full session id."""
+    uid = own_session_uid(user)
+    sessions = await list_sessions(uid, current_jti=str(user.get("jti") or ""))
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@router.post("/sessions/revoke-all")
+async def revoke_all_my_sessions(
+    request: Request, body: RevokeAllBody | None = None, user: dict = Depends(current_user),
+):
+    """Sign out everywhere (else). Every other live API session of the caller
+    is revoked at once — effective on their next request — and, for an Owner,
+    their Firestore/Storage MFA bindings go with them (P1-A3b). Quick login on
+    the phone is NOT touched by this: a sign-out keeps it, by design (§13);
+    a restriction or a security reset removes it through
+    `security.revoke_sessions_for_uid(..., mobile=True)`."""
+    uid = own_session_uid(user)
+    include_current = bool(getattr(body, "include_current", False)) if body is not None else False
+    jti = str(user.get("jti") or "")
+    result = await revoke_sessions_for_uid(
+        uid,
+        "Signed out everywhere" + ("" if include_current else " else"),
+        actor=user,
+        keep_jti=None if include_current else (jti or None),
+    )
+    if include_current and user.get("role") == Role.OWNER and jti:
+        from app.services import owner_mfa
+
+        await owner_mfa.unbind_session(jti, actor=user)
+    await audit.record(
+        actor=user,
+        action=audit.Action.SESSION_ENDED,
+        subject_type="auth",
+        subject_id=uid,
+        reason="Signed out everywhere" + ("" if include_current else " else"),
+        meta={"method": "revoke_all", "session": jti[:8], "revoked": result["api_sessions"],
+              "ip": _client_address(request)},
+    )
+    return {
+        "message": "Signed out everywhere." if include_current else "Signed out everywhere else.",
+        "revoked": result["api_sessions"],
+        "current_kept": not include_current,
+        "problems": result.get("problems", []),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,10 +508,12 @@ class MfaReset(BaseModel):
 
 
 async def _with_mfa(profile: dict, token: str | None = None) -> dict:
-    """Tell the CRM where an Owner stands, so it can show the right step."""
-    if str(profile.get("role")) != str(Role.OWNER):
-        return profile
+    """Tell the client where an Owner or the Observer stands, so it can show
+    the right step (enrol / verify / nothing)."""
     from app.services import owner_mfa
+
+    if not owner_mfa.uses_mfa(profile.get("role")):
+        return profile
 
     verified = False
     if token:
@@ -374,28 +543,42 @@ def _mfa_fail(exc) -> HTTPException:
 
 
 async def _upgraded_session(user: dict, firebase_id_token: str = "", client: str = "crm") -> SessionResponse:
-    """Swap the pending Owner session for one that passed MFA, then bind the
-    caller's Firebase sign-in to it (P1-A3b). The binding result is reported in
-    `user.mfa.firestore_binding`; a failed or missing binding grants nothing in
-    Firestore or Storage, and the client is told so explicitly."""
-    from app.core.security import verify_session
+    """Swap the pending Owner or Observer session for one that passed MFA,
+    then — for an Owner — bind the caller's Firebase sign-in to it (P1-A3b).
+    The binding result is reported in `user.mfa.firestore_binding`; a failed
+    or missing binding grants nothing in Firestore or Storage, and the client
+    is told so explicitly. The Observer has nothing to bind (no Firebase
+    account, no `crmUsers` document): `not_applicable`.
+
+    The new session keeps the old one's client and address: on Android the
+    Owner's pending session was issued with `client: "android"` at `/signin`,
+    and the upgraded one must read the same on `GET /auth/sessions`."""
+    from app.core.security import _session_meta, verify_session
     from app.services import owner_mfa
 
+    role = Role(str(user["role"]))
     old = str(user.get("jti") or "")
+    meta = await _session_meta(old)
     if old:
-        await revoke_session(old)
+        await revoke_session(old, "Upgraded after two-step sign-in")
     token, expires = await issue_session(
         uid=user["uid"], email=user.get("email", ""), name=user.get("name", ""),
-        role=Role.OWNER, renewed_from=old or None, mfa_verified=True,
+        role=role, renewed_from=old or None, mfa_verified=True,
+        client=str(meta.get("client") or _session_client(client)),
+        ip=meta.get("ip"), user_agent=str(meta.get("user_agent") or ""),
     )
     new_jti = str((await verify_session(token)).get("jti") or "")
-    # Step 1 of the mfa_sid binding: a custom token for a NEW Firebase session
-    # (CRM: replaces its sign-in; Android: the `ownerWork` app). The client
-    # redeems it and calls /mfa/bind/confirm; until then nothing is unlocked.
-    binding = await owner_mfa.mint_owner_session(
-        user, firebase_id_token, api_jti=new_jti, api_expires=expires, client=client)
+    if role == Role.OWNER:
+        # Step 1 of the mfa_sid binding: a custom token for a NEW Firebase session
+        # (CRM: replaces its sign-in; Android: the `ownerWork` app). The client
+        # redeems it and calls /mfa/bind/confirm; until then nothing is unlocked.
+        binding = await owner_mfa.mint_owner_session(
+            user, firebase_id_token, api_jti=new_jti, api_expires=expires, client=client)
+    else:
+        binding = {"state": "not_applicable",
+                   "reason": "The Observer has no Firestore or Storage access to unlock."}
     profile = {"uid": user["uid"], "email": user.get("email", ""), "name": user.get("name", ""),
-               "role": str(Role.OWNER), "team": None}
+               "role": str(role), "team": None}
     profile = await _with_mfa(profile, token)
     profile["mfa"] = {**profile.get("mfa", {}), "firestore_binding": binding}
     return session_response(token, expires, profile)

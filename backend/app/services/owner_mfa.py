@@ -29,6 +29,32 @@ What this does instead
 Fail closed: with no encryption key configured, enrolment is refused, so an
 Owner cannot complete sign-in. That is a rollout prerequisite, not a fallback.
 
+── B3: the Observer uses the SAME factor ─────────────────────────────────────
+
+Spec §8: the Observer "requires authenticator-app TOTP for CRM login … No
+alternate password-only bypass." The Observer has no password at all — its
+first factor is the one-time code emailed to a separate mailbox
+(`security.request_observer_code` / `verify_observer_code`), and that code now
+buys a PENDING session (`mfa=False`) exactly as an Owner's password does. The
+second factor is this module, unchanged in mechanism: the binding lives in the
+same `owner_mfa` collection under the Observer's synthetic uid
+(`observer:<email>` — the uid on its `staff` row, which `scripts/reset/seed.py`
+writes and `crm_directory.NOT_MIRRORED` explains), sealed with the same key,
+with the same recovery codes, replay guard and lockout.
+
+Three differences, each deliberate:
+
+  * `required_for(Role.OBSERVER)` is always True. `settings.owner_mfa_required`
+    is the Owner roll-out switch and does not reach the Observer: there is no
+    bypass flag for the identity that provisions Owners.
+  * The Observer gets no Firestore/Storage binding (`mint_owner_session` stays
+    Owner-only). It has no Firebase account and no `crmUsers` document, so
+    there is nothing to bind; the upgraded session reports
+    `firestore_binding: not_applicable`.
+  * Nobody resets the Observer's factor through the API — there is no identity
+    above it. Recovery is its ten recovery codes; losing those too is a
+    deliberate operator action on the `owner_mfa` row (see the B3 report).
+
 Nothing here ever logs, audits or returns a secret after enrolment, a code, or
 a recovery code (other than the recovery codes once, to their owner).
 """
@@ -185,13 +211,62 @@ def _issue_recovery_codes() -> tuple[list[str], list[dict]]:
 
 # ── Records ───────────────────────────────────────────────────────────────────
 
+#: The identities that carry a second factor. `security.issue_session` writes
+#: the `mfa` claim for exactly these roles (through `uses_mfa`, read lazily so
+#: the session layer does not import this module at start-up), and
+#: `deps.current_user` confines a session without it to `MFA_PENDING_ROUTES`.
+MFA_ROLES: frozenset[Role] = frozenset({Role.OWNER, Role.OBSERVER})
+
+#: The prefix of the Observer's synthetic uid (`staff.uid` is `observer:<email>`).
+OBSERVER_UID_PREFIX = "observer:"
+
+
 def _is_owner(user: dict) -> bool:
     return str(user.get("role")) == str(Role.OWNER)
 
 
+def _is_observer(user: dict) -> bool:
+    return str(user.get("role")) == str(Role.OBSERVER)
+
+
+def uses_mfa(role) -> bool:
+    """Does this role sign in with a second factor at all?"""
+    try:
+        return Role(str(role)) in MFA_ROLES
+    except ValueError:
+        return False
+
+
+def required_for(role) -> bool:
+    """Is the second factor ENFORCED for this role right now?
+
+    The Owner's answer is the roll-out switch `settings.owner_mfa_required`.
+    The Observer's answer is always yes: spec §8 allows no bypass for the
+    identity that provisions, suspends and deactivates Owners, so no setting
+    can switch it off.
+    """
+    if not uses_mfa(role):
+        return False
+    if Role(str(role)) == Role.OBSERVER:
+        return True
+    return bool(settings.owner_mfa_required)
+
+
+def _label(user: dict) -> str:
+    """'Owner' or 'Observer' — for the notices, never for a decision."""
+    return "Observer" if _is_observer(user) else "Owner"
+
+
 def _require_owner(user: dict) -> None:
+    """The Owner-only steps (the Firestore/Storage binding)."""
     if not _is_owner(user):
         raise MfaError("Only Owner accounts use this sign-in step.", 403)
+
+
+def _require_mfa_identity(user: dict) -> None:
+    """The steps shared by every identity that carries a second factor."""
+    if not uses_mfa(user.get("role")):
+        raise MfaError("Only Owner and Observer accounts use this sign-in step.", 403)
 
 
 async def _record(uid: str) -> dict | None:
@@ -200,38 +275,48 @@ async def _record(uid: str) -> dict | None:
 
 async def status(user: dict) -> dict:
     """What the sign-in screen needs to know. Never a secret."""
-    _require_owner(user)
+    _require_mfa_identity(user)
     rec = await _record(str(user["uid"]))
     enrolled = bool(rec and rec.get("enrolled_at"))
     locked_until = _aware((rec or {}).get("locked_until"))
     locked = bool(locked_until and locked_until > _now())
     return {
-        "required": bool(settings.owner_mfa_required),
+        "required": required_for(user.get("role")),
         "enrolled": enrolled,
         "verified": bool(user.get("mfa_verified")),
         "configured": bool((settings.owner_mfa_encryption_key or "").strip()),
         "locked_until": locked_until.isoformat() if locked else None,
         "recovery_codes_left": sum(1 for c in (rec or {}).get("recovery", []) if not c.get("used_at")) if enrolled else 0,
+        #: B3 — which identity this factor belongs to, so one client screen
+        #: serves both. The Observer has no Firestore binding step.
+        "identity": str(user.get("role")),
+        "firestore_binding_applies": _is_owner(user),
     }
 
 
 async def start_enrolment(user: dict) -> dict:
     """Create (or replace) a PENDING secret. Refused once enrolled — only the
     Observer can remove an enrolled factor, so a stolen password cannot swap
-    the Owner's authenticator for the thief's."""
-    _require_owner(user)
+    the Owner's authenticator for the thief's.
+
+    For the Observer the pending session that reaches here has ALREADY passed
+    the emailed code (`verify_observer_code` is the only way to an Observer
+    session), which is the "enrol only from a session that passed the first
+    factor" rule — the same shape as an Owner enrolling behind its password."""
+    _require_mfa_identity(user)
     uid = str(user["uid"])
     rec = await _record(uid)
     if rec and rec.get("enrolled_at"):
         raise MfaError("MFA is already set up for this account. If you lost your authenticator, "
-                       "use a recovery code or ask the Observer to reset it.", 409)
+                       + ("use a recovery code." if _is_observer(user)
+                          else "use a recovery code or ask the Observer to reset it."), 409)
     secret = new_secret()
     sealed = _seal(secret)  # raises 503 when not configured — before anything is written
     expires = _now() + timedelta(minutes=settings.owner_mfa_enrol_minutes)
     await get_db()[C.OWNER_MFA].update_one(
         {"uid": uid},
         {"$set": {"uid": uid, "pending_secret": sealed, "pending_expires_at": expires,
-                  "updated_at": _now()},
+                  "identity": str(user.get("role")), "updated_at": _now()},
          "$setOnInsert": {"created_at": _now(), "failures": 0}},
         upsert=True,
     )
@@ -263,24 +348,29 @@ async def _fail(user: dict, rec: dict, why: str) -> None:
         patch["failures"] = 0
     await db[C.OWNER_MFA].update_one({"uid": rec["uid"]}, {"$set": patch})
     await audit.record(actor=user, action=audit.Action.OWNER_MFA_FAILED, subject_type="auth.mfa",
-                       subject_id=str(rec["uid"]), reason=why, meta={"failures": failures})
+                       subject_id=str(rec["uid"]), reason=why,
+                       meta={"failures": failures, "identity": str(user.get("role"))})
     if locked:
         await audit.record(actor=user, action=audit.Action.OWNER_MFA_LOCKED, subject_type="auth.mfa",
                            subject_id=str(rec["uid"]),
                            reason=f"{settings.owner_mfa_max_failures} wrong codes in a row",
-                           meta={"minutes": settings.owner_mfa_lock_minutes})
+                           meta={"minutes": settings.owner_mfa_lock_minutes, "identity": str(user.get("role"))})
+        if _is_observer(user):
+            advice = ("If this was not you, somebody holds a sign-in code from the delivery mailbox: "
+                      "check who can read it, and tell the Owners.")
+        else:
+            advice = "If this was not you, change your password and tell the Observer."
         await _notify(str(rec["uid"]), "locked", f"mfa_locked_{rec['uid']}_{int(time.time())}",
                       "Your Zipper CRM sign-in was locked",
-                      f"Several wrong verification codes were entered for your Owner account. "
-                      f"Sign-in is paused for {settings.owner_mfa_lock_minutes} minutes. "
-                      "If this was not you, change your password and tell the Observer.")
+                      f"Several wrong verification codes were entered for your {_label(user)} account. "
+                      f"Sign-in is paused for {settings.owner_mfa_lock_minutes} minutes. " + advice)
         raise MfaError("Too many wrong codes. Sign-in is paused for a few minutes.", 429)
     raise MfaError("That code is not right. Check the time on your phone and try again.", 401)
 
 
 async def confirm_enrolment(user: dict, code: str) -> list[str]:
     """Check the first code from the authenticator; return the recovery codes."""
-    _require_owner(user)
+    _require_mfa_identity(user)
     uid = str(user["uid"])
     rec = await _record(uid)
     if not rec or not rec.get("pending_secret"):
@@ -304,19 +394,22 @@ async def confirm_enrolment(user: dict, code: str) -> list[str]:
     )
     if getattr(result, "matched_count", 1) == 0:
         raise MfaError("MFA was set up from another window. Sign in again.", 409)
+    label = _label(user)
     await audit.record(actor=user, action=audit.Action.OWNER_MFA_ENROLLED, subject_type="auth.mfa",
-                       subject_id=uid, reason="Owner set up an authenticator app",
-                       meta={"recovery_codes": RECOVERY_CODES})
+                       subject_id=uid, reason=f"{label} set up an authenticator app",
+                       meta={"recovery_codes": RECOVERY_CODES, "identity": str(user.get("role"))})
     await _notify(uid, "enrolled", f"mfa_enrolled_{uid}_{step}",
-                  "Two-step sign-in is on for your Owner account",
-                  "An authenticator app was set up for your Zipper CRM Owner account. "
-                  "If this was not you, tell the Observer immediately.")
+                  f"Two-step sign-in is on for your {label} account",
+                  f"An authenticator app was set up for your Zipper CRM {label} account. "
+                  + ("If this was not you, somebody holds a sign-in code from the delivery mailbox: "
+                     "check who can read it, and tell the Owners immediately."
+                     if _is_observer(user) else "If this was not you, tell the Observer immediately."))
     return codes
 
 
 async def verify(user: dict, *, code: str = "", recovery_code: str = "") -> dict:
     """Check a TOTP code or a recovery code. Returns `{"method": ...}`."""
-    _require_owner(user)
+    _require_mfa_identity(user)
     uid = str(user["uid"])
     rec = await _record(uid)
     if not rec or not rec.get("enrolled_at"):
@@ -337,13 +430,17 @@ async def verify(user: dict, *, code: str = "", recovery_code: str = "") -> dict
                 if getattr(result, "matched_count", 1) == 0:
                     break  # used concurrently — treat as wrong
                 left = sum(1 for x in rec["recovery"] if not x.get("used_at")) - 1
+                label = _label(user)
                 await audit.record(actor=user, action=audit.Action.OWNER_MFA_RECOVERY_USED,
                                    subject_type="auth.mfa", subject_id=uid,
-                                   reason="Owner signed in with a recovery code", meta={"left": left})
+                                   reason=f"{label} signed in with a recovery code",
+                                   meta={"left": left, "identity": str(user.get("role"))})
                 await _notify(uid, "recovery", f"mfa_recovery_{uid}_{i}",
-                              "A recovery code was used on your Owner account",
-                              f"Someone signed in to your Zipper CRM Owner account with a recovery code. "
-                              f"{left} codes are left. If this was not you, tell the Observer immediately.")
+                              f"A recovery code was used on your {label} account",
+                              f"Someone signed in to your Zipper CRM {label} account with a recovery code. "
+                              f"{left} codes are left. If this was not you, "
+                              + ("tell the Owners immediately." if _is_observer(user)
+                                 else "tell the Observer immediately."))
                 return {"method": "recovery_code", "recovery_codes_left": left}
         await _fail(user, rec, "Wrong recovery code")
 
@@ -361,14 +458,15 @@ async def verify(user: dict, *, code: str = "", recovery_code: str = "") -> dict
     if getattr(result, "matched_count", 1) == 0:
         await _fail(user, rec, "A verification code was reused")
     await audit.record(actor=user, action=audit.Action.OWNER_MFA_VERIFIED, subject_type="auth.mfa",
-                       subject_id=uid, reason="Owner passed two-step sign-in", meta={"method": "totp"})
+                       subject_id=uid, reason=f"{_label(user)} passed two-step sign-in",
+                       meta={"method": "totp", "identity": str(user.get("role"))})
     return {"method": "totp"}
 
 
 async def regenerate_recovery_codes(user: dict, code: str) -> list[str]:
     """New recovery codes; the old ones stop working. Needs a verified session
     AND a fresh authenticator code, so a session left open is not enough."""
-    _require_owner(user)
+    _require_mfa_identity(user)
     if not user.get("mfa_verified"):
         raise MfaError("Finish two-step sign-in first.", 403)
     await verify(user, code=code)
@@ -376,7 +474,8 @@ async def regenerate_recovery_codes(user: dict, code: str) -> list[str]:
     uid = str(user["uid"])
     await get_db()[C.OWNER_MFA].update_one({"uid": uid}, {"$set": {"recovery": stored, "updated_at": _now()}})
     await audit.record(actor=user, action=audit.Action.OWNER_MFA_CODES_REGENERATED, subject_type="auth.mfa",
-                       subject_id=uid, reason="Owner replaced their recovery codes")
+                       subject_id=uid, reason=f"{_label(user)} replaced their recovery codes",
+                       meta={"identity": str(user.get("role"))})
     return codes
 
 
@@ -395,13 +494,21 @@ async def reset_by_observer(observer: dict, owner_uid: str, reason: str) -> dict
     rec = await _record(owner_uid)
     had = bool(rec and rec.get("enrolled_at"))
     await db[C.OWNER_MFA].delete_one({"uid": owner_uid})
-    await db[C.SESSIONS].update_many({"uid": owner_uid}, {"$set": {"revoked": True}})
-    # P1-A3b: and every Firestore/Storage binding — effective on the next request.
-    bindings_cleared = await clear_all_bindings(owner_uid, "Observer reset the Owner's MFA", actor=observer)
+    # B3 (§13 "security reset"): every API session of the Owner, their
+    # Firestore/Storage bindings (P1-A3b, effective on the next request) and
+    # their mobile credentials — the Firebase refresh tokens and the quick-login
+    # credentials — through the one helper every revocation path shares.
+    from app.core.security import revoke_sessions_for_uid
+
+    revoked = await revoke_sessions_for_uid(
+        owner_uid, "Observer reset the Owner's MFA", actor=observer, mobile=True)
+    bindings_cleared = bool(revoked.get("mfa_bindings_cleared"))
     audit_id = await audit.record(
         actor=observer, action=audit.Action.OWNER_MFA_RESET, subject_type="auth.mfa",
         subject_id=owner_uid, reason=reason,
-        before={"enrolled": had}, after={"enrolled": False, "sessions": "revoked"},
+        before={"enrolled": had},
+        after={"enrolled": False, "sessions": "revoked", "api_sessions": revoked.get("api_sessions"),
+               "problems": revoked.get("problems") or []},
     )
     notified = await _notify(owner_uid, "reset", f"mfa_reset_{owner_uid}_{audit_id}",
                              "Your two-step sign-in was reset",
@@ -415,14 +522,18 @@ async def reset_by_observer(observer: dict, owner_uid: str, reason: str) -> dict
 
 
 async def _notify(uid: str, kind: str, key: str, title: str, body: str, *, email_to: dict | None = None) -> bool:
-    """In-app notice (and email when the staff row is given). Never raises."""
+    """In-app notice (and email when the staff row is given). Never raises.
+
+    The Observer has no app account (its uid is synthetic), so it gets the
+    email only — an in-app notice would be a document nobody can read."""
     ok = False
-    try:
-        from app.services import notices
-        ok = bool(await notices.deliver(uid, key, type="security", title=title, body=body,
-                                        meta={"kind": f"owner_mfa.{kind}"}))
-    except Exception:  # noqa: BLE001
-        log.exception("could not deliver the MFA %s notice", kind)
+    if not uid.startswith(OBSERVER_UID_PREFIX):
+        try:
+            from app.services import notices
+            ok = bool(await notices.deliver(uid, key, type="security", title=title, body=body,
+                                            meta={"kind": f"owner_mfa.{kind}"}))
+        except Exception:  # noqa: BLE001
+            log.exception("could not deliver the MFA %s notice", kind)
     if email_to is None:
         try:
             email_to = await get_db()[C.STAFF].find_one({"uid": uid})
@@ -444,6 +555,8 @@ async def _notify(uid: str, kind: str, key: str, title: str, body: str, *, email
                 dedupe_key=key,
                 meta={"kind": kind},
             )
+            if uid.startswith(OBSERVER_UID_PREFIX):
+                ok = True  # the email IS the Observer's notice
         except Exception:  # noqa: BLE001
             log.exception("could not email the MFA %s notice", kind)
     return ok
@@ -763,6 +876,29 @@ async def unbind_session(jti: str, actor: dict | None = None) -> bool:
         await audit.record(actor=actor, action=audit.Action.OWNER_MFA_UNBOUND, subject_type="auth.mfa",
                            subject_id=uid, reason="Signed out", meta={"binding": _sid_tag(sid)})
     return removed["ok"]
+
+
+async def unbind_sessions(uid: str, jtis: set[str] | frozenset[str], reason: str) -> bool:
+    """B3 ("sign out everywhere ELSE"): remove the bindings owned by these API
+    sessions, in one transaction, and leave every other binding of `uid` —
+    the kept session's — standing. Idempotent; a binding already gone is
+    success. False only when Firestore could not be written (logged)."""
+    import asyncio
+
+    wanted = {str(j) for j in jtis if j}
+    if not wanted or not uid:
+        return True
+
+    def change(b: dict) -> dict:
+        return {sid: entry for sid, entry in b.items() if str(entry.get("apiJti") or "") not in wanted}
+
+    try:
+        await asyncio.to_thread(_mutate, uid, change)
+    except Exception:  # noqa: BLE001
+        log.exception("owner MFA bindings of %d ended session(s) could not be removed for %s (%s)",
+                      len(wanted), uid, reason)
+        return False
+    return True
 
 
 async def clear_all_bindings(uid: str, reason: str, actor: dict | None = None) -> bool:

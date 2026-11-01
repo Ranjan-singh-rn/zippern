@@ -406,7 +406,10 @@ def appeal(appeal_id: str, subject: str, **over) -> None:
                                                 "createdAt": NOW, **over}
 
 
-MOD = lambda uid: {"uid": uid, "name": uid, "role": "app_admin", "team": "app"}  # noqa: E731
+# §5 (B2): a ban / suspension appeal is DECIDED by the Owner (a reviewer recommends).
+# The four-eyes rule under test here holds for Owners exactly as it held for
+# moderators, so the deciders are Owners and the original decision makers too.
+MOD = lambda uid: {"uid": uid, "name": uid, "role": "owner", "team": None}  # noqa: E731
 user("ap-ban", isBanned=True, accountState="banned", bannedBy="mod-a")
 appeal("ap1", "ap-ban")
 m = refused("B29: the moderator who BANNED cannot decide the appeal",
@@ -414,7 +417,7 @@ m = refused("B29: the moderator who BANNED cannot decide the appeal",
             kind=appeals_svc.AppealError)
 ok("…told why", "cannot decide" in m, m)
 run(appeals_svc.decide_appeal("ap1", "upheld", "The ban stands as decided.", MOD("mod-b")))
-eq("…a different reviewer may", fs.collection("appeals").docs["ap1"]["status"], "upheld")
+eq("…a different Owner may", fs.collection("appeals").docs["ap1"]["status"], "upheld")
 user("ap-susp", isSuspended=True, isBanned=True, accountState="suspended", suspendedBy="mod-c")
 appeal("ap2", "ap-susp")
 refused("B29: nor the moderator who SUSPENDED",

@@ -86,7 +86,8 @@ app.add_middleware(
     allow_credentials=settings.is_production,
     allow_methods=["*"],
     allow_headers=["*"],
-    # P1-A3: lets the CRM tell "finish two-step sign-in" from any other 403.
+    # P1-A3 / B3: lets the CRM (and the Android app) tell "finish two-step
+    # sign-in" from any other 403 — for an Owner and for the Observer.
     expose_headers=["X-Zipper-MFA-Required"],
 )
 

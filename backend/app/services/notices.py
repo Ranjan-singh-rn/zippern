@@ -312,6 +312,66 @@ async def partner_transferred(
     )
 
 
+async def transfer_agency_notice(
+    agency_owner_uid: str, request_id: str, *, side: str, kind: str, subject_name: str,
+    from_name: str, to_name: str,
+) -> bool:
+    """§6 Transfers — "notify source/target/affected": the SOURCE or TARGET agency's
+    owner is told that a transfer the Owner approved moved somebody out of, or
+    into, their agency. Keyed on the request and the side, so one decision is
+    one message per agency."""
+    label = role_label(kind)
+    if side == "source":
+        title = f"A {label} has moved out of your agency"
+        body = (
+            f"{subject_name or 'A ' + label} has been transferred from {from_name or 'your agency'} "
+            f"to {to_name}. Earnings already recorded under your agency are unchanged."
+        )
+    else:
+        title = f"A {label} has joined your agency by transfer"
+        body = (
+            f"{subject_name or 'A ' + label} has been transferred to {to_name or 'your agency'} "
+            f"from {from_name or 'their previous agency'}. Earnings from now on are recorded under your agency."
+        )
+    return await deliver(
+        agency_owner_uid, f"transfer_{request_id}_{side}",
+        type=f"transfer_{side}",
+        title=title,
+        body=body,
+        meta={"role": str(kind), "transferId": request_id, "side": side},
+    )
+
+
+# ── Department vacancy (§9) ─────────────────────────────────────────────────
+
+async def department_vacancy(owner_uid: str, team: str, team_label: str, *, opened: bool,
+                             since_epoch: int) -> bool:
+    """§9 — ONE notice per Owner per vacancy: "<Department> has no Admin"
+    (members report to the Owner until a replacement is appointed), and its
+    closing. Keyed on the vacancy's opening moment, so a retried deactivation
+    delivers once and a later vacancy is a new message."""
+    # The key names the recipient too: one document per Owner per vacancy, or
+    # the second Owner's notice would overwrite the first's.
+    if opened:
+        return await deliver(
+            owner_uid, f"department_vacancy_{team}_{since_epoch}_{owner_uid}",
+            type="department_vacancy",
+            title=f"{team_label} has no Admin",
+            body=(
+                f"{team_label} has no active department Admin. Its members report to the "
+                "Owner until a replacement Admin is appointed."
+            ),
+            meta={"team": team, "vacancy": True},
+        )
+    return await deliver(
+        owner_uid, f"department_vacancy_closed_{team}_{since_epoch}_{owner_uid}",
+        type="department_vacancy_closed",
+        title=f"{team_label} has an Admin again",
+        body=f"A department Admin is in place for {team_label}. Its members report to that Admin again.",
+        meta={"team": team, "vacancy": False},
+    )
+
+
 # ── Host ────────────────────────────────────────────────────────────────────
 
 async def host_application_submitted(uid: str, application_id: str) -> bool:
@@ -364,6 +424,31 @@ async def host_revoked(uid: str, reason: str) -> bool:
         ),
         reason=reason,
         meta={"role": "host", "status": "revoked"},
+    )
+
+
+async def agency_host_revoked(
+    agency_owner_uid: str, agency_id: str, host_uid: str, host_name: str, reason: str,
+    *, change: str = "revoked",
+) -> bool:
+    """§5 Revoke Host — "notify host and agency": the agency's owner is told.
+
+    Keyed on the host and the moment, like `host_revoked`, so a later
+    revoke-then-restore-then-revoke is a second message.
+    """
+    who = host_name or host_uid
+    return await deliver(
+        agency_owner_uid,
+        f"agency_host_{change}_{agency_id}_{host_uid}_{int(datetime.now(timezone.utc).timestamp())}",
+        type=f"agency_host_{change}",
+        title=f"A Host on your roster was {change}",
+        body=(
+            f"{who}'s Host role has been {change}."
+            + (f" Reason: {reason}" if reason else "")
+            + " Their earnings history under your agency is unchanged."
+        ),
+        reason=reason,
+        meta={"role": "host", "agencyId": agency_id, "hostUid": host_uid, "status": change},
     )
 
 

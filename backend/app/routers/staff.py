@@ -211,6 +211,16 @@ async def overview(user: dict = Depends(current_user)):
     return await svc.team_overview(user)
 
 
+@router.get("/departments")
+async def departments(user: dict = Depends(current_user)):
+    """§9 — every department's Admin state: who the active Admins are, whether
+    the seat is VACANT (members report to the Owner until a replacement is
+    appointed), since when and why. Any internal session may read it; the
+    state is written only by the staff lifecycle (invite, deactivate, suspend,
+    reactivate, role change)."""
+    return {"departments": await svc.departments(user)}
+
+
 @router.patch("/{uid}/role", dependencies=[_MANAGE_TEAM])
 async def change_role(uid: str, body: RoleChange, user: dict = Depends(require_write)):
     """Owners only — changing a role changes authority, and revokes any live

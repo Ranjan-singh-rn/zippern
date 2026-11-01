@@ -80,6 +80,7 @@ from app.services.money import (
     HolderType,
     InsufficientBalance,
     Movement,
+    already_applied,
     apply_movement,
 )
 from app.services.partner_ops import PartnerOpsError, _public, _require_reason, _who
@@ -231,6 +232,38 @@ async def _notify_both(recharge: dict, event: str, *, diamonds: int, reason: str
             seller_uid, str(recharge["_id"]), event, diamonds=diamonds, reason=reason, for_seller=True,
         )
     return {"buyer": buyer, "seller": seller}
+
+
+async def _notify_owners(recharge: dict, actor: dict, action: str, *, diamonds: int, reason: str) -> dict:
+    """§8: an Owner alone approves a recharge or decides a refund — the other
+    Owners are told, in-app and by email. Best effort, after the decision."""
+    try:
+        from app.services import owner_mail  # local: keeps the import graph acyclic
+
+        return await owner_mail.notify_other_owners(
+            actor=actor, action=action, reference=str(recharge["_id"]), reference_type="recharge",
+            amount=diamonds, currency=str(Currency.DIAMONDS),
+            title=f"Recharge via {recharge.get('seller_name') or recharge.get('seller_id') or 'seller'}",
+            subject={"type": "user", "id": str(recharge.get("buyer_uid") or "")},
+            reason=reason,
+            rows=[("Seller", str(recharge.get("seller_id") or "")),
+                  ("Amount paid", f"{int(recharge.get('amount_minor') or 0) / 100:,.2f} {recharge.get('currency') or 'INR'}")],
+        )
+    except Exception as exc:  # noqa: BLE001 — the decision stands
+        log.exception("Owner notification for recharge %s (%s) failed", recharge.get("_id"), action)
+        return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _reversal_row(uid: str, rid: str, attempt: int) -> dict | None:
+    """Blocking: the Firestore history row of this refund cycle's clawback, or None.
+
+    Written by `firebase.clawback_user_diamonds` in the same transaction as the
+    debit, so its existence IS the proof the diamonds were taken (M-9)."""
+    snap = (
+        firebase.firestore_client().collection("users").document(uid)
+        .collection("diamondTransactions").document(f"recharge_{rid}_reversal_{attempt}").get()
+    )
+    return (snap.to_dict() or {}) if getattr(snap, "exists", False) else None
 
 
 # ── 1. The buyer files ──────────────────────────────────────────────────────
@@ -524,6 +557,7 @@ async def approve_recharge(recharge_id: str, reason: str, actor: dict) -> dict[s
     out = _public(updated)
     out["replica_synced"] = mirrored
     out["notified"] = notified
+    out["owner_notice"] = await _notify_owners(updated, actor, "recharge_approved", diamonds=diamonds, reason=reason)
     return out
 
 
@@ -532,6 +566,17 @@ async def reject_recharge(recharge_id: str, reason: str, actor: dict) -> dict[st
     recharge = await _recharge(recharge_id)
     rid = str(recharge["_id"])
     now = _now()
+    # M-14: an earlier approval attempt may have debited the seller's coins and
+    # died before crediting the buyer (the request went back to `pending`).
+    # Rejecting it now would leave the seller debited, the buyer uncredited and
+    # the request saying "rejected". The ledger row is the fact; it decides.
+    if await already_applied(f"recharge:{rid}:coins") is not None:
+        raise PartnerOpsError(
+            "The seller's coins for this recharge were already debited by an earlier "
+            "approval attempt, so it cannot be rejected. Approve it again to finish "
+            "crediting the buyer (nothing is debited twice); if the payment is bad, "
+            "approve and then open a refund, which restores the seller's coins."
+        )
     updated = await _cas(rid, str(RechargeStatus.PENDING), {
         "$set": {"status": str(RechargeStatus.REJECTED), "rejection_reason": reason,
                  "reviewed_at": now, "reviewed_by": _who(actor), "updated_at": now},
@@ -613,14 +658,52 @@ async def decide_refund(recharge_id: str, approve: bool, reason: str, actor: dic
     seller_id = str(recharge.get("seller_id") or "")
     now = _now()
 
-    resumable = approve and recharge.get("status") == "refunding"
-    if recharge.get("status") != str(RechargeStatus.REFUND_PENDING) and not resumable:
+    status_now = str(recharge.get("status") or "")
+    if status_now not in (str(RechargeStatus.REFUND_PENDING), "refunding"):
         raise PartnerOpsError(
-            f"No refund is under review on this recharge (it is {recharge.get('status')}). "
+            f"No refund is under review on this recharge (it is {status_now}). "
             "Nothing was changed."
         )
 
+    # The deterministic identity of THIS refund (see request_refund). Records
+    # opened before refund_cycle existed fall back to counting their opened
+    # refund cycles, which is also fixed once the refund is pending.
+    attempt = int(recharge.get("refund_cycle") or 0) or len(
+        [h for h in recharge.get("history", []) if h.get("status") == "refund_pending"]
+    ) or 1
+
+    forced_by_reversal: dict | None = None
     if not approve:
+        # M-9: a refusal must look at what already happened. If an earlier
+        # approval of THIS refund cycle took the diamonds back in Firestore
+        # and died before the Mongo bookkeeping, the request is back under
+        # review with the buyer already debited. Refusing it would record
+        # "approved" over a wallet that was emptied, and the next refund
+        # cycle would claw back a second time (`_reversal_{cycle+1}`). The
+        # reversal row is the fact — so the refund is FINISHED instead.
+        taken_row = await _fs(_reversal_row, buyer_uid, rid, attempt)
+        if taken_row is not None and int(taken_row.get("amount") or 0) > 0:
+            forced_by_reversal = {
+                "history_id": f"recharge_{rid}_reversal_{attempt}",
+                "taken": int(taken_row.get("amount") or 0),
+            }
+            approve = True
+            reason = (
+                f"{reason} [refusal converted to completion: the reversal "
+                f"{forced_by_reversal['history_id']} had already taken "
+                f"{forced_by_reversal['taken']} diamonds from the buyer]"
+            )
+
+    if not approve:
+        if status_now == "refunding":
+            # A live claim is somebody else's decision in flight; a stale one
+            # with no reversal row is safe to refuse (nothing was taken).
+            if recharge.get("claimed_at") and recharge["claimed_at"] > now - STALE_CLAIM:
+                raise PartnerOpsError("The refund is being decided by another request. Nothing was changed.")
+            await get_db()[C.RECHARGES].update_one(
+                {"_id": rid, "status": "refunding"},
+                {"$set": {"status": str(RechargeStatus.REFUND_PENDING), "updated_at": now}},
+            )
         updated = await _cas(rid, str(RechargeStatus.REFUND_PENDING), {
             "$set": {"status": str(RechargeStatus.APPROVED), "refund_rejection_reason": reason,
                      "refund_decided_at": now, "refund_decided_by": _who(actor), "updated_at": now},
@@ -639,17 +722,14 @@ async def decide_refund(recharge_id: str, approve: bool, reason: str, actor: dic
         out = _public(updated)
         out["replica_synced"] = mirrored
         out["notified"] = notified
+        out["owner_notice"] = await _notify_owners(
+            updated, actor, "refund_refused", diamonds=int(recharge.get("diamonds") or 0), reason=reason,
+        )
         return out
 
     credited = int(recharge.get("credited_diamonds") or 0)
     already = int(recharge.get("refunded_diamonds") or 0)
     outstanding = max(0, credited - already)
-    # The deterministic identity of THIS refund (see request_refund). Records
-    # opened before refund_cycle existed fall back to counting their opened
-    # refund cycles, which is also fixed once the refund is pending.
-    attempt = int(recharge.get("refund_cycle") or 0) or len(
-        [h for h in recharge.get("history", []) if h.get("status") == "refund_pending"]
-    ) or 1
 
     claimed = await _claim(rid, str(RechargeStatus.REFUND_PENDING), "refunding", now)
     if claimed is None:
@@ -734,6 +814,7 @@ async def decide_refund(recharge_id: str, approve: bool, reason: str, actor: dic
         after={"status": str(final), "taken": taken, "unrecoverable": unrecoverable,
                "available_before": available_before},
         meta={"buyer_uid": buyer_uid, "seller_id": seller_id, "attempt": attempt,
+              "forced_by_reversal_row": forced_by_reversal,
               "note": "unrecoverable diamonds were already spent; no negative balance was created"},
     )
     mirrored = await _fs(_mirror, updated, {
@@ -747,6 +828,8 @@ async def decide_refund(recharge_id: str, approve: bool, reason: str, actor: dic
     out["available_before"] = available_before
     out["replica_synced"] = mirrored
     out["notified"] = notified
+    out["forced_by_reversal_row"] = forced_by_reversal
+    out["owner_notice"] = await _notify_owners(updated, actor, "refund_approved", diamonds=taken, reason=reason)
     return out
 
 

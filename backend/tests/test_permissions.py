@@ -710,11 +710,24 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     # ── The SA approval queue ───────────────────────────────────────────────
     ("POST", "/cards/{card_id}/sign"): {"can_approve_requests"},
     ("POST", "/cards/sign-bulk"): {"can_approve_requests"},
+    # §8 (B1) — one Owner takes a card through every remaining stage; the same
+    # gate as a signature, because it ends in one.
+    ("POST", "/cards/{card_id}/owner-fast-path"): {"can_approve_requests"},
+    # B1 — money integrity: Finance and the Owners (the two the spec names for
+    # held items and replica repair).
+    ("GET", "/partner-ops/held-items"): {"can_process_payout"},
+    ("POST", "/partner-ops/held-items/{item_type}/{item_id}/release"): {"can_process_payout"},
+    ("GET", "/partner-ops/money/replica-drift"): {"can_process_payout"},
+    ("POST", "/partner-ops/money/replica-drift/repair"): {"can_process_payout"},
     # ── The queue verdict that is not a dependency ──────────────────────────
     # The action is in the body, so the route carries the floor and the verdicts
     # that ban or take money carry their own — see `_REPORT_ACTION_PERMISSION`.
     ("POST", "/users/reports/{report_id}/action"): {"can_view_users"},
     ("POST", "/users/{uid}/warn"): {"can_view_users"},
+    # §5 (B2) — a reviewer's recommendation on a ban / suspension appeal costs
+    # the reviewer's tier; DECIDING keeps the same gate on the door and is the
+    # Owner's in the service (403 for anyone else).
+    ("POST", "/users/appeals/{appeal_id}/recommend"): {"can_ban_users"},
     # ── C2 — reinstatement of a revoked role ────────────────────────────────
     # Reviewers of either kind reach the queue and the recommendation; the
     # per-kind check is the service's, and DECIDING declares no capability on

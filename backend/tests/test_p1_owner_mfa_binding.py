@@ -347,7 +347,10 @@ ok("the account-wide claim writer strips mfa_sid", written and "mfa_sid" not in 
 
 # ── Router wiring / logging hygiene (source checks; FastAPI is stubbed) ──────
 src = (ROOT / "app/routers/auth.py").read_text()
-ok("verify and enrol-confirm mint for the new session", "owner_mfa.mint_owner_session(\n        user, firebase_id_token, api_jti=new_jti" in src)
+ok("verify and enrol-confirm mint for the new session", "owner_mfa.mint_owner_session(\n            user, firebase_id_token, api_jti=new_jti" in src)
+# B3: the Observer shares the factor but has nothing to bind — the mint is
+# Owner-only and the upgraded Observer session says `not_applicable`.
+ok("the mint runs for an Owner only", "if role == Role.OWNER:" in src and '"state": "not_applicable"' in src)
 ok("a confirm route exists for verified sessions only", '@router.post("/mfa/bind/confirm")' in src)
 ok("neither bind route is reachable by a pending session",
    ("POST", "/api/auth/mfa/bind") not in mfa.MFA_PENDING_ROUTES and ("POST", "/api/auth/mfa/bind/confirm") not in mfa.MFA_PENDING_ROUTES)

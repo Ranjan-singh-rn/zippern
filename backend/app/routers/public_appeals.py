@@ -65,6 +65,9 @@ def _fail(exc: svc.PublicAppealError) -> HTTPException:
 class Lookup(BaseModel):
     account_id: str = Field(min_length=6, max_length=128)
     display_name: str = Field(default="", max_length=80)
+    #: §5 — the phone number or email address ON the account. Required to get
+    #: past `not_found`; a wrong one answers 400 with the mismatch sentence.
+    contact: str = Field(default="", max_length=120)
 
 
 @router.post("/lookup")
@@ -73,9 +76,14 @@ async def lookup(body: Lookup, request: Request):
 
     Answers `appealable` (with a masked name), `appeal_pending`, or
     `not_found` — and `not_found` also for an account that is not restricted,
-    so this cannot be used to learn who is banned."""
+    so this cannot be used to learn who is banned. §5: the `contact` must
+    match the account (its registered phone or email) or the answer is a 400
+    naming the mismatch."""
     try:
-        return await svc.lookup(body.account_id, body.display_name, _client_address(request))
+        return await svc.lookup(
+            body.account_id, body.display_name, _client_address(request),
+            contact=str(getattr(body, "contact", "") or ""),
+        )
     except svc.PublicAppealError as exc:
         raise _fail(exc) from exc
 
@@ -108,12 +116,15 @@ async def submit(request: Request):
             detail="Too many appeals from here. Try again in an hour.",
         )
     try:
-        form = await request.form(max_files=svc.MAX_FILES + 1, max_fields=8)
+        form = await request.form(max_files=svc.MAX_FILES + 1, max_fields=9)
     except Exception as exc:  # noqa: BLE001 — a malformed or oversized form
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The form could not be read.") from exc
     try:
         account_id = _field(form, "account_id", 6, 128)
         display_name = _field(form, "display_name", 0, 80)
+        # §5: the phone number or email on the account. Checked in the service
+        # against the Firebase Auth record; absent → CONTACT_REQUIRED (400).
+        contact = _field(form, "contact", 0, 120)
         statement = _field(form, "statement", 1, 4000)
         uploads: list[svc.Upload] = []
         for item in form.getlist("files")[: svc.MAX_FILES + 1]:
@@ -129,6 +140,6 @@ async def submit(request: Request):
     finally:
         await form.close()
     try:
-        return await svc.submit(account_id, display_name, statement, uploads, client)
+        return await svc.submit(account_id, display_name, statement, uploads, client, contact=contact)
     except svc.PublicAppealError as exc:
         raise _fail(exc) from exc

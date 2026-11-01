@@ -643,6 +643,13 @@ async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
     if claim_problem:
         log.warning("storage claim not granted for %s: %s", uid, claim_problem)
 
+    # §9: a newly appointed Admin closes their department's vacancy, and the
+    # members revert to reporting to them.
+    if inv.role in R.ADMIN_ROLES:
+        doc["department_vacancy"] = await refresh_department_vacancy(
+            str(R.team_of(inv.role) or ""), actor, cause="admin appointed", db=db,
+        )
+    doc["reports_to_resolved"] = await resolve_reports_to(doc, db)
     return doc
 
 
@@ -687,17 +694,29 @@ async def list_staff(actor: dict, include_inactive: bool = False) -> list[dict]:
     # Removed here rather than projected away in the query, because `read_own`
     # shares neither the query nor the scope and must keep returning them: a
     # person may always see their own pay.
-    cursor = get_db()[C.STAFF].find(q).sort("created_at", -1)
+    db = get_db()
+    cursor = db[C.STAFF].find(q).sort("created_at", -1)
     # Owners and the observer see pay; everybody else sees their OWN and nobody
     # else's. Row by row rather than caller by caller, so a department admin
     # keeps their own figure on the same screen that hides their reports'.
     sees_all_pay = R.is_owner(role) or R.can_read_all(role)
+    # §9: "Reports to" is resolved from positions and the vacancy state, once
+    # per department, so a member of a department with no Admin reads
+    # "Owner (vacancy)" rather than the uid of whoever invited them.
+    states: dict[str, dict] = {}
     out = []
     async for doc in cursor:
         doc.pop("_id", None)
         if not sees_all_pay and doc.get("uid") != actor["uid"]:
             for field in OWNER_ONLY_EMPLOYMENT_FIELDS:
                 doc.pop(field, None)
+        team = str(doc.get("team") or "")
+        if team in TEAM_LABELS and team not in states:
+            states[team] = await department_state(team, db)
+        state = states.get(team)
+        doc["reports_to_resolved"] = (
+            reports_to_of(doc, state["admins"], state["vacancy"]) if state else reports_to_of(doc, [], False)
+        )
         out.append(doc)
     return out
 
@@ -718,10 +737,13 @@ async def read_own(actor: dict) -> dict:
     session can outlive a row; both should see an empty profile rather than a
     failure, so this answers with `None`.
     """
-    person = await get_db()[C.STAFF].find_one({"uid": actor["uid"]})
+    db = get_db()
+    person = await db[C.STAFF].find_one({"uid": actor["uid"]})
     if person is None:
         return {}
     person.pop("_id", None)
+    # §9: what the person's own profile shows after "Reports to:".
+    person["reports_to_resolved"] = await resolve_reports_to(person, db)
     return person
 
 
@@ -974,6 +996,21 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
     person.pop("_id", None)
     person["crm_user_document"] = mirrored.action
     person["crm_role"] = mirrored.crm_role
+
+    # §9: a role change can vacate one department's Admin seat and fill
+    # another's. Both departments are refreshed from their active rows.
+    vacancies: dict = {}
+    try:
+        old_role_enum = Role(str(old_role))
+    except ValueError:
+        old_role_enum = None
+    if old_role_enum in R.ADMIN_ROLES:
+        old_team = str(R.team_of(old_role_enum) or "")
+        vacancies[old_team] = await refresh_department_vacancy(old_team, actor, cause="admin role changed away", db=db)
+    if new_role in R.ADMIN_ROLES:
+        new_team = str(R.team_of(new_role) or "")
+        vacancies[new_team] = await refresh_department_vacancy(new_team, actor, cause="admin appointed by role change", db=db)
+    person["department_vacancy"] = vacancies
 
     # The Storage role claim follows the Mongo row, which is the authority for
     # an internal role. Without this a promotion to finance_admin would reach
@@ -1506,6 +1543,13 @@ async def _revoke_access(db, person: dict, actor: dict, reason: str, to_status: 
     # The retry marker: what the next run has to finish, or nothing.
     marker_problem = await _note_outstanding(db, uid, noun, not_done, audit_failures,
                                              had=had_marker or retry)
+    # §9: an Admin's access ending may leave their department with no Admin.
+    # Judged from the active rows, after the record write, whatever else is
+    # outstanding; the Owners are told once.
+    if target_role in R.ADMIN_ROLES:
+        person["department_vacancy"] = await refresh_department_vacancy(
+            str(person.get("team") or R.team_of(target_role) or ""), actor, cause=f"admin {_DONE[to_status]}", db=db,
+        )
     if not_done or audit_failures:
         cause = errors[0] if errors else (audit_failures[0][1] if audit_failures else None)
         raise StaffError(
@@ -1586,7 +1630,7 @@ def _login_disabled(uid: str) -> bool:
 
 
 async def team_overview(actor: dict) -> list[dict]:
-    """Headcount per department. Spec 1.3.4."""
+    """Headcount per department. Spec 1.3.4. §9: and whether its Admin seat is vacant."""
     if not R.can_read_all(actor["role"]):
         return []
 
@@ -1597,12 +1641,266 @@ async def team_overview(actor: dict) -> list[dict]:
         {"$sort": {"_id": 1}},
     ]
     out = []
-    async for row in get_db()[C.STAFF].aggregate(pipeline):
+    db = get_db()
+    async for row in db[C.STAFF].aggregate(pipeline):
+        team = str(row["_id"] or "")
+        state = await department_state(team, db) if team in TEAM_LABELS else None
         out.append(
             {"team": row["_id"] or "no team", "headcount": row["count"],
-             "roles": sorted(row["roles"])}
+             "roles": sorted(row["roles"]),
+             "admin_vacancy": bool(state["vacancy"]) if state else False,
+             "admins": [a["uid"] for a in state["admins"]] if state else []}
         )
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §9 — department Admin vacancy
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# "If an Admin is deactivated, members report to Owner until replacement Admin
+# is appointed, then revert. Implement explicit vacancy state."
+#
+# The organisation is Owner → department Admin → department member, and
+# `manages()` already derives authority from positions rather than from the
+# `reports_to` uid written at invite time. What was missing was the STATE: a
+# department whose Admin was deactivated, suspended or moved had members whose
+# "reports to" answered nobody, and nobody was told.
+#
+# One Mongo document per vacancy, `_id = <team>`, so a department has at most
+# one open vacancy and opening it twice is an upsert of the same record:
+#
+#     { _id: "finance", since, cause, caused_by: {uid, name}, open: True,
+#       notified_owners: [uid...], closed_at, closed_by, closed_cause }
+#
+# It is opened by whatever removes the last active Admin (deactivation,
+# suspension, a role change away) and closed by whatever appoints one (an
+# invitation, a reactivation, a role change in). `reports_to_resolved` on every
+# staff row is computed from it: a member of a vacant department reports to
+# the Owner, and the row says so ("Owner (vacancy)"). The Owners get ONE notice
+# per vacancy — in-app and by email, keyed on the vacancy's opening moment —
+# and one when it closes.
+
+DEPARTMENT_VACANCIES = "department_vacancies"
+
+TEAM_LABELS: dict[str, str] = {
+    str(R.Team.APP): "App",
+    str(R.Team.OPS): "Operations",
+    str(R.Team.FINANCE): "Finance",
+    str(R.Team.TECH): "Tech",
+    str(R.Team.SUPPORT): "Support",
+    str(R.Team.MARKETING): "Marketing",
+}
+
+#: What a row's `reports_to_resolved` says when a department has no Admin.
+REPORTS_TO_OWNER_VACANCY = "Owner (vacancy)"
+
+
+def _admin_role_of(team: str) -> Role | None:
+    for role in R.ADMIN_ROLES:
+        if str(R.team_of(role)) == str(team):
+            return role
+    return None
+
+
+async def active_admins_of(team: str, db=None) -> list[dict]:
+    """The ACTIVE Admin rows of one department (`{uid, name, email}`), by role."""
+    role = _admin_role_of(team)
+    if role is None:
+        return []
+    handle = db if db is not None else get_db()
+    out: list[dict] = []
+    async for row in handle[C.STAFF].find({"role": str(role), "is_active": True}):
+        out.append({"uid": str(row.get("uid") or ""), "name": str(row.get("name") or ""),
+                    "email": str(row.get("email") or "")})
+    out.sort(key=lambda r: (r["name"], r["uid"]))
+    return out
+
+
+async def department_state(team: str, db=None) -> dict:
+    """`{team, label, admins, vacancy, vacancy_since, vacancy_cause}` for one department.
+
+    The vacancy is judged from the ACTIVE Admin rows (the authority) and the
+    vacancy record is read alongside it: a record left open while an Admin is
+    active (a crash between the appointment and the close) reads as no
+    vacancy, and `refresh_department_vacancy` closes it on the next pass.
+    """
+    handle = db if db is not None else get_db()
+    team = str(team or "")
+    admins = await active_admins_of(team, handle)
+    record = await handle[DEPARTMENT_VACANCIES].find_one({"_id": team})
+    vacancy = not admins
+    return {
+        "team": team,
+        "label": TEAM_LABELS.get(team, team.title()),
+        "admins": admins,
+        "vacancy": vacancy,
+        "vacancy_since": (record or {}).get("since") if vacancy and record and record.get("open") else None,
+        "vacancy_cause": str((record or {}).get("cause") or "") if vacancy and record and record.get("open") else "",
+    }
+
+
+def reports_to_of(person: Mapping, admins: list[dict], vacancy: bool) -> dict:
+    """Who this staff row reports to, from positions (pure).
+
+        member  → the department's Admin; the Owner while the seat is vacant
+        admin   → the Owner
+        owner   → the Observer
+        observer→ nobody
+
+    `label` is what a screen shows after "Reports to:". `vacancy` is True only
+    for a member whose department has no Admin.
+    """
+    raw = str(person.get("role") or "")
+    try:
+        role = Role(raw)
+    except ValueError:
+        return {"uid": "", "name": "", "role": "", "label": "Unknown", "vacancy": False}
+    if role == Role.OBSERVER:
+        return {"uid": "", "name": "", "role": "", "label": "Nobody", "vacancy": False}
+    if role == Role.OWNER:
+        return {"uid": "", "name": "Observer", "role": str(Role.OBSERVER), "label": "Observer", "vacancy": False}
+    if role in R.ADMIN_ROLES:
+        return {"uid": "", "name": "Owner", "role": str(Role.OWNER), "label": "Owner", "vacancy": False}
+    if role in R.MEMBER_ROLES:
+        if admins and not vacancy:
+            head = admins[0]
+            return {"uid": head["uid"], "name": head["name"], "role": str(_admin_role_of(str(R.team_of(role)))),
+                    "label": head["name"] or head["uid"], "vacancy": False}
+        return {"uid": "", "name": "Owner", "role": str(Role.OWNER), "label": REPORTS_TO_OWNER_VACANCY,
+                "vacancy": True}
+    return {"uid": "", "name": "", "role": "", "label": "Nobody", "vacancy": False}
+
+
+async def resolve_reports_to(person: Mapping, db=None) -> dict:
+    """`reports_to_of` for one row, with its department read now."""
+    team = str(person.get("team") or "")
+    if not team or team not in TEAM_LABELS:
+        return reports_to_of(person, [], False)
+    state = await department_state(team, db)
+    return reports_to_of(person, state["admins"], state["vacancy"])
+
+
+async def _notify_owners_of_vacancy(team: str, record: dict, *, opened: bool, actor: dict) -> dict:
+    """One notice per Owner per vacancy (in-app + email). Never raises."""
+    from app.services import notices
+    from app.services import notify
+
+    label = TEAM_LABELS.get(team, team.title())
+    since = record.get("since")
+    epoch = int(since.timestamp()) if isinstance(since, datetime) else 0
+    delivered: list[str] = []
+    try:
+        owners = await notify.staff_with_roles([Role.OWNER])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vacancy of %s: the Owners could not be listed: %s", team, exc)
+        owners = []
+    for owner in owners:
+        if owner.uid and await notices.department_vacancy(owner.uid, team, label, opened=opened, since_epoch=epoch):
+            delivered.append(owner.uid)
+    email: dict = {}
+    try:
+        from app.services import role_appeals  # local: the shared Owner-email helper
+
+        email = await role_appeals.email_owners(
+            kind="department.vacancy_opened" if opened else "department.vacancy_closed",
+            subject=f"{label} has no Admin" if opened else f"{label} has an Admin again",
+            title=(f"{label} has no department Admin" if opened else f"{label} has a department Admin again"),
+            rows=[
+                ("Department", label),
+                ("Members report to", "Owner (vacancy)" if opened else "the department Admin"),
+                ("Cause", str(record.get("cause") or record.get("closed_cause") or "")),
+                ("By", str(actor.get("name") or actor.get("uid") or "")),
+            ],
+            dedupe_key=f"department.vacancy:{team}:{epoch}:{'opened' if opened else 'closed'}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vacancy of %s: the Owner email was not sent: %s", team, exc)
+    return {"in_app": delivered, "email": email}
+
+
+async def refresh_department_vacancy(team: str, actor: dict, *, cause: str, db=None) -> dict:
+    """Open or close the department's vacancy from its ACTIVE Admin rows. Never raises.
+
+    Called after every change that can add or remove an Admin: a deactivation
+    or suspension of one, a reactivation, an invitation, a role change in or
+    out of the Admin seat. Returns `{team, vacancy, opened, closed}`.
+    """
+    handle = db if db is not None else get_db()
+    team = str(team or "")
+    out = {"team": team, "vacancy": False, "opened": False, "closed": False}
+    if team not in TEAM_LABELS:
+        return out
+    try:
+        admins = await active_admins_of(team, handle)
+        record = await handle[DEPARTMENT_VACANCIES].find_one({"_id": team})
+        now = datetime.now(timezone.utc)
+        if not admins:
+            out["vacancy"] = True
+            if record and record.get("open"):
+                return out  # already open, already told
+            doc = {
+                "since": now, "cause": cause, "open": True,
+                "caused_by": {"uid": str(actor.get("uid") or ""), "name": str(actor.get("name") or "")},
+                "closed_at": None, "closed_by": None, "closed_cause": None,
+            }
+            await handle[DEPARTMENT_VACANCIES].update_one({"_id": team}, {"$set": doc}, upsert=True)
+            await audit.record(
+                actor=actor, action=audit.Action.DEPARTMENT_VACANCY_OPENED, subject_type="department",
+                subject_id=team, reason=f"{TEAM_LABELS[team]} has no active Admin ({cause}).",
+                before={"admin_vacancy": False}, after={"admin_vacancy": True},
+                meta={"cause": cause, "members_report_to": "owner",
+                      "owner_decision_pending": "none — Owner default: one notice per Owner"},
+            )
+            told = await _notify_owners_of_vacancy(team, {"_id": team, **doc}, opened=True, actor=actor)
+            await handle[DEPARTMENT_VACANCIES].update_one(
+                {"_id": team}, {"$set": {"notified_owners": told.get("in_app", [])}}
+            )
+            out["opened"] = True
+            return out
+        if record and record.get("open"):
+            await handle[DEPARTMENT_VACANCIES].update_one(
+                {"_id": team, "open": True},
+                {"$set": {"open": False, "closed_at": now, "closed_cause": cause,
+                          "closed_by": {"uid": str(actor.get("uid") or ""), "name": str(actor.get("name") or "")}}},
+            )
+            await audit.record(
+                actor=actor, action=audit.Action.DEPARTMENT_VACANCY_CLOSED, subject_type="department",
+                subject_id=team, reason=f"{TEAM_LABELS[team]} has an active Admin again ({cause}).",
+                before={"admin_vacancy": True}, after={"admin_vacancy": False},
+                meta={"cause": cause, "admins": [a["uid"] for a in admins],
+                      "members_report_to": "department_admin"},
+            )
+            await _notify_owners_of_vacancy(team, record, opened=False, actor=actor)
+            out["closed"] = True
+    except Exception:  # noqa: BLE001 — the staff change itself has happened
+        log.exception("department vacancy of %s could not be refreshed", team)
+    return out
+
+
+async def departments(actor: dict) -> list[dict]:
+    """Every department's Admin state (§9), for the CRM and the Work hub."""
+    if not R.is_internal(actor["role"]):
+        return []
+    db = get_db()
+    return [await department_state(team, db) for team in TEAM_LABELS]
+
+
+# ── §8: exactly one Observer ──────────────────────────────────────────────────
+#
+# The Observer is a single permanent identity: `settings.observer_email`,
+# seeded once by `scripts/seed_accounts.py`. `invite` refuses the role for
+# everybody (including an Owner), `assignable_roles` never offers it, and
+# `change_role` refuses to move anybody to or from it — so no API path can
+# make a second one. `observer_invariant` is the check a test or a repair
+# script runs against the collection itself.
+
+
+async def observer_invariant(db=None) -> dict:
+    """`{count, ok, uids}` — exactly one Observer row, or what is wrong."""
+    handle = db if db is not None else get_db()
+    rows = [r async for r in handle[C.STAFF].find({"role": str(Role.OBSERVER)})]
+    return {"count": len(rows), "ok": len(rows) == 1, "uids": sorted(str(r.get("uid") or "") for r in rows)}
 
 
 async def _restore_access(db, person: dict, actor: dict, reason: str, target_role: Role) -> dict:
@@ -1681,6 +1979,11 @@ async def _restore_access(db, person: dict, actor: dict, reason: str, target_rol
     person["fully_applied"] = not claim_problem
     person["notified"] = notified
     person["personal_login_disabled"] = await asyncio.to_thread(_login_disabled, uid)
+    # §9: a reactivated Admin closes their department's vacancy; members revert.
+    if target_role in R.ADMIN_ROLES:
+        person["department_vacancy"] = await refresh_department_vacancy(
+            str(person.get("team") or R.team_of(target_role) or ""), actor, cause="admin reactivated", db=db,
+        )
     return person
 
 

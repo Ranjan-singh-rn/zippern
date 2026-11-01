@@ -142,6 +142,7 @@ def may_request(actor: dict) -> bool:
 
 def view(doc: dict) -> dict[str, Any]:
     decision = doc.get("decision") or None
+    hold = doc.get("hold") or None
     return {
         "id": str(doc.get("_id") or ""),
         "kind": str(doc.get("kind") or ""),
@@ -152,9 +153,20 @@ def view(doc: dict) -> dict[str, Any]:
         "status": str(doc.get("status") or ""),
         "requested_by": doc.get("requested_by") or {},
         "requested_at": _iso(doc.get("requested_at")),
+        # §6: the request IS the Operations recommendation — filed by a
+        # reviewer of agencies (`can_approve_kyc`) with a mandatory note — and
+        # it is shown under that name so the CRM reads it as one.
+        "recommendation": {
+            "by": doc.get("requested_by") or {},
+            "note": str(doc.get("note") or ""),
+            "at": _iso(doc.get("requested_at")),
+        },
         "decision": (
             {**decision, "at": _iso(decision.get("at"))} if isinstance(decision, dict) else None
         ),
+        # §6: the hold placed on the subject's unsettled earnings at the move
+        # (`transfer_review`), or None. OWNER_DECISION_PENDING: see `_hold`.
+        "hold": ({**hold, "at": _iso(hold.get("at"))} if isinstance(hold, dict) else None),
     }
 
 
@@ -403,6 +415,64 @@ async def _record_landed_move(req: dict) -> dict:
             "recorded_after_unconfirmed_move": True}
 
 
+#: §6 — the cause recorded on the money hold a transfer places.
+HOLD_CAUSE = "transfer_review"
+
+
+async def _hold(plan: dict, req: dict, note: str, actor: dict, db) -> dict:
+    """§6 — "unsettled earnings during transfer need a visible hold/review for
+    Owner/Finance". The subject's money is FROZEN for the Owner's review with
+    cause `transfer_review` through the existing freeze (`money_freeze`), BEFORE
+    the move, so nothing that was pending under the old agency pays out under
+    the new one by itself. Nothing is settled, moved or cancelled here.
+
+    OWNER_DECISION_PENDING: the settlement policy — whether the earnings a
+    Host or Sub-agency had pending at the moment of a transfer settle under the
+    old agency, the new one, or are split — is an open Owner decision. Until it
+    is made, every transfer places this hold and the Owner releases, withholds
+    or adjusts it on the frozen-money queue (`money_freeze.decide`), which is
+    also where the decision is recorded. The hold is visible on the request
+    (`hold`), on the freeze itself and on the audit entry (`money.frozen`).
+
+    Never raises for a freeze that could not be written: the refusal is
+    recorded on the request and the move is NOT made — a transfer whose hold
+    failed would be exactly the unreviewed settlement the hold exists to stop.
+    """
+    from app.services import money_freeze  # local: read-only use of the money agent's module
+
+    reason = f"Transfer {req.get('_id')} from {plan['from_agency_id']} to {plan['to_agency_id']}: {note}"
+    label = "a transfer (settlement under review)"
+    if plan["kind"] == "host":
+        uid = plan["subject"]["uid"]
+        doc = (await money_freeze.freeze_user(
+            uid, cause=HOLD_CAUSE, label=label, reason=reason, actor=actor,
+            include_partners=False, db=db,
+        ))[0]
+        # The Host's beans stop moving too: `releaseBeansForWeek` and
+        # `convertBeans` read `users/{uid}.payoutHold`, which the freeze record
+        # alone does not write (the moderation paths write it in the same patch
+        # as the restriction; here it is its own write, before the move).
+        await asyncio.to_thread(
+            firebase.firestore_client().collection("users").document(uid).update,
+            money_freeze.hold_fields(label),
+        )
+        subject = {"type": "user", "id": uid}
+    else:
+        doc = await money_freeze.freeze_partner(
+            plan["subject"]["id"], cause=HOLD_CAUSE, label=label, reason=reason, actor=actor, db=db,
+        )
+        subject = {"type": "partner", "id": plan["subject"]["id"]}
+    return {
+        "cause": HOLD_CAUSE,
+        "freeze_id": str(doc.get("_id") or ""),
+        "subject": subject,
+        "status": str(doc.get("status") or "frozen"),
+        "settlement_policy": "OWNER_DECISION_PENDING",
+        "review_by": "owner_or_finance",
+        "at": _now(),
+    }
+
+
 async def _execute(plan: dict, req: dict, note: str, actor: dict, now: datetime) -> dict:
     """Run the EXISTING move for this subject. No balance or ledger row moves."""
     from app.services import partner_ops  # local: partner_ops imports this module's peers
@@ -474,6 +544,8 @@ async def decide(request_id: str, approve: bool, note: str, actor: dict) -> dict
 
     kind = str(req.get("kind") or "")
     moved = None
+    hold = req.get("hold") if isinstance(req.get("hold"), dict) else None
+    plan: dict | None = None
     try:
         if approve and kind == "host" and await asyncio.to_thread(_host_move_landed, req):
             # HT-2: THIS request's move landed on an earlier approval whose answer
@@ -489,6 +561,24 @@ async def decide(request_id: str, approve: bool, note: str, actor: dict) -> dict
                     f"The {_label(kind)} is no longer under the agency this transfer was "
                     "requested from. Nothing was changed — file a new request."
                 )
+            # §6: the hold on unsettled earnings goes on BEFORE the move, and a
+            # hold that cannot be placed stops the move (a transfer is never a
+            # success with its money unreviewed). Idempotent per subject: an
+            # approval retried after an unconfirmed move finds the hold in place.
+            if hold is None:
+                try:
+                    hold = await _hold(plan, req, text, actor, db)
+                except Exception as exc:  # noqa: BLE001 — reported as the refusal it is
+                    raise TransferError(
+                        "The hold on the subject's unsettled earnings could not be placed, so "
+                        f"the transfer was not made: {exc}. Nothing was moved."
+                    ) from exc
+                await db[TRANSFER_REQUESTS].update_one(
+                    {"_id": req["_id"], "deciding_token": token}, {"$set": {"hold": hold}}
+                )
+            # §6: "Failure must not be swallowed; no success response if any
+            # move failed." `_execute` raises on every failure, so a failed move
+            # never reaches the approval stamp below, and the lease is given back.
             moved = await _execute(plan, req, text, actor, now)
         final = "approved" if approve else "rejected"
         updated = await db[TRANSFER_REQUESTS].find_one_and_update(
@@ -520,6 +610,48 @@ async def decide(request_id: str, approve: bool, note: str, actor: dict) -> dict
         after={"status": final,
                "agency_id": req.get("to_agency_id") if approve else req.get("from_agency_id")},
         meta={"kind": kind, "subject_id": req.get("subject_id"), "moved": moved,
-              "balances_moved": False},
+              "balances_moved": False,
+              # §6: historical ledger attribution is unchanged; the unsettled
+              # earnings are HELD for review, not settled either way.
+              "ledger_attribution_changed": False,
+              "hold": ({**hold, "at": _iso(hold.get("at"))} if isinstance(hold, dict) else None),
+              "settlement_policy": "OWNER_DECISION_PENDING" if approve else None},
     )
-    return {"request": view(updated), "moved": moved}
+    # §6: "notify source/target/affected". The affected person was told by the
+    # move itself (`_execute` / `_record_landed_move`); the two agencies' owners
+    # are told here. Best effort and last: the decision is made and recorded.
+    notified = await _notify_agencies(req, plan, moved) if approve else {}
+    return {"request": view(updated), "moved": moved, "hold": view(updated)["hold"], "notified": notified}
+
+
+async def _notify_agencies(req: dict, plan: dict | None, moved: dict | None) -> dict:
+    """Tell the source and target agencies' owners about an approved move. Never raises."""
+    from app.services import partner_applications as apps  # local: apps imports partner_ops
+    from app.services import partner_roles
+
+    out = {"source": False, "target": False}
+    if not moved:
+        return out
+    kind = str(req.get("kind") or "")
+    from_id = str(req.get("from_agency_id") or "")
+    to_id = str(req.get("to_agency_id") or "")
+    subject_name = str(((plan or {}).get("subject") or {}).get("name") or "")
+    try:
+        names = (
+            {from_id: (plan or {}).get("from_name"), to_id: (plan or {}).get("to_name")}
+            if plan else await asyncio.to_thread(apps._current_agency_names, [from_id, to_id])
+        )
+        for side, agency_id in (("source", from_id), ("target", to_id)):
+            if not agency_id:
+                continue
+            row = await get_db()[C.PARTNERS].find_one({"_id": agency_id})
+            owner = await partner_roles.owner_uid_of(row, db=get_db()) if row else ""
+            if not owner or owner == str(req.get("subject_id") or ""):
+                continue
+            out[side] = await notices.transfer_agency_notice(
+                owner, str(req.get("_id") or ""), side=side, kind=kind, subject_name=subject_name,
+                from_name=str(names.get(from_id) or from_id), to_name=str(names.get(to_id) or to_id),
+            )
+    except Exception as exc:  # noqa: BLE001 — the decision stands
+        log.warning("transfer %s: the agencies could not be notified: %s", req.get("_id"), exc)
+    return out

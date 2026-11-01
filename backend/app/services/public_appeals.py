@@ -84,6 +84,80 @@ ALREADY_PENDING = (
     "An appeal for this account is already being reviewed. You will be able to "
     "file another once it has been decided."
 )
+#: §5 — "account-matching contact verification, mismatch error". The person
+#: must give the phone number or the email address that is ON the account (the
+#: Firebase Auth record — the verified identity, never the client-written
+#: profile). A wrong one is refused with its own sentence, distinct from
+#: NOT_FOUND, because the account was found and the proof was not.
+CONTACT_REQUIRED = (
+    "Enter the phone number or the email address that is on the account, so we "
+    "can match the appeal to it."
+)
+CONTACT_MISMATCH = (
+    "The contact details you entered do not match the ones on this account. "
+    "Use the phone number or email address the account was registered with."
+)
+
+
+def normalise_contact(value: str) -> str:
+    """One comparable form for a phone number or an email (pure).
+
+    An email is lower-cased and stripped. A phone number is reduced to its
+    digits with any trunk-prefix zeros dropped; `contact_matches` then accepts
+    a number typed with or without the country code, so `+91 98765 43210`,
+    `098765 43210` and `9876543210` all name one number.
+    """
+    text = str(value or "").strip()
+    if "@" in text:
+        return text.lower()
+    return re.sub(r"\D", "", text).lstrip("0")
+
+
+def contact_matches(supplied: str, phone: str, email: str) -> bool:
+    """Does `supplied` name the account's phone or email (pure)?
+
+    A phone matches when the shorter of the two digit strings (at least six
+    digits) is the tail of the longer — the national number with or without
+    its country code. Never a prefix match: a country code alone is not a
+    phone number.
+    """
+    want = normalise_contact(supplied)
+    if not want:
+        return False
+    if "@" in want:
+        return bool(email) and want == normalise_contact(email)
+    have = normalise_contact(phone)
+    if len(want) < 6 or len(have) < 6:
+        return False
+    short, long_ = (want, have) if len(want) <= len(have) else (have, want)
+    return long_.endswith(short)
+
+
+def _account_contacts(uid: str) -> tuple[str, str]:
+    """Blocking — `(phone, email)` from the Firebase Auth record; '' when absent.
+
+    The email counts whether or not it is marked verified: it is the address
+    the account was registered with, which is what the person is asked for.
+    """
+    try:
+        rec = firebase.get_user(uid)
+    except Exception:  # noqa: BLE001 — unreadable holds nothing
+        return "", ""
+    if rec is None:
+        return "", ""
+    return (
+        str(getattr(rec, "phone_number", "") or "").strip(),
+        str(getattr(rec, "email", "") or "").strip(),
+    )
+
+
+async def _refuse_unless_contact_matches(uid: str, contact: str) -> None:
+    """Raise `PublicAppealError` unless `contact` names the account's phone or email."""
+    if not str(contact or "").strip():
+        raise PublicAppealError(CONTACT_REQUIRED)
+    phone, email = await _fs(_account_contacts, uid)
+    if not contact_matches(contact, phone, email):
+        raise PublicAppealError(CONTACT_MISMATCH)
 
 
 class PublicAppealError(Exception):
@@ -323,8 +397,17 @@ async def _pending_appeal_for(uid: str) -> dict | None:
     return await _fs(_q)
 
 
-async def lookup(account_id: str, display_name: str, client_address: str) -> dict[str, Any]:
-    """What the public page may be told about these details — and no more."""
+async def lookup(
+    account_id: str, display_name: str, client_address: str, contact: str = "",
+) -> dict[str, Any]:
+    """What the public page may be told about these details — and no more.
+
+    §5: the contact (phone or email on the account) must match before anything
+    beyond NOT_FOUND is said. A found account with a wrong contact is refused
+    with `CONTACT_MISMATCH` — a distinct answer, as the spec asks, and one that
+    is only reachable for an account that IS restricted (an unrestricted one
+    answers NOT_FOUND first, so the mismatch error never confirms a ban).
+    """
     if not await _allow(client_key(client_address) + ":lookup", LOOKUPS_PER_HOUR_PER_CLIENT, timedelta(hours=1)):
         raise RateLimited("Too many lookups from here. Try again in an hour.")
     found = await resolve_account(account_id, display_name)
@@ -335,6 +418,7 @@ async def lookup(account_id: str, display_name: str, client_address: str) -> dic
     if not restriction:
         # The same answer as a missing account, on purpose.
         return {"state": "not_found", "message": NOT_FOUND}
+    await _refuse_unless_contact_matches(uid, contact)
     # UGP review: nothing beyond "an appeal can (or cannot yet) be filed" —
     # not ban versus suspension, and not a pending appeal's reference, which
     # belongs to whoever filed it.
@@ -369,8 +453,14 @@ def _delete_blob(path: str) -> None:
 
 async def submit(
     account_id: str, display_name: str, statement: str, files: list[Upload], client_address: str,
+    contact: str = "",
 ) -> dict[str, Any]:
-    """File the appeal. Returns `{reference, status}`. Lifts nothing."""
+    """File the appeal. Returns `{reference, status}`. Lifts nothing.
+
+    §5: the contact must match the account (`_refuse_unless_contact_matches`);
+    rate limits per client and per account, and one pending appeal per account,
+    are the duplicate protection.
+    """
     text = validate_statement(statement)
     checked = validate_uploads(files)
 
@@ -384,6 +474,7 @@ async def submit(
     restriction = users_svc.restriction_of(user)
     if not restriction:
         raise PublicAppealError(NOT_FOUND)
+    await _refuse_unless_contact_matches(uid, contact)
     if await _pending_appeal_for(uid):
         raise PublicAppealError(ALREADY_PENDING)
     # RC (confirmed): after a decision, another appeal needs new evidence or a

@@ -182,6 +182,22 @@ class BalanceRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class Ban(BaseModel):
+    """A ban: the reason, and (§5) its scope, category and evidence.
+
+    `scope` — `account_and_devices` (the default, and what the ban has always
+    done) bars every handset the account was seen on; `account` leaves the
+    handsets alone. `category` is a short label from the CRM's list; `evidence`
+    is a list of references (report ids, storage paths, links) — never files.
+    All three are recorded on the account and on the audit entry.
+    """
+
+    reason: str = Field(min_length=3, max_length=1000)
+    scope: str = Field(default="account_and_devices", pattern=r"^(account|account_and_devices)$")
+    category: str = Field(default="", max_length=80)
+    evidence: list[str] = Field(default_factory=list, max_length=10)
+
+
 class Suspend(BaseModel):
     """A suspension, with an optional term.
 
@@ -539,6 +555,36 @@ async def appeal_evidence(appeal_id: str, user: dict = Depends(current_user)):
     return {"evidence": links}
 
 
+class AppealRecommendation(BaseModel):
+    """§5 — a reviewer's written recommendation for the Owner: `uphold` or
+    `overturn`, with a note of at least ten characters (it is the record)."""
+
+    outcome: str = Field(pattern=r"^(uphold|overturn)$")
+    note: str = Field(min_length=10, max_length=2000)
+
+
+@router.post(
+    "/appeals/{appeal_id}/recommend",
+    dependencies=[Depends(require_permission(Permission.CAN_BAN_USERS))],
+)
+async def recommend_appeal(
+    appeal_id: str, body: AppealRecommendation, user: dict = Depends(require_write)
+):
+    """Record a recommendation on a ban / suspension appeal (§5). Lifts nothing.
+
+    `can_ban_users` — the reviewer's tier — and never the person who made the
+    decision being appealed (four eyes). The appeal stays pending; the Owners
+    are told (audit + email) and decide it at `/decide`."""
+    try:
+        return await appeals_svc.recommend_appeal(appeal_id, body.outcome, body.note, user)
+    except AppealNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except AppealError as exc:
+        raise HTTPException(
+            status_code=getattr(exc, "status_code", None) or status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
 @router.post(
     "/appeals/{appeal_id}/decide",
     dependencies=[Depends(require_permission(Permission.CAN_BAN_USERS))],
@@ -547,6 +593,11 @@ async def decide_appeal(
     appeal_id: str, body: AppealDecision, user: dict = Depends(require_write)
 ):
     """Decide an appeal, and reverse what an overturn can reverse.
+
+    §5: the OWNER's decision. `can_ban_users` stays on the door (an Owner holds
+    it; a reviewer reaching this is refused by the service with 403 and told
+    to recommend instead), and the four-eyes rule holds for the Owner too: an
+    Owner who made the decision being appealed cannot decide the appeal.
 
     `can_ban_users`, and not a lighter permission, because an overturn lifts a
     ban — the same act as `POST /{uid}/unban` arriving through the appeal that
@@ -567,8 +618,8 @@ async def decide_appeal(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
     except AppealError as exc:
-        # HT-2: `AppealDecisionNotRecorded` carries 409 / 503; every other
-        # appeal refusal stays a 400.
+        # HT-2: `AppealDecisionNotRecorded` carries 409 / 503, `AppealForbidden`
+        # 403; every other appeal refusal stays a 400.
         raise HTTPException(
             status_code=getattr(exc, "status_code", None) or status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
@@ -733,7 +784,7 @@ _BAN_USERS = Depends(require_permission(Permission.CAN_BAN_USERS))
 
 
 @router.post("/{uid}/ban", dependencies=[_BAN_USERS])
-async def ban_user(uid: str, body: Reason, user: dict = Depends(require_write)):
+async def ban_user(uid: str, body: Ban, user: dict = Depends(require_write)):
     """Ban an account, and bar every handset it has been seen on. Immediate —
     moderation needs no signature (5.6).
 
@@ -741,9 +792,20 @@ async def ban_user(uid: str, body: Reason, user: dict = Depends(require_write)):
     document under `users/{uid}/devices`, not the single `deviceId` written at
     profile setup years ago, and the response says how many handsets it actually
     reached and which ones it could not. Barring a handset locks out EVERY
-    account on it, which is the point and also the cost."""
+    account on it, which is the point and also the cost.
+
+    §5: `scope`, `category` and `evidence` are recorded with the reason, the
+    actor and the time. A ban does not itself revoke a partner role."""
+    # `getattr` rather than attribute access: a caller still sending the older
+    # `{reason}` body gets the ban it always got (account and devices).
+    scope = str(getattr(body, "scope", None) or svc.BAN_SCOPE_ACCOUNT_AND_DEVICES)
     try:
-        return await svc.ban_user(uid, body.reason, user)
+        return await svc.ban_user(
+            uid, body.reason, user,
+            ban_device_too=(scope != svc.BAN_SCOPE_ACCOUNT),
+            category=str(getattr(body, "category", "") or ""),
+            evidence=list(getattr(body, "evidence", None) or []),
+        )
     except UserError as exc:
         raise _fail(exc) from exc
 

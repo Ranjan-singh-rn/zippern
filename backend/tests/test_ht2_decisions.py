@@ -643,7 +643,9 @@ eq("…recorded approved; granted ONCE; decision audited once",
 # ══════════════════════════════════════════════════════════════════════════════
 print("4. The appeal decision")
 
-MOD = lambda u: {"uid": u, "name": u, "role": "app_admin", "team": "app"}  # noqa: E731
+# §5 (B2): a ban / suspension appeal is decided by the OWNER (a reviewer recommends),
+# so the deciders here are Owners — the HT-2 behaviour under test is unchanged.
+MOD = lambda u: {"uid": u, "name": u, "role": "owner", "team": None}  # noqa: E731
 
 
 def banned_with_appeal() -> tuple[str, str]:

@@ -547,7 +547,7 @@ run(asyncio.to_thread(firebase_mod.clawback_user_diamonds, "u-claim", 20,
                       reason="x", history_id=f"card_{cid_k}", require_full=True))
 eq("(the interrupted attempt took the money; no ledger row yet)", (users()["u-claim"]["diamonds"], ledger_rows(cid_k)), (80, 0))
 m = refuses("rejecting a card whose execution has started is refused",
-            cards_svc.reject(cid_k, OWNER, "Changed my mind."), kind=ANY)
+            cards_svc.reject(cid_k, THE_OWNER, "Changed my mind."), kind=ANY)  # B-2: an Owner rejects a signed card
 ok("…saying to run it again", "Run the execution again" in m, m)
 eq("…the card is still approved", card_of(cid_k)["stage"], "approved")
 run(svc.execute_balance_card(cid_k, OWNER))
@@ -557,7 +557,7 @@ user("u-rej", diamonds=100)
 run(svc.warn_user("u-rej", "Fourth offence.", STAFF, request_id="req-rej",
                   deduction={"currency": "diamonds", "amount": 20}))
 cid_r = approve_card(cards_for("u-rej")[0])
-run(cards_svc.reject(cid_r, OWNER, "Not warranted."))
+run(cards_svc.reject(cid_r, THE_OWNER, "Not warranted."))  # B-2: only an Owner rejects a signed card
 eq("an approved card nobody has started executing can still be rejected", card_of(cid_r)["stage"], "rejected")
 m = refuses("…and a rejected card cannot then be executed", svc.execute_balance_card(cid_r, OWNER))
 eq("…nothing moved", users()["u-rej"]["diamonds"], 100)

@@ -680,6 +680,13 @@ async def decide(appeal_id: str, outcome: str, note: str, actor: dict) -> dict[s
     Anyone but the Owner is refused with 403. The request is claimed with a
     conditional update on its open status before anything is restored, so two
     decisions cannot both run; the lock is released and the person is told.
+
+    Spec §6 steps 7–9: the Owner's decision is final; "Admin recommendation is
+    never final approval" (`recommend` moves the request to `recommended` and
+    restores nothing). OWNER_DECISION_PENDING: whether a recommendation must
+    exist BEFORE the Owner may decide is left open — today a `pending` request
+    may be decided directly, and the recommendation (when there is one) is
+    recorded on the decision's audit entry.
     """
     if not R.is_owner_value((actor or {}).get("role")):
         raise RoleAppealForbidden(OWNER_ONLY_DECIDE)

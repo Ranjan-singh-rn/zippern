@@ -1,6 +1,7 @@
 """The money board.
 
-Spec Part 5. Teams do the work, owners sign, nothing moves money without both.
+Spec Part 5. Teams do the work, owners sign, nothing moves money without a
+signature.
 
     Requested → Under Review → Awaiting Sign-off → Approved → Executed
 
@@ -10,15 +11,40 @@ is visibly stuck rather than silently lost (5.2.6).
 Rules enforced here, not in the UI:
   * a member's card is verified by their own admin           (5.5.1)
   * an admin's own card is verified by a different admin     (5.5.2)
-  * an owner cannot sign a card they raised                  (5.5.3)
   * nothing skips Under Review, including an owner's card    (5.5.4)
   * rejection requires a reason                              (5.5.5)
+  * only an owner rejects a verified or signed card          (B-2)
+
+── THE OWNER-ALONE DECISION (master spec §8) ────────────────────────────────
+
+    "One Owner may raise, verify, sign and execute a money card alone. This
+     intentionally overrides the older two-Owner separation model. Audit every
+     step. Notify other Owners in-app and by email with actor, action, amount
+     and card reference. Department staff never approve final money movement.
+     No state transition may be skipped."
+
+So the three refusals that used to keep two humans on every card — the raiser
+cannot verify, the raiser cannot sign, the verifier cannot sign — **no longer
+apply when the actor is an Owner**. They still apply to everybody else: a
+Finance admin who raised a card cannot verify it, and nobody but an Owner
+signs or executes. What replaces the second person is the record and the
+telling: every stage still writes its own audit entry, even when one Owner
+runs them back to back (`owner_fast_path`), and every signature, execution,
+recharge approval, refund decision and frozen-money decision is pushed to the
+other active Owners in-app and by email (`owner_mail`).
+
+One refusal is deliberately kept: an Owner does not sign a card whose
+**subject is themselves** (their own capital drawings). That is not the
+two-Owner model, it is self-dealing, and the decision does not mention it —
+`SELF_SUBJECT_NEEDS_ANOTHER_OWNER` is the flag, marked OWNER_DECISION_PENDING.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
 
 from bson import ObjectId
 
@@ -27,6 +53,16 @@ from app.core import roles as R
 from app.core.compat import StrEnum
 from app.core.roles import Role, Team
 from app.db.mongo import C, get_db
+
+log = logging.getLogger(__name__)
+
+#: Master spec §8, confirmed: one Owner may take a card through every stage.
+OWNER_ALONE = True
+
+#: OWNER_DECISION_PENDING — an Owner still cannot sign the card that pays
+#: *them* (`subject.id == signer`). Set False to let the owner-alone rule cover
+#: self-subject cards too; nothing else reads this flag.
+SELF_SUBJECT_NEEDS_ANOTHER_OWNER = True
 
 
 class Stage(StrEnum):
@@ -37,6 +73,13 @@ class Stage(StrEnum):
     EXECUTED = "executed"
     REJECTED = "rejected"
     FAILED = "failed"
+
+
+#: The stages a card can still be decided from — what "pending" means on the
+#: board, in the hold-for-review queue and in the freeze snapshots.
+PENDING_STAGES: frozenset[str] = frozenset(
+    {str(Stage.REQUESTED), str(Stage.UNDER_REVIEW), str(Stage.AWAITING_SIGNOFF), str(Stage.APPROVED)}
+)
 
 
 class CardType(StrEnum):
@@ -111,6 +154,27 @@ class CardType(StrEnum):
     #: is a trap someone eventually falls into.
     OWNER_CAPITAL_IN = "owner_capital_in"
     OWNER_DRAWINGS = "owner_drawings"
+
+
+#: B-3: the card types the GENERIC `POST /api/cards` route may raise. Every
+#: type with a raise route of its own (coin purchase, lending, repayment,
+#: recovery, write-off, commission/sub-agency/host payouts, balance changes,
+#: expenses, capital, chance configuration) is refused there, because those
+#: routes carry the validations a signer relies on — the price check, the
+#: duplicate-UTR scan, `can_take_inventory`, the live wallet read — and a card
+#: raised past them looks exactly like an honest one. Nothing in the CRM calls
+#: the generic route (`zipper-crm/lib/api.ts` declares `cards.raise` and no
+#: page uses it), so the allow-list is the configuration-only types that have
+#: no executor and move no balance.
+GENERIC_RAISE_TYPES: frozenset[str] = frozenset(
+    {
+        str(CardType.RATE_CHANGE),
+        str(CardType.PRICING_CHANGE),
+        str(CardType.FX_OVERRIDE),
+        str(CardType.PROMOTION),
+        str(CardType.REFUND),
+    }
+)
 
 
 #: The card types a partner may read when they are the **subject** of one.
@@ -216,6 +280,8 @@ async def raise_card(card: NewCard, actor: dict) -> dict:
         "requested_by": _who(actor),
         "created_at": now,
         "updated_at": now,
+        "review_started_by": None,
+        "review_started_at": None,
         "verified_by": None,
         "verified_at": None,
         "verification_note": card.auto_verified_note if card.auto_verified else None,
@@ -249,17 +315,63 @@ async def raise_card(card: NewCard, actor: dict) -> dict:
 
 
 async def start_review(card_id: str, actor: dict) -> dict:
-    """Move a card into Under Review. Spec 5.2.2."""
+    """Move a card into Under Review. Spec 5.2.2.
+
+    Its own audit entry (`card.review_started`) and its own timestamp, so a
+    card's history can prove the stage was passed through and not skipped
+    (5.5.4 / B-23). Conditional on the card still being `requested`: two
+    reviewers opening it at once record one start.
+    """
     card = await _get(card_id)
     if card["stage"] != Stage.REQUESTED:
         raise CardError(f"Card is {card['stage']}, not awaiting review.")
 
     _assert_can_verify(card, actor)
-    return await _set_stage(card_id, Stage.UNDER_REVIEW, actor, "Review started")
+    await _record_review_start(card, actor)
+    return await _get(card_id, as_dict=True)
+
+
+async def _record_review_start(card: dict, actor: dict) -> str:
+    card_id = str(card["_id"])
+    now = datetime.now(timezone.utc)
+    res = await get_db()[C.CARDS].update_one(
+        {"_id": ObjectId(card_id), "stage": str(Stage.REQUESTED)},
+        {"$set": {
+            "stage": str(Stage.UNDER_REVIEW),
+            "review_started_by": _who(actor),
+            "review_started_at": now,
+            "updated_at": now,
+        }},
+    )
+    if getattr(res, "matched_count", 1) != 1:
+        latest = await _get(card_id)
+        raise CardError(f"Card is {latest['stage']}, not awaiting review.")
+    return await audit.record(
+        actor=actor,
+        action=audit.Action.CARD_REVIEW_STARTED,
+        subject_type="card",
+        subject_id=card_id,
+        reason="Review started",
+        before={"stage": str(Stage.REQUESTED)},
+        after={"stage": str(Stage.UNDER_REVIEW)},
+        card_id=card_id,
+    )
 
 
 async def verify(card_id: str, actor: dict, note: str) -> dict:
-    """Verification complete — hand to owners. Spec 5.2.3."""
+    """Verification complete — hand to owners. Spec 5.2.3.
+
+    B-23 — NOTHING SKIPS UNDER REVIEW. A card that is still `requested` is not
+    moved straight to `awaiting_signoff`: the Under Review transition is
+    recorded first — its own stage write, its own audit entry, its own
+    timestamp and reviewer — and only then is the verification written. The
+    caller that pressed "verify" on a fresh card did look at it; what changes
+    is that the record now says so. `start_review` first, then `verify`, is
+    the same two writes made by two requests.
+
+    B-6 — the stage write is conditional on the stage this read, so a verify
+    racing a reject cannot resurrect a rejected card.
+    """
     if not note.strip():
         raise CardError("Verification requires a note describing what was checked.")
 
@@ -269,9 +381,12 @@ async def verify(card_id: str, actor: dict, note: str) -> dict:
 
     _assert_can_verify(card, actor)
 
+    if card["stage"] == Stage.REQUESTED:
+        await _record_review_start(card, actor)
+
     now = datetime.now(timezone.utc)
-    await get_db()[C.CARDS].update_one(
-        {"_id": ObjectId(card_id)},
+    res = await get_db()[C.CARDS].update_one(
+        {"_id": ObjectId(card_id), "stage": str(Stage.UNDER_REVIEW)},
         {
             "$set": {
                 "stage": str(Stage.AWAITING_SIGNOFF),
@@ -282,6 +397,9 @@ async def verify(card_id: str, actor: dict, note: str) -> dict:
             }
         },
     )
+    if getattr(res, "matched_count", 1) != 1:
+        latest = await _get(card_id)
+        raise CardError(f"Card is {latest['stage']} and cannot be verified.")
 
     await audit.record(
         actor=actor,
@@ -289,7 +407,7 @@ async def verify(card_id: str, actor: dict, note: str) -> dict:
         subject_type="card",
         subject_id=card_id,
         reason=note,
-        before={"stage": card["stage"]},
+        before={"stage": str(Stage.UNDER_REVIEW)},
         after={"stage": str(Stage.AWAITING_SIGNOFF)},
         card_id=card_id,
     )
@@ -297,7 +415,13 @@ async def verify(card_id: str, actor: dict, note: str) -> dict:
 
 
 async def sign(card_id: str, actor: dict, note: str = "") -> dict:
-    """Owner signature. Spec 5.2.4."""
+    """Owner signature. Spec 5.2.4.
+
+    B-6 — conditional on the card still awaiting signature: a sign racing a
+    reject loses instead of turning a rejected card into an approved one.
+    After the signature the other Owners are told (§8); a failure to tell
+    them never undoes the signature — it is recorded and retried.
+    """
     if not R.can_sign_money(actor["role"]):
         raise CardError("Only a business owner can sign this.")
 
@@ -307,49 +431,67 @@ async def sign(card_id: str, actor: dict, note: str = "") -> dict:
             f"Card is {card['stage']}. Only verified cards can be signed."
         )
 
-    # 5.5.3 — nobody signs their own request.
-    if card["requested_by"]["uid"] == actor["uid"]:
-        raise CardError("You raised this card. Another owner must sign it.")
+    # ── The two-person refusals, kept for everybody who is not an Owner ──────
+    #
+    # §8: one Owner may raise, verify and sign the same card. Only an Owner
+    # reaches this function at all (`can_sign_money`), so under the decision
+    # these two checks are switched off by `OWNER_ALONE`; they are kept in the
+    # code, not deleted, because the decision is a flag the business can
+    # reverse, and because a reader of the audit should see what was relaxed.
+    owner_alone = OWNER_ALONE and R.is_owner_value(actor.get("role"))
+    if not owner_alone:
+        # 5.5.3 — nobody signs their own request.
+        if card["requested_by"]["uid"] == actor["uid"]:
+            raise CardError("You raised this card. Another owner must sign it.")
 
-    # Separation of duties: the person who verified cannot also sign. This is
-    # what keeps two humans on every movement now that owners may verify.
-    verifier = card.get("verified_by") or {}
-    if verifier.get("uid") == actor["uid"]:
-        raise CardError(
-            "You verified this card. Someone else must sign it."
-        )
+        # Separation of duties: the person who verified cannot also sign.
+        verifier = card.get("verified_by") or {}
+        if verifier.get("uid") == actor["uid"]:
+            raise CardError(
+                "You verified this card. Someone else must sign it."
+            )
 
     # ── Nor the person the money is FOR ──────────────────────────────────────
     #
     # `routers/capital.py` and `services/capital.py` both state that an owner
-    # cannot sign their own capital card. Nothing enforced it. The two checks
-    # above compare the signer against the RAISER and the VERIFIER, and an owner
-    # whose capital card was raised by a finance admin is neither — so owner A
-    # could legally sign the card that pays owner A.
-    #
-    # `subject` is set by every caller that has one (`capital.py` writes
-    # `subject_type="owner"`, `subject_id=<owner uid>`), so this reads as "you
-    # are the subject of this movement" rather than being specific to capital.
-    # A card with no subject is unaffected.
+    # cannot sign their own capital card. The two checks above compare the
+    # signer against the RAISER and the VERIFIER, and an owner whose capital
+    # card was raised by a finance admin is neither — so owner A could legally
+    # sign the card that pays owner A. `subject` is set by every caller that
+    # has one (`capital.py` writes `subject_type="owner"`, `subject_id=<owner
+    # uid>`), so this reads as "you are the subject of this movement" rather
+    # than being specific to capital. A card with no subject is unaffected.
+    # Kept under the owner-alone decision (OWNER_DECISION_PENDING): self-dealing
+    # is not the two-Owner model the decision overrides.
     subject = card.get("subject") or {}
-    if subject.get("id") and subject.get("id") == actor["uid"]:
+    if SELF_SUBJECT_NEEDS_ANOTHER_OWNER and subject.get("id") and subject.get("id") == actor["uid"]:
         raise CardError(
             "This card pays you. Another owner must sign it."
         )
 
     now = datetime.now(timezone.utc)
-    await get_db()[C.CARDS].update_one(
-        {"_id": ObjectId(card_id)},
+    res = await get_db()[C.CARDS].update_one(
+        {"_id": ObjectId(card_id), "stage": str(Stage.AWAITING_SIGNOFF)},
         {
             "$set": {
                 "stage": str(Stage.APPROVED),
                 "signed_by": _who(actor),
                 "signed_at": now,
                 "signature_note": note.strip() or None,
+                "owner_alone": bool(
+                    owner_alone
+                    and (
+                        card["requested_by"]["uid"] == actor["uid"]
+                        or (card.get("verified_by") or {}).get("uid") == actor["uid"]
+                    )
+                ),
                 "updated_at": now,
             }
         },
     )
+    if getattr(res, "matched_count", 1) != 1:
+        latest = await _get(card_id)
+        raise CardError(f"Card is {latest['stage']}. Only verified cards can be signed.")
 
     await audit.record(
         actor=actor,
@@ -360,13 +502,27 @@ async def sign(card_id: str, actor: dict, note: str = "") -> dict:
         before={"stage": str(Stage.AWAITING_SIGNOFF)},
         after={"stage": str(Stage.APPROVED)},
         card_id=card_id,
-        meta={"amount": card["amount"], "currency": card["currency"]},
+        meta={
+            "amount": card["amount"], "currency": card["currency"],
+            "owner_alone": owner_alone,
+            "raised_by_signer": card["requested_by"]["uid"] == actor["uid"],
+            "verified_by_signer": (card.get("verified_by") or {}).get("uid") == actor["uid"],
+        },
     )
-    return await _get(card_id, as_dict=True)
+    signed = await _get(card_id, as_dict=True)
+    signed["owner_notice"] = await _notify_owners(signed, actor, "card_signed")
+    return signed
 
 
 async def reject(card_id: str, actor: dict, reason: str) -> dict:
-    """Reject at any stage before execution. Spec 5.5.5."""
+    """Reject at any stage before execution. Spec 5.5.5 / B-2.
+
+    Who may: before verification, the owning team's admin, Finance or an
+    Owner (the same people who could verify it); once verified or signed,
+    only an Owner. A writing member of another department cannot refuse a
+    card they could never have verified, and nobody below an Owner can undo
+    an Owner's signature.
+    """
     if not reason.strip():
         raise CardError("Rejection requires a reason.")
 
@@ -374,8 +530,7 @@ async def reject(card_id: str, actor: dict, reason: str) -> dict:
     if card["stage"] in (Stage.EXECUTED, Stage.REJECTED):
         raise CardError(f"Card is already {card['stage']}.")
 
-    if card["stage"] == Stage.AWAITING_SIGNOFF and not R.can_sign_money(actor["role"]):
-        raise CardError("Only an owner can reject a card awaiting signature.")
+    _assert_can_reject(card, actor)
 
     # UGP review: once an execution has started (`claim_execution`), money may
     # already have left the live balance — a debit is taken from Firestore
@@ -435,6 +590,10 @@ async def claim_execution(card_id: str, actor: dict) -> None:
     Idempotent: a retry of an interrupted execution finds the card still
     approved and claimed, keeps the first claim, and carries on. Refuses a card
     that is not approved — including one a reject got to first.
+
+    B1 (M-12): every executor now claims — coin purchases, lending, repayments,
+    recoveries, write-offs, commission and sub-agency payouts, expenses and
+    capital, not only withdrawals and balance debits.
     """
     now = datetime.now(timezone.utc)
     oid = ObjectId(card_id)
@@ -467,6 +626,7 @@ async def mark_executed(
             "$set": {
                 "stage": str(stage),
                 "executed_at": now if succeeded else None,
+                "executed_by": _who(actor) if succeeded else None,
                 "execution_result": result,
                 "updated_at": now,
             }
@@ -489,7 +649,134 @@ async def mark_executed(
         card_id=card_id,
         meta=result,
     )
-    return await _get(card_id, as_dict=True)
+    done = await _get(card_id, as_dict=True)
+    if succeeded:
+        done["owner_notice"] = await _notify_owners(done, actor, "card_executed")
+    return done
+
+
+# ── Execution registry, for the owner fast path ───────────────────────────────
+#
+# Execution is type-specific (`partner_ops.execute_coin_purchase`,
+# `users.execute_balance_card`, `expenses.execute_expense`, …) and those modules
+# import this one, so the board cannot import them back. They register instead:
+# one callable per type, `async (card_id, actor, *, payment_ref="") -> dict`.
+
+Executor = Callable[..., Awaitable[dict]]
+EXECUTORS: dict[str, Executor] = {}
+
+
+def register_executor(card_type: CardType | str, fn: Executor) -> None:
+    EXECUTORS[str(card_type)] = fn
+
+
+async def owner_fast_path(
+    card_id: str,
+    actor: dict,
+    *,
+    verification_note: str,
+    signature_note: str = "",
+    execute: bool = False,
+    payment_ref: str = "",
+) -> dict:
+    """§8 — one Owner takes a card from wherever it is to signed (and executed).
+
+    **Every transition still happens, in order, with its own audit entry**:
+    `requested → under_review` (`card.review_started`), `→ awaiting_signoff`
+    (`card.verified`), `→ approved` (`card.signed`) and, when `execute` is
+    asked for and the type has a registered executor, `→ executed`
+    (`card.executed`, written by that executor). Nothing is skipped and
+    nothing is written as one combined step; what this adds is one request
+    and one entry (`card.owner_fast_path`) saying the sequence was run as a
+    whole by one person.
+
+    Each step is conditional on the stage it expects (B-6), so two Owners
+    running this on the same card at once produce one sequence: the loser's
+    first write misses and it is told what the card is now. A step that fails
+    leaves the card exactly at the stage reached — visible on the board — and
+    the error names it.
+
+    Owner only. The other Owners are told by the signature and the execution
+    exactly as they are when the steps are taken one at a time.
+    """
+    if not (OWNER_ALONE and R.is_owner_value(actor.get("role"))):
+        raise CardError("Only a business owner may take a card through every stage alone.")
+    if not str(verification_note or "").strip():
+        raise CardError("Verification requires a note describing what was checked.")
+
+    steps: list[dict] = []
+    card = await _get(card_id)
+    if card["stage"] in (Stage.EXECUTED, Stage.REJECTED, Stage.FAILED):
+        raise CardError(f"Card is already {card['stage']}.")
+
+    if card["stage"] == Stage.REQUESTED:
+        await start_review(card_id, actor)
+        steps.append({"stage": str(Stage.UNDER_REVIEW), "action": audit.Action.CARD_REVIEW_STARTED})
+        card = await _get(card_id)
+    if card["stage"] == Stage.UNDER_REVIEW:
+        await verify(card_id, actor, verification_note)
+        steps.append({"stage": str(Stage.AWAITING_SIGNOFF), "action": audit.Action.CARD_VERIFIED})
+        card = await _get(card_id)
+    if card["stage"] == Stage.AWAITING_SIGNOFF:
+        await sign(card_id, actor, signature_note)
+        steps.append({"stage": str(Stage.APPROVED), "action": audit.Action.CARD_SIGNED})
+        card = await _get(card_id)
+
+    executed: dict | None = None
+    if execute:
+        executor = EXECUTORS.get(str(card.get("type")))
+        if executor is None:
+            raise CardError(
+                f"A {card.get('type')} card is executed from its own route; the fast path "
+                "stopped at the signature. Execute it there."
+            )
+        executed = await executor(card_id, actor, payment_ref=payment_ref)
+        steps.append({"stage": str(Stage.EXECUTED), "action": audit.Action.CARD_EXECUTED})
+
+    await audit.record(
+        actor=actor,
+        action=audit.Action.CARD_OWNER_FAST_PATH,
+        subject_type="card",
+        subject_id=card_id,
+        reason=verification_note.strip(),
+        before={"stage": card["stage"] if not steps else str(steps[0]["stage"])},
+        after={"stage": str(steps[-1]["stage"]) if steps else card["stage"]},
+        card_id=card_id,
+        meta={"steps": [s["action"] for s in steps], "executed": executed is not None,
+              "amount": card.get("amount"), "currency": card.get("currency")},
+    )
+    out = await _get(card_id, as_dict=True)
+    out["fast_path"] = {"steps": steps, "executed": executed}
+    return out
+
+
+# ── Telling the other Owners ──────────────────────────────────────────────────
+
+
+async def _notify_owners(card: dict, actor: dict, action: str) -> dict:
+    """§8: push a card signature / execution to every other active Owner.
+
+    Best effort and LAST: the stage and its audit entry are already committed.
+    `owner_mail` records what it could not deliver and the sweep retries it;
+    nothing here ever raises into the business action.
+    """
+    try:
+        from app.services import owner_mail  # local: keeps the import graph acyclic
+
+        return await owner_mail.notify_other_owners(
+            actor=actor,
+            action=action,
+            reference=str(card.get("id") or card.get("_id") or ""),
+            reference_type="card",
+            amount=card.get("amount"),
+            currency=str(card.get("currency") or ""),
+            title=str(card.get("title") or card.get("type") or "card"),
+            card_type=str(card.get("type") or ""),
+            subject=card.get("subject") or {},
+        )
+    except Exception as exc:  # noqa: BLE001 — the signature stands
+        log.exception("Owner notification for card %s (%s) failed", card.get("id"), action)
+        return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ── Reading the board ─────────────────────────────────────────────────────────
@@ -679,7 +966,8 @@ def partner_view(card: dict, own_ids: set[str], own_uid: str = "") -> dict:
             )
 
     # ── 2. Who did it ────────────────────────────────────────────────────────
-    for field in ("requested_by", "verified_by", "signed_by", "rejected_by"):
+    for field in ("requested_by", "review_started_by", "verified_by", "signed_by",
+                  "rejected_by", "executed_by", "execution_claimed_by"):
         if field in card:
             card[field] = _their_side(card.get(field), own_uid)
 
@@ -687,6 +975,11 @@ def partner_view(card: dict, own_ids: set[str], own_uid: str = "") -> dict:
     for field in ("verification_note", "signature_note"):
         if field in card:
             card[field] = None
+    # The hold marker names the staff member who placed it; a partner is told
+    # that the item is held, not by whom.
+    held = card.get("held")
+    if isinstance(held, dict):
+        card["held"] = {k: v for k, v in held.items() if k not in ("by", "released_by")}
 
     return card
 
@@ -694,19 +987,22 @@ def partner_view(card: dict, own_ids: set[str], own_uid: str = "") -> dict:
 async def awaiting_my_signature(user: dict, limit: int = 200) -> list[dict]:
     """An owner's queue — verified cards they are allowed to sign.
 
-    Excludes their own requests, since they cannot sign those (5.5.3).
+    Under the owner-alone decision an owner's own requests are in it too (they
+    may sign them); with the decision off they are excluded (5.5.3). A card
+    whose subject is the owner is never listed: nobody signs the card that
+    pays them.
     """
     if not R.can_sign_money(user["role"]):
         return []
 
+    q: dict = {"stage": str(Stage.AWAITING_SIGNOFF)}
+    if not OWNER_ALONE:
+        q["requested_by.uid"] = {"$ne": user["uid"]}
+    if SELF_SUBJECT_NEEDS_ANOTHER_OWNER:
+        q["subject.id"] = {"$ne": user["uid"]}
     cursor = (
         get_db()[C.CARDS]
-        .find(
-            {
-                "stage": str(Stage.AWAITING_SIGNOFF),
-                "requested_by.uid": {"$ne": user["uid"]},
-            }
-        )
+        .find(q)
         .sort("created_at", 1)  # oldest first — the queue should drain
         .limit(min(limit, 500))
     )
@@ -721,12 +1017,12 @@ async def waiting_on_me(user: dict) -> dict:
     counts = {"to_verify": 0, "to_sign": 0, "mine_pending": 0}
 
     if R.can_sign_money(role):
-        counts["to_sign"] = await db[C.CARDS].count_documents(
-            {
-                "stage": str(Stage.AWAITING_SIGNOFF),
-                "requested_by.uid": {"$ne": user["uid"]},
-            }
-        )
+        q: dict = {"stage": str(Stage.AWAITING_SIGNOFF)}
+        if not OWNER_ALONE:
+            q["requested_by.uid"] = {"$ne": user["uid"]}
+        if SELF_SUBJECT_NEEDS_ANOTHER_OWNER:
+            q["subject.id"] = {"$ne": user["uid"]}
+        counts["to_sign"] = await db[C.CARDS].count_documents(q)
 
     if R.is_team_admin(role) or role == Role.FINANCE_ADMIN:
         vq: dict = {"stage": {"$in": [str(Stage.REQUESTED), str(Stage.UNDER_REVIEW)]}}
@@ -765,8 +1061,11 @@ def _who(actor: dict) -> dict:
 def _assert_can_verify(card: dict, actor: dict) -> None:
     role: Role = actor["role"]
 
-    # 5.5.1 / 5.5.2 — nobody verifies their own request.
-    if card["requested_by"]["uid"] == actor["uid"]:
+    # 5.5.1 / 5.5.2 — nobody verifies their own request. §8 lifts this for an
+    # Owner and for nobody else: a Finance admin who raised a card still hands
+    # it to another admin.
+    owner_alone = OWNER_ALONE and R.is_owner_value(actor.get("role"))
+    if card["requested_by"]["uid"] == actor["uid"] and not owner_alone:
         raise CardError(
             "You raised this card. Someone else must verify it."
         )
@@ -776,6 +1075,22 @@ def _assert_can_verify(card: dict, actor: dict) -> None:
         raise CardError(
             "Verification is done by the owning team's admin, or by Finance."
         )
+
+
+def _assert_can_reject(card: dict, actor: dict) -> None:
+    """B-2 — who may refuse a card, by stage."""
+    role = actor["role"]
+    if R.can_sign_money(role):
+        return
+    stage = str(card.get("stage") or "")
+    if stage in (str(Stage.REQUESTED), str(Stage.UNDER_REVIEW)):
+        card_team = Team(card["team"]) if card.get("team") else None
+        if R.can_verify_money(role, card_team):
+            return
+        raise CardError(
+            "Only the owning team's admin, Finance or an owner can reject a card."
+        )
+    raise CardError("Only an owner can reject a card that has been verified or signed.")
 
 
 async def _get(card_id: str, as_dict: bool = False) -> dict:
@@ -788,24 +1103,6 @@ async def _get(card_id: str, as_dict: bool = False) -> dict:
     if doc is None:
         raise CardError("Card not found.")
     return _public(doc) if as_dict else doc
-
-
-async def _set_stage(card_id: str, stage: Stage, actor: dict, reason: str) -> dict:
-    now = datetime.now(timezone.utc)
-    await get_db()[C.CARDS].update_one(
-        {"_id": ObjectId(card_id)},
-        {"$set": {"stage": str(stage), "updated_at": now}},
-    )
-    await audit.record(
-        actor=actor,
-        action=audit.Action.CARD_VERIFIED,
-        subject_type="card",
-        subject_id=card_id,
-        reason=reason,
-        after={"stage": str(stage)},
-        card_id=card_id,
-    )
-    return await _get(card_id, as_dict=True)
 
 
 def _public(doc: dict) -> dict:

@@ -292,6 +292,55 @@ class Action:
     LOGIN_FAILED = "login.failed"
     EXPORT = "export"
 
+    # --- auth (B3) ---
+    #: A Firebase-token sign-in that named the Observer — by address, by the
+    #: synthetic uid or by its staff row — and was refused (spec §8: the
+    #: Observer has no Android access; "deny, not just hide navigation").
+    #: Carries the client, the address and the Firebase uid; never a token.
+    AUTH_OBSERVER_DENIED = "auth.observer_denied"
+    #: Every live API session of one person revoked at once by
+    #: `security.revoke_sessions_for_uid` — a restriction, a ban, a role
+    #: revocation, a security reset or "sign out everywhere". `meta` carries
+    #: the counts and what could not be done; the reason is the caller's.
+    SESSIONS_REVOKED = "session.revoked_all"
+
+    # --- moderation/roles (B2) ---
+    #: §5 — a reviewer's written recommendation on a ban / suspension appeal
+    #: (`services/appeals.recommend_appeal`). Not a verdict; the Owner decides.
+    APPEAL_RECOMMENDED = "appeal.recommended"
+    #: §9 — a department lost its last active Admin: its members report to the
+    #: Owner until a replacement is appointed (`services/staff`). One entry per
+    #: vacancy, and one when it closes.
+    DEPARTMENT_VACANCY_OPENED = "department.vacancy_opened"
+    DEPARTMENT_VACANCY_CLOSED = "department.vacancy_closed"
+
+    # --- money (B1) ---
+    #: A card moved into Under Review. Its own action: `card.verified` used to
+    #: be written for both the review start and the verification, so a card's
+    #: history could not say whether the review stage was ever recorded (B-23).
+    CARD_REVIEW_STARTED = "card.review_started"
+    #: One Owner took a card through review → verification → signature (and,
+    #: when asked, execution) in one request. Each stage still writes its own
+    #: entry; this one records that the sequence was run as the fast path.
+    CARD_OWNER_FAST_PATH = "card.owner_fast_path"
+    #: The other active Owners were told (in-app and by email) that an Owner or
+    #: Finance moved money: card signed/executed, recharge approved, refund
+    #: decided, frozen money decided. `meta.event_key` is the deterministic key.
+    OWNER_NOTIFIED = "owner_money.notified"
+    #: The notification above could not be completed for every Owner. The
+    #: business action stands; the notice is kept retryable (`owner_notices`).
+    OWNER_NOTICE_FAILED = "owner_money.notice_failed"
+    #: A Firestore balance replica that fell behind Mongo (`replica_stale`) was
+    #: brought back by replaying the pending deltas, keyed on their ledger ids.
+    REPLICA_REPAIRED = "replica.repaired"
+    REPLICA_REPAIR_FAILED = "replica.repair_failed"
+    #: A pending card / recharge / sale of a partner whose role was revoked was
+    #: put on hold for Finance/Owner review — nothing approved, cancelled or
+    #: executed by the machine.
+    MONEY_ITEM_HELD = "money.item_held"
+    #: Finance or an Owner lifted that hold so the item can be decided.
+    MONEY_ITEM_RELEASED = "money.item_released"
+
 
 def _entry(
     *,

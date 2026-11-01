@@ -26,7 +26,7 @@ import asyncio
 import logging
 import secrets
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 from firebase_admin import auth as fb_auth
@@ -157,8 +157,16 @@ class Act:
 
 class SaleStatus:
     PENDING = "pending"
+    #: M-11: claimed by an approval in flight (compare-and-set from `pending`
+    #: or `failed`); re-taken after `SALE_STALE_CLAIM` if the process died.
+    APPROVING = "approving"
     APPROVED = "approved"
+    #: Debited, not credited. Resumable — approving again continues.
     FAILED = "failed"
+
+
+#: A sale left `approving` longer than this belongs to a process that died.
+SALE_STALE_CLAIM = timedelta(minutes=10)
 
 
 class PayoutStatus:
@@ -323,6 +331,96 @@ async def _move(m: Movement) -> dict:
         "balance_after": result.balance_after,
         "replica_synced": result.replica_synced,
     }
+
+
+async def _move_once(m: Movement) -> tuple[dict, bool]:
+    """A card's movement, or the record of it if it already happened (B-5).
+
+    Every executor keys its ledger row on the card, so a replayed execution —
+    a double click, a retry after a timeout, a second worker — finds the row
+    already there. That used to be treated as a failure: the card was marked
+    FAILED over money that had moved, could never be executed again, and
+    invited a fresh (double) card. Now it is what it is: already applied. The
+    stored row's figures come back and the caller closes the card as
+    executed. `(movement, already_applied)`.
+    """
+    try:
+        return await _move(m), False
+    except PartnerOpsError as exc:
+        if not isinstance(exc.__cause__, DuplicateMovement) or not m.idempotency_key:
+            raise
+        row = await get_db()[C.LEDGER].find_one({"idempotency_key": m.idempotency_key}) or {}
+        return {
+            "ledger_id": str(row.get("_id") or ""),
+            "balance_before": int(row.get("balance_before") or 0),
+            "balance_after": int(row.get("balance_after") or 0),
+            "replica_synced": True,
+            "already_applied": True,
+        }, True
+
+
+async def _claim(card_id: str, actor: dict) -> None:
+    """M-12: every executor claims the card before its first write."""
+    try:
+        await card_svc.claim_execution(card_id, actor)
+    except CardError as exc:
+        raise PartnerOpsError(str(exc)) from exc
+
+
+def _already_recorded(partner: dict, card_id: str) -> dict | None:
+    """The `credit.history` entry this card already wrote, if any.
+
+    An execution that crashed between the partner-record update and closing
+    the card is run again; the entry is the proof the update landed, so the
+    retry closes the card instead of applying the figure twice (M-12)."""
+    for entry in ((partner.get("credit") or {}).get("history") or []):
+        if isinstance(entry, dict) and str(entry.get("card_id") or "") == str(card_id):
+            return entry
+    return None
+
+
+#: How many times a conditional credit update is re-read and retried when a
+#: concurrent executor moved the figure under it.
+_CREDIT_CAS_ATTEMPTS = 5
+
+
+async def _update_credit_conditionally(
+    seller_id: str, card_id: str, compute, *, kind: PartnerKind | None = PartnerKind.SELLER,
+) -> tuple[dict, dict]:
+    """Apply a change to `credit.outstanding` only if it is still what was read.
+
+    `compute(partner) -> (update_doc, result)` builds the update from the
+    outstanding figure it read; the write carries that figure in its filter,
+    so a lending executing concurrently with a repayment cannot overwrite the
+    other's figure — the loser re-reads and recomputes (M-12). A card whose
+    entry is already in `credit.history` is not applied again.
+
+    Returns `(partner_after, result)`; `result["replayed"]` is True when the
+    entry already existed.
+    """
+    for _attempt in range(_CREDIT_CAS_ATTEMPTS):
+        partner = await _partner(seller_id, kind)
+        prior = _already_recorded(partner, card_id)
+        if prior is not None:
+            return partner, {"replayed": True, "entry": prior}
+        outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
+        update, result = compute(partner)
+        filt: dict = {"_id": seller_id}
+        if (partner.get("credit") or {}).get("outstanding") is not None:
+            # The figure read is in the filter: a concurrent executor that
+            # moved it makes this write miss. A record with no credit figure
+            # yet (its first lending) has nothing to compare; the ledger key
+            # and the history guard above still make that case idempotent.
+            filt["credit.outstanding"] = outstanding
+        updated = await get_db()[C.PARTNERS].find_one_and_update(
+            filt, update, return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            return updated, {**result, "replayed": False}
+    raise PartnerOpsError(
+        "This seller's credit figure kept changing while the card was being executed. "
+        "Nothing was applied — execute it again."
+    )
 
 
 # ── Firestore replica ─────────────────────────────────────────────────────────
@@ -4685,6 +4783,18 @@ async def revoke_partner(
         partner, destination, reason, actor, now, planned=(live_subs, hosts, destination)
     )
 
+    # Spec §5 "Revoke Coin Seller": pending cards/requests go to Finance/Owner
+    # review; nothing is approved, cancelled or executed. The freeze above
+    # already put them on the held list (cause `role_revoked`); the hook is
+    # idempotent and reports the ids so the audit entry names what is waiting.
+    held_queue: dict | None = None
+    if kind == str(PartnerKind.SELLER):
+        from app.services import revocation_hooks  # local: the hook file imports nothing of ours at import time
+
+        held_queue = await revocation_hooks.hold_pending_money_for_revoked_seller(
+            partner_id, reason=reason, actor=actor,
+        )
+
     await audit.record(
         actor=actor,
         action=audit.Action.PARTNER_REVOKED,
@@ -4693,7 +4803,8 @@ async def revoke_partner(
         reason=reason,
         before=before,
         after={"status": str(PartnerStatus.REVOKED), "is_active": False},
-        meta={"kind": kind, "dependents_moved": moved, "role_family_kept": True},
+        meta={"kind": kind, "dependents_moved": moved, "role_family_kept": True,
+              **({"held_queue": held_queue} if held_queue is not None else {})},
     )
 
     # ── The slot is KEPT (C1 / B04) ─────────────────────────────────────────
@@ -5379,8 +5490,9 @@ async def execute_coin_purchase(card_id: str, actor: dict) -> dict:
     coins = int(card.get("amount", 0))
     paid = int(payload.get("amount_paid_minor", 0))
 
+    await _claim(card_id, actor)
     try:
-        movement = await _move(
+        movement, replayed = await _move_once(
             Movement(
                 holder_type=HolderType.SELLER,
                 holder_id=seller_id,
@@ -5402,7 +5514,7 @@ async def execute_coin_purchase(card_id: str, actor: dict) -> dict:
         await _finish(card_id, actor, {"error": str(exc)}, False)
         raise
 
-    if paid:
+    if paid and not replayed:
         await get_db()[C.PARTNERS].update_one(
             {"_id": seller_id},
             {
@@ -5475,8 +5587,9 @@ async def execute_lending(card_id: str, actor: dict) -> dict:
     coins = int(card.get("amount", 0))
     due_at = payload.get("due_at")
 
+    await _claim(card_id, actor)
     try:
-        movement = await _move(
+        movement, _replayed = await _move_once(
             Movement(
                 holder_type=HolderType.SELLER,
                 holder_id=seller_id,
@@ -5495,29 +5608,33 @@ async def execute_lending(card_id: str, actor: dict) -> dict:
         raise
 
     now = _now()
-    updated = await get_db()[C.PARTNERS].find_one_and_update(
-        {"_id": seller_id},
-        {
-            "$inc": {"credit.outstanding": coins, "credit.total_lent": coins},
-            "$set": {
-                "credit.due_at": due_at,
-                "credit.terms": payload.get("terms", ""),
-                "credit.last_issued_at": now,
-                "updated_at": now,
+
+    def _compute(partner: dict) -> tuple[dict, dict]:
+        before = int((partner.get("credit") or {}).get("outstanding", 0))
+        return (
+            {
+                "$inc": {"credit.outstanding": coins, "credit.total_lent": coins},
+                "$set": {
+                    "credit.due_at": due_at,
+                    "credit.terms": payload.get("terms", ""),
+                    "credit.last_issued_at": now,
+                    "updated_at": now,
+                },
+                "$push": {
+                    "credit.history": {
+                        "at": now,
+                        "event": "issued",
+                        "coins": coins,
+                        "due_at": due_at,
+                        "card_id": card_id,
+                        "by": _who(actor),
+                    }
+                },
             },
-            "$push": {
-                "credit.history": {
-                    "at": now,
-                    "event": "issued",
-                    "coins": coins,
-                    "due_at": due_at,
-                    "card_id": card_id,
-                    "by": _who(actor),
-                }
-            },
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+            {"outstanding_before": before},
+        )
+
+    updated, applied = await _update_credit_conditionally(seller_id, card_id, _compute)
     outstanding = int(((updated or {}).get("credit") or {}).get("outstanding", coins))
 
     return await _finish(
@@ -5527,6 +5644,7 @@ async def execute_lending(card_id: str, actor: dict) -> dict:
             "coins_lent": coins,
             "due_at": due_at,
             "outstanding_after": outstanding,
+            "debt_recorded": "replayed" if applied.get("replayed") else "recorded",
             **movement,
         },
         True,
@@ -5596,49 +5714,58 @@ async def execute_repayment(card_id: str, actor: dict) -> dict:
     seller_id = (card.get("subject") or {}).get("id", "")
     coins = int(card.get("amount", 0))
 
-    partner = await _partner(seller_id, PartnerKind.SELLER)
-    outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
-    applied = min(coins, outstanding)
-    remaining = outstanding - applied
-
+    await _claim(card_id, actor)
     now = _now()
-    update: dict = {
-        "$set": {
-            "credit.outstanding": remaining,
-            "credit.last_repaid_at": now,
-            "updated_at": now,
-        },
-        "$inc": {"credit.total_repaid": applied},
-        "$push": {
-            "credit.history": {
-                "at": now,
-                "event": "repaid",
-                "coins": applied,
-                "card_id": card_id,
-                "by": _who(actor),
-            }
-        },
-    }
-    if remaining == 0:
-        # Debt closed — the due date no longer applies, and the seller is
-        # unblocked for new inventory.
-        update["$set"]["credit.due_at"] = None
-    await get_db()[C.PARTNERS].update_one({"_id": seller_id}, update)
 
-    await audit.record(
-        actor=actor,
-        action=audit.Action.LENDING_REPAY,
-        subject_type="partner",
-        subject_id=seller_id,
-        reason=card.get("reason", "Credit repaid"),
-        before={"outstanding": outstanding},
-        after={"outstanding": remaining},
-        card_id=card_id,
-        meta={
-            "coins": applied,
-            "payment_ref": (card.get("payload") or {}).get("payment_ref"),
-        },
-    )
+    def _compute(partner: dict) -> tuple[dict, dict]:
+        outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
+        applied = min(coins, outstanding)
+        remaining = outstanding - applied
+        update: dict = {
+            # M-12: `$inc`, never a `$set` of a figure computed from a stale
+            # read — and the filter carries the figure that was read.
+            "$inc": {"credit.outstanding": -applied, "credit.total_repaid": applied},
+            "$set": {"credit.last_repaid_at": now, "updated_at": now},
+            "$push": {
+                "credit.history": {
+                    "at": now,
+                    "event": "repaid",
+                    "coins": applied,
+                    "card_id": card_id,
+                    "by": _who(actor),
+                }
+            },
+        }
+        if remaining == 0:
+            # Debt closed — the due date no longer applies, and the seller is
+            # unblocked for new inventory.
+            update["$set"]["credit.due_at"] = None
+        return update, {"outstanding_before": outstanding, "applied": applied, "remaining": remaining}
+
+    _updated, result = await _update_credit_conditionally(seller_id, card_id, _compute)
+    if result.get("replayed"):
+        entry = result["entry"]
+        applied = int(entry.get("coins") or 0)
+        partner = await _partner(seller_id, PartnerKind.SELLER)
+        remaining = int((partner.get("credit") or {}).get("outstanding", 0))
+        outstanding = remaining + applied
+    else:
+        outstanding, applied, remaining = result["outstanding_before"], result["applied"], result["remaining"]
+        await audit.record(
+            actor=actor,
+            action=audit.Action.LENDING_REPAY,
+            subject_type="partner",
+            subject_id=seller_id,
+            reason=card.get("reason", "Credit repaid"),
+            before={"outstanding": outstanding},
+            after={"outstanding": remaining},
+            card_id=card_id,
+            meta={
+                "coins": applied,
+                "payment_ref": (card.get("payload") or {}).get("payment_ref"),
+                "idempotency_key": f"card:{card_id}:repay",
+            },
+        )
 
     return await _finish(
         card_id,
@@ -5648,6 +5775,7 @@ async def execute_repayment(card_id: str, actor: dict) -> dict:
             "outstanding_before": outstanding,
             "outstanding_after": remaining,
             "cleared": remaining == 0,
+            "replayed": bool(result.get("replayed")),
         },
         True,
     )
@@ -5719,15 +5847,29 @@ async def execute_recovery(card_id: str, actor: dict) -> dict:
     penalty = int(payload.get("penalty_coins", 0))
     target = int(card.get("amount", 0))
 
+    await _claim(card_id, actor)
     partner = await _partner(seller_id, PartnerKind.SELLER)
     outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
-    balance = await get_balance(HolderType.SELLER, seller_id, Currency.COINS)
-    recovered = max(0, min(balance, target))
+
+    # A replay of an interrupted execution: the debit is keyed on the card and
+    # the record entry names it, so what was recovered the first time is what
+    # is recovered — never a second slice of whatever the balance holds now.
+    prior_entry = _already_recorded(partner, card_id)
+    prior_row = await get_db()[C.LEDGER].find_one({"idempotency_key": f"card:{card_id}:recover"})
+    if prior_row is not None:
+        recovered = abs(int(prior_row.get("amount") or 0))
+        balance = int(prior_row.get("balance_before") or 0)
+    elif prior_entry is not None:
+        recovered = int(prior_entry.get("coins") or 0)
+        balance = await get_balance(HolderType.SELLER, seller_id, Currency.COINS)
+    else:
+        balance = await get_balance(HolderType.SELLER, seller_id, Currency.COINS)
+        recovered = max(0, min(balance, target))
 
     movement: dict = {"ledger_id": None, "balance_before": balance, "balance_after": balance}
     if recovered > 0:
         try:
-            movement = await _move(
+            movement, _replayed = await _move_once(
                 Movement(
                     holder_type=HolderType.SELLER,
                     holder_id=seller_id,
@@ -5745,36 +5887,41 @@ async def execute_recovery(card_id: str, actor: dict) -> dict:
             await _finish(card_id, actor, {"error": str(exc)}, False)
             raise
 
-    # The penalty is added to the debt, then everything recovered comes off it.
-    remaining = max(0, outstanding + penalty - recovered)
     shortfall = max(0, target - recovered)
-
     now = _now()
-    await get_db()[C.PARTNERS].update_one(
-        {"_id": seller_id},
-        {
-            "$set": {
-                "credit.outstanding": remaining,
-                "credit.last_recovered_at": now,
-                "updated_at": now,
+
+    def _compute(current: dict) -> tuple[dict, dict]:
+        before = int((current.get("credit") or {}).get("outstanding", 0))
+        # The penalty is added to the debt, then everything recovered comes
+        # off it — as an increment on the figure read, never a `$set`.
+        remaining = max(0, before + penalty - recovered)
+        return (
+            {
+                "$inc": {
+                    "credit.outstanding": remaining - before,
+                    "credit.total_recovered": recovered,
+                    "credit.total_penalty": penalty,
+                },
+                "$set": {"credit.last_recovered_at": now, "updated_at": now},
+                "$push": {
+                    "credit.history": {
+                        "at": now,
+                        "event": "recovered",
+                        "coins": recovered,
+                        "penalty_coins": penalty,
+                        "shortfall": shortfall,
+                        "card_id": card_id,
+                        "by": _who(actor),
+                    }
+                },
             },
-            "$inc": {
-                "credit.total_recovered": recovered,
-                "credit.total_penalty": penalty,
-            },
-            "$push": {
-                "credit.history": {
-                    "at": now,
-                    "event": "recovered",
-                    "coins": recovered,
-                    "penalty_coins": penalty,
-                    "shortfall": shortfall,
-                    "card_id": card_id,
-                    "by": _who(actor),
-                }
-            },
-        },
-    )
+            {"outstanding_before": before, "remaining": remaining},
+        )
+
+    updated, applied = await _update_credit_conditionally(seller_id, card_id, _compute)
+    remaining = int(((updated or {}).get("credit") or {}).get("outstanding", 0))
+    if not applied.get("replayed"):
+        outstanding = applied["outstanding_before"]
 
     result = {
         "target": target,
@@ -5783,6 +5930,7 @@ async def execute_recovery(card_id: str, actor: dict) -> dict:
         "penalty_coins": penalty,
         "outstanding_before": outstanding,
         "outstanding_after": remaining,
+        "replayed": bool(applied.get("replayed")),
         "note": (
             f"Balance covered {recovered:,} of {target:,}. "
             f"{shortfall:,} remains an open receivable against this seller."
@@ -5840,44 +5988,50 @@ async def execute_write_off(card_id: str, actor: dict) -> dict:
     partner_id = (card.get("subject") or {}).get("id", "")
     coins = int(card.get("amount", 0))
 
-    partner = await _partner(partner_id)
-    outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
-    written = min(coins, outstanding)
-    remaining = outstanding - written
-
+    await _claim(card_id, actor)
     now = _now()
-    await get_db()[C.PARTNERS].update_one(
-        {"_id": partner_id},
-        {
-            "$set": {
-                "credit.outstanding": remaining,
-                "credit.written_off_at": now,
-                "updated_at": now,
-            },
-            "$inc": {"credit.total_written_off": written},
-            "$push": {
-                "credit.history": {
-                    "at": now,
-                    "event": "written_off",
-                    "coins": written,
-                    "card_id": card_id,
-                    "by": _who(actor),
-                }
-            },
-        },
-    )
 
-    await audit.record(
-        actor=actor,
-        action=audit.Action.LENDING_WRITE_OFF,
-        subject_type="partner",
-        subject_id=partner_id,
-        reason=card.get("reason", "Bad debt written off"),
-        before={"outstanding": outstanding},
-        after={"outstanding": remaining},
-        card_id=card_id,
-        meta={"coins": written, "is_loss": True, "loss_coins": written},
-    )
+    def _compute(partner: dict) -> tuple[dict, dict]:
+        outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
+        written = min(coins, outstanding)
+        remaining = outstanding - written
+        return (
+            {
+                "$inc": {"credit.outstanding": -written, "credit.total_written_off": written},
+                "$set": {"credit.written_off_at": now, "updated_at": now},
+                "$push": {
+                    "credit.history": {
+                        "at": now,
+                        "event": "written_off",
+                        "coins": written,
+                        "card_id": card_id,
+                        "by": _who(actor),
+                    }
+                },
+            },
+            {"outstanding_before": outstanding, "written": written, "remaining": remaining},
+        )
+
+    _updated, result = await _update_credit_conditionally(partner_id, card_id, _compute, kind=None)
+    if result.get("replayed"):
+        written = int(result["entry"].get("coins") or 0)
+        partner = await _partner(partner_id)
+        remaining = int((partner.get("credit") or {}).get("outstanding", 0))
+        outstanding = remaining + written
+    else:
+        outstanding, written, remaining = result["outstanding_before"], result["written"], result["remaining"]
+        await audit.record(
+            actor=actor,
+            action=audit.Action.LENDING_WRITE_OFF,
+            subject_type="partner",
+            subject_id=partner_id,
+            reason=card.get("reason", "Bad debt written off"),
+            before={"outstanding": outstanding},
+            after={"outstanding": remaining},
+            card_id=card_id,
+            meta={"coins": written, "is_loss": True, "loss_coins": written,
+                  "idempotency_key": f"card:{card_id}:write_off"},
+        )
 
     return await _finish(
         card_id,
@@ -5887,6 +6041,7 @@ async def execute_write_off(card_id: str, actor: dict) -> dict:
             "outstanding_before": outstanding,
             "outstanding_after": remaining,
             "is_loss": True,
+            "replayed": bool(result.get("replayed")),
         },
         True,
     )
@@ -5905,7 +6060,14 @@ async def record_sale(
     actor: dict,
     reason: str = "",
 ) -> dict:
-    """File a sale. Nothing moves until it is approved. Spec 4.3.8."""
+    """File a sale. Nothing moves until it is approved. Spec 4.3.8.
+
+    M-11: the buyer must EXIST — a `users/{uid}` document the credit can land
+    on. The credit is a `set(merge, Increment)`, which would otherwise mint an
+    orphan document and destroy the seller's inventory into a non-account. A
+    Firestore that cannot be read refuses the filing (retry), which is a
+    different answer from "no such user" (final).
+    """
     diamonds = _positive(diamonds, "Diamonds")
     amount_paid_minor = _non_negative(amount_paid_minor, "Amount paid")
     buyer = (buyer_uid or "").strip()
@@ -5917,6 +6079,24 @@ async def record_sale(
         )
 
     seller = await _approved_partner(seller_id, PartnerKind.SELLER)
+    if buyer == str(seller.get("owner_crm_uid") or ""):
+        raise PartnerOpsError(
+            "Buyer and seller are the same account. A genuine sale has a distinct buyer."
+        )
+
+    try:
+        wallet = await asyncio.to_thread(firebase.read_host_wallet, buyer)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Firestore user lookup failed for sale buyer %s", buyer)
+        raise PartnerOpsError(
+            f"The buyer '{buyer}' could not be read from Firestore, so the sale was not "
+            "filed. Try again once Firestore is reachable."
+        ) from exc
+    if wallet is None:
+        raise PartnerOpsError(
+            f"No app account with uid '{buyer}'. A sale credits a buyer's own wallet, so it "
+            "cannot be filed against an account that does not exist."
+        )
 
     now = _now()
     text = _reason(
@@ -5924,7 +6104,9 @@ async def record_sale(
     )
     doc = {
         "seller_id": seller_id,
+        "seller_name": str(seller.get("name") or ""),
         "buyer_uid": buyer,
+        "buyer_name": str(wallet.get("name") or ""),
         "diamonds": diamonds,
         "amount_paid_minor": amount_paid_minor,
         "status": SaleStatus.PENDING,
@@ -5991,25 +6173,66 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
     except money_freeze.MoneyFrozen as exc:
         raise MoneyFrozenError(str(exc)) from exc
 
+    # M-11 — CLAIM THE DECISION (compare-and-set on the status). `pending` and
+    # `failed` (debited, not credited) both move to `approving`; a live
+    # `approving` claim refuses, a stale one (a process that died mid-step) is
+    # re-taken. Every money step behind the claim is idempotent on the sale,
+    # so resuming finishes the job rather than repeating it.
+    now = _now()
+    claimed = await db[SALES].find_one_and_update(
+        {"_id": oid, "status": {"$in": [SaleStatus.PENDING, SaleStatus.FAILED]}},
+        {"$set": {"status": SaleStatus.APPROVING, "claimed_at": now, "updated_at": now}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if claimed is None:
+        claimed = await db[SALES].find_one_and_update(
+            {"_id": oid, "status": SaleStatus.APPROVING, "claimed_at": {"$lt": now - SALE_STALE_CLAIM}},
+            {"$set": {"claimed_at": now, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+    if claimed is None:
+        fresh = await db[SALES].find_one({"_id": oid}) or sale
+        raise PartnerOpsError(
+            f"This sale is {fresh.get('status')} — it is being approved by another request, "
+            "or was already decided. Nothing was moved twice."
+        )
+
+    async def _back_to(status: str, failure: str | None = None) -> None:
+        patch: dict = {"status": status, "updated_at": _now()}
+        if failure is not None:
+            patch["failure"] = failure
+        await db[SALES].update_one({"_id": oid, "status": SaleStatus.APPROVING}, {"$set": patch})
+
     # 1. Seller's inventory comes down first. If it is short, this raises and
     #    the sale stays pending — nothing was credited, so nothing to unwind.
-    debit = await _move(
-        Movement(
-            holder_type=HolderType.SELLER,
-            holder_id=seller_id,
-            currency=Currency.COINS,
-            amount=-diamonds,
-            action=audit.Action.INVENTORY_DEBIT,
-            reason=reason,
-            actor=actor,
-            idempotency_key=f"sale:{sale_id}:coins",
-            meta={"sale_id": sale_id, "buyer_uid": buyer_uid},
-        )
-    )
-
-    # 2. Only now does the buyer receive anything.
+    #    A debit that already landed (this sale resumed) is "continue", not a
+    #    failure: the ledger row is keyed on the sale.
     try:
-        credit = await _move(
+        debit, _debit_replayed = await _move_once(
+            Movement(
+                holder_type=HolderType.SELLER,
+                holder_id=seller_id,
+                currency=Currency.COINS,
+                amount=-diamonds,
+                action=audit.Action.INVENTORY_DEBIT,
+                reason=reason,
+                actor=actor,
+                idempotency_key=f"sale:{sale_id}:coins",
+                meta={"sale_id": sale_id, "buyer_uid": buyer_uid},
+            )
+        )
+    except PartnerOpsError:
+        await _back_to(str(sale.get("status") or SaleStatus.PENDING))
+        raise
+    except Exception:
+        await _back_to(str(sale.get("status") or SaleStatus.PENDING))
+        raise
+
+    # 2. Only now does the buyer receive anything — with the app-visible
+    #    history row (`diamondTransactions/sale_{id}`) written beside the
+    #    balance delta, so the buyer's history explains the credit (M-11/M-18).
+    try:
+        credit, _credit_replayed = await _move_once(
             Movement(
                 holder_type=HolderType.USER,
                 holder_id=buyer_uid,
@@ -6020,21 +6243,21 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
                 actor=actor,
                 idempotency_key=f"sale:{sale_id}:diamonds",
                 meta={"sale_id": sale_id, "seller_id": seller_id},
+                history={
+                    "id": f"sale_{sale_id}",
+                    "reason": f"Diamonds bought from {sale.get('seller_name') or seller_id} — verified by Zipper",
+                    "reasonLabel": "Diamond purchase",
+                    "saleId": sale_id,
+                    "sellerId": seller_id,
+                    "context": "sale",
+                },
             )
         )
-    except PartnerOpsError as exc:
+    except Exception as exc:  # noqa: BLE001
         # The seller has been debited and the buyer has not been credited. Mark
-        # the sale failed and shout — this needs a human, not a silent retry.
-        await db[SALES].update_one(
-            {"_id": oid},
-            {
-                "$set": {
-                    "status": SaleStatus.FAILED,
-                    "failure": str(exc),
-                    "updated_at": _now(),
-                }
-            },
-        )
+        # the sale failed and shout. It is RESUMABLE: approving it again finds
+        # the debit already applied and continues with the credit (M-11).
+        await _back_to(SaleStatus.FAILED, failure=str(exc))
         log.error(
             "Sale %s debited seller %s but could not credit buyer %s: %s",
             sale_id,
@@ -6044,12 +6267,13 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
         )
         raise PartnerOpsError(
             f"The seller was debited but the buyer could not be credited ({exc}). "
-            "The sale is marked failed and needs a manual correction card."
+            "The sale is marked failed; approve it again to finish the credit — "
+            "the seller is not debited twice."
         ) from exc
 
     now = _now()
     updated_sale = await db[SALES].find_one_and_update(
-        {"_id": oid},
+        {"_id": oid, "status": SaleStatus.APPROVING},
         {
             "$set": {
                 "status": SaleStatus.APPROVED,
@@ -6061,6 +6285,11 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
         },
         return_document=ReturnDocument.AFTER,
     )
+    if updated_sale is None:
+        fresh = await db[SALES].find_one({"_id": oid}) or {}
+        raise PartnerOpsError(
+            f"This sale was decided by another request ({fresh.get('status')}). Nothing was moved twice."
+        )
 
     # 3. Lifetime sold, on the record and on the document the CRM reads.
     partner = await db[C.PARTNERS].find_one_and_update(
@@ -6101,6 +6330,20 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
     out["buyer_diamonds_after"] = credit["balance_after"]
     out["total_coins_sold"] = total_sold
     out["replica_synced"] = synced
+    out["resumed"] = str(sale.get("status") or "") == SaleStatus.FAILED
+    # §8: one Owner's click minted diamonds — the other Owners are told.
+    try:
+        from app.services import owner_mail  # local: keeps the import graph acyclic
+
+        out["owner_notice"] = await owner_mail.notify_other_owners(
+            actor=actor, action="sale_approved", reference=sale_id, reference_type="sale",
+            amount=diamonds, currency=str(Currency.DIAMONDS),
+            title=f"Sale by {sale.get('seller_name') or seller_id} to {buyer_uid}",
+            subject={"type": "seller", "id": str(seller_id)}, reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Owner notification for sale %s failed", sale_id)
+        out["owner_notice"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
     return out
 
 
@@ -6177,8 +6420,9 @@ async def execute_commission_payout(
     agency_id = (card.get("subject") or {}).get("id", "")
     amount_minor = int(card.get("amount", 0))
 
+    await _claim(card_id, actor)
     try:
-        movement = await _move(
+        movement, _replayed = await _move_once(
             Movement(
                 holder_type=HolderType.AGENCY,
                 holder_id=agency_id,
@@ -6255,6 +6499,41 @@ async def accrue_commission(
     total_minor = int(computed["commission_minor"])
     lines = [h for h in computed["hosts"] if h["share_minor"] > 0]
 
+    # B-22: a provisional slab table or bean rate (the live economy document
+    # could not be read, a documented fallback was used) is refused on the
+    # human path exactly as on the unattended one. `commission.py` itself
+    # says a provisional figure "must not be paid without confirming the live
+    # configuration"; a person looking at the preview sees the warning, and a
+    # person who still wants the figure accrued confirms appConfig/economy
+    # first. A liability created from a guess is a liability either way.
+    if computed.get("provisional"):
+        why = " ".join(computed.get("warnings") or []) or "The live economy configuration could not be read."
+        raise PartnerOpsError(
+            f"Commission for {computed['agency_name'] or agency_id} in {span} was NOT accrued: the "
+            f"figure is provisional. {why} Confirm appConfig/economy and try again — a liability is "
+            "never created from a fallback table."
+        )
+
+    # M-6 / B-7: the identity of an accrual is its WINDOW, not its label.
+    # `2026-W40` and `2026-10`, or any label with an explicit since/until, over
+    # the same cash-outs must not accrue twice. Two guards:
+    #   * the ledger key carries the window (`commission:{agency}:{host}:{window}`),
+    #     so the same window under any label is one movement per host;
+    #   * a window that OVERLAPS one already accrued for this agency without
+    #     being identical is refused outright — a month after its weeks, a week
+    #     inside an accrued month, a shifted explicit range.
+    window = commission_window_label(computed["since"], computed["until"])
+    overlapping = await _overlapping_accruals(agency_id, computed["since"], computed["until"])
+    clash = [o for o in overlapping if o.get("window") != window]
+    if clash:
+        first = clash[0]
+        raise PartnerOpsError(
+            f"The period {span} ({window}) overlaps commission already accrued for "
+            f"{computed['agency_name'] or agency_id} — {first.get('period') or '?'} "
+            f"({first.get('window') or '?'}, {len(clash)} ledger row(s)). The same cash-outs "
+            "cannot be billed twice. Nothing was credited."
+        )
+
     if host:
         lines = [h for h in lines if h["host_id"] == host]
         if not lines:
@@ -6293,6 +6572,13 @@ async def accrue_commission(
     credited_minor = 0
     for line in lines:
         share = int(line["share_minor"])
+        # The key every accrual before M-6 wrote — the label. Probed so that a
+        # period accrued under the old key is recognised as done rather than
+        # accrued again under the window key.
+        legacy_key = f"commission:{agency_id}:{line['host_id']}:{span}"
+        if await get_db()[C.LEDGER].find_one({"idempotency_key": legacy_key}) is not None:
+            already.append({"host_id": line["host_id"], "amount_minor": share, "key": legacy_key})
+            continue
         movement = Movement(
             holder_type=HolderType.AGENCY,
             holder_id=agency_id,
@@ -6301,10 +6587,11 @@ async def accrue_commission(
             action=audit.Action.COMMISSION_ACCRUE,
             reason=text,
             actor=actor,
-            idempotency_key=f"commission:{agency_id}:{line['host_id']}:{span}",
+            idempotency_key=f"commission:{agency_id}:{line['host_id']}:{window}",
             meta={
                 "host_id": line["host_id"],
                 "period": span,
+                "window": window,
                 "agency_id": agency_id,
                 # The whole derivation travels with the movement, so the
                 # statement can explain this line without recomputing it.
@@ -6314,7 +6601,7 @@ async def accrue_commission(
         try:
             result = await apply_movement(movement)
         except DuplicateMovement:
-            # This host's leg of this period was accrued by an earlier run.
+            # This host's leg of this window was accrued by an earlier run.
             # Re-running a period is a no-op per host, not a failure — the
             # hosts that have not been accrued yet must still go through.
             already.append(
@@ -6361,6 +6648,7 @@ async def accrue_commission(
             "agency_id": agency_id,
             "agency_kind": computed["agency_kind"],
             "period": span,
+            "window": window,
             "since": computed["since"],
             "until": computed["until"],
             "billing_minor": computed["billing"]["billing_minor"],
@@ -6392,6 +6680,7 @@ async def accrue_commission(
         "agency_name": computed["agency_name"],
         "agency_kind": computed["agency_kind"],
         "period": span,
+        "window": window,
         "since": computed["since"],
         "until": computed["until"],
         # `amount_minor` is what this period is worth, and keeps the name
@@ -6413,6 +6702,51 @@ async def accrue_commission(
         "provisional": computed["provisional"],
         "computed_by": "server, from the ledger — the caller supplied the period only",
     }
+
+
+def commission_window_label(since: datetime, until: datetime) -> str:
+    """The window as it appears in an accrual's idempotency key (M-6).
+
+    Minute precision in UTC: `2026-09-28T00:00..2026-10-05T00:00`. Two labels
+    that resolve to the same half-open window produce the same key."""
+    def _fmt(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+    return f"{_fmt(since)}..{_fmt(until)}"
+
+
+async def _overlapping_accruals(agency_id: str, since: datetime, until: datetime) -> list[dict]:
+    """Earlier accruals of this agency whose window intersects `[since, until)`.
+
+    Read from the ledger itself, not a registry: every accrual row carries its
+    window in `meta.commission_breakdown.since/until` (rows written before
+    M-6 included), so an accrual made under the label key is seen too.
+    """
+    cursor = get_db()[C.LEDGER].find({
+        "holder_type": str(HolderType.AGENCY),
+        "holder_id": agency_id,
+        "currency": str(Currency.COMMISSION),
+        "action": audit.Action.COMMISSION_ACCRUE,
+        "meta.commission_breakdown.since": {"$lt": until},
+        "meta.commission_breakdown.until": {"$gt": since},
+    })
+    out: list[dict] = []
+    async for row in cursor:
+        meta = row.get("meta") or {}
+        breakdown = meta.get("commission_breakdown") or {}
+        row_since, row_until = breakdown.get("since"), breakdown.get("until")
+        if not isinstance(row_since, datetime) or not isinstance(row_until, datetime):
+            continue
+        out.append({
+            "ledger_id": str(row.get("_id") or ""),
+            "host_id": meta.get("host_id"),
+            "period": meta.get("period"),
+            "window": meta.get("window") or commission_window_label(row_since, row_until),
+            "since": row_since, "until": row_until,
+        })
+    return out
 
 
 def _breakdown_meta(computed: dict, line: dict) -> dict:
@@ -6750,7 +7084,13 @@ async def execute_host_withdrawal(
     # debit the wallet twice.
     try:
         debited = await asyncio.to_thread(
-            firebase.debit_host_beans, host_uid, beans, settle, debit_id=f"card_{card_id}"
+            firebase.debit_host_beans, host_uid, beans, settle, debit_id=f"card_{card_id}",
+            # M-17: the app-visible `beanTransactions/card_{id}` row, in the
+            # same transaction as the debit, so the host sees "paid out, UTR …".
+            record_history={
+                "id": f"card_{card_id}", "card_id": card_id, "payment_ref": ref,
+                "reason": "withdrawal", "label": f"Withdrawal paid — {beans:,} beans",
+            },
         )
     except (firebase.TransactionNotApplied, firebase.TransactionOutcomeUnknown) as exc:
         # HT-2: NOT "nothing was paid — raise a fresh one". The re-read found no
@@ -7034,8 +7374,9 @@ async def execute_subagency_payout(
     parent_id = payload.get("parent_id", "")
     amount_minor = int(card.get("amount", 0))
 
+    await _claim(card_id, actor)
     try:
-        movement = await _move(
+        movement, replayed = await _move_once(
             Movement(
                 holder_type=HolderType.AGENCY,
                 holder_id=sub_id,
@@ -7059,8 +7400,10 @@ async def execute_subagency_payout(
         raise
 
     now = _now()
+    # Conditional on leg 1 still pending: a replayed execution finds it paid
+    # and leaves the first record (who paid, when, which reference) untouched.
     payout = await get_db()[SUBAGENCY_PAYOUTS].find_one_and_update(
-        {"card_id": card_id},
+        {"card_id": card_id, "status": PayoutStatus.PENDING},
         {
             "$set": {
                 "status": PayoutStatus.PARENT_PAID,
@@ -7073,23 +7416,26 @@ async def execute_subagency_payout(
         },
         return_document=ReturnDocument.AFTER,
     )
+    if payout is None:
+        payout = await get_db()[SUBAGENCY_PAYOUTS].find_one({"card_id": card_id})
 
-    await audit.record(
-        actor=actor,
-        action=Act.SUBAGENCY_PAID_PARENT,
-        subject_type="subagency_payout",
-        subject_id=str(payout["_id"]) if payout else card_id,
-        reason=card.get("reason", "Sub-agency commission paid via parent"),
-        after={"status": PayoutStatus.PARENT_PAID},
-        card_id=card_id,
-        meta={
-            "parent_id": parent_id,
-            "sub_id": sub_id,
-            "amount_minor": amount_minor,
-            "payment_ref": ref,
-            "leg2_outstanding": True,
-        },
-    )
+    if not replayed:
+        await audit.record(
+            actor=actor,
+            action=Act.SUBAGENCY_PAID_PARENT,
+            subject_type="subagency_payout",
+            subject_id=str(payout["_id"]) if payout else card_id,
+            reason=card.get("reason", "Sub-agency commission paid via parent"),
+            after={"status": PayoutStatus.PARENT_PAID},
+            card_id=card_id,
+            meta={
+                "parent_id": parent_id,
+                "sub_id": sub_id,
+                "amount_minor": amount_minor,
+                "payment_ref": ref,
+                "leg2_outstanding": True,
+            },
+        )
 
     await _finish(
         card_id,
@@ -7196,3 +7542,56 @@ async def open_subagency_payouts(
         .limit(max(1, min(limit, 500)))
     )
     return [_public(doc) async for doc in cursor]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Executors, registered for the owner fast path (§8)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `cards.owner_fast_path(..., execute=True)` runs the type's executor after the
+# signature. The board cannot import this module (it imports the board), so
+# each executor registers itself here, normalised to one signature:
+# `async (card_id, actor, *, payment_ref="") -> dict`. A payout needs a bank
+# reference and refuses without one, exactly as its own route does.
+
+
+async def _exec_coin_purchase(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_coin_purchase(card_id, actor)
+
+
+async def _exec_lending(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_lending(card_id, actor)
+
+
+async def _exec_repayment(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_repayment(card_id, actor)
+
+
+async def _exec_recovery(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_recovery(card_id, actor)
+
+
+async def _exec_write_off(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_write_off(card_id, actor)
+
+
+async def _exec_commission_payout(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_commission_payout(card_id, payment_ref, actor)
+
+
+async def _exec_host_withdrawal(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_host_withdrawal(card_id, payment_ref, actor)
+
+
+async def _exec_subagency_payout(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    return await execute_subagency_payout(card_id, payment_ref, actor)
+
+
+card_svc.register_executor(CardType.SELLER_COIN_PURCHASE, _exec_coin_purchase)
+card_svc.register_executor(CardType.LENDING_ISSUE, _exec_lending)
+card_svc.register_executor(CardType.LENDING_REPAY, _exec_repayment)
+card_svc.register_executor(CardType.LENDING_RECOVER, _exec_recovery)
+card_svc.register_executor(CardType.BAD_DEBT_WRITE_OFF, _exec_write_off)
+card_svc.register_executor(CardType.COMMISSION_PAYOUT, _exec_commission_payout)
+card_svc.register_executor(CardType.HOST_WITHDRAWAL, _exec_host_withdrawal)
+card_svc.register_executor(CardType.SUBAGENCY_PAYOUT, _exec_subagency_payout)

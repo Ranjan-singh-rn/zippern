@@ -47,6 +47,13 @@ module adds is the rest of the table, and the parent rules, BEFORE a record
 is written — so an ineligible application is refused with a sentence rather
 than created and rejected.
 
+Spec §3 (B2): the ONE shared eligibility function is `assert_eligible`,
+called at every door — application, invitation, approval, restoration and
+migration — see the section headed "THE ONE SHARED ELIGIBILITY FUNCTION".
+Spec §4: a decided (rejected) application is never replayed into an approval
+(`DECIDED_REFUSAL`); the person applies again and that is a new record.
+Owner, Observer and staff are refused by name (`internal_refusal`).
+
 ── OWNERSHIP ───────────────────────────────────────────────────────────────
 
 Every document this module writes carries `ownerUid` = the signed-in uid,
@@ -239,6 +246,22 @@ INTERNAL_REFUSAL = (
     "ZIPPER staff accounts cannot hold partner roles. Partner roles are for "
     "people outside the company."
 )
+
+#: §8 — the Owner and the Observer are refused by name: neither may hold a
+#: partner or department role, and the sentence should say which governance
+#: identity is being refused rather than call them "staff".
+OWNER_REFUSAL = "An Owner cannot hold a partner role (Host, Agency, Sub-agency or Coin Seller)."
+OBSERVER_REFUSAL = "The Observer cannot hold a partner role (Host, Agency, Sub-agency or Coin Seller)."
+
+
+def internal_refusal(internal_role: Any) -> str:
+    """The refusal for an internal identity, by what it is (pure)."""
+    role = str(internal_role or "").strip().lower()
+    if role in ("owner", "superadmin"):
+        return OWNER_REFUSAL
+    if role == "observer":
+        return OBSERVER_REFUSAL
+    return INTERNAL_REFUSAL
 
 
 GUEST_REFUSAL = (
@@ -529,9 +552,12 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
     Returns `{"options": [...], "blocked": {kind: reason}}` — the reasons are
     for the app to show beside a greyed-out choice, in the user's words.
     """
-    # Internal staff hold no partner role, ever — before any other rule.
+    # Internal identities hold no partner role, ever — before any other rule
+    # (§3 / §8: Owner + any other role, Observer + any other role, Staff +
+    # partner role are all prohibited). The sentence names the Owner and the
+    # Observer, whose exclusion is a governance rule rather than a staffing one.
     if held.get("internal"):
-        return {"options": [], "blocked": {k: INTERNAL_REFUSAL for k in KINDS}}
+        return {"options": [], "blocked": {k: internal_refusal(held.get("internal")) for k in KINDS}}
     # AUTH-002 (Phase 1A): a guest holds no partner or host role, ever.
     if held.get("guest"):
         return {"options": [], "blocked": {k: GUEST_REFUSAL for k in KINDS}}
@@ -853,6 +879,145 @@ def _urls(form: dict, key: str, max_items: int = 3) -> list[str]:
     return [str(u).strip() for u in raw if str(u).strip().startswith("https://")][:max_items]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE ONE SHARED ELIGIBILITY FUNCTION (spec §3)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# "The backend must enforce one shared role-eligibility function during
+# application, invitation, approval, restoration and migration." That function
+# is `assert_eligible` below. Every door onto a partner or Host role goes
+# through it, naming the door it is:
+#
+#     application   `submit_partner_application`, `submit_host_application`,
+#                   `refuse_client_created_registration` (a client-created
+#                   Firestore document), `reapply_sub_agency`
+#     invitation    an agency's Host invitation being decided
+#                   (`users.decide_host_application` → `grant_host`)
+#     approval      `partner_ops.approve_partner` / `reactivate_partner` (through
+#                   `_enforce_role_rules_at_decision`)
+#     restoration   `users.restore_host`, a decided reinstatement request
+#                   (`role_appeals.decide` → the existing restore)
+#     migration     `partner_ops.attach_login` (B16) — a record that already
+#                   exists being bound to a login
+#
+# The table itself is `eligible_kinds` (pure) over `held_roles` (authoritative
+# records). What the contexts differ in is only WHAT IS EXCLUDED from "held"
+# (the record being decided is not held against itself) and the closing words.
+# Nothing else — not the Owner/Observer/staff exclusion, not the family rule,
+# not the revoked-kind refusal, not the parent pin — varies by door.
+#
+# The three older names (`recheck_at_decision`, `recheck_host_restore`,
+# `_refuse_if_ineligible`) are kept as thin wrappers so no caller changes.
+
+ELIGIBILITY_CONTEXTS = ("application", "invitation", "approval", "restoration", "migration")
+
+_CLOSING = {
+    "application": "",
+    "invitation": " Nothing was approved.",
+    "approval": " Nothing was approved.",
+    "restoration": " Nothing was restored.",
+    "migration": " Nothing was approved.",
+}
+
+#: §4 — a DECIDED application is never replayed into approval. A rejected
+#: record stays rejected as history (Decision 16: the person applies again,
+#: and that is a NEW record); an approved one is approved once.
+DECIDED_REFUSAL = (
+    "This application was already decided ({status}). A decided application is "
+    "never replayed into an approval: the person applies again, which is a new "
+    "record, and the decided one stays as history."
+)
+
+
+async def _decided_record_refusal(partner_id: str) -> str:
+    """'' unless `partner_id` names a record whose decision is final (rejected)."""
+    pid = str(partner_id or "").strip()
+    if not pid:
+        return ""
+    row = await get_db()[C.PARTNERS].find_one({"_id": pid})
+    status = str((row or {}).get("status") or "")
+    if status == str(PartnerStatus.REJECTED):
+        return DECIDED_REFUSAL.format(status=status)
+    return ""
+
+
+async def assert_eligible(
+    uid: str,
+    kind: str,
+    *,
+    context: str,
+    exclude_partner_id: str = "",
+    exclude_host_application_id: str = "",
+    ignore_guest: bool = False,
+    parent_id: str = "",
+    parent_name: str = "",
+    restoring_host: bool = False,
+) -> dict[str, Any]:
+    """May `uid` hold `kind`, judged NOW, for this `context`? Raises ApplicationError.
+
+    Returns what the person holds (the `held_roles` answer, after exclusions),
+    so a caller that needs the parent pin can read it without a second query.
+
+      * `exclude_partner_id` — the partner record being decided is not held
+        against itself (approval / migration);
+      * `exclude_host_application_id` — the host application being decided is
+        not held against itself (invitation / restoration);
+      * `restoring_host` — the revoked Host role itself is not held against its
+        own restoration; its agency is checked against the parent pin;
+      * `ignore_guest` — `partner_ops.attach_login` (B16) only: the login it
+        attaches is created by staff with an unverified address, which is not
+        the app-guest case the guest rule exists for. Every other rule applies.
+
+    §4: in the `approval` and `migration` contexts the excluded record is read,
+    and a REJECTED one is refused with `DECIDED_REFUSAL` — a decided application
+    cannot be replayed into an approval.
+    """
+    kind = str(kind or "").strip()
+    if context not in ELIGIBILITY_CONTEXTS:
+        raise ValueError(f"'{context}' is not an eligibility context: {ELIGIBILITY_CONTEXTS}")
+    if kind not in KINDS:
+        raise ApplicationError("Choose Host, Agency, Sub-agency or Coin Seller.")
+    closing = _CLOSING[context]
+
+    if context in ("approval", "migration") and exclude_partner_id:
+        decided = await _decided_record_refusal(exclude_partner_id)
+        if decided:
+            raise ApplicationError(decided)
+
+    held = await held_roles(uid)
+    if ignore_guest:
+        held["guest"] = False
+    if exclude_partner_id:
+        held["partners"] = [p for p in held.get("partners", []) if p.get("id") != exclude_partner_id]
+    pending = held.get("pending_host_application")
+    if pending and exclude_host_application_id and pending.get("id") == exclude_host_application_id:
+        held["pending_host_application"] = None
+    restoring = held.get("host") or {}
+    if restoring_host:
+        held["host"] = None
+
+    table = eligible_kinds(held)
+    if kind not in table["options"]:
+        if context == "application" and held.get("guest") and not held.get("internal"):
+            # Approved contact rule: no verified contact is refused with the
+            # machine-readable `ContactRequired` (same sentence as before), so
+            # the caller can route to verification. Staff are refused as staff.
+            raise await asyncio.to_thread(contact_required_error, uid)
+        if context == "application":
+            fallback = f"You cannot apply as a {notices.role_label(kind)} right now."
+        else:
+            fallback = f"This person cannot hold a {notices.role_label(kind)} {'role ' if kind == 'host' else ''}now."
+        raise ApplicationError((table["blocked"].get(kind) or fallback) + closing)
+
+    # RC role rule: the second role sits under the one parent it may.
+    pin_against = parent_id if not restoring_host else str(restoring.get("agency_id") or "")
+    if pin_against:
+        pinned = parent_pin_refusal(table, kind, pin_against, parent_name)
+        if pinned:
+            raise ApplicationError(pinned + closing)
+    return held
+
+
 async def recheck_at_decision(
     uid: str, kind: str, *, exclude_partner_id: str = "", exclude_host_application_id: str = "",
     ignore_guest: bool = False, parent_id: str = "",
@@ -871,25 +1036,21 @@ async def recheck_at_decision(
     `ignore_guest` is for `partner_ops.attach_login` (B16) only: the login it
     attaches is created by staff with an unverified address, which is not the
     app-guest case the guest rule exists for. Every other rule still applies.
+
+    The one shared function is `assert_eligible`; this is the approval /
+    invitation / migration door onto it (a host application being decided is
+    an invitation; a partner record with a login being attached is a migration).
     """
-    held = await held_roles(uid)
-    if ignore_guest:
-        held["guest"] = False
-    held["partners"] = [p for p in held.get("partners", []) if p.get("id") != exclude_partner_id]
-    pending = held.get("pending_host_application")
-    if pending and exclude_host_application_id and pending.get("id") == exclude_host_application_id:
-        held["pending_host_application"] = None
-    table = eligible_kinds(held)
-    if kind not in table["options"]:
-        raise ApplicationError(
-            (table["blocked"].get(kind) or f"This person cannot hold a {notices.role_label(kind)} now.")
-            + " Nothing was approved."
-        )
-    # RC role rule: the second role sits under the one parent it may.
-    if parent_id:
-        pinned = parent_pin_refusal(table, kind, parent_id)
-        if pinned:
-            raise ApplicationError(pinned + " Nothing was approved.")
+    # A host application being decided is the invitation door; a partner record
+    # is the approval door. (`attach_login` is the migration door and arrives
+    # here too — the exclusion and the refusal are the same as an approval's.)
+    context = "invitation" if (exclude_host_application_id and not exclude_partner_id) else "approval"
+    await assert_eligible(
+        uid, kind, context=context,
+        exclude_partner_id=exclude_partner_id,
+        exclude_host_application_id=exclude_host_application_id,
+        ignore_guest=ignore_guest, parent_id=parent_id,
+    )
 
 
 async def recheck_host_restore(uid: str, *, exclude_host_application_id: str = "") -> None:
@@ -900,40 +1061,17 @@ async def recheck_host_restore(uid: str, *, exclude_host_application_id: str = "
     main Agency X may be a Host only directly under X. So a Host who went on to
     hold a Sub-agency of the SAME main agency may have the Host role back (the
     old B33 case, now the rule itself); a Host whose Sub-agency sits under a
-    different agency may not.
+    different agency may not. The restoration door onto `assert_eligible`.
     """
-    held = await held_roles(uid)
-    restoring = held.get("host") or {}
-    held["host"] = None
-    pending = held.get("pending_host_application")
-    if pending and exclude_host_application_id and pending.get("id") == exclude_host_application_id:
-        held["pending_host_application"] = None
-    table = eligible_kinds(held)
-    if "host" in table["options"]:
-        pinned = parent_pin_refusal(table, "host", str(restoring.get("agency_id") or ""))
-        if not pinned:
-            return
-        raise ApplicationError(pinned + " Nothing was restored.")
-    raise ApplicationError(
-        (table["blocked"].get("host") or "This person cannot hold a Host role now.")
-        + " Nothing was restored."
+    await assert_eligible(
+        uid, "host", context="restoration",
+        exclude_host_application_id=exclude_host_application_id, restoring_host=True,
     )
 
 
 async def _refuse_if_ineligible(uid: str, kind: str) -> dict[str, Any]:
-    held = await held_roles(uid)
-    table = eligible_kinds(held)
-    if kind not in table["options"]:
-        # Approved contact rule: no verified contact is refused with the
-        # machine-readable `ContactRequired` (same sentence as before), so the
-        # caller can route to verification. Staff are refused as staff.
-        if held.get("guest") and not held.get("internal"):
-            raise await asyncio.to_thread(contact_required_error, uid)
-        raise ApplicationError(
-            table["blocked"].get(kind)
-            or f"You cannot apply as a {notices.role_label(kind)} right now."
-        )
-    return held
+    """The application door onto `assert_eligible`."""
+    return await assert_eligible(uid, kind, context="application")
 
 
 #: Sources a CLIENT writes when it creates an `agencies` / `sellers` document
@@ -1441,19 +1579,20 @@ async def reapply_sub_agency(
     # The role table, as the parent-created path applies it: the combinations
     # (a Host under another agency, a revoked role, …) — but not the guest arm,
     # because a parent-created login is a fresh password account; the contact
-    # rule that matters for it is Decision 15, at activation.
-    held = await held_roles(uid)
-    table = eligible_kinds({**held, "guest": False})
-    if "sub_agency" not in table["options"]:
-        raise ApplicationError(
-            table["blocked"].get("sub_agency")
-            or "This person cannot hold a Sub-agency role now. Nothing was created."
-        )
-
+    # rule that matters for it is Decision 15, at activation. The same shared
+    # function as every other door (§3), with the parent pin applied to the
+    # validated parent.
     parent = await ops._validate_parent_agency(parent_id or "", uid)
-    pinned = parent_pin_refusal(table, "sub_agency", str(parent["_id"]), str(parent.get("name") or ""))
-    if pinned:
-        raise ApplicationError(pinned + " Nothing was created.")
+    try:
+        await assert_eligible(
+            uid, "sub_agency", context="application", ignore_guest=True,
+            parent_id=str(parent["_id"]), parent_name=str(parent.get("name") or ""),
+        )
+    except ApplicationError as exc:
+        text = str(exc)
+        raise ApplicationError(
+            text if text.endswith("Nothing was created.") else text + " Nothing was created."
+        ) from exc
 
     fields = _clean(form, _STR_FIELDS_AGENCY)
     if not fields.get("agencyName"):

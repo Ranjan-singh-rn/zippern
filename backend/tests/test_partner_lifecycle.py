@@ -739,24 +739,28 @@ STAFF_CASES = {
     "st-dept-admin": ("ops_admin", "ops_admin"),
     "st-dept-member": ("finance_member", "finance_member"),
 }
+# B2 (spec §3 / §8): the Owner and the Observer are refused BY NAME; a
+# department role is refused as staff. One shared function, three sentences.
+_NAMED = {"owner": "owner", "observer": "observer"}
 for uid, (mongo_role, crm_role) in STAFF_CASES.items():
     user(uid)
     db["staff"].docs[uid] = {"_id": uid, "uid": uid, "role": mongo_role, "email": f"{uid}@zipper.test"}
     if crm_role:
         fs.collection("crmUsers").docs[uid] = {"role": crm_role, "isActive": True}
+    word = _NAMED.get(mongo_role, "staff")
     e = run(apps.eligibility(uid))
     eq(f"{mongo_role}: no partner options", e["options"], [])
-    ok(f"{mongo_role}: every kind carries the staff reason",
-       set(e["blocked"]) == set(apps.KINDS) and all("staff" in v for v in e["blocked"].values()))
+    ok(f"{mongo_role}: every kind carries the {word} reason",
+       set(e["blocked"]) == set(apps.KINDS) and all(word in v.lower() for v in e["blocked"].values()))
     for kind in ("agency", "sub_agency", "seller"):
         before = len(db["partners"].docs)
         m = refuses(f"{mongo_role} cannot submit {kind}",
                     apps.submit_partner_application(uid, kind, SELLER_FORM if kind == "seller" else AGENCY_FORM,
                                                     A if kind == "sub_agency" else None, SERVICE))
-        ok(f"{mongo_role}: {kind} refusal names staff", "staff" in m.lower())
+        ok(f"{mongo_role}: {kind} refusal names {word}", word in m.lower())
         eq(f"{mongo_role}: nothing written for {kind}", len(db["partners"].docs), before)
     m = refuses(f"{mongo_role} cannot submit host", apps.submit_host_application(uid, HOST_FORM, A, SERVICE))
-    ok(f"{mongo_role}: host refusal names staff", "staff" in m.lower())
+    ok(f"{mongo_role}: host refusal names {word}", word in m.lower())
 
 # A staff identity known only to crmUsers (no Mongo row yet) is still internal.
 user("st-crm-only")
@@ -854,8 +858,14 @@ async def _race_approve():
     return await asyncio.gather(ops.approve_partner(D1, WHY, STAFF),
                                 ops.approve_partner("b3-d-legacy", WHY, STAFF), return_exceptions=True)
 res = run(_race_approve())
-eq("B3.6 concurrent approvals → exactly one agency approved",
-   sum(1 for p in (partner(D1), partner("b3-d-legacy")) if p["status"] == "approved"), 1)
+# B2 (spec §4): a DECIDED application is never replayed into an approval. Both
+# records are rejected, so NEITHER is approved — the race the claim lock used to
+# arbitrate between two releasable records cannot start, because the decided
+# refusal comes before the claim is even read.
+eq("B3.6 concurrent approvals of two REJECTED records → neither is approved (§4: no replay)",
+   sum(1 for p in (partner(D1), partner("b3-d-legacy")) if p["status"] == "approved"), 0)
+ok("B3.6 …both refusals say a decided application is not replayed",
+   all(isinstance(r, Exception) and "already decided" in str(r) for r in res), repr(res))
 
 # B3.6b — the SAME race, with the interleaving FORCED rather than left to the
 # scheduler. B3.6 above passed or failed depending on thread timing (it failed
@@ -915,10 +925,14 @@ try:
     run(_forced())
 finally:
     roles._is_releasable, roles.claim_role_family = _real_releasable, _real_claim
-eq("B3.6b forced interleaving → still exactly one agency approved",
-   sum(1 for p in (partner(R1), partner("b3-r-legacy")) if p["status"] == "approved"), 1)
-eq("B3.6b …and it is the record whose approval re-affirmed the claim first",
-   partner(R1)["status"], "approved")
+# B2 (spec §4): with both records rejected, the forced interleaving never
+# reaches the claim hand-over — both approvals are refused as replays and the
+# records stay exactly as decided. (The claim-CAS fix itself is pinned at the
+# claim level by tests/test_b2_governance.py; this scenario no longer has a
+# legal way to run through an approval.)
+eq("B3.6b forced interleaving → still no rejected record is approved",
+   sum(1 for p in (partner(R1), partner("b3-r-legacy")) if p["status"] == "approved"), 0)
+eq("B3.6b …the decided record stays rejected", partner(R1)["status"], "rejected")
 
 # B5 — Host combinations, at application AND at approval
 def make_host(uid, under):

@@ -606,7 +606,21 @@ ok("…saying the host is still under its agency and to approve again",
    str(got))
 eq("…the request is still pending, its lease released",
    (request_doc(T1)["status"], request_doc(T1).get("deciding_token")), ("pending", None))
-ok("…nothing moved in Firestore", S.state() == before)
+# B2 (spec §6): the Owner's approval places the HOLD on the Host's unsettled
+# earnings (`payoutHold*` on the account, cause `transfer_review`) BEFORE the
+# move, so a move that is then refused leaves the hold — recorded on the still-
+# pending request — and nothing else. The host, the rosters and the verification
+# record are exactly as they were.
+_HOLD_FIELDS = ("payoutHold", "payoutHoldReason", "payoutHoldAt")
+
+
+def _without_hold(state: dict) -> dict:
+    return {path: {k: v for k, v in doc.items() if k not in _HOLD_FIELDS} for path, doc in state.items()}
+
+
+ok("…nothing moved in Firestore (only the §6 hold on the Host's earnings was written)",
+   _without_hold(S.state()) == _without_hold(before)
+   and S.docs[f"users/{huid}"].get("payoutHold") is True)
 ok("…no approval was audited and nobody was told the agency changed",
    not any(a["action"] == svc.Act.APPROVED for a in AUDIT[audits:]) and not [n for n in NOTICES if n[0] == huid])
 

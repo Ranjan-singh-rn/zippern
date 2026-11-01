@@ -182,6 +182,7 @@ MONGO_DELETE: dict[str, str] = {
     "subagency_payouts": "sub-agency payouts (money history)",
     "weekly_business_reports": "weekly business reports (money history)",
     "reconciliation": "ledger reconciliation rows",
+    "owner_notices": "Owner money-notification delivery state (names Owners; money history)",
     "email_deliveries": "email delivery records (audit data; name recipients)",
     "report_subscriptions": "report subscriptions keyed by staff email",
     "public_appeal_rate": "public appeal form rate counters",

@@ -728,14 +728,25 @@ async def _owned_seller_ids(uid: str) -> list[str]:
     return [str(r.get("_id")) for r in rows if str(r.get("kind") or "") == "seller" and r.get("_id")]
 
 
-async def _close_crm_access(uid: str) -> dict:
+async def _revoke_api_sessions(uid: str) -> int:
+    """Every live API session of this uid — partner or otherwise — revoked. Never raises.
+
+    The same sweep `partner_ops._revoke_partner_sessions` makes, keyed on the
+    uid the sessions were issued to. A suspension (§5) revokes "all CRM sessions
+    for the UID"; a resume revokes the stale ones so the person authenticates
+    afresh. Reported as a count; the restriction or the lift stands regardless.
+    """
     from app.services import partner_ops  # local: partner_ops imports this module's peers
 
-    revoked = 0
     try:
-        revoked = await partner_ops._revoke_partner_sessions({"owner_crm_uid": uid})
-    except Exception as exc:  # noqa: BLE001 — the restriction stands regardless
-        log.warning("CRM sessions of %s were not revoked: %s", uid, exc)
+        return await partner_ops._revoke_partner_sessions({"owner_crm_uid": uid})
+    except Exception as exc:  # noqa: BLE001 — the decision stands regardless
+        log.warning("API sessions of %s were not revoked: %s", uid, exc)
+        return 0
+
+
+async def _close_crm_access(uid: str) -> dict:
+    revoked = await _revoke_api_sessions(uid)
     flagged = await _fs(_set_account_restricted, uid, True)
     hidden = await _fs(_set_seller_listings_restricted, await _owned_seller_ids(uid), True)
     return {"crm_sessions_revoked": revoked, "crm_login_flagged": flagged,
@@ -752,6 +763,24 @@ async def _reopen_crm_access(uid: str) -> dict:
     return {"crm_login_flagged": flagged, "seller_listings_unflagged": shown}
 
 
+#: §5 Ban — what a ban records besides its reason. `category` is the kind of
+#: breach (free text from a short list the CRM offers; the server does not
+#: constrain the vocabulary beyond length), `evidence` is a list of references
+#: (report ids, storage paths, URLs) — never files. `scope` is what the ban
+#: reaches: the account alone, or the account and every handset it was seen on.
+BAN_SCOPE_ACCOUNT = "account"
+BAN_SCOPE_ACCOUNT_AND_DEVICES = "account_and_devices"
+BAN_SCOPES = (BAN_SCOPE_ACCOUNT, BAN_SCOPE_ACCOUNT_AND_DEVICES)
+MAX_BAN_EVIDENCE = 10
+
+
+def _ban_details(category: str | None, evidence: list | None) -> dict:
+    """The category and evidence of a ban, bounded (pure)."""
+    cat = str(category or "").strip()[:80]
+    refs = [str(e).strip()[:500] for e in (evidence or []) if str(e or "").strip()][:MAX_BAN_EVIDENCE]
+    return {"category": cat, "evidence": refs}
+
+
 async def ban_user(
     uid: str,
     reason: str,
@@ -760,6 +789,8 @@ async def ban_user(
     ban_device_too: bool = True,
     *,
     enforce_target_policy: bool = True,
+    category: str | None = None,
+    evidence: list | None = None,
 ) -> dict:
     """Ban an account, and every handset it has been seen on.
 
@@ -811,6 +842,8 @@ async def ban_user(
 
     reason = _require_reason(reason)
     user = await _load_user(uid)
+    details = _ban_details(category, evidence)
+    scope = BAN_SCOPE_ACCOUNT_AND_DEVICES if ban_device_too else BAN_SCOPE_ACCOUNT
 
     before = {
         "isBanned": bool(user.get("isBanned", False)),
@@ -830,6 +863,22 @@ async def ban_user(
         "suspendedUntil": fb_firestore.DELETE_FIELD,
         "suspensionDays": fb_firestore.DELETE_FIELD,
         "banReason": reason,
+        # §5: scope, category and evidence travel with the ban, on the account
+        # (what the app and the CRM read) as well as on the audit entry. The
+        # actor and the time are `_stamp` below.
+        "banScope": scope,
+        "banCategory": details["category"],
+        "banEvidence": details["evidence"],
+        # Phase 1A (SESSION-003) / §5 "alternate login methods bound to the same
+        # UID": every token issued before now — whatever provider minted it —
+        # is refused by the rules (`sessionCurrent`) and by the callables. The
+        # restriction is on the UID, so every sign-in method that resolves to
+        # it is closed by it. Monotonic — never lowered below a cut-off another
+        # path already set.
+        "credentialsValidAfter": max(
+            int(user.get("credentialsValidAfter") or 0),
+            int(datetime.now(timezone.utc).timestamp()) + 1,
+        ),
         # GOV B42: the owner-update rule now refuses a banned account, so the app
         # can no longer clear its own presence. Cleared here, server-side, or the
         # account would stay "online" in every list for good.
@@ -938,6 +987,8 @@ async def ban_user(
         "isBanned": True,
         "isSuspended": False,
         "banReason": reason,
+        "banScope": scope,
+        "banCategory": details["category"],
     }
     audit_id = await audit.record(
         actor=actor,
@@ -949,6 +1000,13 @@ async def ban_user(
         after=after,
         meta={
             "name": user.get("name", ""),
+            # §5: scope, category and evidence — the actor and the time are on
+            # the entry itself. `partner_roles_touched: False` is the statement
+            # that a ban does not itself revoke a partner role.
+            "scope": scope,
+            "category": details["category"],
+            "evidence": details["evidence"],
+            "partner_roles_touched": False,
             # Which handsets this ban actually reached. Recorded on the entry
             # because it is the half a reviewer cannot see from the account
             # screen, and because `unban_user` is judged against it later.
@@ -965,6 +1023,9 @@ async def ban_user(
         before,
         after,
         audit_id,
+        scope=scope,
+        category=details["category"],
+        evidence=details["evidence"],
         device_banned=bool(barred),
         devices_barred=barred,
         device_failures=device_failures,
@@ -1404,13 +1465,36 @@ async def resume_user(
         # nightly sweep finding an account it has nothing to do to, for ever.
         "suspendedUntil": fb_firestore.DELETE_FIELD,
         "suspensionDays": fb_firestore.DELETE_FIELD,
+        # §5 Resume: "revoke stale sessions and require fresh authentication".
+        # Every token issued before this moment — including one minted during
+        # the suspension by any sign-in method bound to the uid — is refused by
+        # the rules and the callables; the person signs in again and their
+        # access is recomputed from each role's OWN status at that sign-in.
+        "credentialsValidAfter": max(
+            int(user.get("credentialsValidAfter") or 0),
+            int(datetime.now(timezone.utc).timestamp()) + 1,
+        ),
         **_stamp(actor, "resumed"),
     }
     await _patch_user(uid, patch)
 
+    # §5 Resume: the stale sessions. The Firebase refresh tokens (so no new ID
+    # token is minted on a sign-in that predates the suspension) and every CRM
+    # API session of the uid. Reported, never swallowed; the resume stands.
+    session_problem = await asyncio.to_thread(firebase.revoke_sessions, uid)
+    if session_problem:
+        log.error("resume_user: sessions not revoked for %s: %s", uid, session_problem)
+    stale_sessions = await _revoke_api_sessions(uid)
+
     # C4: CRM access returns for whatever role is still approved — no role is
-    # touched here, so a role revoked meanwhile stays revoked.
+    # touched here, so a role revoked meanwhile stays revoked. Access is
+    # recomputed from each role's own status (`account_state.partner_refusal`
+    # per record) at the next sign-in: a revoked or suspended role stays
+    # disabled, and nothing here releases frozen money (`money_freeze`).
     crm_access = await _reopen_crm_access(uid)
+    crm_access["stale_sessions_revoked"] = stale_sessions
+    crm_access["fresh_authentication_required"] = True
+    crm_access["money_released"] = False
 
     after = {
         "accountState": str(AccountState.ACTIVE),
@@ -1510,6 +1594,18 @@ async def lift_expired_suspensions(actor: dict, limit: int = 200) -> dict:
     return {"checked": len(docs), "lifted": lifted, "failed": failed}
 
 
+#: §5 Warning — "Do not invent an automatic warning count threshold."
+#:
+#: OWNER_DECISION_PENDING: whether a number of warnings should ever escalate by
+#: itself is the Owner's decision and has not been made. Until it is, this is
+#: `None` and NOTHING in this module (or anywhere else in the backend) reads the
+#: `warnings` counter to restrict, revoke, revoke sessions or freeze money. A
+#: warning is a recorded moderation notice: an immutable event linked to the uid
+#: and, when it came from one, the source report; the person is told; the
+#: history is readable (`list_warnings`, `GET /users/{uid}/warnings`).
+WARNING_AUTO_THRESHOLD: int | None = None  # OWNER_DECISION_PENDING
+
+
 async def warn_user(
     uid: str, reason: str, actor: dict, meta: dict | None = None,
     *,
@@ -1518,6 +1614,13 @@ async def warn_user(
     deduction: dict | None = None,
 ) -> dict:
     """Record a formal warning against an account — optionally with a deduction.
+
+    §5: a warning ALONE blocks no login, revokes no role, revokes no session
+    and freezes no money. It is an immutable event — the `warnings` entry's
+    reason, issuer and time are written once and never rewritten (only the
+    status of a linked deduction moves as its card is decided) — linked to the
+    uid and to the source report when `meta.report_id` names one. There is no
+    automatic count threshold (`WARNING_AUTO_THRESHOLD`).
 
     The warning is written with the real actor's uid and name. It used to be
     issued by "Admin", so a pattern of warnings could not be attributed to
@@ -2524,6 +2627,15 @@ async def revoke_host(
     else:
         await _patch_user(uid, patch)
 
+    # §5 Revoke Host: "stop live/call". Every room this Host is streaming in is
+    # ended through the existing intervention (`live.end_room`), audited as
+    # its own act with this revocation's reason. Best effort and reported: the
+    # revocation is committed above, and a room that cannot be closed is named
+    # rather than hidden. Calls are ended by the app when it reads the flags
+    # (`isHost: false` is refused by the call functions); the backend has no
+    # call-control path of its own.
+    live_rooms = await _end_live_rooms_of(uid, reason, actor)
+
     after = {"isHost": False, "agencyId": before["agencyId"]}
     audit_id = await audit.record(
         actor=actor,
@@ -2533,14 +2645,86 @@ async def revoke_host(
         reason=reason,
         before=before,
         after=after,
-        meta={"agency_id": before["agencyId"], **(meta or {})},
+        meta={
+            "agency_id": before["agencyId"],
+            "live_rooms_ended": live_rooms["ended"],
+            "live_rooms_not_ended": live_rooms["failed"],
+            # Stated: the person's account and their other roles are untouched.
+            "account_touched": False,
+            "other_roles_touched": False,
+            **(meta or {}),
+        },
     )
-    # Tell the person. The audit row and the account patch are committed;
-    # this is delivery, best effort, and last.
+    # Tell the person — and their agency (§5: "notify host and agency"). The
+    # audit row and the account patch are committed; this is delivery, best
+    # effort, and last.
     from app.services import notices
 
-    await notices.host_revoked(uid, reason)
-    return _result(uid, before, after, audit_id)
+    notified_host = await notices.host_revoked(uid, reason)
+    notified_agency = await _notify_agency_of_host_change(
+        before["agencyId"], uid, str(user.get("name") or ""), "revoked", reason,
+    )
+    return _result(
+        uid, before, after, audit_id,
+        live_rooms_ended=live_rooms["ended"],
+        live_rooms_not_ended=live_rooms["failed"],
+        notified={"host": notified_host, "agency": notified_agency},
+    )
+
+
+async def _end_live_rooms_of(uid: str, reason: str, actor: dict) -> dict:
+    """End every ACTIVE live room hosted by `uid`. Never raises.
+
+    Returns `{"ended": [room ids], "failed": [{"room_id", "error"}]}`.
+    """
+    from app.services import live as live_svc  # local: live imports this module's peers
+
+    out: dict[str, list] = {"ended": [], "failed": []}
+    try:
+        def _rooms() -> list[str]:
+            q = (
+                firebase.firestore_client().collection(live_svc.ROOMS)
+                .where(filter=FieldFilter("hostUid", "==", uid))
+                .where(filter=FieldFilter("isActive", "==", True))
+                .limit(20)
+            )
+            return [snap.id for snap in q.stream()]
+
+        rooms = await _fs(_rooms)
+    except Exception as exc:  # noqa: BLE001 — the revocation stands; say what happened
+        log.warning("live rooms of %s could not be listed: %s", uid, exc)
+        return {"ended": [], "failed": [{"room_id": "", "error": f"rooms could not be listed: {exc}"}]}
+    for room_id in rooms:
+        try:
+            await live_svc.end_room(room_id, f"{reason} (Host role revoked)", actor)
+            out["ended"].append(room_id)
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            log.warning("live room %s of %s not ended on revocation: %s", room_id, uid, exc)
+            out["failed"].append({"room_id": room_id, "error": str(exc)})
+    return out
+
+
+async def _notify_agency_of_host_change(
+    agency_id: str, host_uid: str, host_name: str, change: str, reason: str,
+) -> bool:
+    """Tell the agency's owner that one of their Hosts was revoked (§5). Never raises."""
+    from app.services import notices
+    from app.services import partner_roles
+
+    agency_id = str(agency_id or "").strip()
+    if not agency_id:
+        return False
+    try:
+        agency = await get_db()[C.PARTNERS].find_one({"_id": agency_id})
+        owner = await partner_roles.owner_uid_of(agency, db=get_db()) if agency else ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("agency %s owner could not be resolved for the host notice: %s", agency_id, exc)
+        return False
+    if not owner or owner == host_uid:
+        return False
+    return await notices.agency_host_revoked(
+        owner, agency_id, host_uid, host_name, reason, change=change,
+    )
 
 
 async def restore_host(
@@ -2861,6 +3045,15 @@ async def decide_host_application(
         )
     if current == "rejected" and not approve:
         raise UserError("This application has already been refused.")
+    if current == "rejected" and approve:
+        # §4: a decided application is never replayed into an approval. The
+        # refusal is history; the person applies again (a NEW application),
+        # exactly as a rejected partner record is never approved (Decision 16).
+        raise UserError(
+            "This application was already refused. A decided application is never "
+            "replayed into an approval — the person applies again, and the refused "
+            "application stays as history."
+        )
     if current == "approved" and approve:
         holder_uid = str(app.get("activatedByUid") or app.get("applicantUid") or "").strip()
         holder = None
@@ -3624,6 +3817,17 @@ async def execute_balance_card(card_id: str, actor: dict) -> dict:
                 card_id=card_id,
                 idempotency_key=card_id,
                 meta={"card_type": card.get("type")},
+                # M-18: the app-visible history row (`diamondTransactions` /
+                # `beanTransactions` `card_{id}`), written beside the balance
+                # delta, so an admin credit explains itself on the person's
+                # history screen as the debit path's row already does.
+                history={
+                    "id": f"card_{card_id}",
+                    "reason": card.get("reason", "Balance adjustment"),
+                    "reasonLabel": "Credit by Zipper",
+                    "cardId": card_id,
+                    "context": "admin_credit",
+                },
             )
         )
     except InsufficientBalance as exc:
@@ -3671,6 +3875,15 @@ async def execute_balance_card(card_id: str, actor: dict) -> dict:
         },
         succeeded=True,
     )
+
+
+async def _exec_balance_card(card_id: str, actor: dict, *, payment_ref: str = "") -> dict:
+    """§8: the balance-card executor as the owner fast path calls it."""
+    return await execute_balance_card(card_id, actor)
+
+
+cards.register_executor(CardType.BALANCE_CREDIT, _exec_balance_card)
+cards.register_executor(CardType.BALANCE_DEBIT, _exec_balance_card)
 
 
 async def _execute_debit_on_live_balance(

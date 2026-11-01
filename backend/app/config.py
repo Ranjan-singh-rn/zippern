@@ -147,6 +147,18 @@ class Settings(BaseSettings):
     otp_ttl_minutes: int = 10
     otp_max_attempts: int = 5
     otp_resend_cooldown_seconds: int = 60
+    #: B-4 (B3): `POST /auth/observer/request-code` is unauthenticated. A new
+    #: request no longer voids the codes already out there, and on top of the
+    #: resend cooldown it is limited per calling address AND globally over a
+    #: window — the global one is the limit nobody can dodge, and it also
+    #: bounds the mail the delivery mailbox can be made to receive. With a
+    #: 60 s cooldown and a 10-minute TTL at most ten codes can ever be live.
+    otp_request_window_minutes: int = 10
+    otp_request_limit_per_ip: int = 3
+    otp_request_limit_global: int = 8
+    #: The Observer's second factor (authenticator app) has NO switch: spec §8
+    #: allows no bypass for the identity that provisions Owners. It shares the
+    #: Owner MFA settings above (encryption key, lockout, enrolment window).
 
     # Email
     sendgrid_api_key: str = ""
@@ -446,6 +458,33 @@ class Settings(BaseSettings):
     credit_due_notice_days: int = 3
     # 8A.2.11 — an overdue seller is reminded on this cadence, not every scan.
     credit_overdue_repeat_hours: int = 72
+
+    # ── Money integrity — B1 ─────────────────────────────────────────────────
+    #
+    # M-1: a Firestore balance replica left behind by a failed sync is alerted
+    # once it has been stale this long. The transactional sweep repairs it
+    # every 15 minutes; a replica still stale after this many minutes is one
+    # the repair could not fix, which is what the alert is for.
+    alert_replica_stale_minutes: int = 10
+    # §8 Owner-alone decisions: the other Owners must be told. A notification
+    # that is still pending (in-app or email not delivered) after this long is
+    # raised as an alert; the sweep keeps retrying it meanwhile.
+    alert_owner_notice_pending_minutes: int = 30
+    # M-11 / M-14: a recharge or sale claimed by a process that died — status
+    # `approving` / `refunding` / `failed` — is raised once it is this old.
+    alert_money_claim_stale_minutes: int = 30
+    # M-4: the rupee difference below which a day's app economy (Firestore
+    # platformRevenue) and its own ledgers are considered to agree.
+    reconciliation_tolerance_inr: float = 10.0
+
+    # M-5 — OWNER_DECISION_PENDING. How many whole weeks a closed earnings week
+    # is held before it is released for withdrawal. The spec says "the exact
+    # settlement policy remains an Owner decision"; `0` keeps the behaviour the
+    # Cloud Function has today (a week is released on the Monday after it
+    # closes). The release itself runs in `functions/src/payouts.ts`; this
+    # setting is published by `GET /api/reports/payout-policy` so the CRM, the
+    # app and the Function read one figure.
+    payout_release_arrears_weeks: int = 0
 
     # ── Repeat suppression — how an alert avoids becoming noise ──────────────
     #

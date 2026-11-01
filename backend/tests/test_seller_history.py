@@ -81,6 +81,11 @@ from app.db.mongo import C  # noqa: E402
 import app.db.firebase as firebase  # noqa: E402
 
 firebase.sync_balance_to_firestore = lambda *a, **k: True  # type: ignore[assignment]
+# M-11: a sale is filed only against a buyer whose `users/{uid}` document
+# exists. The buyer here does; Firestore itself is not under test.
+firebase.read_host_wallet = lambda uid: {  # type: ignore[assignment]
+    "beans": 0, "beans_available": 0, "agency_id": "", "is_verified_host": False, "name": "Buyer",
+}
 
 from app.core.roles import Role, Team  # noqa: E402
 from app.services import cards as cards_svc  # noqa: E402

@@ -152,6 +152,16 @@ def partner_refusal(record: Mapping[str, Any] | None) -> AccountRefused | None:
             reason="partner_awaiting_verification",
         )
 
+    # §5 / §6 (B2): a REVOKED role is refused as revoked — its own reason, said
+    # before the inactive check (a revoked record is inactive too, and
+    # "deactivated" would hide the one fact the person and the CRM need: the
+    # way back is a reinstatement request the Owner decides).
+    if status == "revoked":
+        return AccountRefused(
+            "This role was revoked. You can request reinstatement from the app.",
+            reason="partner_revoked",
+        )
+
     if record.get("is_active") is False:
         return AccountRefused(
             "This account has been deactivated.",

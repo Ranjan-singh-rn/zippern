@@ -726,3 +726,40 @@ async def definitions(user: dict = Depends(require_internal)):
             "logged": "Every export writes an audit entry (action 'export').",
         },
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAYOUT POLICY — M-5
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/payout-policy")
+async def payout_policy(user: dict = Depends(require_internal)):
+    """The hold between a week closing and its beans becoming withdrawable.
+
+    OWNER_DECISION_PENDING. The master spec says the exact settlement policy
+    for host earnings "remains an Owner decision"; `PAYOUT_RELEASE_ARREARS_WEEKS`
+    is the flag for it, default `0` — the behaviour the Monday release has
+    today (a week released on the Monday after it closes, ~30 minutes after it
+    ends in IST). `1` would hold each week one full week in arrears, the
+    7–13 day chargeback window the design document describes. The release
+    itself runs in `functions/src/payouts.ts`; this is the one place the
+    figure is published so the CRM, the app and the Function can read it.
+    """
+    from app.config import settings as _settings
+
+    weeks = int(getattr(_settings, "payout_release_arrears_weeks", 0) or 0)
+    return {
+        "release_arrears_weeks": weeks,
+        "setting": "PAYOUT_RELEASE_ARREARS_WEEKS",
+        "owner_decision_pending": True,
+        "current_behaviour": (
+            "a closed ISO week is released on the Monday after it closes (00:30 IST)"
+            if weeks == 0 else
+            f"a closed ISO week is released {weeks} full week(s) after it closes "
+            f"({7 * weeks}–{7 * weeks + 6} days in arrears)"
+        ),
+        "applies_to": "functions/src/payouts.ts releaseBeansForWeek cutoff",
+        "note": "Changing the figure here changes nothing until the Function reads it; the "
+                "owner decides the policy and both are moved together.",
+    }

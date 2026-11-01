@@ -75,6 +75,8 @@ class _Status:
     HTTP_403_FORBIDDEN = 403
     HTTP_404_NOT_FOUND = 404
     HTTP_409_CONFLICT = 409
+    #: The observer code request, limited (B-4 / B3).
+    HTTP_429_TOO_MANY_REQUESTS = 429
     #: A scheduled job that raised. The router turns it into this after writing
     #: the failed run to the log, so the failure path is exercisable here.
     HTTP_500_INTERNAL_SERVER_ERROR = 500
@@ -364,15 +366,33 @@ def _dig(doc: Any, path: str) -> Any:
 
 
 def _set_path(doc: dict, path: str, value: Any) -> None:
+    """`$set` on a plain or dotted key — list indexes included, as Mongo does
+    it (`recovery.0.used_at` marks ONE recovery code used; see `owner_mfa`).
+    A numeric part on a list addresses that element; on a dict it is a key."""
     parts = str(path).split(".")
-    target = doc
+    target: Any = doc
     for part in parts[:-1]:
+        if isinstance(target, list) and part.isdigit():
+            index = int(part)
+            while len(target) <= index:
+                target.append({})
+            if not isinstance(target[index], (dict, list)):
+                target[index] = {}
+            target = target[index]
+            continue
         nxt = target.get(part)
-        if not isinstance(nxt, dict):
+        if not isinstance(nxt, (dict, list)):
             nxt = {}
             target[part] = nxt
         target = nxt
-    target[parts[-1]] = value
+    last = parts[-1]
+    if isinstance(target, list) and last.isdigit():
+        index = int(last)
+        while len(target) <= index:
+            target.append(None)
+        target[index] = value
+    else:
+        target[last] = value
 
 
 def _cmp_ok(actual: Any, want: Any) -> bool:

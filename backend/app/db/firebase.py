@@ -242,6 +242,47 @@ def revoke_sessions(uid: str) -> str:
         return f"The live sessions could not be revoked: {exc}"
 
 
+#: Where `functions/src/quickLogin.ts` keeps the mobile quick-login credentials:
+#: one document per credential, id = sha256(secret), field `uid` = the holder.
+QUICK_LOGIN_COLLECTION = "quickLoginTokens"
+
+
+def revoke_quick_login(uid: str) -> str:
+    """B3 / §13 (security reset): delete every quick-login credential of `uid`.
+
+    The credential is what lets "Continue as …" walk back into an account
+    with no password; `redeemQuickLogin` already refuses a banned, suspended or
+    deleted account at redemption, and a displaced device loses its own. This
+    is the server-side revocation for the cases those do not cover — a reset
+    of the person's security (an Observer MFA reset, "sign out everywhere"
+    with a reset) — called from `security.revoke_sessions_for_uid`.
+
+    Never reads or logs a secret: the documents are keyed by a hash and are
+    deleted by reference. @return '' on success, or a sentence saying what
+    could not be done.
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return "No account id was given."
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter  # local: as users.py uses it
+
+        client = firestore_client()
+        query = client.collection(QUICK_LOGIN_COLLECTION).where(
+            filter=FieldFilter("uid", "==", uid)
+        ).limit(100)
+        removed = 0
+        for snap in query.stream():
+            snap.reference.delete()
+            removed += 1
+        if removed:
+            log.info("Revoked %d quick-login credential(s) for %s", removed, uid)
+        return ""
+    except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
+        log.exception("could not revoke the quick-login credentials of %s", uid)
+        return f"The quick-login credentials could not be revoked: {exc}"
+
+
 def clear_user_phone(uid: str) -> None:
     """Detach whatever phone number is on this account.
 
@@ -255,8 +296,44 @@ _FIELD_MAP = {
     ("user", "diamonds"): ("users", "diamonds"),
     ("user", "beans"): ("users", "beans"),
     ("seller", "coins"): ("sellers", "coinBalance"),
+    #: Paise, exactly as Mongo holds it (`money.Currency.COMMISSION`). The
+    #: rupee figure the CRM shows is `commissionBalanceInr`, written beside it
+    #: by `_balance_fields` on every sync (M-15).
     ("agency", "commission"): ("agencies", "commissionBalance"),
 }
+
+#: The app's history subcollection for each user currency (M-18).
+_HISTORY_COLLECTION = {"diamonds": "diamondTransactions", "beans": "beanTransactions"}
+
+#: `{collection}/{holder}/replicaSyncs/{ledger_id}` — the server-only marker
+#: that a CRM movement's delta reached the live balance. Written in the same
+#: batch/transaction as the `Increment`, read first by the drift repair, so a
+#: delta is applied once however many times it is replayed (M-1).
+REPLICA_SYNCS = "replicaSyncs"
+
+
+def _balance_fields(holder_type: str, currency: str, field: str, delta: int,
+                    balance_after: int | None) -> dict:
+    """The fields one balance sync writes on the holder's document."""
+    fields: dict = {field: firestore.Increment(int(delta))}
+    if holder_type == "agency" and currency == "commission":
+        # Mongo sees every commission movement (nothing in the app moves it),
+        # so an ABSOLUTE rupee mirror is correct here and self-healing — unlike
+        # diamonds, where the app spends behind Mongo's back and only a delta
+        # is honest. The unit of the paise field is stated on the document so
+        # a reader cannot mistake 12,500 paise for ₹12,500 (M-15).
+        fields["commissionBalanceUnit"] = "paise"
+        if balance_after is not None:
+            fields["commissionBalanceInr"] = int(balance_after) / 100
+    return fields
+
+
+def _history_doc(history: dict | None) -> dict | None:
+    if not history or not str(history.get("id") or "").strip():
+        return None
+    row = {k: v for k, v in dict(history).items() if k != "id"}
+    row.setdefault("timestamp", firestore.SERVER_TIMESTAMP)
+    return row
 
 
 def sync_balance_to_firestore(
@@ -264,8 +341,12 @@ def sync_balance_to_firestore(
     holder_id: str,
     currency: str,
     delta: int,
+    *,
+    balance_after: int | None = None,
+    history: dict | None = None,
+    marker_id: str = "",
 ) -> bool:
-    """Apply a CRM movement to the balance the Android app reads.
+    """Apply a CRM movement to the balance the Android app reads. Blocking.
 
     THIS APPLIES A DELTA, NOT AN ABSOLUTE.
 
@@ -282,11 +363,19 @@ def sync_balance_to_firestore(
     Firestore owns the live balance, and each CRM movement moves the live
     balance by exactly what the CRM decided — nothing more.
 
-    The two ledgers are reconciled by the nightly job, which compares them and
-    reports drift rather than having one stamp on the other.
+    B1: three things travel with the delta, in ONE batch so they land together
+    or not at all —
+
+      * the app-visible history row (`history`, M-18): a sale credit or an
+        admin credit now explains itself on the person's history screen;
+      * the `replicaSyncs/{marker_id}` marker (M-1): the proof this delta
+        reached the live balance, which is what lets `apply_replica_delta_once`
+        replay a failed sync without ever applying it twice;
+      * for agency commission, the rupee mirror `commissionBalanceInr` (M-15).
 
     Returns True on success. A failure here does not invalidate the ledger —
-    Mongo is already correct and reconciliation will report the divergence.
+    Mongo is already correct, the balance row is marked `replica_stale`, the
+    `replica_drift` alert names it and the repair replays it.
     """
     target = _FIELD_MAP.get((holder_type, currency))
     if target is None:
@@ -297,23 +386,86 @@ def sync_balance_to_firestore(
 
     collection, field = target
     try:
+        client = firestore_client()
+        ref = client.collection(collection).document(holder_id)
+        batch = client.batch()
         # `set(..., merge=True)` rather than `update()`: a holder whose
         # Firestore document does not exist yet (a seller created in the CRM
         # before their first sign-in) raised NotFound and lost the sync.
-        firestore_client().collection(collection).document(holder_id).set(
-            {field: firestore.Increment(int(delta))}, merge=True
-        )
+        batch.set(ref, _balance_fields(holder_type, currency, field, delta, balance_after), merge=True)
+        row = _history_doc(history) if holder_type == "user" else None
+        if row is not None:
+            batch.set(ref.collection(_HISTORY_COLLECTION[currency]).document(str(history["id"])), row)
+        if marker_id:
+            batch.set(ref.collection(REPLICA_SYNCS).document(str(marker_id)), {
+                "delta": int(delta), "currency": currency,
+                "historyId": str((history or {}).get("id") or ""),
+                "timestamp": firestore.SERVER_TIMESTAMP,
+            })
+        batch.commit()
         return True
     except Exception:  # noqa: BLE001 — never let a replica failure break the ledger
         log.exception(
             "Firestore balance sync failed for %s/%s/%s (delta %s) — Mongo is "
-            "committed, reconciliation will report the gap",
+            "committed; the balance row is marked stale for repair",
             holder_type,
             holder_id,
             currency,
             delta,
         )
         return False
+
+
+def apply_replica_delta_once(
+    holder_type: str,
+    holder_id: str,
+    currency: str,
+    delta: int,
+    *,
+    marker_id: str,
+    balance_after: int | None = None,
+    history: dict | None = None,
+) -> dict:
+    """M-1 — replay one failed balance sync, exactly once. Blocking.
+
+    A transaction reads `replicaSyncs/{marker_id}` first: present means this
+    ledger row's delta already reached the live balance (the original sync
+    landed and only its answer was lost, or an earlier repair wrote it), and
+    nothing is written. Absent, the `Increment`, the history row and the
+    marker are written together. Raises on a Firestore failure — the caller
+    leaves the entry pending and says so.
+
+    Returns `{"applied": bool}`.
+    """
+    target = _FIELD_MAP.get((holder_type, currency))
+    if target is None:
+        raise ValueError(f"No Firestore mapping for {holder_type}/{currency}")
+    if not marker_id:
+        raise ValueError("A replica replay needs the ledger id it is keyed on")
+    collection, field = target
+    client = firestore_client()
+    ref = client.collection(collection).document(holder_id)
+    marker_ref = ref.collection(REPLICA_SYNCS).document(str(marker_id))
+    row = _history_doc(history) if holder_type == "user" else None
+
+    @firestore.transactional
+    def _replay(transaction) -> dict:
+        marker = marker_ref.get(transaction=transaction)
+        if getattr(marker, "exists", False):
+            return {"applied": False}
+        if int(delta) != 0:
+            transaction.set(ref, _balance_fields(holder_type, currency, field, delta, balance_after), merge=True)
+        if row is not None:
+            transaction.set(ref.collection(_HISTORY_COLLECTION[currency]).document(str(history["id"])), row)
+        transaction.set(marker_ref, {
+            "delta": int(delta), "currency": currency,
+            "historyId": str((history or {}).get("id") or ""),
+            "repaired": True,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+        })
+        return {"applied": True}
+
+    return _replay(client.transaction())
 
 
 class HostBeansUnavailable(Exception):
@@ -416,7 +568,7 @@ def read_host_wallet(uid: str) -> dict | None:
 
 def debit_host_beans(
     uid: str, amount: int, settle: dict | None = None, history: dict | None = None,
-    *, debit_id: str = "",
+    *, debit_id: str = "", record_history: dict | None = None,
 ) -> dict:
     """Take `amount` beans out of a host's live wallet, or refuse. Blocking.
 
@@ -571,6 +723,30 @@ def debit_host_beans(
                     "beansBefore": held,
                     "agencyId": str(data.get("agencyId") or "").strip(),
                     "reason": str(history.get("reason") or ""),
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+        if record_history and str(record_history.get("id") or "").strip():
+            # M-17: a host withdrawal leaves the app-visible `beanTransactions`
+            # row too — the host sees "paid out, UTR …" rather than an
+            # unexplained drop. Written in the same transaction as the debit,
+            # under a deterministic id, so a replay (caught by the marker
+            # above) never writes it twice. Unlike `history`, this row is NOT
+            # the idempotency token and does not change the balance guards.
+            transaction.set(
+                ref.collection("beanTransactions").document(str(record_history["id"])),
+                {
+                    "type": "debit",
+                    "amount": amount,
+                    "availableBefore": available,
+                    "beansBefore": held,
+                    "balanceAfter": held - amount,
+                    "agencyId": str(data.get("agencyId") or "").strip(),
+                    "reason": str(record_history.get("reason") or "withdrawal"),
+                    "reasonLabel": str(record_history.get("label") or "Withdrawal paid"),
+                    "paymentRef": str(record_history.get("payment_ref") or ""),
+                    "cardId": str(record_history.get("card_id") or debit_id or ""),
+                    "context": "withdrawal",
                     "timestamp": firestore.SERVER_TIMESTAMP,
                 },
             )

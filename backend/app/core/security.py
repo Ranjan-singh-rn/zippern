@@ -13,7 +13,11 @@ Three ways in — two for people, one for a machine:
 
   * **The observer** has no stored password. Each sign-in generates a one-time
     code, delivered to a mailbox that is deliberately not the account address.
-    Holding the observer email is not sufficient to sign in.
+    Holding the observer email is not sufficient to sign in — and since B3
+    (spec §8) neither is the code alone: it buys a PENDING session, and the
+    authenticator app (`services/owner_mfa`, the same factor Owners carry)
+    makes it a session. The observer has no Android access at all: a Firebase
+    token naming it is refused by name (`ObserverDenied`).
 
   * **A service credential** is a standing key held by an unattended job. It
     issues no session, carries no JWT and has no role. It resolves to a named
@@ -66,6 +70,19 @@ class AuthError(Exception):
     """Authentication failed. The message is safe to return to the caller."""
 
 
+class ObserverDenied(AuthError):
+    """A Firebase-token sign-in that resolves to the Observer (B3, spec §8).
+
+    The Observer is CRM-only and signs in with the emailed code and TOTP; it
+    has no Android access at all, and no Firebase account by design. A Firebase
+    token carrying its address — a Google sign-in on the app with that Gmail,
+    or any provider — is refused by name so the client can say so, and is
+    audited by the router. `code` is the machine-readable reason.
+    """
+
+    code = "observer_denied"
+
+
 class IdentityConflictError(AuthError):
     """One person, two accounts — and the system refuses to guess which.
 
@@ -82,6 +99,40 @@ class IdentityConflictError(AuthError):
 
 
 # ── Session tokens ────────────────────────────────────────────────────────────
+
+def _carries_mfa_claim(role: Role) -> bool:
+    """Does a session for this role carry the second-factor claim (`mfa`)?
+
+    An Owner's and the Observer's session is PENDING until `services/owner_mfa`
+    verifies a code and issues the upgraded one; `deps.current_user` confines a
+    pending session to the MFA routes. The set itself (`owner_mfa.MFA_ROLES`)
+    is owned by the MFA service and read lazily, so this module's import graph
+    stays as flat as it was.
+    """
+    from app.services.owner_mfa import uses_mfa  # local: keeps the import graph flat
+
+    return uses_mfa(role)
+
+
+#: The clients a session can be issued to. Recorded on the session document for
+#: `GET /auth/sessions`; an unknown value is recorded as "" rather than refused.
+SESSION_CLIENTS: frozenset[str] = frozenset({"crm", "android"})
+
+#: How much of a User-Agent is kept on a session record. Enough to tell a
+#: laptop from a handset on the sessions list; not a fingerprint.
+USER_AGENT_MAX_CHARS = 160
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """A stored timestamp as an aware UTC datetime, or None for anything else.
+
+    Duck-typed on `tzinfo` rather than `isinstance(value, datetime)`: the
+    session-lifetime tests replace this module's `datetime` with a movable
+    clock, and an isinstance against the replacement would call every real
+    timestamp "not a datetime"."""
+    if value is None or not hasattr(value, "tzinfo") or not hasattr(value, "replace"):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def is_renewable(role: Role) -> bool:
@@ -122,6 +173,9 @@ async def issue_session(
     partner_status: str | None = None,
     renewed_from: str | None = None,
     mfa_verified: bool = False,
+    client: str = "",
+    ip: str | None = None,
+    user_agent: str = "",
 ) -> tuple[str, datetime]:
     """Mint a session token.
 
@@ -129,6 +183,10 @@ async def issue_session(
     partner, and are absent from every internal token exactly as they were
     before this parameter existed — an owner's session is byte-for-byte the
     session it was.
+
+    `client`, `ip` and `user_agent` (B3 / §13) go on the RECORD only, never on
+    the token: they are what `GET /auth/sessions` shows a person so they can
+    recognise "my laptop" and "my phone", and they decide nothing.
 
     `partner_ids` maps a capability (`"agency"` / `"seller"`) to the one partner
     record the holder may read for it. It is the whole of an external session's
@@ -190,11 +248,16 @@ async def issue_session(
         "token_expires_at": expires,
         "revoked": False,
         "renewed_from": renewed_from,
+        #: B3 — where this session was issued to and from. Display only.
+        "client": client if client in SESSION_CLIENTS else "",
+        "ip": str(ip or "")[:64] or None,
+        "user_agent": str(user_agent or "")[:USER_AGENT_MAX_CHARS],
     }
-    if role == Role.OWNER:
-        # P1-A3: whether THIS session passed the Owner's second factor. Only an
-        # Owner token carries it; `deps.current_user` limits an Owner session
-        # without it to the MFA routes. Set only by `services/owner_mfa`.
+    if _carries_mfa_claim(role):
+        # P1-A3 / B3: whether THIS session passed the second factor. Only an
+        # Owner's or the Observer's token carries it; `deps.current_user`
+        # limits a session without it to the MFA routes. Set only by
+        # `services/owner_mfa`.
         claims["mfa"] = bool(mfa_verified)
         record["mfa_verified"] = bool(mfa_verified)
     if partner_ids is not None or partner_status is not None:
@@ -267,8 +330,194 @@ async def _session_expiry(jti: str) -> datetime | None:
     return (record or {}).get("token_expires_at")
 
 
-async def revoke_session(jti: str) -> None:
-    await get_db()[C.SESSIONS].update_one({"jti": jti}, {"$set": {"revoked": True}})
+async def _session_meta(jti: str) -> dict:
+    """`{client, ip, user_agent}` recorded on a session, for the one that
+    replaces it (the MFA upgrade). Empty when there is no such record."""
+    record = await get_db()[C.SESSIONS].find_one({"jti": jti}) if jti else None
+    record = record or {}
+    return {
+        "client": str(record.get("client") or ""),
+        "ip": record.get("ip"),
+        "user_agent": str(record.get("user_agent") or ""),
+    }
+
+
+async def revoke_session(jti: str, reason: str = "") -> None:
+    patch: dict = {"revoked": True, "revoked_at": datetime.now(timezone.utc)}
+    if reason:
+        patch["revoked_reason"] = str(reason)[:200]
+    await get_db()[C.SESSIONS].update_one({"jti": jti}, {"$set": patch})
+
+
+# ── B3 / §13 — revoking every session of one person ──────────────────────────
+#
+# "Restriction, ban, role revocation and security reset revoke appropriate
+# sessions." Until now each path did its own `update_many({"uid": …})` and
+# nothing else — so a suspended Owner's Firestore binding, a banned person's
+# quick-login credential and the Observer's reset of an Owner's factor each had
+# to remember the other halves, and did not all remember. This is the one
+# helper they share. It never raises for a downstream failure: what did not
+# happen is returned in `problems`, because a moderation decision that has
+# already been written must not fail on the sweep that follows it.
+
+
+async def revoke_sessions_for_uid(
+    uid: str,
+    reason: str,
+    *,
+    actor: Mapping[str, object] | None = None,
+    keep_jti: str | None = None,
+    mobile: bool = False,
+) -> dict:
+    """Revoke every live API session of `uid`, and what rides on them.
+
+    Always:
+      * every unrevoked session record of `uid` is marked revoked (with
+        `revoked_reason`), except `keep_jti` — the caller's own session on
+        "sign out everywhere else". Effective on the next request: both
+        `verify_session` and `renew_session` read the flag.
+      * the Owner MFA Firestore/Storage bindings of `uid` are cleared when any
+        of its sessions held one (P1-A3b) — a binding must not outlive the
+        session it was minted for.
+
+    With `mobile=True` (a restriction, a ban or a security reset — NOT an
+    ordinary sign-out, which must keep quick login working):
+      * the Firebase refresh tokens are revoked (`firebase.revoke_sessions`),
+        so no new ID token can be minted for the account;
+      * the quick-login credentials are deleted (`firebase.revoke_quick_login`),
+        so "Continue as …" cannot walk back into the account.
+      The Observer's synthetic uid names no Firebase account; both are skipped.
+
+    `actor`, when given, is written on one audit row (`session.revoked_all`)
+    naming the reason and the counts. Never the tokens.
+
+    Returns::
+
+        {"uid", "api_sessions": n, "kept": jti-prefix or None,
+         "mfa_bindings_cleared": True | False | None (none held),
+         "firebase_revoked": True | False | None (not asked),
+         "quick_login_revoked": True | False | None (not asked),
+         "problems": [sentences]}
+    """
+    db = get_db()
+    uid = str(uid or "").strip()
+    reason = str(reason or "").strip() or "Sessions revoked"
+    problems: list[str] = []
+    if not uid:
+        return {"uid": "", "api_sessions": 0, "kept": None, "mfa_bindings_cleared": None,
+                "firebase_revoked": None, "quick_login_revoked": None,
+                "problems": ["No account id was given."]}
+
+    # One record at a time rather than `update_many` with `$ne`, so the kept
+    # session and the binding question are decided on what was actually read.
+    revoked = 0
+    bound: set[str] = set()
+    async for session in db[C.SESSIONS].find({"uid": uid}):
+        jti = str(session.get("jti") or "")
+        if not jti or session.get("revoked"):
+            continue
+        if keep_jti and jti == keep_jti:
+            continue
+        if session.get("mfa_binding_id"):
+            bound.add(jti)
+        await revoke_session(jti, reason)
+        revoked += 1
+
+    bindings_cleared: bool | None = None
+    if bound:
+        from app.services import owner_mfa  # local: keeps the import graph flat
+
+        if keep_jti:
+            # "Everywhere else": only the bindings of the sessions that ended.
+            # The kept session's own Firestore/Storage binding must survive.
+            bindings_cleared = await owner_mfa.unbind_sessions(uid, bound, reason)
+        else:
+            # Nothing kept: every binding of the uid, including any whose
+            # session record is already gone.
+            bindings_cleared = await owner_mfa.clear_all_bindings(uid, reason)
+        if not bindings_cleared:
+            problems.append("the Owner's Firestore/Storage MFA bindings were NOT removed")
+
+    firebase_revoked: bool | None = None
+    quick_login_revoked: bool | None = None
+    if mobile and not uid.startswith("observer:"):
+        problem = await asyncio.to_thread(firebase.revoke_sessions, uid)
+        firebase_revoked = problem == ""
+        if problem:
+            problems.append(problem)
+        problem = await asyncio.to_thread(firebase.revoke_quick_login, uid)
+        quick_login_revoked = problem == ""
+        if problem:
+            problems.append(problem)
+
+    if actor is not None:
+        from app.core import audit  # local: keeps the import graph flat
+
+        try:
+            await audit.record(
+                actor=dict(actor),
+                action=audit.Action.SESSIONS_REVOKED,
+                subject_type="auth",
+                subject_id=uid,
+                reason=reason,
+                meta={
+                    "api_sessions": revoked,
+                    "kept": (keep_jti or "")[:8] or None,
+                    "mfa_bindings_cleared": bindings_cleared,
+                    "firebase_revoked": firebase_revoked,
+                    "quick_login_revoked": quick_login_revoked,
+                    "problems": list(problems),
+                },
+            )
+        except Exception:  # noqa: BLE001 — the revocation stands; say the record failed
+            log.exception("session revocation for %s could not be audited", uid)
+            problems.append("the revocation was not written to the audit log")
+
+    log.info("Revoked %d session(s) of %s: %s", revoked, uid, reason)
+    return {
+        "uid": uid,
+        "api_sessions": revoked,
+        "kept": (keep_jti or "")[:8] or None,
+        "mfa_bindings_cleared": bindings_cleared,
+        "firebase_revoked": firebase_revoked,
+        "quick_login_revoked": quick_login_revoked,
+        "problems": problems,
+    }
+
+
+async def list_sessions(uid: str, *, current_jti: str = "") -> list[dict]:
+    """The live sessions of one person, newest first — `GET /auth/sessions`.
+
+    Live means: not revoked, and the token not yet expired (a record inside
+    the renewal grace is a credential nobody can use directly, so it is left
+    out). Each entry carries a short fingerprint of the session id and what
+    was recorded at issue; never the token and never the full `jti`.
+    """
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    async for s in get_db()[C.SESSIONS].find({"uid": uid}):
+        if s.get("revoked"):
+            continue
+        expires = _aware(s.get("token_expires_at"))
+        if expires is None or expires <= now:
+            continue
+        jti = str(s.get("jti") or "")
+        issued = _aware(s.get("issued_at"))
+        last_active = _aware(s.get("state_checked_at")) or issued
+        out.append({
+            "id": jti[:8],
+            "current": bool(current_jti) and jti == current_jti,
+            "client": str(s.get("client") or "") or "unknown",
+            "ip": s.get("ip"),
+            "user_agent": str(s.get("user_agent") or ""),
+            "issued_at": issued.isoformat() if issued else None,
+            "expires_at": expires.isoformat(),
+            "last_active_at": last_active.isoformat() if last_active else None,
+            "mfa_verified": bool(s.get("mfa_verified")) if "mfa_verified" in s else None,
+            "renewed": bool(s.get("renewed_from")),
+        })
+    out.sort(key=lambda e: (e["current"], e["issued_at"] or ""), reverse=True)
+    return out
 
 
 # ── Renewal ───────────────────────────────────────────────────────────────────
@@ -328,11 +577,13 @@ async def revoke_session(jti: str) -> None:
 # a password — which is the correct end of "and if expire also… asking relogin".
 
 
-async def renew_session(token: str) -> tuple[str, datetime, dict]:
+async def renew_session(token: str, *, ip: str | None = None) -> tuple[str, datetime, dict]:
     """Replace a live or recently expired session with a fresh one.
 
     Returns the same triple as `sign_in_with_firebase` — token, expiry,
-    profile — because the caller does the same thing with it.
+    profile — because the caller does the same thing with it. `ip` is the
+    renewing request's address for the new record (display only); the client
+    and user agent carry over from the record being replaced.
 
     The session presented is **revoked** before the replacement is issued, so
     exactly one token is live at a time and a renewal cannot be replayed. That
@@ -418,7 +669,7 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
             raise AuthError("Your role has changed. Sign in again.")
 
         name = str(staff.get("name", ""))
-        await revoke_session(jti)
+        await revoke_session(jti, "Renewed")
         # P1-A3: a renewal continues the SAME sign-in, so an Owner who passed
         # MFA keeps it and one who has not still has not. An Observer reset of
         # the Owner's MFA revokes every session, so nothing stale renews.
@@ -426,6 +677,8 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
         new_token, expires = await issue_session(
             uid=uid, email=email, name=name, role=current, renewed_from=jti,
             mfa_verified=mfa_ok,
+            client=str(record.get("client") or ""), ip=ip or record.get("ip"),
+            user_agent=str(record.get("user_agent") or ""),
         )
         log.info("Renewed the session of %s (%s)", uid, current)
         profile = {
@@ -468,7 +721,7 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
     if partner.role != role:
         raise AuthError("Your role has changed. Sign in again.")
 
-    await revoke_session(jti)
+    await revoke_session(jti, "Renewed")
     new_token, expires = await issue_session(
         uid=uid,
         email=email,
@@ -477,6 +730,8 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
         partner_ids=partner.partner_ids,
         partner_status=partner.status,
         renewed_from=jti,
+        client=str(record.get("client") or ""), ip=ip or record.get("ip"),
+        user_agent=str(record.get("user_agent") or ""),
     )
     log.info(
         "Renewed the session of partner %s (%s), scope %s",
@@ -716,7 +971,32 @@ async def _refuse_restricted_app_account(uid: str) -> None:
 # ── Firebase sign-in (staff, owners, partners) ────────────────────────────────
 
 
-async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
+#: What an Observer-bearing Firebase token is told. One sentence for the three
+#: doors (address, synthetic uid, staff row), so none of them is more
+#: informative than the others.
+OBSERVER_DENIED_MESSAGE = (
+    "The Observer account cannot sign in here. It is CRM-only: use the emailed "
+    "sign-in code at /observer, then the authenticator app."
+)
+
+
+def _is_observer_identity(uid: str, email: str) -> bool:
+    """Does this Firebase token NAME the Observer, before any directory read?
+
+    Two cheap checks: the configured Observer address on the token, and the
+    synthetic uid shape `observer:<email>` (a uid nobody can produce from a
+    real Firebase account, but which an Admin-SDK-created account could
+    carry). The staff-row check in `sign_in_with_firebase` is the third door.
+    """
+    observer = settings.observer_email.lower().strip()
+    if email and observer and email == observer:
+        return True
+    return str(uid or "").startswith("observer:")
+
+
+async def sign_in_with_firebase(
+    id_token: str, *, client: str = "crm", ip: str | None = None, user_agent: str = "",
+) -> tuple[str, datetime, dict]:
     try:
         decoded = firebase.verify_id_token(id_token)
     except Exception as exc:  # noqa: BLE001
@@ -724,6 +1004,23 @@ async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
 
     uid = decoded.get("uid", "")
     email = (decoded.get("email") or "").lower()
+
+    # ── B3: the Observer, refused on the token itself ────────────────────────
+    #
+    # Spec §8: "Backend must deny Android access, not just hide navigation."
+    # The Observer has NO Android access at all and no Firebase account; any
+    # token carrying its address or its synthetic uid is refused before a
+    # single directory read, with a named reason the client can show and the
+    # router audits (`auth.observer_denied`). The staff-row check further down
+    # is the same refusal for a token that names the Observer only through
+    # its `staff` row.
+    if _is_observer_identity(uid, email):
+        log.warning(
+            "Refused a Firebase-token Observer sign-in (uid %s, client %s): the token "
+            "names the Observer. The Observer signs in only via the emailed code.",
+            uid, client,
+        )
+        raise ObserverDenied(OBSERVER_DENIED_MESSAGE)
 
     # Computed once and shared by both lookups below. The staff path and the
     # partner path are entitled to exactly the same proof, and deriving it twice
@@ -756,7 +1053,7 @@ async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
             email or "<no email>",
             uid,
         )
-        raise AuthError("This account cannot sign in here.")
+        raise ObserverDenied(OBSERVER_DENIED_MESSAGE)
 
     if staff is not None:
         # ── Staff takes precedence, always ──────────────────────────────────
@@ -773,7 +1070,8 @@ async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
         name = staff.get("name", "")
 
         token, expires = await issue_session(
-            uid=uid, email=email, name=name, role=role
+            uid=uid, email=email, name=name, role=role,
+            client=client, ip=ip, user_agent=user_agent,
         )
         return (
             token,
@@ -802,6 +1100,7 @@ async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
         role=partner.role,
         partner_ids=partner.partner_ids,
         partner_status=partner.status,
+        client=client, ip=ip, user_agent=user_agent,
     )
     return token, expires, partner.profile(uid, email)
 
@@ -1245,29 +1544,146 @@ def _hash_code(code: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{code}".encode()).hexdigest()
 
 
-async def request_observer_code(requested_by_ip: str | None = None) -> dict:
+class ObserverCodeRateLimited(AuthError):
+    """Too many code requests from one address, or from everywhere (B-4)."""
+
+
+class ObserverCodeProofFailed(AuthError):
+    """The `previous_code` offered with a code request was wrong (B-4). A 401,
+    not a 429: it is a failed guess, and it was charged as one."""
+
+
+#: A code request is logged in the same collection as the codes, under this
+#: `kind`, so the TTL index on `expires_at` reaps the log with the codes. Code
+#: records carry `email` + `used`; request records carry neither, so neither
+#: query ever sees the other's documents.
+_OTP_REQUEST_KIND = "request"
+
+
+def _code_is_live(record: Mapping, now: datetime) -> bool:
+    """Unexpired and still inside its attempt budget."""
+    expires = _aware(record.get("expires_at"))
+    if expires is None or expires < now:
+        return False
+    return int(record.get("attempts") or 0) < int(settings.otp_max_attempts)
+
+
+async def _outstanding_codes(db, email: str, now: datetime) -> list[dict]:
+    """Every live code for the observer, newest first; dead ones are reaped."""
+    live: list[dict] = []
+    async for record in db[C.OBSERVER_OTP].find({"email": email, "used": False}):
+        if _code_is_live(record, now):
+            live.append(record)
+        else:
+            await db[C.OBSERVER_OTP].delete_one({"_id": record["_id"]})
+    live.sort(key=lambda r: _aware(r.get("created_at")) or now, reverse=True)
+    return live
+
+
+def _match_code(records: list[dict], code: str) -> dict | None:
+    """The record `code` matches, or None. Every record is compared, so the
+    time taken does not say which one — or whether any — matched."""
+    supplied = str(code or "").strip()
+    found: dict | None = None
+    for record in records:
+        if hmac.compare_digest(str(record.get("code_hash") or ""),
+                               _hash_code(supplied, str(record.get("salt") or ""))):
+            found = found or record
+    return found
+
+
+async def _count_code_misses(db, email: str, records: list[dict]) -> int:
+    """A wrong guess spends one attempt on EVERY outstanding code — the budget
+    is per sign-in, not per code, or issuing more codes would buy more guesses.
+    Returns the attempts left on the freshest code."""
+    await db[C.OBSERVER_OTP].update_many(
+        {"email": email, "used": False}, {"$inc": {"attempts": 1}}
+    )
+    freshest = min((int(r.get("attempts") or 0) for r in records), default=0)
+    return max(int(settings.otp_max_attempts) - freshest - 1, 0)
+
+
+async def request_observer_code(
+    requested_by_ip: str | None = None, *, previous_code: str = "",
+) -> dict:
     """Generate a one-time code and email it to the delivery mailbox.
 
     The response never contains the code, and never reveals whether delivery
     succeeded in a way that could be used to probe the mailbox.
+
+    ── B-4: a request no longer voids the codes already out there ───────────
+    This endpoint is unauthenticated, and it used to delete every outstanding
+    code before issuing the new one. So anybody could lock the Observer out
+    for ever by calling it once a minute — and the Observer is the only
+    identity that provisions, suspends and deactivates Owners and resets their
+    MFA. Now:
+
+      * an outstanding code stays valid for the whole of its TTL. A new
+        request simply adds one; `verify_observer_code` accepts any live code
+        and consumes them all on success;
+      * the requester may PROVE the previous code (`previous_code`): the
+        proven code and its siblings are voided and a fresh one is sent at
+        once, cooldown waived — "I have it, I want a new one" costs the
+        legitimate holder nothing, and a wrong proof costs an attempt from the
+        same budget a wrong sign-in does;
+      * a per-address limit and a global limit over a window
+        (`otp_request_limit_per_ip` / `otp_request_limit_global` per
+        `otp_request_window_minutes`), on top of the resend cooldown. The
+        address is best effort (`X-Forwarded-For` is caller-supplied); the
+        global limit is the one nobody can dodge, and it also bounds the mail
+        the delivery mailbox can be made to receive.
     """
     db = get_db()
     email = settings.observer_email.lower()
     now = datetime.now(timezone.utc)
+    ip = str(requested_by_ip or "").strip()[:64]
 
-    recent = await db[C.OBSERVER_OTP].find_one(
-        {"email": email, "created_at": {"$gt": now - timedelta(
-            seconds=settings.otp_resend_cooldown_seconds
-        )}}
+    # ── Limits ───────────────────────────────────────────────────────────────
+    window_start = now - timedelta(minutes=int(settings.otp_request_window_minutes))
+    if ip:
+        from_ip = await db[C.OBSERVER_OTP].count_documents(
+            {"kind": _OTP_REQUEST_KIND, "ip": ip, "created_at": {"$gt": window_start}}
+        )
+        if from_ip >= int(settings.otp_request_limit_per_ip):
+            log.warning("Observer code request refused: per-address limit reached")
+            raise ObserverCodeRateLimited(
+                "Too many sign-in codes were requested from this address. "
+                "Wait a few minutes and try again."
+            )
+    in_window = await db[C.OBSERVER_OTP].count_documents(
+        {"kind": _OTP_REQUEST_KIND, "created_at": {"$gt": window_start}}
     )
-    if recent is not None:
-        raise AuthError(
-            f"A code was sent recently. Wait "
-            f"{settings.otp_resend_cooldown_seconds} seconds before requesting another."
+    if in_window >= int(settings.otp_request_limit_global):
+        log.warning("Observer code request refused: global limit reached")
+        raise ObserverCodeRateLimited(
+            "Too many sign-in codes were requested recently. "
+            "Wait a few minutes and try again."
         )
 
-    # Any outstanding codes are void once a new one is issued.
-    await db[C.OBSERVER_OTP].delete_many({"email": email})
+    outstanding = await _outstanding_codes(db, email, now)
+
+    # ── Proof of the previous code ───────────────────────────────────────────
+    proven = False
+    if str(previous_code or "").strip():
+        matched = _match_code(outstanding, previous_code)
+        if matched is None:
+            if outstanding:
+                await _count_code_misses(db, email, outstanding)
+            log.warning("Observer code request: the previous code offered was wrong")
+            raise ObserverCodeProofFailed("That code is not correct.")
+        # Proven: the holder of the outstanding codes is asking. They are void
+        # from here — the fresh one replaces them, as a sign-in would.
+        await db[C.OBSERVER_OTP].delete_many({"email": email, "used": False})
+        proven = True
+
+    if not proven:
+        cooldown = timedelta(seconds=int(settings.otp_resend_cooldown_seconds))
+        newest = _aware(outstanding[0].get("created_at")) if outstanding else None
+        if newest is not None and newest > now - cooldown:
+            raise AuthError(
+                f"A code was sent recently. Wait "
+                f"{settings.otp_resend_cooldown_seconds} seconds before requesting another."
+            )
 
     code = f"{secrets.randbelow(1_000_000):06d}"
     salt = secrets.token_hex(16)
@@ -1282,7 +1698,17 @@ async def request_observer_code(requested_by_ip: str | None = None) -> dict:
             "expires_at": expires,
             "attempts": 0,
             "used": False,
-            "requested_from": requested_by_ip,
+            "requested_from": ip or None,
+        }
+    )
+    # The request log entry — reaped with the window, never carries the code.
+    await db[C.OBSERVER_OTP].insert_one(
+        {
+            "kind": _OTP_REQUEST_KIND,
+            "ip": ip or None,
+            "created_at": now,
+            "expires_at": now + timedelta(minutes=int(settings.otp_request_window_minutes)),
+            "proven": proven,
         }
     )
 
@@ -1295,41 +1721,39 @@ async def request_observer_code(requested_by_ip: str | None = None) -> dict:
     return {
         "sent_to": _mask_email(settings.observer_otp_delivery_email),
         "expires_in_minutes": settings.otp_ttl_minutes,
+        #: How many codes are now live, so the screen can say "any of the
+        #: codes sent in the last N minutes works".
+        "outstanding": len(outstanding) + 1 if not proven else 1,
     }
 
 
-async def verify_observer_code(code: str) -> tuple[str, datetime, dict]:
-    """Exchange a valid code for a session."""
+async def verify_observer_code(
+    code: str, *, ip: str | None = None, user_agent: str = "",
+) -> tuple[str, datetime, dict]:
+    """Exchange a valid code for a PENDING session (B3: the first factor).
+
+    Any live outstanding code is accepted (B-4); a wrong guess spends one
+    attempt on all of them; success consumes every one. The session issued
+    carries `mfa=False` — `deps.current_user` confines it to the MFA routes
+    until `owner_mfa.verify` (or enrolment) issues the upgraded one.
+    """
     db = get_db()
     email = settings.observer_email.lower()
     now = datetime.now(timezone.utc)
 
-    record = await db[C.OBSERVER_OTP].find_one({"email": email, "used": False})
-    if record is None:
+    outstanding = await _outstanding_codes(db, email, now)
+    if not outstanding:
         raise AuthError("No sign-in code is outstanding. Request a new one.")
 
-    if record["expires_at"] < now:
-        await db[C.OBSERVER_OTP].delete_one({"_id": record["_id"]})
-        raise AuthError("That code has expired. Request a new one.")
-
-    if record["attempts"] >= settings.otp_max_attempts:
-        await db[C.OBSERVER_OTP].delete_one({"_id": record["_id"]})
-        raise AuthError("Too many incorrect attempts. Request a new code.")
-
-    expected = record["code_hash"]
-    supplied = _hash_code(code.strip(), record["salt"])
-
-    if not hmac.compare_digest(expected, supplied):
-        await db[C.OBSERVER_OTP].update_one(
-            {"_id": record["_id"]}, {"$inc": {"attempts": 1}}
-        )
-        remaining = settings.otp_max_attempts - record["attempts"] - 1
+    matched = _match_code(outstanding, code)
+    if matched is None:
+        remaining = await _count_code_misses(db, email, outstanding)
         raise AuthError(
-            f"That code is not correct. {max(remaining, 0)} attempts remaining."
+            f"That code is not correct. {remaining} attempts remaining."
         )
 
-    # Single use — consumed the moment it succeeds.
-    await db[C.OBSERVER_OTP].delete_one({"_id": record["_id"]})
+    # Single use — every outstanding code is consumed the moment one succeeds.
+    await db[C.OBSERVER_OTP].delete_many({"email": email, "used": False})
 
     # ── THE RECORD MUST EXIST, AND IT MUST BE ACTIVE ─────────────────────────
     #
@@ -1362,8 +1786,12 @@ async def verify_observer_code(code: str) -> tuple[str, datetime, dict]:
         raise AuthError("This account cannot sign in.")
     name = observer.get("name", "Observer")
 
+    # B3: PENDING until the authenticator code is verified (`mfa=False`). The
+    # Observer is never issued for "android" — it has no app access at all —
+    # so the client is recorded as the CRM whatever was asked.
     token, expires = await issue_session(
-        uid=uid, email=email, name=name, role=Role.OBSERVER
+        uid=uid, email=email, name=name, role=Role.OBSERVER,
+        client="crm", ip=ip, user_agent=user_agent,
     )
     profile = {
         "uid": uid,

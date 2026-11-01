@@ -94,6 +94,13 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # ── Their own session and identity ────────────────────────────────────
         ("GET", "/api/auth/me"),
         ("POST", "/api/auth/signout"),
+        # B3 / §13 (B-21): the sessions this login holds, and "sign out
+        # everywhere". Both act on the session's OWN uid (`own_session_uid`),
+        # take no id from the request, and read or revoke nothing of anybody
+        # else's — an agency seeing a session it does not recognise is the
+        # person who most needs to be able to end it.
+        ("GET", "/api/auth/sessions"),
+        ("POST", "/api/auth/sessions/revoke-all"),
         # ── Decision 15 (RC): verifying their own contacts ────────────────────
         # A role approved by the Owner waits until the login holds BOTH a
         # verified phone and a verified email. These three are how the
@@ -326,35 +333,45 @@ async def current_user(
     return user
 
 
-#: Returned on an Owner route reached before MFA. The CRM reads this header
-#: (not the message) to show the second-factor step.
+#: Returned on an Owner or Observer route reached before MFA. The CRM and the
+#: Android app read this header (not the message) to show the second-factor
+#: step. Exposed through CORS in `app/main.py`.
 MFA_REQUIRED_HEADER = "X-Zipper-MFA-Required"
 
 
+def _mfa_required_refusal() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Two-step sign-in required. Enter the code from your authenticator app.",
+        headers={MFA_REQUIRED_HEADER: "1"},
+    )
+
+
 def _refuse_owner_without_mfa(request: Request | None, user: dict) -> None:
-    """P1-A3 — an Owner session that has not passed MFA reaches the MFA routes,
-    `me` and sign-out, and nothing else.
+    """P1-A3 / B3 — an Owner's or the Observer's session that has not passed
+    MFA reaches the MFA routes, `me` and sign-out, and nothing else.
 
     Server-side, on every route, because every route depends on
     `current_user`. The browser gate this replaces could be skipped by anyone
     holding the password; this cannot, because the API itself refuses.
     A request whose route cannot be identified is refused, as for partners.
-    """
-    if user.get("role") != R.Role.OWNER or user.get("mfa_verified"):
-        return
-    from app.config import settings
-    from app.services.owner_mfa import MFA_PENDING_ROUTES
 
-    if not settings.owner_mfa_required:
+    Whether the factor is enforced is `owner_mfa.required_for(role)`: the
+    Owner's roll-out switch, and ALWAYS for the Observer (spec §8: no bypass
+    for the identity that provisions Owners). The name is kept from P1-A3 so
+    the tests that pin the gate keep pointing at it.
+    """
+    from app.services.owner_mfa import MFA_PENDING_ROUTES, required_for, uses_mfa
+
+    role = user.get("role")
+    if not uses_mfa(role) or user.get("mfa_verified"):
+        return
+    if not required_for(role):
         return
     key = _route_key(request)
     if key is not None and key in MFA_PENDING_ROUTES:
         return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Two-step sign-in required. Enter the code from your authenticator app.",
-        headers={MFA_REQUIRED_HEADER: "1"},
-    )
+    raise _mfa_required_refusal()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -524,12 +541,22 @@ async def require_write_or_partner(user: dict = Depends(current_user)) -> dict:
 
 
 async def require_owner(user: dict = Depends(current_user)) -> dict:
-    """Only owners sign money. Spec 1.2.1."""
+    """Only owners sign money. Spec 1.2.1.
+
+    B-18 (B3): the role is re-read from the `staff` row before the route runs,
+    exactly as `require_permission` does (§19 — see `_confirm_role_on_record`).
+    Every `require_owner` route moves money or settles it — execute, settle,
+    pay, decide frozen money, release an alert — and a session whose Owner role
+    was taken away by a script, a migration or a hand edit must not sign one
+    more card on the strength of a week-old claim. One indexed read per Owner
+    money action; reads elsewhere stay as cheap as they were.
+    """
     if not R.is_owner(user["role"]):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only a business owner can approve this.",
         )
+    await _confirm_role_on_record(user, R.Role.OWNER)
     return user
 
 
@@ -579,12 +606,23 @@ async def require_owner_provisioner(user: dict = Depends(current_user)) -> dict:
     observer is deliberately kept away from. This guard stands alongside it
     rather than weakening it, and the route it guards cannot name a role at all:
     see `POST /staff/owners`, which hardcodes `Role.OWNER`.
+
+    ── B3: AND THE SESSION MUST HAVE PASSED THE AUTHENTICATOR ────────────────
+
+    Every governance route this guards — provision, suspend, reactivate and
+    deactivate an Owner, reset an Owner's MFA — needs `mfa_verified` on the
+    session. `current_user` already confines a pending Observer session to the
+    MFA routes; this is the second, independent refusal on the routes that
+    matter most, and it reads the session rather than any setting, so no
+    configuration can waive it.
     """
     if user["role"] != Role.OBSERVER:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the observer provisions owner accounts.",
         )
+    if not user.get("mfa_verified"):
+        raise _mfa_required_refusal()
     return user
 
 

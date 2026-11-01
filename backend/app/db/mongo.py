@@ -135,6 +135,11 @@ class C:
     #: nothing compared them before, so the two could drift indefinitely
     #: without anyone knowing when it started.
     RECONCILIATION = "reconciliation"
+    #: B1 — one row per Owner-notification event (`_id` = the deterministic
+    #: event key `owner_money:{ref}:{action}`): who was told, how, and whether
+    #: every delivery succeeded. A row that is still `pending` is retried by
+    #: the transactional sweep and raised by the `owner_notice_failed` alert.
+    OWNER_NOTICES = "owner_notices"
 
 
 async def connect(*, ensure: bool = True) -> None:

@@ -181,6 +181,14 @@ def can_verify_money(role: Role, card_team: Team | None) -> bool:
     process anything before staff were hired. Separation of duties is preserved
     a different way: whoever verifies a card cannot also sign it, enforced in
     `cards.sign`. So two different people are always involved.
+
+    OWNER_DECISION_PENDING (spec §9, B2): the master specification says
+    "Finance is the only non-Owner role permitted to verify money cards where
+    defined". The accepted flow (spec 5.5.1) also lets a department admin
+    verify their OWN department's cards, and that is what this predicate still
+    does. Narrowing it to Finance alone is a one-line change here — made only
+    on the Owner's word, because it changes who can move a card towards
+    signature in every department.
     """
     if role == Role.OWNER:
         return True

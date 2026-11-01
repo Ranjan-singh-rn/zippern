@@ -328,11 +328,6 @@ refuses(
 
 run(card_svc.verify(own["id"], OWNER_B, "Checked against the supplier invoice."))
 refuses(
-    "the person who verified a card cannot also sign it",
-    lambda: card_svc.sign(own["id"], OWNER_B, "Approved."),
-    error=CardError,
-)
-refuses(
     "a team admin cannot sign — verification is not approval",
     lambda: card_svc.sign(own["id"], OPS_ADMIN, "Approved."),
     error=CardError,
@@ -342,24 +337,39 @@ refuses(
     lambda: card_svc.sign(own["id"], FIN_ADMIN, "Approved."),
     error=CardError,
 )
-signed = run(card_svc.sign(own["id"], OWNER_A, "Approved."))
-check("a third person signs it", signed["stage"], str(Stage.APPROVED))
+# Master spec §8 (owner-alone): the Owner who verified a card MAY sign it. The
+# two-person refusal that used to live here is kept for everybody who is not
+# an Owner — and nobody who is not an Owner signs at all.
+signed = run(card_svc.sign(own["id"], OWNER_B, "Approved."))
+check("the Owner who verified it signs it (§8)", signed["stage"], str(Stage.APPROVED))
+check("…and the card says the signature was owner-alone", signed["owner_alone"], True)
 
-# An owner's own card is not exempt from any of it.
+# An owner's own card: under §8 the same Owner may verify and sign it, and the
+# record still shows every stage with that Owner's name on each.
 owners_own = run(raise_one(actor=OWNER_A, category=X.ExpenseCategory.INFRASTRUCTURE))
 check("an owner's own card starts at Requested like everyone else's", owners_own["stage"], str(Stage.REQUESTED))
+verified_own = run(card_svc.verify(owners_own["id"], OWNER_A, "Mine, and correct — invoice attached."))
+check("an Owner may verify the card they raised (§8)", verified_own["stage"], str(Stage.AWAITING_SIGNOFF))
+check("…and Under Review was recorded, not skipped (B-23)",
+      verified_own["review_started_by"]["uid"], OWNER_A["uid"])
+own_signed = run(card_svc.sign(owners_own["id"], OWNER_A, "Approved."))
+check("an Owner may sign the card they raised (§8)", own_signed["stage"], str(Stage.APPROVED))
+own_actions = [e["action"] for e in run(audit_log.history_for("card", owners_own["id"]))]
+for action in (
+    audit_log.Action.CARD_RAISED,
+    audit_log.Action.CARD_REVIEW_STARTED,
+    audit_log.Action.CARD_VERIFIED,
+    audit_log.Action.CARD_SIGNED,
+):
+    truthy(f"…every step is its own audit entry: {action}", action in own_actions)
+# A Finance admin who raised a card still cannot verify it — the relaxation is
+# the Owner's alone.
+fin_own = run(raise_one(actor=FIN_ADMIN, category=X.ExpenseCategory.INFRASTRUCTURE))
 refuses(
-    "an owner cannot verify the card they raised",
-    lambda: card_svc.verify(owners_own["id"], OWNER_A, "Mine, and correct."),
+    "a finance admin still cannot verify the card they raised",
+    lambda: card_svc.verify(fin_own["id"], FIN_ADMIN, "Mine, and correct."),
     error=CardError,
 )
-run(card_svc.verify(owners_own["id"], FIN_ADMIN, "Invoice checked."))
-refuses(
-    "an owner cannot sign the card they raised",
-    lambda: card_svc.sign(owners_own["id"], OWNER_A, "Approved."),
-    error=CardError,
-)
-run(card_svc.sign(owners_own["id"], OWNER_B, "Approved."))
 
 # Paying twice pays once.
 run(X.execute_expense(owners_own["id"], "UTR-DUP", OWNER_B))
@@ -384,14 +394,16 @@ check(
     1,
 )
 
-# Three people were involved in that card and no two of them were the same.
+# §8: one Owner raised, verified and signed that card, and the record names
+# that Owner at every stage — the trail, not a second person, is the control.
 paid_card = run(card_svc._get(owners_own["id"], as_dict=True))
 people = {
     paid_card["requested_by"]["uid"],
     paid_card["verified_by"]["uid"],
     paid_card["signed_by"]["uid"],
 }
-check("three distinct people touched one expense", len(people), 3)
+check("one Owner is named at every stage of their own expense (§8)", people, {OWNER_A["uid"]})
+check("…and the card records that it was owner-alone", paid_card["owner_alone"], True)
 
 
 # ── Authority, as wired on the routes ─────────────────────────────────────────

@@ -904,7 +904,8 @@ user("u-appeal-susp", isSuspended=True, isBanned=True, accountState="suspended",
 device_ban("dev-appeal", manualBan=True, reason="Ops: shared handset at a cafe.")
 appeal("appeal-susp", "u-appeal-susp")
 
-decided = run(appeals_svc.decide_appeal("appeal-susp", "overturned", APPEAL_REASON, OPS))
+# §5 (B2): a ban / suspension appeal is decided by the OWNER; a reviewer recommends.
+decided = run(appeals_svc.decide_appeal("appeal-susp", "overturned", APPEAL_REASON, OWNER))
 check("an overturned suspension is resumed", stored("u-appeal-susp")["accountState"], "active")
 check("…and audited as a resume", "user.resumed" in actions("u-appeal-susp"), True)
 ok("…never as an unban", "user.unbanned" not in actions("u-appeal-susp"))
@@ -937,7 +938,7 @@ ok(
 
 user("u-appeal-clean")
 appeal("appeal-clean", "u-appeal-clean")
-decided = run(appeals_svc.decide_appeal("appeal-clean", "overturned", APPEAL_REASON, OPS))
+decided = run(appeals_svc.decide_appeal("appeal-clean", "overturned", APPEAL_REASON, OWNER))
 ok(
     "an appeal about an unrestricted account says so rather than writing anything",
     any("no restriction" in r for r in decided["reversed"]),

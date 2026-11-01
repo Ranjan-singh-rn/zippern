@@ -181,6 +181,40 @@ class Action:
     #: the restriction simply went away. Conflating them in the audit log would
     #: make the two indistinguishable to whoever reads it next.
     APPEAL_AUTO_RESOLVED = "appeal.auto_resolved"
+    #: §5 — a reviewer's written recommendation on a ban / suspension appeal,
+    #: for the Owner to decide. Not a verdict: nothing is lifted by it. The
+    #: one definition is `core/audit.Action` (the B2 block); this is the alias
+    #: the rest of this module reads beside its two verdict actions.
+    APPEAL_RECOMMENDED = audit.Action.APPEAL_RECOMMENDED
+
+
+class AppealForbidden(AppealError):
+    """Refused because of WHO is deciding — mapped to 403 by the router."""
+
+    status_code = 403
+
+
+#: §5 — ban / suspension appeals: "reviewer recommendation → Owner for lifting
+#: bans and suspensions (four-eyes always)".
+#:
+#: OWNER_DECISION_PENDING: the final authority on lifting a ban or a suspension
+#: through an appeal is implemented as the Owner's (the stated default). A
+#: reviewer holding `can_ban_users` RECOMMENDS (`recommend_appeal`, mandatory
+#: written note, never the original decider); the Owner DECIDES
+#: (`decide_appeal`, never the original decider either — another Owner decides
+#: an appeal against an Owner's own ban). Whether a recommendation must exist
+#: before the Owner may decide is left open; today the Owner may decide a
+#: pending appeal with or without one, and the recommendation is recorded on
+#: the decision when there is one.
+OWNER_ONLY_DECIDE = (
+    "Only the Owner decides a ban or suspension appeal. Record your recommendation "
+    "on it instead; the Owners are told."
+)
+FOUR_EYES_REFUSAL = (
+    "You made the decision being appealed, so you cannot decide the appeal. "
+    "Someone else has to look at it."
+)
+RECOMMENDATIONS = ("uphold", "overturn")
 
 
 async def _fs(fn: Callable, *args, **kwargs):
@@ -228,7 +262,51 @@ async def list_appeals(
         min(limit, MAX_READ)
     )
     docs = await _fs(lambda: list(query.stream()))
-    return [{"id": d.id, **(d.to_dict() or {})} for d in docs]
+    rows = [{"id": d.id, **(d.to_dict() or {})} for d in docs]
+    # §5: "CRM reviewer sees original decision maker, ban, evidence and notes".
+    # The decision maker, the ban's reason / category / evidence and the
+    # reviewer's recommendation are put beside each appeal, read from the
+    # account (`users/{uid}`) now — the appeal document itself carries only
+    # what was true when it was filed. Best effort per row: an unreadable
+    # account leaves `restriction` as None and the appeal still lists.
+    summaries: dict[str, dict | None] = {}
+    for row in rows:
+        uid = str(row.get("subjectUid") or "").strip()
+        if not uid:
+            row["restriction"] = None
+            continue
+        if uid not in summaries:
+            try:
+                summaries[uid] = restriction_summary(await users_svc.load_user(uid))
+            except Exception:  # noqa: BLE001 — the queue still lists
+                summaries[uid] = None
+        row["restriction"] = summaries[uid]
+    return rows
+
+
+def restriction_summary(user: dict | None) -> dict | None:
+    """What a reviewer needs to see beside an appeal (pure): the restriction
+    the account is under now, who decided it, when, why, and the ban's
+    category and evidence references. None for an unrestricted account."""
+    if not user:
+        return None
+    state = users_svc.restriction_of(user)
+    if not state:
+        return None
+    banned = state == str(users_svc.AccountState.BANNED)
+    verb = "banned" if banned else "suspended"
+    return {
+        "state": state,
+        "reason": str(user.get("banReason") or ""),
+        "category": str(user.get("banCategory") or "") if banned else "",
+        "evidence": list(user.get("banEvidence") or []) if banned else [],
+        "scope": str(user.get("banScope") or "") if banned else "account",
+        "decidedBy": str(user.get(f"{verb}By") or ""),
+        "decidedByName": str(user.get(f"{verb}ByName") or ""),
+        "decidedByRole": str(user.get(f"{verb}ByRole") or ""),
+        "decidedAt": user.get(f"{verb}At"),
+        "suspendedUntil": user.get("suspendedUntil") if not banned else None,
+    }
 
 
 async def appeals_for_agency(agency_id: str, limit: int = 100) -> list[dict[str, Any]]:
@@ -308,6 +386,101 @@ async def reports_for_agency_hosts(
     return out[:limit]
 
 
+# ── The recommendation (§5) ───────────────────────────────────────────────────
+
+
+async def recommend_appeal(
+    appeal_id: str, outcome: str, note: str, actor: dict
+) -> dict[str, Any]:
+    """A reviewer's written recommendation — uphold or overturn — for the Owner.
+
+    Nothing is lifted. The appeal stays `pending` (so the queue, the duplicate
+    rule and `auto_resolve_pending` keep working exactly as before) and gains a
+    `recommendation` block; the Owners are told through the audit log and the
+    existing Owner email path. Four eyes: the person who made the decision
+    being appealed cannot recommend on it either. A second recommendation
+    replaces the first (the history of both is on the document).
+    """
+    note = _require_reason(note)
+    outcome = str(outcome or "").strip()
+    if outcome not in RECOMMENDATIONS:
+        raise AppealError("A recommendation must be 'uphold' or 'overturn'.")
+
+    ref = _ref(appeal_id)
+    snap = await _fs(ref.get)
+    if not snap.exists:
+        raise AppealNotFound("No appeal with that id.")
+    appeal = snap.to_dict() or {}
+    status_before = str(appeal.get("status", str(AppealStatus.PENDING)))
+    if status_before != str(AppealStatus.PENDING):
+        raise AppealError(f"This appeal was already {status_before}.")
+    subject_uid = str(appeal.get("subjectUid") or "").strip()
+    if not subject_uid:
+        raise AppealError("This appeal does not name an account.")
+    if str(actor.get("uid", "")).strip() in await _original_deciders(appeal, subject_uid):
+        raise AppealError(FOUR_EYES_REFUSAL)
+
+    now = datetime.now(timezone.utc)
+    recommendation = {
+        "outcome": outcome,
+        "note": note,
+        "byUid": str(actor.get("uid", "")),
+        "byName": str(actor.get("name", "")),
+        "byRole": str(actor.get("role", "")),
+        "at": now,
+    }
+    previous = appeal.get("recommendation")
+    patch: dict[str, Any] = {
+        "recommendation": recommendation,
+        "recommendationHistory": firestore.ArrayUnion([recommendation]),
+    }
+    try:
+        await _fs(ref.update, patch)
+    except Exception as exc:  # noqa: BLE001 — nothing was lifted; say so
+        raise AppealError(f"The recommendation could not be recorded: {exc}") from exc
+
+    audit_id = await audit.record(
+        actor=actor,
+        action=Action.APPEAL_RECOMMENDED,
+        subject_type="appeal",
+        subject_id=appeal_id,
+        reason=note,
+        before={"status": status_before, "recommendation": (previous or {}).get("outcome")},
+        after={"status": status_before, "recommendation": outcome},
+        meta={
+            "subject_uid": subject_uid,
+            "kind": str(appeal.get("kind", "")),
+            "restriction": str(appeal.get("restrictionAtFiling") or ""),
+            "notify": "owners",
+            "final_authority": "owner",
+            "owner_decision_pending": "whether a recommendation must precede the Owner's decision",
+        },
+    )
+    from app.services import role_appeals  # local: the shared Owner-email helper
+
+    email = await role_appeals.email_owners(
+        kind="appeal.recommended",
+        subject=f"Appeal recommendation: {outcome} — {appeal.get('subjectName') or subject_uid}",
+        title="A ban or suspension appeal is waiting for your decision",
+        rows=[
+            ("Appeal", appeal_id),
+            ("Account", subject_uid),
+            ("Restriction", str(appeal.get("restrictionAtFiling") or appeal.get("kind") or "")),
+            ("Recommendation", outcome),
+            ("Note", note),
+            ("Recommended by", str(actor.get("name") or actor.get("uid") or "")),
+        ],
+        dedupe_key=f"appeal.recommended:{appeal_id}:{now.isoformat()}",
+    )
+    return {
+        "appeal_id": appeal_id,
+        "status": status_before,
+        "recommendation": {**recommendation, "at": now.isoformat()},
+        "audit_id": audit_id,
+        "owner_notified": {"audit": Action.APPEAL_RECOMMENDED, "email": email},
+    }
+
+
 # ── The decision ──────────────────────────────────────────────────────────────
 
 
@@ -316,11 +489,18 @@ async def decide_appeal(
 ) -> dict[str, Any]:
     """Uphold or overturn an appeal, and reverse what an overturn can reverse.
 
+    §5: the Owner's decision (`OWNER_ONLY_DECIDE` for anyone else — mapped to
+    403), on a reviewer's recommendation where there is one; four eyes always.
+
     Returns `reversed` — what actually changed — and `outstanding`, the things
     that could not be undone from here and need a separate act. Both are shown
     to the reviewer, because "overturned" on its own would imply the second
     list is empty.
     """
+    from app.core.roles import is_owner_value
+
+    if not is_owner_value((actor or {}).get("role")):
+        raise AppealForbidden(OWNER_ONLY_DECIDE)
     reason = _require_reason(reason)
 
     # ── Only the two real verdicts, and the refusal is explicit ──────────────
@@ -367,10 +547,7 @@ async def decide_appeal(
     # `suspendedBy`, stamped by `users._stamp`), and a contested report
     # carries who decided it (`reviewedBy`).
     if str(actor.get("uid", "")).strip() in await _original_deciders(appeal, subject_uid):
-        raise AppealError(
-            "You made the decision being appealed, so you cannot decide the "
-            "appeal. Someone else has to look at it."
-        )
+        raise AppealError(FOUR_EYES_REFUSAL)
 
     # B40: claim the decision against the status read above BEFORE anything
     # is reversed — a lease taken in a transaction, so two reviewers deciding
@@ -565,6 +742,7 @@ async def _decide_under_lease(
                     )
 
     now = datetime.now(timezone.utc)
+    recommendation = appeal.get("recommendation") if isinstance(appeal.get("recommendation"), dict) else None
     patch = {
         "status": str(verdict_enum),
         "decisionReason": reason,
@@ -575,6 +753,15 @@ async def _decide_under_lease(
         "outcomeAuditId": outcome_audit_id,
         "reversed": reversed_acts,
         "outstanding": outstanding,
+        # §5: the recommendation this decision was made on, if there was one —
+        # and whether the Owner followed it. The reviewer's note stays on the
+        # document; the CRM shows the original decision maker, the ban, the
+        # evidence and the notes side by side.
+        "decidedOnRecommendation": (
+            {"outcome": recommendation.get("outcome"), "byUid": recommendation.get("byUid"),
+             "followed": (recommendation.get("outcome") == "overturn") == (verdict_enum is AppealStatus.OVERTURNED)}
+            if recommendation else None
+        ),
     }
     # B40: stamped only while this decision's lease still holds and the appeal
     # is still pending — never over a verdict or a resolution made meanwhile.
@@ -622,6 +809,9 @@ async def _decide_under_lease(
             "agency_id": appeal.get("agencyId"),
             "reversed": reversed_acts,
             "outstanding": outstanding,
+            "original_decided_by": sorted(await _original_deciders(appeal, subject_uid)),
+            "recommendation": patch["decidedOnRecommendation"],
+            "final_authority": "owner",
         },
     )
 

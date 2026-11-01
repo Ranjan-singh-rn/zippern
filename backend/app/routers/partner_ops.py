@@ -59,6 +59,7 @@ from app.core.deps import (
     own_partner_id_or_403,
     own_session_uid,
     partner_ids_of,
+    require_internal,
     require_owner,
     require_permission,
     require_team_admin,
@@ -1762,6 +1763,112 @@ async def decide_frozen_money(freeze_key: str, body: FreezeDecision, user: dict 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# B1 — money integrity: held items, replica drift, Owner notices
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Finance (its admin) and the Owners. `require_internal` admits the session and
+# `enforce_permission(CAN_PROCESS_PAYOUT)` narrows it to the two the spec names
+# — checked in the body, like the accrual route, and never `require_write`.
+# (Written out on each route, not behind a helper, so the permissions canary
+# in tests/test_permissions.py sees every gate.)
+
+
+class HeldRelease(BaseModel):
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+@router.get("/held-items")
+async def list_held_items(
+    limit: int = Query(default=200, ge=1, le=500),
+    include_released: bool = Query(default=False),
+    user: dict = Depends(require_internal),
+):
+    """Spec §5 / §11: every pending card, recharge, sale and sub-agency payout
+    of a revoked partner, held for Finance/Owner review (`held.reason =
+    'role_revoked'`). Nothing on this list is approved, cancelled or executed
+    by the machine.
+
+    Response: `{cards: [...], recharges: [...], sales: [...], subagency_payouts: [...], total}`;
+    each item carries `held: {reason, partner_kind, partner_id, note, at, by}`.
+    """
+    await enforce_permission(user, Permission.CAN_PROCESS_PAYOUT)
+    from app.services import money_freeze
+
+    return await money_freeze.list_held_items(limit, include_released=include_released)
+
+
+@router.post("/held-items/{item_type}/{item_id}/release")
+async def release_held_item(
+    item_type: str, item_id: str, body: HeldRelease, user: dict = Depends(require_internal),
+):
+    """Finance or an Owner lifts the hold so the item can be decided through
+    its ordinary route. `item_type`: card | recharge | sale | subagency_payout.
+    The marker stays on the item with `released_at/by/reason`."""
+    await enforce_permission(user, Permission.CAN_PROCESS_PAYOUT)
+    from app.services import money_freeze
+
+    try:
+        return await money_freeze.release_hold(item_type, item_id, body.reason, user)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/money/replica-drift")
+async def list_replica_drift(
+    limit: int = Query(default=200, ge=1, le=500), user: dict = Depends(require_internal),
+):
+    """M-1: balances whose last Firestore sync failed, with the deltas still owed."""
+    await enforce_permission(user, Permission.CAN_PROCESS_PAYOUT)
+    from app.services import money
+
+    rows = await money.find_replica_drift(limit)
+    out = []
+    for row in rows:
+        row["id"] = str(row.pop("_id", ""))
+        out.append(row)
+    return {"balances": out, "count": len(out)}
+
+
+@router.post("/money/replica-drift/repair")
+async def repair_replica_drift(
+    limit: int = Query(default=200, ge=1, le=500), user: dict = Depends(require_internal),
+):
+    """M-1: replay every pending replica delta once (keyed on its ledger id)
+    and clear `replica_stale` where everything landed. The sweep does the
+    same every 15 minutes; this is the button for "Firestore is back now"."""
+    await enforce_permission(user, Permission.CAN_PROCESS_PAYOUT)
+    from app.services import money
+
+    return await money.repair_replica_drift(actor=user, limit=limit)
+
+
+@router.get("/owner-notices")
+async def list_owner_notices(
+    limit: int = Query(default=200, ge=1, le=500), user: dict = Depends(require_owner),
+):
+    """§8: Owner money notifications still pending (not every Owner told)."""
+    from app.services import owner_mail
+
+    rows = await owner_mail.pending(limit)
+    return {"pending": rows, "count": len(rows)}
+
+
+@router.post("/owner-notices/retry")
+async def retry_owner_notices(
+    limit: int = Query(default=100, ge=1, le=500), user: dict = Depends(require_owner),
+):
+    """§8: re-attempt every pending Owner notification now."""
+    from app.services import owner_mail
+
+    rows = await owner_mail.retry_pending(limit)
+    return {"retried": len(rows), "rows": rows}
 
 
 @router.post("/partners/{partner_id}/activate", dependencies=[_APPROVE_PARTNER])

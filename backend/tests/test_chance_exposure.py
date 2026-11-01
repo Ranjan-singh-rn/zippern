@@ -785,9 +785,12 @@ falsy(
     "staff record, not from a list written in this module",
     any("owner3" in address for address in recipients),
 )
+# §8: signing the configuration card also emails the other Owners (an
+# "Owner money action" notice that names the mechanic); the alert is the
+# email that is NOT that notice.
 bodies = [
     row for row in PROVIDER.sent
-    if PLAYER_CEILING in str(row.get("html", ""))
+    if PLAYER_CEILING in str(row.get("html", "")) and "Owner money action" not in str(row.get("html", ""))
 ]
 truthy("the email names the mechanic", bodies)
 contains("and what it would have paid", str(bodies[0]["html"]), "2,000")
@@ -1352,7 +1355,8 @@ falsy(
     any(SMALL in str(row.get("meta", {})) for row in divergent_mail),
 )
 alert_body = next(
-    str(row["html"]) for row in PROVIDER.sent if DIVERGENT in str(row.get("html", ""))
+    str(row["html"]) for row in PROVIDER.sent
+    if DIVERGENT in str(row.get("html", "")) and "Owner money action" not in str(row.get("html", ""))
 )
 contains("the email states the confidence bound it was judged against", alert_body, "sigma")
 contains("and names all three causes without choosing", alert_body, "does not guess")
