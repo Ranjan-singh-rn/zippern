@@ -288,7 +288,7 @@ describe('N3 — a stale or displaced credential cannot touch the deletion state
     expect(doc.phoneKey).toBe('')
     expect(doc.email).toBe('')
     expect(auth.deleted).toEqual(['U'])
-    expect(storage.cleared).toEqual(['profileMedia/U/'])
+    expect(storage.cleared).toEqual(['profileMedia/U/', 'hostVerification/U/'])
   })
 
   test('"Delete now" is refused when the sign-in is older than ten minutes', async () => {
@@ -481,7 +481,7 @@ describe('DEACT-001 — completed deletions leave the queue', () => {
     expect(due.deletionDueAt).toBeUndefined()
     expect(auth.deleted).toEqual(['DUE'])
     // The completed records were taken out of the queue without repeating a purge.
-    expect(storage.cleared).toEqual(['profileMedia/DUE/'])
+    expect(storage.cleared).toEqual(['profileMedia/DUE/', 'hostVerification/DUE/'])
     for (let i = 0; i < 60; i++) {
       expect(db.read(`users/DONE${String(i).padStart(2, '0')}`).deletionDueAt).toBeUndefined()
     }
@@ -499,7 +499,7 @@ describe('DEACT-001 — completed deletions leave the queue', () => {
     expect(db.writes).toBe(writes)
     expect(db.deletes).toBe(deletes)
     expect(auth.deleted).toEqual(['DUE'])
-    expect(storage.cleared).toEqual(['profileMedia/DUE/'])
+    expect(storage.cleared).toEqual(['profileMedia/DUE/', 'hostVerification/DUE/'])
   })
 
   test('a purge whose login deletion failed stays queued, and the retry repeats nothing else', async () => {
@@ -511,14 +511,14 @@ describe('DEACT-001 — completed deletions leave the queue', () => {
     expect(auth.users.has('U')).toBe(true)
     expect(doc.accountState).toBe('permanently_deactivated') // identity already released
     expect(doc.deletionDueAt).toBeTruthy() // still queued for the retry
-    expect(storage.cleared).toEqual(['profileMedia/U/'])
+    expect(storage.cleared).toEqual(['profileMedia/U/', 'hostVerification/U/'])
 
     auth.failDelete.clear()
     await sweep()
     doc = db.read('users/U')
     expect(auth.deleted).toEqual(['U'])
     expect(doc.deletionDueAt).toBeUndefined()
-    expect(storage.cleared).toEqual(['profileMedia/U/']) // not cleared a second time
+    expect(storage.cleared).toEqual(['profileMedia/U/', 'hostVerification/U/']) // not cleared a second time
   })
 
   test('the 60-day recovery period is unchanged', () => {

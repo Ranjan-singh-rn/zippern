@@ -4,8 +4,9 @@
  *
  * What is pinned:
  *
- *   * the request: From no-reply@zipperlive.org / "ZIPPER Live", no Reply-To
- *     unless SENDGRID_REPLY_TO is set, every kind of tracking switched off,
+ *   * the request: From no-reply@zipperlive.org / "ZIPPER Live" (info@ /
+ *     support@ only once their §12 switch is on), never a Reply-To, every kind
+ *     of tracking switched off,
  *     a plain-text part beside the HTML, the key only in the Authorization
  *     header;
  *   * retries only when SendGrid demonstrably did not accept the request
@@ -166,14 +167,37 @@ describe('the request SendGrid receives', () => {
     noLeak(r.logs)
   })
 
-  test('SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME and SENDGRID_REPLY_TO override the defaults', async () => {
+  test('SENDGRID_FROM_EMAIL and SENDGRID_FROM_NAME override the defaults; SENDGRID_REPLY_TO is never a Reply-To (§12)', async () => {
     process.env.SENDGRID_FROM_EMAIL = 'alerts@zipperlive.org'
     process.env.SENDGRID_FROM_NAME = 'ZIPPER Alerts'
     process.env.SENDGRID_REPLY_TO = 'support@zipperlive.org'
     await MAIL.sendTransactionalMail(codeMail)
     const req = sg.requests[0]
     expect(req.body.from).toEqual({ email: 'alerts@zipperlive.org', name: 'ZIPPER Alerts' })
-    expect(req.body.reply_to).toEqual({ email: 'support@zipperlive.org' })
+    expect(req.body.reply_to).toBe(undefined)
+  })
+
+  test('§12 identities on the wire: info/support from no-reply@ until switched on; never a Reply-To; tracking off', async () => {
+    try {
+      await MAIL.sendNotificationMail('owner@example.com', 'Weekly', '<p>r</p>', 'info')
+      await MAIL.sendNotificationMail('owner@example.com', 'Ticket', '<p>t</p>', 'support')
+      process.env.EMAIL_IDENTITY_INFO_ENABLED = 'true'
+      process.env.EMAIL_IDENTITY_SUPPORT_ENABLED = 'true'
+      await MAIL.sendNotificationMail('owner@example.com', 'Weekly', '<p>r</p>', 'info')
+      await MAIL.sendNotificationMail('owner@example.com', 'Ticket', '<p>t</p>', 'support')
+      await MAIL.sendNotificationMail('owner@example.com', 'Approved', '<p>a</p>', 'transactional')
+      await MAIL.sendTransactionalMail(codeMail)
+    } finally {
+      delete process.env.EMAIL_IDENTITY_INFO_ENABLED
+      delete process.env.EMAIL_IDENTITY_SUPPORT_ENABLED
+    }
+    expect(sg.requests.map((r) => r.body.from.email)).toEqual([
+      'no-reply@zipperlive.org', 'no-reply@zipperlive.org',
+      'info@zipperlive.org', 'support@zipperlive.org',
+      'no-reply@zipperlive.org', 'no-reply@zipperlive.org',
+    ])
+    expect(sg.requests.every((r) => r.body.reply_to === undefined)).toBe(true)
+    for (const r of sg.requests) expect(r.body.tracking_settings).toEqual(TRACKING_OFF)
   })
 
   test('an HTML-only notification gets a plain-text part that keeps its links', async () => {

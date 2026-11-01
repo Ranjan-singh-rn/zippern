@@ -149,6 +149,19 @@ class DocRef {
     this._store._bump(this.path)
     this._store.writes++
   }
+  /**
+   * `create()` — fails if the document already exists, as the SDK does
+   * (gRPC status 6, `ALREADY_EXISTS`). Added deliberately for the approval
+   * queue's F-12 fix: a re-delivered trigger must not mint a second record.
+   */
+  async create(data) {
+    if (this._store._docs.has(this.path)) {
+      const err = new Error(`6 ALREADY_EXISTS: Document already exists: ${this.path}`)
+      err.code = 6
+      throw err
+    }
+    await this.set(data)
+  }
   async update(data) {
     const prior = this._store._docs.get(this.path)
     if (!prior) throw new Error(`update on missing document ${this.path}`)
@@ -194,7 +207,9 @@ class Query {
     // for a scalar operand. Anything that is not an array never matches.
     // `<` and `in` added deliberately (minute billing): the call watchdog
     // selects `status in [connected, ending]` and `lastTickAt < cutoff`.
-    if (!['==', '<=', '<', 'in', 'array-contains'].includes(op)) {
+    // `>=` and `>` added deliberately (F-14 / F-18): the daily revenue roll-up
+    // selects `createdAt >= dayStart`, the weekly report `timestamp >= weekStart`.
+    if (!['==', '<=', '<', '>=', '>', 'in', 'array-contains'].includes(op)) {
       throw new Error(`fakeFirestore: unsupported operator "${op}" — add it deliberately`)
     }
     return new Query(this._store, this._collection,
@@ -246,7 +261,10 @@ class Query {
         const a = comparable(v)
         const b = comparable(f.value)
         if (a == null) return false
-        return f.op === '<' ? a < b : a <= b
+        if (f.op === '<') return a < b
+        if (f.op === '<=') return a <= b
+        if (f.op === '>') return a > b
+        return a >= b
       })
     }
     const orderField = this._order ? this._order.field : null

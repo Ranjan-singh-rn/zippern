@@ -41,9 +41,12 @@
         "npm --prefix \"$RESOURCE_DIR\" run build"
       ],
       "//2": "The entrance artwork folders are inputs to the one-off upload scripts, not something any function reads at runtime. Without these lines every deploy packed 111 MB of entrance art (102 MB of it image-sequence Lottie JSON) into the function bundle and uploaded it again.",
+      "//3": "Audit I-9: `.env*` is never part of the uploaded source. The CLI reads functions/.env locally at deploy time and sets the values as environment variables on each function; the file itself has no runtime reader, so excluding it from the archive changes nothing about configuration and stops a key file travelling inside every source bundle. `*.log` covers the firebase-debug logs (kept listed) and anything else a local run leaves behind.",
       "ignore": [
         "node_modules",
         ".git",
+        ".env*",
+        "*.log",
         "firebase-debug.log",
         "firebase-debug.*.log",
         "*.local",

@@ -178,18 +178,89 @@ async function cleanWelcome(raw: unknown, { allowEmpty }: { allowEmpty: boolean 
 // ── Private rooms ────────────────────────────────────────────────────────────
 
 /**
- * A four-digit password, salted and hashed.
+ * A four-digit password, salted and hashed — in a document NO CLIENT CAN READ.
  *
- * Four digits is ten thousand combinations, so the hash is not what makes this
- * safe — the server being the only thing that can check it is, along with the
- * attempt counter in `joinPartyRoom`. What the hash buys is that the password
- * never sits in a document that every client in the room can read, which is
- * where it would have been if it were stored plainly: `partyRooms` is readable
- * by any signed-in user, so a plaintext field would have made every private room
- * public to anyone who opened the collection.
+ * ── F-7 (audit 2026-11-01): the hash used to sit on the room document ────────
+ *
+ * Four digits is ten thousand combinations. A salted SHA-256 of one is not a
+ * secret, it is a puzzle that takes a laptop under a second: anyone who could
+ * read `passwordHash` and `passwordSalt` could recover the PIN offline and
+ * `joinPartyRoom` would then admit them. And everyone could read them —
+ * `partyRooms/{id}` is `allow read: if request.auth != null`, because the room
+ * list needs the title and the seat counts of private rooms too.
+ *
+ * So the secret now lives in `partyRooms/{id}/private/secret`. No rule matches
+ * that path, and firestore.rules ends in `match /{document=**} { allow read,
+ * write: if false }`, so it is server-only without a rules change. The room
+ * document keeps only `passwordAttempts` (a count) and `visibility`.
+ *
+ * The hash is still what makes "the server is the only thing that can check
+ * it" true even for somebody holding a Firestore export; the attempt counter is
+ * what makes online guessing visible. Neither pretends four digits are strong.
+ *
+ * ── Rooms created before this (migration) ────────────────────────────────────
+ *
+ * A room opened by the previous build still carries its hash on the room
+ * document. It is honoured from there until the room closes — a live room
+ * must not lock its own members out on deploy — and moved into the secret
+ * document on the first successful join or the owner's next password edit;
+ * the legacy fields are deleted in the same write. `closeRoom` deletes the
+ * secret document, so a closed room holds nothing. Rooms that closed BEFORE
+ * this build still carry their legacy fields; a one-off Admin SDK sweep over
+ * `partyRooms where isActive == false` that deletes `passwordHash` and
+ * `passwordSalt` finishes the migration (PINs of closed rooms open nothing,
+ * so this is hygiene, not urgency).
  */
 function hashPassword(password: string, salt: string): string {
   return crypto.createHash('sha256').update(`${salt}:${password}`).digest('hex')
+}
+
+/** The server-only subcollection and document that hold a room's secret. */
+export const PRIVATE_SUBCOLLECTION = 'private'
+export const PRIVATE_SECRET_DOC = 'secret'
+
+function secretRefOf(roomRef: admin.firestore.DocumentReference): admin.firestore.DocumentReference {
+  return roomRef.collection(PRIVATE_SUBCOLLECTION).doc(PRIVATE_SECRET_DOC)
+}
+
+/** A fresh salt and the hash of this password under it. */
+function secretFor(password: string): { passwordHash: string; passwordSalt: string } {
+  const passwordSalt = crypto.randomBytes(16).toString('hex')
+  return { passwordHash: hashPassword(password, passwordSalt), passwordSalt }
+}
+
+/** The pre-F-7 fields on a room document, if that room still carries them. */
+function legacySecretOf(
+  room: admin.firestore.DocumentSnapshot,
+): { passwordHash: string; passwordSalt: string } | null {
+  const passwordHash = String(room.get('passwordHash') ?? '')
+  const passwordSalt = String(room.get('passwordSalt') ?? '')
+  return passwordHash ? { passwordHash, passwordSalt } : null
+}
+
+/** Removes the legacy fields from a room document, in whatever write carries it. */
+function legacySecretCleared(): Record<string, unknown> {
+  return {
+    passwordHash: admin.firestore.FieldValue.delete(),
+    passwordSalt: admin.firestore.FieldValue.delete(),
+  }
+}
+
+/**
+ * Pure: does `given` open a room whose secret is `secret`? Constant-time on
+ * the hash comparison; false for a room with no secret at all.
+ */
+export function passwordMatches(
+  given: unknown,
+  secret: { passwordHash?: unknown; passwordSalt?: unknown } | null | undefined,
+): boolean {
+  const hash = String(secret?.passwordHash ?? '')
+  const salt = String(secret?.passwordSalt ?? '')
+  const password = String(given ?? '')
+  if (!hash || !password) return false
+  const expected = Buffer.from(hashPassword(password, salt), 'hex')
+  const stored = Buffer.from(hash, 'hex')
+  return expected.length === stored.length && crypto.timingSafeEqual(expected, stored)
 }
 
 function validPassword(raw: unknown): string {
@@ -198,6 +269,20 @@ function validPassword(raw: unknown): string {
     throw new functions.https.HttpsError('invalid-argument', 'The room password must be 4 digits.')
   }
   return s
+}
+
+/**
+ * The wrong-PIN refusal, thrown INSIDE the join transaction and counted
+ * OUTSIDE it. A transaction that throws is rolled back, writes included — so
+ * the old `tx.update(passwordAttempts + 1)` followed by a throw never
+ * incremented anything. The counter is now written after the rollback.
+ */
+const WRONG_PASSWORD = 'PARTY_WRONG_PASSWORD'
+function wrongPassword(): functions.https.HttpsError {
+  return new functions.https.HttpsError('permission-denied', 'That password is not right.', { code: WRONG_PASSWORD })
+}
+function isWrongPassword(err: unknown): boolean {
+  return (err as { details?: { code?: unknown } } | null)?.details?.code === WRONG_PASSWORD
 }
 
 // ── Roles inside a room ──────────────────────────────────────────────────────
@@ -348,13 +433,8 @@ export const createPartyRoom = functions
     const visibility = data?.visibility === VISIBILITY_PRIVATE ? VISIBILITY_PRIVATE : VISIBILITY_PUBLIC
     const welcomeMessage = await cleanWelcome(data?.welcomeMessage, { allowEmpty: true })
 
-    let passwordSalt = ''
-    let passwordHash = ''
-    if (visibility === VISIBILITY_PRIVATE) {
-      const password = validPassword(data?.password)
-      passwordSalt = crypto.randomBytes(16).toString('hex')
-      passwordHash = hashPassword(password, passwordSalt)
-    }
+    // Validated before anything is written, so a bad PIN costs nothing.
+    const password = visibility === VISIBILITY_PRIVATE ? validPassword(data?.password) : ''
 
     // Close anything this host left behind. A crash never runs endParty, and a
     // ghost room keeps showing in the list with nobody in it — the same defect
@@ -379,7 +459,19 @@ export const createPartyRoom = functions
      */
     const firstName = name.split(/\s+/)[0] || name
 
-    const roomRef = await db.collection('partyRooms').add({
+    const roomRef = db.collection('partyRooms').doc()
+    if (password !== '') {
+      // F-7: the secret goes FIRST and goes to the server-only document. If
+      // the room write below then fails there is an orphaned secret under a
+      // room that does not exist, which is nothing; the other order would open
+      // a private room with no key, admitting nobody until the owner reset it.
+      await secretRefOf(roomRef).set({
+        ...secretFor(password),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      })
+    }
+
+    await roomRef.set({
       hostUid: uid,
       hostName: name,
       hostPhotoUrl: String(userSnap.get('photoUrl') ?? ''),
@@ -395,8 +487,8 @@ export const createPartyRoom = functions
       seatCount,
       seatMode,
       visibility,
-      passwordSalt,
-      passwordHash,
+      // F-7: no `passwordHash` / `passwordSalt` here, ever again. The count of
+      // wrong guesses is not a secret and stays where ops can see it.
       passwordAttempts: 0,
       admins: [],
       lockedSeats: [],
@@ -513,6 +605,15 @@ export const updatePartyRoom = functions
       }
     }
 
+    /*
+     * F-7: the secret is written to `private/secret`, never onto the room
+     * document; any legacy copy on the room document is deleted in the same
+     * room write. `secretWrite` is what this update does to it: a new secret,
+     * its removal, or nothing.
+     */
+    const secretRef = secretRefOf(roomRef)
+    let secretWrite: { passwordHash: string; passwordSalt: string } | 'delete' | null = null
+
     if (data?.visibility !== undefined) {
       const visibility = data.visibility === VISIBILITY_PRIVATE ? VISIBILITY_PRIVATE : VISIBILITY_PUBLIC
       updates.visibility = visibility
@@ -521,31 +622,39 @@ export const updatePartyRoom = functions
         // one it already had. Going private with no password would be a lock
         // with no key, and every listener would be admitted anyway.
         if (data?.password !== undefined) {
-          const salt = crypto.randomBytes(16).toString('hex')
-          updates.passwordSalt = salt
-          updates.passwordHash = hashPassword(validPassword(data.password), salt)
+          secretWrite = secretFor(validPassword(data.password))
           updates.passwordAttempts = 0
-        } else if (!String(roomSnap.get('passwordHash') ?? '')) {
-          throw new functions.https.HttpsError(
-            'invalid-argument',
-            'Set a 4-digit password to make this room private.',
-          )
+        } else {
+          const existing = await secretRef.get()
+          if (!existing.exists && legacySecretOf(roomSnap) === null) {
+            throw new functions.https.HttpsError(
+              'invalid-argument',
+              'Set a 4-digit password to make this room private.',
+            )
+          }
         }
       } else {
         // Public again: drop the secret rather than keep it lying around.
-        updates.passwordSalt = ''
-        updates.passwordHash = ''
+        secretWrite = 'delete'
         updates.passwordAttempts = 0
       }
     } else if (data?.password !== undefined) {
       // Changing the password without touching visibility.
-      const salt = crypto.randomBytes(16).toString('hex')
-      updates.passwordSalt = salt
-      updates.passwordHash = hashPassword(validPassword(data.password), salt)
+      secretWrite = secretFor(validPassword(data.password))
       updates.passwordAttempts = 0
     }
 
     if (Object.keys(updates).length === 0) return { updated: false }
+
+    if (secretWrite === 'delete') {
+      await secretRef.delete()
+      Object.assign(updates, legacySecretCleared())
+    } else if (secretWrite !== null) {
+      // Secret first, room second: a room that says "private" with a key in
+      // place is right; a key for a room that still says "public" is harmless.
+      await secretRef.set({ ...secretWrite, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+      Object.assign(updates, legacySecretCleared())
+    }
 
     await roomRef.update(updates)
 
@@ -602,90 +711,112 @@ export const joinPartyRoom = functions
 
     const userSnap = await requireUser(uid)
     const roomRef = db.collection('partyRooms').doc(roomId)
+    const secretRef = secretRefOf(roomRef)
 
     // Resolved before the transaction opens: it reads a collection the
     // transaction has no other business with, and Firestore forbids a read
     // after a write.
     const cosmetics = await resolveCosmetics(userSnap)
 
-    return db.runTransaction(async (tx) => {
-      const roomSnap = await tx.get(roomRef)
-      requireLiveRoom(roomSnap)
-      refuseIfKicked(roomSnap, uid)
+    let joined
+    try {
+      joined = await db.runTransaction(async (tx) => {
+        const roomSnap = await tx.get(roomRef)
+        requireLiveRoom(roomSnap)
+        refuseIfKicked(roomSnap, uid)
 
-      const listenerRef = roomRef.collection('listeners').doc(uid)
-      const listenerSnap = await tx.get(listenerRef)
-      const role = roleOf(roomSnap, uid)
+        const listenerRef = roomRef.collection('listeners').doc(uid)
+        const listenerSnap = await tx.get(listenerRef)
+        const role = roleOf(roomSnap, uid)
 
-      /*
-       * The password, unless you are already in or you own the place.
-       *
-       * Re-joining without re-typing matters more than it sounds: Android kills
-       * and restores this screen freely, and a room that demanded four digits
-       * again on every process restart would be unusable.
-       */
-      const isPrivate = roomSnap.get('visibility') === VISIBILITY_PRIVATE
-      if (isPrivate && !listenerSnap.exists && role === 'member') {
-        const salt = String(roomSnap.get('passwordSalt') ?? '')
-        const hash = String(roomSnap.get('passwordHash') ?? '')
-        const given = String(data?.password ?? '')
-        if (!given) {
-          throw new functions.https.HttpsError('permission-denied', 'This room needs a password.')
+        /*
+         * The password, unless you are already in or you own the place.
+         *
+         * Re-joining without re-typing matters more than it sounds: Android kills
+         * and restores this screen freely, and a room that demanded four digits
+         * again on every process restart would be unusable.
+         */
+        const isPrivate = roomSnap.get('visibility') === VISIBILITY_PRIVATE
+        const needsPassword = isPrivate && !listenerSnap.exists && role === 'member'
+        // F-7: the secret is read from the server-only document, inside the
+        // transaction and before any write (Firestore forbids a read after one).
+        const secretSnap = needsPassword ? await tx.get(secretRef) : null
+        let migrateLegacy: { passwordHash: string; passwordSalt: string } | null = null
+        if (needsPassword) {
+          const given = String(data?.password ?? '')
+          if (!given) {
+            throw new functions.https.HttpsError('permission-denied', 'This room needs a password.')
+          }
+          // A room opened before F-7 still carries its hash on the room
+          // document: honoured until it closes, and moved on the way past.
+          const legacy = secretSnap?.exists ? null : legacySecretOf(roomSnap)
+          const secret = secretSnap?.exists ? (secretSnap.data() as Record<string, unknown>) : legacy
+          if (!passwordMatches(given, secret)) throw wrongPassword()
+          migrateLegacy = legacy
         }
-        if (!hash || hashPassword(given, salt) !== hash) {
-          /*
-           * Count the misses. Four digits is ten thousand guesses, which a
-           * script gets through in minutes, and the counter is what makes that
-           * visible rather than silent. It is not a lockout — locking a room
-           * because a stranger guessed at it would hand any passer-by the
-           * ability to shut it — it is a number the owner and ops can see.
-           */
-          tx.update(roomRef, {
-            passwordAttempts: admin.firestore.FieldValue.increment(1),
+
+        const roomUpdates: Record<string, unknown> = {}
+        if (migrateLegacy) {
+          tx.set(secretRef, { ...migrateLegacy, migratedAt: admin.firestore.FieldValue.serverTimestamp() })
+          Object.assign(roomUpdates, legacySecretCleared())
+        }
+
+        if (!listenerSnap.exists) {
+          tx.set(listenerRef, {
+            uid,
+            name: String(userSnap.get('name') ?? '').trim() || 'Guest',
+            photoUrl: String(userSnap.get('photoUrl') ?? ''),
+            level: Number(userSnap.get('level') ?? 0),
+            /*
+             * The cosmetics this person is wearing, RESOLVED TO URLS here.
+             *
+             * The ids alone are not enough. An entrance is a video clip, and
+             * playing it means knowing `bagItems/{id}.videoUrl` — so handing the
+             * room an item id makes every client that sees this arrival look the
+             * same item up for itself. A room of forty is forty reads of one
+             * document, per arrival, and the whole reason these are denormalised
+             * onto the listener row is to avoid exactly that.
+             *
+             * So the lookup happens once, here, on the way in. The ids are kept
+             * alongside because a client may want to know WHICH cosmetic it is
+             * without caring where the asset lives.
+             */
+            ...cosmetics,
+            joinedAt: admin.firestore.FieldValue.serverTimestamp(),
           })
-          throw new functions.https.HttpsError('permission-denied', 'That password is not right.')
+          roomUpdates.listenerCount = admin.firestore.FieldValue.increment(1)
         }
-      }
+        // One write to the room document, whatever this join changes on it.
+        if (Object.keys(roomUpdates).length > 0) tx.update(roomRef, roomUpdates)
 
-      if (!listenerSnap.exists) {
-        tx.set(listenerRef, {
-          uid,
-          name: String(userSnap.get('name') ?? '').trim() || 'Guest',
-          photoUrl: String(userSnap.get('photoUrl') ?? ''),
-          level: Number(userSnap.get('level') ?? 0),
-          /*
-           * The cosmetics this person is wearing, RESOLVED TO URLS here.
-           *
-           * The ids alone are not enough. An entrance is a video clip, and
-           * playing it means knowing `bagItems/{id}.videoUrl` — so handing the
-           * room an item id makes every client that sees this arrival look the
-           * same item up for itself. A room of forty is forty reads of one
-           * document, per arrival, and the whole reason these are denormalised
-           * onto the listener row is to avoid exactly that.
-           *
-           * So the lookup happens once, here, on the way in. The ids are kept
-           * alongside because a client may want to know WHICH cosmetic it is
-           * without caring where the asset lives.
-           */
-          ...cosmetics,
-          joinedAt: admin.firestore.FieldValue.serverTimestamp(),
-        })
-        tx.update(roomRef, {
-          listenerCount: admin.firestore.FieldValue.increment(1),
-        })
-      }
+        tx.set(db.collection('users').doc(uid), presence(roomId), { merge: true })
 
-      tx.set(db.collection('users').doc(uid), presence(roomId), { merge: true })
-
-      return {
-        joined: true,
-        role,
-        seatCount: Number(roomSnap.get('seatCount') ?? 0),
-        mode: String(roomSnap.get('mode') ?? MODE_AUDIO),
-        seatMode: String(roomSnap.get('seatMode') ?? SEAT_MODE_FREE),
-        welcomeMessage: String(roomSnap.get('welcomeMessage') ?? DEFAULT_WELCOME),
-      }
-    })
+        return {
+          joined: true,
+          role,
+          seatCount: Number(roomSnap.get('seatCount') ?? 0),
+          mode: String(roomSnap.get('mode') ?? MODE_AUDIO),
+          seatMode: String(roomSnap.get('seatMode') ?? SEAT_MODE_FREE),
+          welcomeMessage: String(roomSnap.get('welcomeMessage') ?? DEFAULT_WELCOME),
+        }
+      })
+    } catch (err) {
+      if (!isWrongPassword(err)) throw err
+      /*
+       * Count the misses. Four digits is ten thousand guesses, which a script
+       * gets through in minutes, and the counter is what makes that visible
+       * rather than silent. It is not a lockout — locking a room because a
+       * stranger guessed at it would hand any passer-by the ability to shut it
+       * — it is a number the owner and ops can see. Written HERE, after the
+       * transaction above rolled back, because a write made inside a
+       * transaction that throws is discarded with it.
+       */
+      await roomRef
+        .update({ passwordAttempts: admin.firestore.FieldValue.increment(1) })
+        .catch(() => undefined)
+      throw err
+    }
+    return joined
   })
 
 /** Leave a room entirely: vacate any seat, drop presence, decrement the count. */
@@ -1432,6 +1563,9 @@ async function closeRoom(roomRef: admin.firestore.DocumentReference): Promise<vo
     listenerCount: 0,
     occupantCount: 0,
   })
+  // F-7: a closed room holds no secret. (Deleting a document that does not
+  // exist is a no-op, so a public room costs nothing here.)
+  batch.delete(secretRefOf(roomRef))
 
   await batch.commit()
 }

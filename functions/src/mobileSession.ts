@@ -51,15 +51,86 @@
  * was broken. `enforcingPresentedSession()` below is the FUNCTION's name; the
  * environment variable is `ENFORCE_MOBILE_SESSION`.
  *
- * That default is deliberate and it is temporary. Every build currently on the
- * estate calls these functions without a session id, so turning this on before
- * the app ships would sign out every user on the platform at once. Layer 2 above
- * has no such dependency and is live immediately.
+ * That default is deliberate and it is temporary: turning it on while builds
+ * that send no id are in use signs those users out on their first protected
+ * call. Layer 2 above has no such dependency and is live immediately. It is NOT
+ * set anywhere today, in any environment.
  *
- * Set `ENFORCE_MOBILE_SESSION=true` once the Android build that sends the id is
- * the minimum supported version — step 7 of the rollout in
- * docs/workstream-0/PHASE-B-DEPLOYMENT-READINESS.md. It is NOT set anywhere
- * today, in any environment.
+ * ── Which app builds send a session id (F-15; checked 1 Nov 2026) ────────────
+ *
+ * The id rides on the callable payload as `sessionId`. Android adds it in
+ * `SessionManager.withSession()` (zipper-app util/SessionManager.kt), which
+ * every callable wrapper calls: `MoneyFunctions.call()` (data/repository/
+ * MoneyFunctions.kt), `HostFunctions.call()`, `PartnerFunctions.call()`,
+ * `PartyRepository`'s call helper and `AgoraTokenRepository.requestToken()`
+ * (generateAgoraToken). It attaches the id this device holds (DataStore
+ * `session_token`, saved by `AuthRepository.generateSession()` from
+ * `startMobileSession`'s answer) and sends nothing when it holds none.
+ *
+ *   1.2.1 (versionCode 14, git d5d3365) and older: no `withSession`, so no
+ *     callable carries an id. Builds 15 to 18 were not checked; treat them as
+ *     sending none.
+ *   1.2.5 (APK 19, built 20 Oct; source git 00af9aa; `withSession` is present
+ *     in the APK's dex): every callable above carries the id once a session is
+ *     held. Gap: a GUEST whose `startMobileSession` failed at sign-in keeps its
+ *     anonymous credential (SESS-4) and, from the next cold start, uses the app
+ *     holding no session, sending no id on ANY callable until it signs in again.
+ *   1.2.6 (APK 20, git 97204de plus the working tree): the same wrappers, and
+ *     the gap is closed (A-9): Splash calls `AuthRepository.ensureMobileSession()`
+ *     and does not enter Main until a session is held, showing a retry screen
+ *     instead. An APK 20 device in Main always presents an id.
+ *
+ * NOT an app: the CRM web console calls `generateAgoraToken` for live-watch
+ * (zipper-crm/components/LiveWatch.tsx) and sends no id.
+ *
+ * ── What the flag changes ────────────────────────────────────────────────────
+ *
+ * One thing: in `assertActiveSession` a MISSING id goes from tolerated (logged
+ * as `mobile session not presented`) to refused with `SESSION_DISPLACED`,
+ * which the app turns into a sign-out. A wrong id, a sign-in older than
+ * `credentialsValidAfter` and a restricted account are refused flag or no flag.
+ * The callables that become strict are exactly the callers of
+ * `assertActiveSession`, 29 of them refusing outright:
+ *
+ *   settleGift; startCall, acceptCall; convertBeans, claimDailyReward,
+ *   purchaseBagItem, equipBagItem; activateHost, setCallRate,
+ *   submitHostCapture; toggleLike; requestEmailBindCode, verifyEmailBindCode;
+ *   generateAgoraToken; submitPartnerApplication, submitHostApplication,
+ *   checkPartnerActivation, submitRechargeRequest; createPartyRoom,
+ *   updatePartyRoom, joinPartyRoom, takePartySeat, requestPartySeat,
+ *   decidePartySeatRequest, invitePartySeat, respondPartySeatInvite,
+ *   setPartySeatMute, setPartySeatLock, setPartyAdmin
+ *
+ * and bindVerifiedIdentity, whose bind still succeeds and only withholds the
+ * same-uid `customToken`. Unchanged by the flag: tickCall (ends a call on a
+ * wrong id or a stale sign-in, never on a missing one), endCall, declineCall;
+ * requestAccountDeletion, recoverAccount and purgeMyAccountNow (accounts.ts
+ * requires the id already: always for the first, whenever a session is on
+ * record for the other two); mintQuickLoginToken (refuses a wrong id only);
+ * and every callable not listed above.
+ *
+ * ── Flip procedure ───────────────────────────────────────────────────────────
+ *
+ * Step 7 of the rollout sequence in
+ * docs/workstream-0/GIT-BASELINE-AND-PHASE-B-FIXES.md, in this order:
+ *
+ *   1. Make APK 20 the forced minimum: publish with `--min-supported 20`
+ *      (backend/scripts/publish_apk.py writes
+ *      appConfig/androidUpdate.{channel}.minSupportedVersionCode), so any
+ *      older build must update before it is used again.
+ *   2. Wait until no active account runs an older build:
+ *      backend/scripts/d18_adoption_report.py over `appBuildReports` (fed by
+ *      the versionCode APK 19 and 20 send to resolveIdentity).
+ *   3. Decide the CRM live-watch path first: as it stands, generateAgoraToken
+ *      would refuse every CRM viewer once the flag is on.
+ *   4. Watch `mobile session not presented` (logged with uid and operation)
+ *      fall to nothing but the expected CRM calls.
+ *   5. Set ENFORCE_MOBILE_SESSION=true in the functions environment and
+ *      redeploy the 30 functions above; it is read from process.env, so only
+ *      a deploy changes it. There is one Firebase project: this is production.
+ *   6. Watch `mobile session refused` with verdict `missing_refused`, and the
+ *      app's forced sign-outs. Rollback: remove the variable and redeploy the
+ *      same functions.
  */
 
 import * as functions from 'firebase-functions'

@@ -35,6 +35,17 @@
  * report; none of them needs tracking, and an unsubscribe link on a code email
  * would let one click stop every future code to that address.
  *
+ * Sender identities — spec §12, the same table as backend/app/services/email.py:
+ *
+ *     auth | security | transactional  →  no-reply@   always
+ *     info                             →  info@       only if EMAIL_IDENTITY_INFO_ENABLED
+ *     support                          →  support@    only if EMAIL_IDENTITY_SUPPORT_ENABLED
+ *
+ * Both switches default to false (owner question Q8: info@ and support@ are not
+ * confirmed mailboxes), and an identity whose switch is off leaves from no-reply@.
+ * Every send names its identity. No Reply-To is ever set — SENDGRID_REPLY_TO is
+ * read only as the support@ address once that switch is on.
+ *
  * The transport is replaceable so the callables can run in tests without a
  * network, and the SendGrid endpoint can be pointed at a local test server.
  */
@@ -42,12 +53,17 @@ import * as functions from 'firebase-functions/v1'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { MailService } = require('@sendgrid/mail')
 
+/** Spec §12 sender identities (the backend's `SenderIdentity`, minus its legacy `bulk`). */
+export type MailIdentity = 'auth' | 'security' | 'transactional' | 'info' | 'support'
+
 export interface MailMessage {
   to: string
   subject: string
   html: string
   /** Plain-text part. Empty: derived from `html`. */
   text: string
+  /** Which §12 identity this leaves under. Absent: `transactional`. */
+  identity?: MailIdentity
 }
 
 /** What a transport may report back; `undefined` is read as one attempt. */
@@ -221,14 +237,65 @@ function providerProblem(): string | null {
   return provider === 'sendgrid' ? null : 'unsupported_provider'
 }
 
-function sender(): { from: { email: string; name: string }; replyTo: string } {
-  return {
-    from: {
-      email: String(process.env.SENDGRID_FROM_EMAIL ?? '').trim() || DEFAULT_FROM_EMAIL,
-      name: String(process.env.SENDGRID_FROM_NAME ?? '').trim() || DEFAULT_FROM_NAME,
-    },
-    replyTo: String(process.env.SENDGRID_REPLY_TO ?? '').trim(),
+/**
+ * identity → its stream and the environment switch that turns it on (`null`:
+ * always on). The env names are the backend settings' names, upper-cased, so one
+ * value in the deployment configuration means the same thing on both sides.
+ */
+export const IDENTITY_TABLE: Readonly<Record<MailIdentity, { stream: 'no-reply' | 'info' | 'support'; switchEnv: string | null }>> =
+  Object.freeze({
+    auth: { stream: 'no-reply', switchEnv: null },
+    security: { stream: 'no-reply', switchEnv: null },
+    transactional: { stream: 'no-reply', switchEnv: null },
+    info: { stream: 'info', switchEnv: 'EMAIL_IDENTITY_INFO_ENABLED' },
+    support: { stream: 'support', switchEnv: 'EMAIL_IDENTITY_SUPPORT_ENABLED' },
+  })
+
+/** pydantic's reading of a boolean env value, so both sides agree on "on". */
+function switchOn(name: string | null): boolean {
+  if (!name) return false
+  return ['1', 'true', 'yes', 'on', 'y', 't'].includes(String(process.env[name] ?? '').trim().toLowerCase())
+}
+
+function domainOf(address: string): string {
+  return String(address ?? '').trim().toLowerCase().split('@')[1] ?? ''
+}
+
+/** Everything about how one identity leaves. No secret in it. */
+export function identityResolution(identity: MailIdentity = 'transactional'): {
+  identity: MailIdentity
+  stream: string
+  switchEnv: string | null
+  enabled: boolean
+  from: { email: string; name: string }
+  replyTo: ''
+  tracking: 'off'
+} {
+  const key: MailIdentity = identity in IDENTITY_TABLE ? identity : 'transactional'
+  const row = IDENTITY_TABLE[key]
+  const enabled = row.switchEnv === null || switchOn(row.switchEnv)
+  const noReply = {
+    email: String(process.env.SENDGRID_FROM_EMAIL ?? '').trim() || DEFAULT_FROM_EMAIL,
+    name: String(process.env.SENDGRID_FROM_NAME ?? '').trim() || DEFAULT_FROM_NAME,
   }
+  let from = noReply
+  if (enabled && row.stream === 'info') {
+    from = {
+      email: String(process.env.MAIL_FROM_INFO ?? '').trim() || `info@${domainOf(noReply.email)}`,
+      name: noReply.name,
+    }
+  } else if (enabled && row.stream === 'support') {
+    from = {
+      email:
+        String(process.env.MAIL_FROM_SUPPORT ?? '').trim() ||
+        String(process.env.SENDGRID_REPLY_TO ?? '').trim() ||
+        `support@${domainOf(noReply.email)}`,
+      name: noReply.name,
+    }
+  }
+  // No Reply-To, on any identity (§12). Tracking: off for everything sent from
+  // here — auth and security by the spec, the rest because none of it needs it.
+  return { identity: key, stream: row.stream, switchEnv: row.switchEnv, enabled, from, replyTo: '', tracking: 'off' }
 }
 
 const service = new MailService()
@@ -242,7 +309,7 @@ const sendGrid: MailTransport = async (m) => {
   service.setApiKey(apiKey)
   if (testBaseUrl) service.client.setDefaultRequest('baseUrl', testBaseUrl)
 
-  const who = sender()
+  const who = identityResolution(m.identity ?? 'transactional')
   const message: Record<string, unknown> = {
     to: m.to,
     from: who.from,
@@ -256,7 +323,7 @@ const sendGrid: MailTransport = async (m) => {
       ganalytics: { enable: false },
     },
   }
-  if (who.replyTo) message.replyTo = who.replyTo
+  // Deliberately no Reply-To (spec §12): a reply goes to the From address.
 
   const started = clock()
   let attempts = 0
@@ -318,11 +385,11 @@ function asSendError(err: unknown): MailSendError {
 
 // ── The two callers ─────────────────────────────────────────────────────────
 
-/** A one-time code. Throws `MailUnavailable` when it could not be sent. */
+/** A one-time code — identity `auth` unless the caller names another. Throws `MailUnavailable` when it could not be sent. */
 export async function sendTransactionalMail(message: MailMessage): Promise<void> {
   const toDomain = mailDomain(message.to)
   try {
-    const info = await transport(message)
+    const info = await transport({ ...message, identity: message.identity ?? 'auth' })
     functions.logger.info('transactional mail sent', { toDomain, attempts: (info && info.attempts) || 1 })
   } catch (err) {
     const notConfigured = err instanceof MailUnavailable
@@ -338,24 +405,32 @@ export async function sendTransactionalMail(message: MailMessage): Promise<void>
 }
 
 /**
- * A notification (registration, approval, report). No key: logged and skipped.
- * A failed send throws a `MailSendError` — never the SDK's error, which can hold
- * the API key.
+ * A notification (registration, approval, report), under the named §12
+ * identity (default `transactional`). No key: logged and skipped, and the
+ * result says `not_configured` so a caller keeping a send marker can tell
+ * "sent" from "skipped". A failed send throws a `MailSendError` — never the
+ * SDK's error, which can hold the API key.
  */
-export async function sendNotificationMail(to: string, subject: string, html: string): Promise<void> {
+export async function sendNotificationMail(
+  to: string,
+  subject: string,
+  html: string,
+  identity: MailIdentity = 'transactional',
+): Promise<'sent' | 'not_configured'> {
   const toDomain = mailDomain(to)
   const hasKey = String(process.env[SENDGRID_KEY_ENV] ?? '').trim() !== ''
-  functions.logger.info('sendMail called', { toDomain, hasKey })
+  functions.logger.info('sendMail called', { toDomain, hasKey, identity })
   if (!hasKey || providerProblem()) {
     functions.logger.error(
       `${SENDGRID_KEY_ENV} is not available to this function (or EMAIL_PROVIDER is not sendgrid) — email will NOT be sent.`,
       { toDomain },
     )
-    return
+    return 'not_configured'
   }
   try {
-    const info = await transport({ to, subject, html, text: '' })
-    functions.logger.info('✅ Email sent', { toDomain, attempts: (info && info.attempts) || 1 })
+    const info = await transport({ to, subject, html, text: '', identity })
+    functions.logger.info('✅ Email sent', { toDomain, identity, attempts: (info && info.attempts) || 1 })
+    return 'sent'
   } catch (err) {
     const failed = asSendError(err)
     functions.logger.error('❌ SendGrid error', {

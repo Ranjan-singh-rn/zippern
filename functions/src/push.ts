@@ -201,7 +201,14 @@ export const pushChatMessage = asia
 
 // ── Live ─────────────────────────────────────────────────────────────────────
 
-export const pushLiveStarted = asia
+export const pushLiveStarted = functions
+  .region('asia-south1')
+  // F-13 (audit 2026-11-01): the comment below always assumed 540 s, but the
+  // builder never asked for it — the fan-out ran under the default 60 s and a
+  // popular host's followers past the first few hundred were silently never
+  // told. Now the timeout matches the budget the cap was sized for.
+  .runWith({ timeoutSeconds: 540, memory: '256MB' })
+  .firestore
   .document('liveRooms/{roomId}')
   .onCreate(async (snap, context) => {
     const room = snap.data() as Record<string, any>

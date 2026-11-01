@@ -48,10 +48,20 @@ import {
   type QuickLoginOutcome,
 } from './quickLoginPolicy'
 import { MAX_APPEAL_SLOTS, appealIsPending, reappealProblem, restrictionKeyOf, selfAppealId } from './appealIds'
+import { appCheckRuntimeOptions, clientIpOf, enforceRateLimit, refuseWithoutAppCheck } from './rateLimit'
 
 function store(): admin.firestore.Firestore {
   return admin.firestore()
 }
+
+/**
+ * F-8: the three UNAUTHENTICATED callables in this file share one builder —
+ * App Check enforcement follows `ENFORCE_APP_CHECK` (off today; see
+ * rateLimit.ts for the order of operations before it can be turned on), and
+ * each handler takes a token from its per-device / per-IP bucket before it
+ * reads anything.
+ */
+const publicCallable = functions.region('asia-south1').runWith(appCheckRuntimeOptions()).https
 
 const CREDENTIALS = 'quickLoginTokens'
 const CHALLENGES = 'quickLoginChallenges'
@@ -139,9 +149,13 @@ export function verifySignature(
  * Single-use and short-lived, which is what stops a captured signature being
  * replayed against a second redemption.
  */
-export const quickLoginChallenge = functions
-  .region('asia-south1')
-  .https.onCall(async () => {
+export const quickLoginChallenge = publicCallable
+  .onCall(async (_data: unknown, context) => {
+    // F-8: one document per call with nothing to show for it — the cheapest
+    // litter a script can make. Bounded per address (no device id is sent).
+    refuseWithoutAppCheck(context, 'quickLoginChallenge')
+    await enforceRateLimit('quickLoginChallenge', { ip: clientIpOf(context.rawRequest) })
+
     const id = crypto.randomBytes(16).toString('base64url')
     const value = crypto.randomBytes(32).toString('base64url')
 
@@ -316,14 +330,13 @@ async function retireOthers(uid: string, deviceId: string, keepHash: string): Pr
  * signature the caller can only produce on the original device, a single-use
  * challenge, account state, a per-binding rate limit, and rotation on success.
  */
-export const redeemQuickLogin = functions
-  .region('asia-south1')
-  .https.onCall(async (data: {
+export const redeemQuickLogin = publicCallable
+  .onCall(async (data: {
     token?: string
     challengeId?: string
     signature?: string
     deviceId?: string
-  }) => {
+  }, context) => {
     const secret = String(data?.token ?? '')
     const challengeId = String(data?.challengeId ?? '')
     const signature = String(data?.signature ?? '')
@@ -333,6 +346,11 @@ export const redeemQuickLogin = functions
     if (secret.length < MIN_SECRET_CHARS) {
       throw refuse('refused')
     }
+
+    // F-8: after the free shape check, before the first read. The per-binding
+    // failure counter below still applies; this bounds the reads themselves.
+    refuseWithoutAppCheck(context, 'redeemQuickLogin')
+    await enforceRateLimit('redeemQuickLogin', { deviceId, ip: clientIpOf(context.rawRequest) }, now)
 
     const credHash = hash(secret)
     const rateRef = store().collection(RATE).doc(credHash)
@@ -738,15 +756,14 @@ export const revokeQuickLogin = functions
  * requirement. The field set matches `appealFields()` in `firestore.rules`
  * exactly, so the CRM reads one shape whichever route an appeal arrived by.
  */
-export const submitAccountAppeal = functions
-  .region('asia-south1')
-  .https.onCall(async (data: {
+export const submitAccountAppeal = publicCallable
+  .onCall(async (data: {
     token?: string
     challengeId?: string
     signature?: string
     deviceId?: string
     statement?: string
-  }) => {
+  }, context) => {
     const secret = String(data?.token ?? '')
     const challengeId = String(data?.challengeId ?? '')
     const signature = String(data?.signature ?? '')
@@ -766,6 +783,11 @@ export const submitAccountAppeal = functions
      */
     const problem = statementProblem(statement)
     if (problem) throw new functions.https.HttpsError('invalid-argument', problem)
+
+    // F-8: a bucket a person never meets (one appeal per restriction, typed by
+    // hand) and a script meets at once. Before the first read.
+    refuseWithoutAppCheck(context, 'submitAccountAppeal')
+    await enforceRateLimit('submitAccountAppeal', { deviceId, ip: clientIpOf(context.rawRequest) }, now)
 
     const credHash = hash(secret)
     const rateRef = store().collection(RATE).doc(credHash)

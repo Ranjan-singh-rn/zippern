@@ -27,7 +27,8 @@ import { type CrmUserDoc, syncClaim } from './storageClaims'
 import { assertActiveSession } from './mobileSession'
 import { activeHostRefusal } from './hostEligibility'
 import { rosterRowIsCurrent } from './roster'
-import { SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
+import { type MailIdentity, SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
+import { activeOwnerEmails, sendOnce } from './mailLog'
 import { isoWeekLabelUtc } from './time'
 import { deriveAgoraUid } from './agoraUid'
 
@@ -44,8 +45,26 @@ const asiaFirestoreMail = functions.region('asia-south1').runWith({ secrets: [SE
 // and skipped; a failed send throws — now a sanitized error, because the SDK's
 // own error for a network failure carries the request headers, key included.
 
-async function sendMail(to: string, subject: string, html: string): Promise<void> {
-  await sendNotificationMail(to, subject, html)
+// Spec §12: every send names its identity — partner mail is `transactional`,
+// the weekly report `info` (from no-reply@ until EMAIL_IDENTITY_INFO_ENABLED).
+async function sendMail(
+  to: string, subject: string, html: string, identity: MailIdentity = 'transactional',
+): Promise<'sent' | 'not_configured'> {
+  return sendNotificationMail(to, subject, html, identity)
+}
+
+/**
+ * F-20: a partner email at most once per (document, kind) — see mailLog.ts.
+ * Never throws; the outcome is logged (domain only) and kept on the marker.
+ */
+async function sendPartnerMailOnce(
+  docId: string, kind: string, collection: string, to: string, subject: string, html: string,
+): Promise<string> {
+  const result = await sendOnce(admin.firestore(), {
+    docId, kind, collection, to, subject, html, identity: 'transactional', send: sendMail,
+  })
+  functions.logger.info('partner mail', { docId, kind, result, toDomain: mailDomain(to) })
+  return result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1328,9 +1347,11 @@ export const weeklyPayoutReportGenerator = functions
       { merge: true },
     )
 
-    // ── Email superadmin ──────────────────────────────────────────────────────
-    const superadminSnap = await db.collection('crmUsers').where('role', '==', 'superadmin').limit(1).get()
-    const superadminEmail = superadminSnap.empty ? '314zipper@gmail.com' : (superadminSnap.docs[0].data().email as string)
+    // ── Email every active Owner (F-17) ───────────────────────────────────────
+    // All `crmUsers` with role superadmin and isActive != false — not "the
+    // first one found", and no hard-coded fallback address. None: logged below
+    // and the report is not emailed (it is still stored and visible in the CRM).
+    const ownerEmails = await activeOwnerEmails(db)
 
     // Everything below that came from Firestore or from an API response is
     // escaped before it goes into the HTML. The service key cannot reach here —
@@ -1516,10 +1537,21 @@ export const weeklyPayoutReportGenerator = functions
         ? `Zipper Weekly Payout Report — ${weekLabel} — ${accrual.needsPersonCount} agency(ies) NOT accrued`
         : `Zipper Weekly Payout Report — ${weekLabel} — commission accrued`
 
-    try {
-      await sendMail(superadminEmail, subject, emailHtml)
-    } catch (mailErr) {
-      functions.logger.error('Failed to send weekly report email:', mailErr)
+    if (ownerEmails.length === 0) {
+      functions.logger.error(
+        `Weekly report ${weekLabel}: no active Owner (crmUsers role superadmin, isActive != false) has an ` +
+        'email address — the report was NOT emailed. It is stored in weeklyPayoutReports.',
+      )
+    }
+    // One message per Owner, so no Owner's address is shown to another.
+    // Identity `info`: general platform information, from no-reply@ until the
+    // owner switches EMAIL_IDENTITY_INFO_ENABLED on (Q8).
+    for (const ownerEmail of ownerEmails) {
+      try {
+        await sendMail(ownerEmail, subject, emailHtml, 'info')
+      } catch (mailErr) {
+        functions.logger.error('Failed to send weekly report email:', { toDomain: mailDomain(ownerEmail), mailErr })
+      }
     }
 
     const logPayload = {
@@ -1802,21 +1834,43 @@ export const onAgencyApproved = asiaFirestoreMail
 
 </div>
 </body></html>`
-      try {
-        await sendMail(email, `🎉 Your agency is approved — Log in to Zipper Live!`, html)
-      } catch (err) {
-        functions.logger.error('Failed to send agency approval email:', err)
-      }
+      // F-20: once per agency — a re-delivered event, or a later transition
+      // back into 'approved' (a reactivation, which the API tells by its own
+      // notice), finds the `mailLog/{agencyId}_approved` marker and sends nothing.
+      await sendPartnerMailOnce(agencyId, 'approved', 'agencies', email,
+        `🎉 Your agency is approved — Log in to Zipper Live!`, html)
     }
 
-    functions.logger.info(`Agency ${agencyId} approval done — notification + email sent.`)
+    functions.logger.info(`Agency ${agencyId} approval handled (email at most once per agency).`)
     return null
   })
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. PLATFORM STATS AGGREGATOR
-//    Scheduled: daily at midnight UTC
-//    Aggregates today's giftTransactions → writes/updates platformRevenue doc
+//    Scheduled: daily at midnight UTC (us-central1: no .region(), as before)
+//    Rolls yesterday's giftTransactions up into platformRevenueDaily/{YYYY-MM-DD}
+//
+//    F-14 / M-16 (system audit 1 Nov 2026). This job queried
+//    `giftTransactions.timestamp` and summed `beanValue`, but settleGift
+//    (gifts.ts) writes `createdAt` and `beansCredited`: the query matched
+//    nothing and every roll-up it ever wrote was zero. It also wrote that
+//    roll-up to `platformRevenue/{YYYY-MM-DD}`, the collection of per-gift and
+//    per-call revenue rows (gifts.ts, calls.ts), so every scan of
+//    `platformRevenue` met two document shapes. The roll-up now has its own
+//    collection and reads exactly the fields settleGift writes:
+//      createdAt       the day window, [00:00, next 00:00) UTC
+//      diamondCost     what the sender paid (unit × quantity)
+//      beansCredited   what the receiver earned
+//      quantity        gifts in the row (a lucky combo counts its units)
+//      lucky.reward    diamonds credited back to a lucky-gift sender
+//    platformProfit = diamonds spent − beans credited − lucky rewards, i.e. the
+//    sum of the `platformCut` settleGift writes on each gift's platformRevenue
+//    row. Gifts only, as before; call revenue stays in the per-call rows.
+//
+//    No client reads platformRevenueDaily (no rule matches it: server-only).
+//    The CRM's `getPlatformRevenueDays` keeps folding the per-transaction rows,
+//    which already won every day: it keeps whichever shape reports more, and
+//    the old roll-ups were zero.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const dailyPlatformStatsAggregator = functions.pubsub
@@ -1826,75 +1880,89 @@ export const dailyPlatformStatsAggregator = functions.pubsub
     const now = new Date()
 
     // "Yesterday" window — by the time this runs at midnight UTC, we aggregate
-    // the full previous calendar day
+    // the full previous calendar day: [dayStart, nextDayStart).
     const dayStart = new Date(now)
     dayStart.setUTCDate(dayStart.getUTCDate() - 1)
     dayStart.setUTCHours(0, 0, 0, 0)
 
-    const dayEnd = new Date(dayStart)
-    dayEnd.setUTCHours(23, 59, 59, 999)
+    const nextDayStart = new Date(dayStart)
+    nextDayStart.setUTCDate(nextDayStart.getUTCDate() + 1)
+
+    // Stored for display only. The query's upper bound is `nextDayStart`,
+    // exclusive, so a gift in the last millisecond of the day is not lost.
+    const dayEnd = new Date(nextDayStart.getTime() - 1)
 
     const dayLabel = dayStart.toISOString().split('T')[0] // e.g. "2025-06-30"
 
     const tsStart = admin.firestore.Timestamp.fromDate(dayStart)
     const tsEnd = admin.firestore.Timestamp.fromDate(dayEnd)
+    const tsNextDay = admin.firestore.Timestamp.fromDate(nextDayStart)
 
     functions.logger.info(`Aggregating platform stats for ${dayLabel}`)
 
-    // Fetch all gift transactions for the day
-    let totalRevenue = 0    // total value of gifts sent (in beans or diamonds)
+    let giftSnap: FirebaseFirestore.QuerySnapshot
+    try {
+      giftSnap = await db
+        .collection('giftTransactions')
+        .where('createdAt', '>=', tsStart)
+        .where('createdAt', '<', tsNextDay)
+        .get()
+    } catch (err) {
+      // No roll-up rather than a zero one: a zero for a day that had gifts is
+      // exactly the wrong figure this job used to write.
+      functions.logger.error(`Failed to fetch giftTransactions for ${dayLabel}; no roll-up written.`, err)
+      return null
+    }
+
+    let totalTransactions = 0
     let totalGifts = 0
     let totalDiamondSpend = 0
     let totalBeanEarned = 0
+    let totalLuckyReward = 0
 
-    try {
-      const giftSnap = await db
-        .collection('giftTransactions')
-        .where('timestamp', '>=', tsStart)
-        .where('timestamp', '<=', tsEnd)
-        .get()
-
-      for (const giftDoc of giftSnap.docs) {
-        const gift = giftDoc.data()
-        const diamondCost: number = (gift.diamondCost as number) || 0
-        const beanValue: number = (gift.beanValue as number) || 0
-
-        totalGifts++
-        totalDiamondSpend += diamondCost
-        totalBeanEarned += beanValue
-        // Platform revenue = diamonds spent - beans earned (platform margin)
-        totalRevenue += diamondCost - beanValue
-      }
-    } catch (err) {
-      functions.logger.error('Failed to fetch giftTransactions:', err)
+    for (const giftDoc of giftSnap.docs) {
+      const gift = giftDoc.data()
+      const lucky = gift.lucky as { reward?: unknown } | undefined
+      totalTransactions++
+      totalGifts += Number(gift.quantity) || 1
+      totalDiamondSpend += Number(gift.diamondCost) || 0
+      totalBeanEarned += Number(gift.beansCredited) || 0
+      totalLuckyReward += Number(lucky?.reward) || 0
     }
 
-    // Platform takes a cut — total diamonds in minus beans out = profit
-    const platformProfit = totalDiamondSpend - totalBeanEarned
+    // Zipper's margin: diamonds in, minus beans out, minus diamonds paid back
+    // on lucky wins (negative on a day of big wins; recorded as it is).
+    const platformProfit = totalDiamondSpend - totalBeanEarned - totalLuckyReward
     const platformPayout = totalBeanEarned
 
-    // Write/update platformRevenue doc for this day
-    const revenueRef = db.collection('platformRevenue').doc(dayLabel)
-    await revenueRef.set(
+    // The roll-up's own collection. Never `platformRevenue`: see above.
+    await db.collection('platformRevenueDaily').doc(dayLabel).set(
       {
         date: dayLabel,
         dayStart: tsStart,
         dayEnd: tsEnd,
+        totalTransactions,
         totalGifts,
         totalDiamondSpend,
         totalBeanEarned,
-        platformRevenue: totalRevenue,
+        totalLuckyReward,
+        // The same figure as platformProfit, under the name the CRM's roll-up
+        // fold (zipper-crm/lib/finance.ts) reads first.
+        platformRevenue: platformProfit,
         platformProfit,
         platformPayout,
+        source: 'giftTransactions',
         updatedAt: admin.firestore.Timestamp.now(),
       },
       { merge: true }
     )
 
-    functions.logger.info(`Platform stats for ${dayLabel} written.`, {
+    functions.logger.info(`Platform stats for ${dayLabel} written to platformRevenueDaily.`, {
+      totalTransactions,
       totalGifts,
       totalDiamondSpend,
       totalBeanEarned,
+      totalLuckyReward,
       platformProfit,
     })
 
@@ -2401,7 +2469,7 @@ export const onAgencyRegistered = asiaFirestoreMail
       </div>
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
-        Questions? Reply to this email or reach us at
+        Questions? Reach us at
         <a href="mailto:314zipper@gmail.com" style="color:#ec4899;text-decoration:none;">314zipper@gmail.com</a>
       </p>
     </div>
@@ -2415,11 +2483,9 @@ export const onAgencyRegistered = asiaFirestoreMail
 </div>
 </body></html>`
 
-    try {
-      await sendMail(email, `✅ Registration received — ${agencyName} | Zipper Live`, html)
-    } catch (err) {
-      functions.logger.error('Failed to send agency registration email:', err)
-    }
+    // F-20: once per agency document, however often this event is delivered.
+    await sendPartnerMailOnce(snap.id, 'registered', 'agencies', email,
+      `✅ Registration received — ${agencyName} | Zipper Live`, html)
     return null
   })
 
@@ -2513,11 +2579,9 @@ export const onSellerRegistered = asiaFirestoreMail
 </div>
 </body></html>`
 
-    try {
-      await sendMail(email, `✅ Application received — Zipper Coin Seller`, html)
-    } catch (err) {
-      functions.logger.error('Failed to send seller registration email:', err)
-    }
+    // F-20: once per seller document, however often this event is delivered.
+    await sendPartnerMailOnce(snap.id, 'registered', 'sellers', email,
+      `✅ Application received — Zipper Coin Seller`, html)
     return null
   })
 
@@ -2630,11 +2694,10 @@ export const onSellerApproved = asiaFirestoreMail
 </div>
 </body></html>`
 
-    try {
-      await sendMail(email, `🎉 You're approved — Start selling Zipper coins!`, html)
-    } catch (err) {
-      functions.logger.error('Failed to send seller approval email:', err)
-    }
+    // F-20: once per seller — a re-delivered event or a later false → true
+    // flip (a reactivation) finds the `mailLog/{sellerId}_approved` marker.
+    await sendPartnerMailOnce(change.after.id, 'approved', 'sellers', email,
+      `🎉 You're approved — Start selling Zipper coins!`, html)
     return null
   })
 
@@ -2647,7 +2710,7 @@ export const onSellerApproved = asiaFirestoreMail
 
 export const onAgencyResendEmail = asiaFirestoreMail
   .document('agencies/{agencyId}')
-  .onUpdate(async (change) => {
+  .onUpdate(async (change, context) => {
     const before = change.before.data()
     const after  = change.after.data()
 
@@ -2700,8 +2763,18 @@ export const onAgencyResendEmail = asiaFirestoreMail
   </div>
 </div>
 </body></html>`
-      await sendMail(email, `✅ Registration received — ${agencyName} | Zipper Live`, html)
+      // A staff-requested resend IS a second email, on purpose — so it is keyed
+      // on this flag flip's event id: a re-delivery of the same event sends nothing.
+      await sendPartnerMailOnce(change.after.id, `resend-registration-${context.eventId}`, 'agencies', email,
+        `✅ Registration received — ${agencyName} | Zipper Live`, html)
       functions.logger.info('Resent registration email for agency', { toDomain: mailDomain(email) })
+    }
+
+    // F-20: "approved" only for an agency that IS approved — a resend request on
+    // a pending, suspended or rejected agency would tell them something false.
+    if (resendType === 'approval' && after.status !== 'approved') {
+      functions.logger.warn('Approval email resend refused: the agency is not approved', { status: String(after.status ?? '') })
+      return null
     }
 
     if (resendType === 'approval') {
@@ -2737,7 +2810,8 @@ export const onAgencyResendEmail = asiaFirestoreMail
   </div>
 </div>
 </body></html>`
-      await sendMail(email, `✅ Your agency "${agencyName}" is approved — Log in now | Zipper Live`, html)
+      await sendPartnerMailOnce(change.after.id, `resend-approval-${context.eventId}`, 'agencies', email,
+        `✅ Your agency "${agencyName}" is approved — Log in now | Zipper Live`, html)
       functions.logger.info('Resent approval email for agency', { toDomain: mailDomain(email) })
     }
 
@@ -2751,7 +2825,7 @@ export const onAgencyResendEmail = asiaFirestoreMail
 
 export const onSellerResendEmail = asiaFirestoreMail
   .document('sellers/{sellerId}')
-  .onUpdate(async (change) => {
+  .onUpdate(async (change, context) => {
     const before = change.before.data()
     const after  = change.after.data()
 
@@ -2803,8 +2877,15 @@ export const onSellerResendEmail = asiaFirestoreMail
   </div>
 </div>
 </body></html>`
-      await sendMail(email, `✅ Application received — Zipper Coin Seller`, html)
+      await sendPartnerMailOnce(change.after.id, `resend-registration-${context.eventId}`, 'sellers', email,
+        `✅ Application received — Zipper Coin Seller`, html)
       functions.logger.info('Resent seller registration email', { toDomain: mailDomain(email) })
+    }
+
+    // F-20: "approved" only for a seller that IS approved.
+    if (resendType === 'approval' && after.isApproved !== true) {
+      functions.logger.warn('Approval email resend refused: the seller is not approved')
+      return null
     }
 
     if (resendType === 'approval') {
@@ -2840,7 +2921,8 @@ export const onSellerResendEmail = asiaFirestoreMail
   </div>
 </div>
 </body></html>`
-      await sendMail(email, `🎉 You're approved — Start selling Zipper coins!`, html)
+      await sendPartnerMailOnce(change.after.id, `resend-approval-${context.eventId}`, 'sellers', email,
+        `🎉 You're approved — Start selling Zipper coins!`, html)
       functions.logger.info('Resent seller approval email', { toDomain: mailDomain(email) })
     }
 
@@ -2965,6 +3047,20 @@ export const onApprovalApproved = asiaFirestore
     // Only trigger when status changes to 'approved'
     if (before.status === after.status || after.status !== 'approved') return null
 
+    // F-12: Firestore triggers are delivered AT LEAST ONCE, and a re-delivery
+    // carries the same `before`/`after` payload — so the event cannot say
+    // whether this approval was already applied. The document can. Already
+    // applied, or already recorded as failed: nothing to do. (The create path
+    // below is idempotent on its own as well; this read just saves the work.)
+    const fresh = await change.after.ref.get()
+    if (fresh.exists && (fresh.get('appliedAt') != null || fresh.get('applyFailed') === true)) {
+      functions.logger.info(
+        `Approval ${requestId} was already ${fresh.get('appliedAt') != null ? 'applied' : 'recorded as failed'}; ` +
+        'the re-delivered event was ignored.',
+      )
+      return null
+    }
+
     const { targetCollection, targetDocId, operation, payload, type } = after
 
     functions.logger.info(
@@ -3007,6 +3103,7 @@ export const onApprovalApproved = asiaFirestore
         targetCollection as string,
         (targetDocId as string) ?? '',
         (payload as Record<string, unknown>) ?? {},
+        requestId,
       )
 
       await change.after.ref.update({
@@ -3259,6 +3356,25 @@ async function writePartnerCrmUser(
 }
 
 /**
+ * F-12: the partner record an approval creates is keyed BY THE REQUEST ID.
+ *
+ * `agencies/{requestId}` / `sellers/{requestId}` — one request, one possible
+ * record, whatever the delivery count. The request id is itself a Firestore
+ * auto-id minted by the CRM's `addDoc`, so the shape of partner ids does not
+ * change; what changes is that it is now traceable back to the decision that
+ * created it (`_approvalRequestId` on the record says so too).
+ */
+function approvalTargetId(requestId: string): string {
+  return requestId
+}
+
+/** The SDK's "document already exists" — gRPC status 6 (`ALREADY_EXISTS`). */
+function isAlreadyExists(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null
+  return e?.code === 6 || e?.code === 'already-exists' || /ALREADY_EXISTS/.test(String(e?.message ?? ''))
+}
+
+/**
  * Route an approved request to the handler for its operation. Throws on refusal.
  * Returns a short note about anything done beyond the target document itself.
  */
@@ -3268,6 +3384,7 @@ async function applyApproval(
   targetCollection: string,
   targetDocId: string,
   payload: Record<string, unknown>,
+  requestId: string,
 ): Promise<string> {
   if (typeof targetCollection !== 'string' || !targetCollection) {
     throw new Error('Approval has no target collection.')
@@ -3299,25 +3416,51 @@ async function applyApproval(
     }
     assertPartnerCreatePayload(type, payload)
 
-    // create_agency / create_seller submit an empty targetDocId — the id is
-    // minted here rather than passed through db.collection(x).doc(''), which throws.
-    const ref = db.collection(collection).doc()
+    // create_agency / create_seller submit an empty targetDocId. F-12: the id
+    // is DERIVED from the request id rather than minted fresh per delivery
+    // (`.doc()` used to mint one per invocation, and a re-delivered trigger
+    // created a second agency or seller for the same decision). Every delivery
+    // of this event now names the same document, and `create()` below refuses
+    // to write it twice.
+    const ref = db.collection(collection).doc(approvalTargetId(requestId))
+
+    const existing = await ref.get()
+    if (existing.exists) {
+      if (existing.get('_approvalRequestId') === requestId) {
+        // An earlier delivery of this very approval already did the work.
+        return `${collection}/${ref.id} already existed from an earlier delivery of this approval; nothing was written again`
+      }
+      throw new Error(
+        `${collection}/${ref.id} already exists and was not created by this approval. ` +
+        'Nothing was written — a request id must not name an existing record.'
+      )
+    }
 
     // The CRM account FIRST, the partner record second, and deliberately that
-    // way round. `.doc()` mints the id locally and writes nothing, so nothing
-    // exists yet — and `writePartnerCrmUser` throws when it cannot write, which
-    // here means the approval is recorded as failed with the reason on it and
+    // way round. The id above is derived locally and nothing has been written
+    // yet — and `writePartnerCrmUser` throws when it cannot write, which here
+    // means the approval is recorded as failed with the reason on it and
     // NOTHING was created. The other order would leave a live agency whose owner
     // cannot sign in beside a request claiming success: the exact half-made
     // state `/agencies` badges "no login attached".
     const login = await writePartnerCrmUser(targetCollection, ref.id, payload)
 
     try {
-      await ref.set({
+      await ref.create({
         ...withoutCredentials(payload, `${type} → ${targetCollection}`),
         _approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+        _approvalRequestId: requestId,
       })
     } catch (err) {
+      // Two deliveries racing: the other one's `create()` landed first. If the
+      // record it wrote is THIS approval's, the work is done and the CRM login
+      // it may have written is the one that record needs — leave both alone.
+      if (isAlreadyExists(err)) {
+        const again = await ref.get()
+        if (again.exists && again.get('_approvalRequestId') === requestId) {
+          return `${collection}/${ref.id} was created by a concurrent delivery of this approval; nothing was written again`
+        }
+      }
       // Undo only what this invocation created, so a pre-existing account is
       // never removed by a failure that has nothing to do with it.
       if (login.createdUid) {

@@ -25,6 +25,11 @@ const db = admin.firestore()
  * mechanism: week N's earnings are simply released for withdrawal at the end of
  * week N+1. A Monday gift waits about thirteen days, a Sunday one about seven.
  *
+ * What the job actually does is set by `appConfig/economy.payoutReleaseArrearsWeeks`
+ * (OWNER_DECISION_PENDING, see `payoutReleaseArrearsWeeks` below): 1 is the
+ * hold described here; 0, the default and the behaviour so far, releases week
+ * N on the Monday it closes.
+ *
  * ── The three numbers a host sees ────────────────────────────────────────────
  *
  *   beans             total balance — spendable and convertible now
@@ -102,22 +107,88 @@ export function accrueWeeklyEarning(
  */
 const RELEASE_PAGE_SIZE = 500
 
+/**
+ * M-5 / F-22, OWNER_DECISION_PENDING: how many whole weeks a closed earnings
+ * week waits, beyond today's release, before it becomes withdrawable.
+ *
+ * Read from `appConfig/economy.payoutReleaseArrearsWeeks` at the start of every
+ * run, as an integer >= 0:
+ *
+ *   0  the default, and what an absent field means: TODAY'S BEHAVIOUR. The
+ *      Monday 00:30 IST run releases the ISO week that closed half an hour
+ *      earlier, so an earning is held between 30 minutes and 7 days.
+ *   1  one week in arrears, as the header above and BACKEND-DESIGN.md § 3.4
+ *      describe: week N is released by the run after week N+1 closes, a hold
+ *      of about 7 to 14 days, so a chargeback lands while the beans are held.
+ *   n  the cutoff moves back n weeks.
+ *
+ * A value that is not a whole number from 0 to MAX_PAYOUT_RELEASE_ARREARS_WEEKS
+ * is treated as 0 (today's behaviour, never a silent payout freeze) and the
+ * run logs an error naming it.
+ *
+ * The owner has not decided the policy (system audit 1 Nov 2026, M-5 / F-22,
+ * open question 4). The backend publishes the same flag at
+ * GET /api/reports/payout-policy (`PAYOUT_RELEASE_ARREARS_WEEKS` in
+ * backend/app/config.py), which is the figure the CRM and the app show; this
+ * field is the one that releases money. They are separate settings: change
+ * both together, or hosts are told one date and paid on another.
+ *
+ * Raising it holds weeks that would otherwise be released (nothing already
+ * released is touched; a held week is taken by the first run whose cutoff
+ * reaches it). Lowering it releases what it was holding on the next run.
+ */
+export const PAYOUT_RELEASE_ARREARS_FIELD = 'payoutReleaseArrearsWeeks'
+export const MAX_PAYOUT_RELEASE_ARREARS_WEEKS = 52
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+
+/** The configured arrears; 0 and `valid: false` for anything that is not a whole number in range. */
+export function payoutReleaseArrearsWeeks(raw: unknown): { weeks: number; valid: boolean } {
+  if (raw === undefined || raw === null) return { weeks: 0, valid: true }
+  if (
+    typeof raw === 'number' && Number.isInteger(raw) &&
+    raw >= 0 && raw <= MAX_PAYOUT_RELEASE_ARREARS_WEEKS
+  ) {
+    return { weeks: raw, valid: true }
+  }
+  return { weeks: 0, valid: false }
+}
+
+/**
+ * The newest IST week a run at `nowMs` may release: the week containing
+ * `now - 7 days`, moved back `arrearsWeeks` more weeks. With 0 this is exactly
+ * the cutoff the job has always used.
+ */
+export function releaseCutoffWeekKey(nowMs: number, arrearsWeeks: number): string {
+  return istWeekKey(new Date(nowMs - (1 + arrearsWeeks) * WEEK_MS))
+}
+
 export const releaseBeansForWeek = functions
   .region('asia-south1')
   .runWith({ timeoutSeconds: 540, memory: '512MB' })
   .pubsub.schedule('30 0 * * 1')
   .timeZone('Asia/Kolkata')
   .onRun(async () => {
-    // The week that closed last night, plus any earlier week still unreleased
-    // because the host was blocked at the time.
-    const cutoff = istWeekKey(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
-
     // One read for the whole run. Every statement in this batch is settled at
     // the same rate, which is also what makes a week's figure reproducible.
     const cfgSnap = await db.collection('appConfig').doc('economy').get()
     const rateInr = Number(
       (cfgSnap.get('giftRates') as Record<string, any> | undefined)?.beanToInrRate ?? 0.01,
     )
+
+    // The week that closed last night (or, with an arrears hold configured,
+    // the week that closed that many weeks before it), plus any earlier week
+    // still unreleased because the host was blocked at the time.
+    // OWNER_DECISION_PENDING: see `payoutReleaseArrearsWeeks` above.
+    const rawArrears = cfgSnap.get(PAYOUT_RELEASE_ARREARS_FIELD)
+    const arrears = payoutReleaseArrearsWeeks(rawArrears)
+    if (!arrears.valid) {
+      functions.logger.error(
+        `releaseBeansForWeek: appConfig/economy.${PAYOUT_RELEASE_ARREARS_FIELD} is ` +
+        `${String(JSON.stringify(rawArrears)).slice(0, 80)}, not a whole number from 0 to ` +
+        `${MAX_PAYOUT_RELEASE_ARREARS_WEEKS}; released with the default of 0 weeks in arrears.`,
+      )
+    }
+    const cutoff = releaseCutoffWeekKey(Date.now(), arrears.weeks)
 
     let released = 0, skipped = 0, beansTotal = 0, seen = 0
     let cursor: admin.firestore.QueryDocumentSnapshot | null = null
@@ -152,7 +223,8 @@ export const releaseBeansForWeek = functions
 
     functions.logger.info(
       `releaseBeansForWeek: released ${released} week(s) totalling ${beansTotal} beans; ` +
-      `${skipped} skipped; ${seen} pending week(s) examined`,
+      `${skipped} skipped; ${seen} pending week(s) examined; cutoff ${cutoff} ` +
+      `(${arrears.weeks} week(s) in arrears)`,
     )
     return null
   })

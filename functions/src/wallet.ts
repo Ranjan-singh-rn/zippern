@@ -1,7 +1,8 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 import { istDateKey } from './time'
-import { assertActiveSession } from './mobileSession'
+import { assertActiveSession, restrictionVerdict, ACCOUNT_RESTRICTED } from './mobileSession'
+import { guestRefusal } from './hostEligibility'
 
 const db = admin.firestore()
 
@@ -192,6 +193,18 @@ export const convertBeans = functions
 
 // ── claimDailyReward ─────────────────────────────────────────────────────────
 
+/** `HttpsError.details.code` when the reward needs a verified contact and the caller has none. */
+export const VERIFIED_CONTACT_REQUIRED = 'VERIFIED_CONTACT_REQUIRED'
+
+/**
+ * Pure: does `appConfig/economy` require a verified contact for the daily
+ * reward? Absent, malformed or anything but `true` is `false` — the default,
+ * which is today's behaviour.
+ */
+export function dailyRewardRequiresVerifiedContact(economy: Record<string, unknown> | null | undefined): boolean {
+  return economy?.dailyRewardRequiresVerifiedContact === true
+}
+
 /**
  * Daily sign-in reward.
  *
@@ -201,6 +214,28 @@ export const convertBeans = functions
  *
  * The day key is IST, computed server-side. A device with its clock moved
  * forward claims nothing extra.
+ *
+ * ── F-9 / M-22 (audit 2026-11-01): who may claim ─────────────────────────────
+ *
+ * Reward diamonds are mintable by any account and convertible — through a
+ * gift to a colluding host — into withdrawable beans, and a guest account
+ * costs nothing to create. Two things here, and a third deliberately not:
+ *
+ *   1. A restricted account (banned, suspended, deletion requested) is
+ *      refused. `assertActiveSession` already refuses it before the
+ *      transaction; the check is repeated INSIDE the transaction on the same
+ *      read that pays, so a ban landing between the two is honoured and the
+ *      refusal does not depend on a call made outside this function.
+ *   2. `appConfig/economy.dailyRewardRequiresVerifiedContact` (default FALSE,
+ *      so nothing changes until the CRM sets it): when true, a caller whose
+ *      token carries neither a phone number nor a verified email — a guest —
+ *      is refused `VERIFIED_CONTACT_REQUIRED` and nothing is credited. The
+ *      same test as `guestRefusal` for host invitations, read from the
+ *      verified token, never from the document.
+ *   3. OWNER_DECISION_PENDING (audit Q5 / Q6): whether reward diamonds should
+ *      instead be ring-fenced (spendable on cosmetics, never giftable into a
+ *      payout). Not implemented; the flag above is the smaller lever and the
+ *      decision is the owner's.
  */
 export const claimDailyReward = functions
   .region('asia-south1')
@@ -213,12 +248,34 @@ export const claimDailyReward = functions
     const today    = istDateKey()
     const claimRef = userRef.collection('dailyClaims').doc(today)
     const schedRef = db.collection('appConfig').doc('dailyRewards')
+    const economyRef = db.collection('appConfig').doc('economy')
+    const token = context.auth?.token as Record<string, unknown> | undefined
 
     return db.runTransaction(async (tx) => {
-      const [userSnap, claimSnap, schedSnap] = await Promise.all([
-        tx.get(userRef), tx.get(claimRef), tx.get(schedRef),
+      const [userSnap, claimSnap, schedSnap, economySnap] = await Promise.all([
+        tx.get(userRef), tx.get(claimRef), tx.get(schedRef), tx.get(economyRef),
       ])
       if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Account not found.')
+
+      // F-9: the restriction state, on the read that pays.
+      const restricted = restrictionVerdict((f) => userSnap.get(f))
+      if (restricted) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'This account is restricted and cannot claim rewards.',
+          { code: ACCOUNT_RESTRICTED, state: restricted },
+        )
+      }
+      // M-22: a verified contact, when the economy config asks for one.
+      if (dailyRewardRequiresVerifiedContact(economySnap.data() as Record<string, unknown> | undefined)
+          && guestRefusal(token)) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Add your phone number or email to claim daily rewards.',
+          { code: VERIFIED_CONTACT_REQUIRED },
+        )
+      }
+
       if (claimSnap.exists) {
         throw new functions.https.HttpsError('already-exists', 'Already claimed today.')
       }

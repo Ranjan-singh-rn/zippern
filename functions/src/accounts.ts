@@ -9,7 +9,60 @@ const db = admin.firestore()
 const REGION = 'asia-south1' as const
 
 /**
- * Deleting an account — as a thirty-day pause, not a cliff.
+ * Deleting an account — as a sixty-day pause (`GRACE_DAYS`), not a cliff.
+ *
+ * ── SPEC §7, VERIFIED 2026-11-01 (functions hygiene batch) ───────────────────
+ *
+ *   request    `requestAccountDeletion` → `accountState: 'recovery_pending'`,
+ *              `deletionDueAt = now + GRACE_DAYS` (60), stamped by the SERVER's
+ *              clock. A REPEATED request never moves the deadline: the
+ *              `isDeleted === true` branch answers with the existing due date
+ *              and writes nothing (test: accountDeletionSpec7.test.js).
+ *   recover    `recoverAccount` before the due date restores the account
+ *              exactly as it was. AT or after the due date — whether or not
+ *              the sweep has run yet — it refuses `RECOVERY_EXPIRED` (C8/B27)
+ *              and the scheduled purge finishes the deletion.
+ *   purge      `purgeDeletedAccounts` (03:30 IST) / `purgeMyAccountNow`.
+ *              Idempotent: a completed record leaves the queue, a retry
+ *              repeats no destructive step (DEACT-001, `finishPurge`).
+ *   staff /    A login with protected CRM access refuses `CRM_ACCESS_HELD`
+ *   partner    (STAFF-005); a Host with unsettled responsibilities refuses
+ *              `PARTNER_RESPONSIBILITIES`; the sweep HOLDS either rather than
+ *              purging around it. Governance and audit records are never
+ *              destroyed by a self-deletion — see the table below.
+ *   blockers   F-21: the open-withdrawal check FAILS CLOSED. A read error is
+ *              `unavailable` (`DELETION_CHECK_UNAVAILABLE`), nothing is written,
+ *              and the sweep retries that account the next night.
+ *
+ * ── WHAT A PURGE DELETES, WHAT IT ANONYMISES, WHAT IT KEEPS ──────────────────
+ *
+ *   DELETED (gone for good)
+ *     users/{uid}/{fcmTokens,followers,following,ownedItems}   PURGED_SUBCOLLECTIONS
+ *     publicProfiles/{uid}, hostVerification/{uid} (Firestore)
+ *     publicSellers/{sellerId} owned by the uid
+ *     Cloud Storage  profileMedia/{uid}/*  and  hostVerification/{uid}/*
+ *                    (F-10 — the face-verification capture and its attempts.
+ *                    OWNER_DECISION_PENDING, audit Q8: delete at purge is the
+ *                    DEFAULT; if the owner decides biometric captures must be
+ *                    retained for dispute defence, remove that prefix from
+ *                    `purgedStoragePrefixes` and set a retention period there.)
+ *     The Firebase Auth login (last, see `purgeAccount`).
+ *
+ *   ANONYMISED (the document stays, the person is removed from it)
+ *     users/{uid}: name, photoUrl, bio, phoneNumber, phoneKey, email,
+ *     sessionToken, deviceId, fcmToken → '' ; every presence/listing flag →
+ *     false ; every active role flag → false ; `accountState:
+ *     'permanently_deactivated'`, `isDeleted: true`, `purgedAt`.
+ *     crmUsers/{uid} (a released partner login): `isActive: false`, `purgedAt`.
+ *     agencies/{agencyId}/agencyHosts/{uid}: marked inactive ('purged'), kept.
+ *
+ *   RETAINED (financial and audit retention — never deleted by a purge)
+ *     users/{uid}/{diamondTransactions, beanTransactions, dailyStats,
+ *     weeklyEarnings, warnings, giftShowcase, blocked}   RETAINED_SUBCOLLECTIONS
+ *     The skeleton on users/{uid}: uid, agencyId, timestamps, balances.
+ *     Every top-level ledger row that names the uid (giftTransactions,
+ *     giftEvents, platformRevenue, withdrawalRequests, weeklyPayoutReports/…,
+ *     appeals, authEvents, reports) — a purge touches none of them.
  *
  * ── WHAT "DELETE MY ACCOUNT" USED TO DO ──────────────────────────────────────
  *
@@ -35,10 +88,10 @@ const REGION = 'asia-south1' as const
  *   request  →  `isDeleted: true`, `deletionRequestedAt`, `deletionDueAt`
  *               The account is hidden everywhere and stops ringing, but nothing
  *               is destroyed.
- *   within 30 days, they sign in  →  `recoverAccount`, everything restored
+ *   within GRACE_DAYS, they sign in →  `recoverAccount`, everything restored
  *                                    exactly as it was.
  *   or they choose to finish now  →  `purgeMyAccountNow`.
- *   or the thirty days elapse     →  `purgeDeletedAccounts` finishes it.
+ *   or the grace days elapse      →  `purgeDeletedAccounts` finishes it.
  *
  * ── WHAT A PURGE RELEASES, AND WHAT IT KEEPS FOR EVER ────────────────────────
  *
@@ -416,13 +469,37 @@ const BLOCKER_SENTENCE: Record<DeletionBlocker, string> = {
   open_withdrawal: 'a withdrawal is still being paid',
 }
 
+/** `HttpsError.details.code` when a deletion blocker could not be checked (F-21). */
+export const DELETION_CHECK_UNAVAILABLE = 'DELETION_CHECK_UNAVAILABLE'
+
+/** Withdrawal statuses that still have money in flight. */
+const OPEN_WITHDRAWAL_STATUSES = ['pending', 'approved', 'processing']
+
+/**
+ * How many of this host's withdrawals are still being paid.
+ *
+ * F-21: FAILS CLOSED. This used to answer 0 on a read error, so a Firestore
+ * hiccup at exactly the wrong moment let a deletion proceed past a withdrawal
+ * that was still being paid — the one blocker whose cost is real money owed to
+ * nobody. A check that could not run is not a check that passed: the callable
+ * answers `unavailable` and writes nothing; the sweep logs the failure and
+ * retries that account the next night (its due date is untouched).
+ */
 async function openWithdrawalsOf(uid: string): Promise<number> {
+  let snap: FirebaseFirestore.QuerySnapshot
   try {
-    const snap = await db.collection('withdrawalRequests').where('hostUid', '==', uid).get()
-    return snap.docs.filter((d) => ['pending', 'approved', 'processing'].includes(String(d.get('status') ?? ''))).length
-  } catch {
-    return 0
+    snap = await db.collection('withdrawalRequests').where('hostUid', '==', uid).get()
+  } catch (err) {
+    logger.error('account lifecycle: open-withdrawal check failed; deletion blocked', {
+      uid, err: String(err),
+    })
+    throw new HttpsError(
+      'unavailable',
+      'Your account could not be checked for withdrawals in progress. Please try again in a few minutes.',
+      { code: DELETION_CHECK_UNAVAILABLE },
+    )
   }
+  return snap.docs.filter((d) => OPEN_WITHDRAWAL_STATUSES.includes(String(d.get('status') ?? ''))).length
 }
 
 /** Throw PARTNER_RESPONSIBILITIES if a Host's responsibilities are unsettled. */
@@ -466,6 +543,67 @@ async function markPurgeComplete(uid: string): Promise<void> {
     deletionDueAt: admin.firestore.FieldValue.delete(),
     deletionHeld: admin.firestore.FieldValue.delete(),
   })
+}
+
+/**
+ * The Cloud Storage prefixes a purge removes — the person's own uploads.
+ *
+ *   profileMedia/{uid}/       profile photos (the client's own uploads).
+ *   hostVerification/{uid}/   F-10: the face-verification capture
+ *                             (`capture.jpg`) and every `attempts/*` frame —
+ *                             BIOMETRIC data (hosts.ts `captureObjectPath`).
+ *                             It used to survive a "permanent" deletion.
+ *
+ * OWNER_DECISION_PENDING (audit 2026-11-01, open question 8): whether the
+ * biometric captures should instead be retained for a fixed period for
+ * dispute defence. The DEFAULT, implemented here, is delete at purge — a
+ * capture of a person who has left is the heaviest thing the business can
+ * hold with the least reason to hold it. If the owner decides otherwise,
+ * drop the prefix here and add the retention period beside it.
+ */
+export function purgedStoragePrefixes(uid: string): string[] {
+  return [`profileMedia/${uid}/`, `hostVerification/${uid}/`]
+}
+
+/**
+ * Delete everything under each prefix. Returns the prefixes that could NOT be
+ * cleared, so the caller can record the debt rather than forget it.
+ */
+async function clearStorage(uid: string, prefixes: string[]): Promise<string[]> {
+  const left: string[] = []
+  for (const prefix of prefixes) {
+    try {
+      await admin.storage().bucket().deleteFiles({ prefix })
+    } catch (err) {
+      left.push(prefix)
+      logger.error(`purgeAccount: storage ${prefix} could not be cleared`, err)
+    }
+  }
+  return left
+}
+
+/**
+ * The prefixes a record still owes to Storage — only ones a purge of THIS
+ * uid may delete, whatever the field holds.
+ */
+function pendingStoragePrefixes(uid: string, raw: unknown): string[] {
+  const allowed = new Set(purgedStoragePrefixes(uid))
+  return Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string' && allowed.has(p)) : []
+}
+
+/**
+ * Record what Storage still holds for this account, or clear the record.
+ *
+ * `storagePurgePending` is what makes a Storage failure a DEBT rather than an
+ * orphan: the record stays queued (its due date is kept), the sweep returns to
+ * it the next night, and `finishPurge` retries exactly these prefixes — and
+ * only these, so a retry never re-lists what was already cleared.
+ */
+async function recordStorageDebt(uid: string, left: string[]): Promise<void> {
+  await db.collection('users').doc(uid).set(
+    { storagePurgePending: left.length > 0 ? left : admin.firestore.FieldValue.delete() },
+    { merge: true },
+  )
 }
 
 async function deleteQuery(
@@ -589,19 +727,26 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
   // can sign into.
   removed += 1
 
-  // Uploaded media. Best-effort: a storage failure must not leave the account
-  // half-deleted, and an orphaned file is a far smaller problem than a user
-  // document that survived the purge.
-  try {
-    await admin.storage().bucket().deleteFiles({ prefix: `profileMedia/${uid}/` })
-  } catch (err) {
-    logger.warn(`purgeAccount: storage for ${uid} could not be cleared`, err)
-  }
+  // Uploaded media and (F-10) the biometric captures. A storage failure must
+  // not leave the account half-deleted — the identity is already released and
+  // the login still goes below — but it is no longer forgotten either: the
+  // prefixes still owed are recorded, the record stays queued, and the sweep's
+  // `finishPurge` retries them until Storage is clean.
+  const storageLeft = await clearStorage(uid, purgedStoragePrefixes(uid))
+  await recordStorageDebt(uid, storageLeft)
 
   // Last, for the reason above. Already gone is success; any other failure is
   // thrown, so the due date stays set and the sweep's next run finishes the
   // job with `finishPurge` — without repeating the steps above.
   await deleteLogin(uid)
+
+  if (storageLeft.length > 0) {
+    logger.error(
+      `purgeAccount: ${uid} stays queued — Storage still holds ${storageLeft.join(', ')}; ` +
+        'the sweep retries it',
+    )
+    return { uid, removed }
+  }
 
   // Only now is the deletion complete: out of the queue for good (DEACT-001).
   await markPurgeComplete(uid)
@@ -612,11 +757,21 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
 /**
  * Finish a purge whose identity was already released — `accountState` is
  * `permanently_deactivated` — but which is still queued: a login deletion that
- * failed, or a record completed before DEACT-001 was fixed, when a purge never
- * cleared its due date. Repeats nothing that already happened: the login is
- * deleted only if it still exists, then the record leaves the queue.
+ * failed, a Storage prefix that could not be cleared (`storagePurgePending`),
+ * or a record completed before DEACT-001 was fixed, when a purge never cleared
+ * its due date. Repeats nothing that already happened: only the Storage
+ * prefixes still recorded as owed are retried, the login is deleted only if it
+ * still exists, and the record leaves the queue only once both are done.
  */
 async function finishPurge(uid: string): Promise<void> {
+  const snap = await db.collection('users').doc(uid).get()
+  const owed = pendingStoragePrefixes(uid, snap.exists ? snap.get('storagePurgePending') : undefined)
+  let storageLeft: string[] = []
+  if (owed.length > 0) {
+    storageLeft = await clearStorage(uid, owed)
+    await recordStorageDebt(uid, storageLeft)
+  }
+
   let loginExists = true
   try {
     await admin.auth().getUser(uid)
@@ -625,6 +780,13 @@ async function finishPurge(uid: string): Promise<void> {
     loginExists = false
   }
   if (loginExists) await deleteLogin(uid)
+
+  if (storageLeft.length > 0) {
+    logger.error(
+      `finishPurge: ${uid} stays queued — Storage still holds ${storageLeft.join(', ')}`,
+    )
+    return
+  }
   await markPurgeComplete(uid)
 }
 
@@ -818,7 +980,7 @@ export const recoverAccount = onCall(
 // ── Finish it now ─────────────────────────────────────────────────────────────
 
 /**
- * Skip the thirty days.
+ * Skip the grace period (DEACT-003: sixty days now, see `GRACE_DAYS`).
  *
  * Offered beside Recover, because somebody who has come back specifically to
  * confirm the deletion should not have to wait a month for it, and because an
@@ -871,7 +1033,7 @@ export const purgeMyAccountNow = onCall(
   },
 )
 
-// ── The thirty-day sweep ──────────────────────────────────────────────────────
+// ── The grace-period sweep (GRACE_DAYS) ──────────────────────────────────────
 
 /**
  * Finish deletions whose grace period has run out.

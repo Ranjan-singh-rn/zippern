@@ -44,6 +44,7 @@ import { STATE_ACTIVE, STATE_PERMANENTLY_DEACTIVATED, STATE_RECOVERY_PENDING, re
 import { normaliseCrmRole, deriveRoleFlags, PARTNER_ROLES } from './crmRoles'
 import { bindingPayload, decideGuestClaim, GuestClaimStatus } from './guestBinding'
 import { AdoptionCandidate, decideEmailAdoption } from './emailAdoption'
+import { appCheckRuntimeOptions, clientIpOf, enforceRateLimit, RATE_LIMITS, refuseWithoutAppCheck } from './rateLimit'
 
 /**
  * AUTH-001 reverse index: guest uid → the one device it belongs to. Written only
@@ -319,6 +320,8 @@ export const revokeQuickLoginOnRestriction = functions
  */
 export const claimGuestIdentity = functions
   .region('asia-south1')
+  // F-8: App Check enforcement follows ENFORCE_APP_CHECK (off today; rateLimit.ts).
+  .runWith(appCheckRuntimeOptions())
   .https.onCall(async (data: {
     deviceId?: string
     /** The raw secret. Only its SHA-256 is stored. */
@@ -340,6 +343,12 @@ export const claimGuestIdentity = functions
         'A device id and a device secret are required.',
       )
     }
+
+    // F-8: four to eight reads, Auth lookups and a transaction per call, with
+    // no caller to bill them to — bounded per device and per address before
+    // the first read.
+    refuseWithoutAppCheck(context, 'claimGuestIdentity')
+    await enforceRateLimit('claimGuestIdentity', { deviceId, ip: clientIpOf(context.rawRequest) })
 
     const secretHash = hashToken(secret)
     const ref = db.collection('guestDeviceBindings').doc(deviceId)
@@ -1352,9 +1361,21 @@ export const adoptEmailAccount = functions
  * grows per tap. [BATCH] documents per pass and [MAX_PASSES] passes, so the run
  * is bounded and a backlog drains over consecutive days rather than timing out
  * in one.
+ *
+ * F-8 (audit 2026-11-01): the bound was 10 passes × 400 = 4,000 deletes per
+ * collection per night, under the default 60 s timeout. A script could make
+ * more challenges than that in an hour, so the litter outgrew the sweep by
+ * design. Now 50 passes (20,000 per collection per night), a 540 s timeout,
+ * and a wall-clock budget so the run stops cleanly rather than being killed
+ * mid-batch; the rate limits in rateLimit.ts bound what a script can make.
+ * The `rateLimits` buckets themselves are swept here too.
  */
 const SWEEP_BATCH = 400
-const SWEEP_MAX_PASSES = 10
+const SWEEP_MAX_PASSES = 50
+/** Stop starting new passes after this much of the 540 s have gone. */
+const SWEEP_TIME_BUDGET_MS = 420_000
+/** Set by each run of the sweep; shared by every collection it walks. */
+let sweepDeadlineMs = Number.POSITIVE_INFINITY
 
 async function sweepExpired(
   collection: string,
@@ -1363,6 +1384,10 @@ async function sweepExpired(
 ): Promise<number> {
   let removed = 0
   for (let pass = 0; pass < SWEEP_MAX_PASSES; pass++) {
+    if (Date.now() >= sweepDeadlineMs) {
+      functions.logger.warn(`sweep ${collection}: time budget spent after ${pass} pass(es); the rest drains tomorrow`)
+      break
+    }
     const stale = await db
       .collection(collection)
       .where(field, '<=', cutoff)
@@ -1388,24 +1413,33 @@ async function sweepExpired(
 
 export const sweepQuickLoginTokens = functions
   .region('asia-south1')
+  // F-8: fifty passes of four hundred over four collections need more than
+  // the default minute. The time budget inside `sweepExpired` keeps the run
+  // well short of this.
+  .runWith({ timeoutSeconds: 540, memory: '256MB' })
   .pubsub.schedule('30 4 * * *')
   .timeZone('Asia/Kolkata')
   .onRun(async () => {
     const now = admin.firestore.Timestamp.now()
+    sweepDeadlineMs = Date.now() + SWEEP_TIME_BUDGET_MS
     // Rate records outlive their cool-off by a day, so a sweep running between
     // two attempts cannot wipe a counter that is still doing its job.
     const rateCutoff = admin.firestore.Timestamp.fromMillis(
       now.toMillis() - 24 * 60 * 60 * 1000,
     )
 
-    const credentials = await sweepExpired('quickLoginTokens', 'expiresAt', now)
+    // Challenges first: the collection that grows per tap is the one a
+    // spent budget must not leave for tomorrow.
     const challenges = await sweepExpired('quickLoginChallenges', 'expiresAt', now)
+    const credentials = await sweepExpired('quickLoginTokens', 'expiresAt', now)
     const rate = await sweepExpired('quickLoginRate', 'updatedAt', rateCutoff)
+    // F-8: rate-limit buckets carry their own `expiresAt` (a day past their window).
+    const buckets = await sweepExpired(RATE_LIMITS, 'expiresAt', now)
 
-    if (credentials + challenges + rate > 0) {
+    if (credentials + challenges + rate + buckets > 0) {
       functions.logger.info(
         `sweepQuickLoginTokens removed ${credentials} credentials, ` +
-        `${challenges} challenges, ${rate} rate records.`,
+        `${challenges} challenges, ${rate} rate records, ${buckets} rate-limit buckets.`,
       )
     }
     return null

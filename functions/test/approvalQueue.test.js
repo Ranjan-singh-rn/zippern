@@ -374,6 +374,17 @@ describe('GOV-1 — still applied: what the CRM files, approved by another Owner
     expect(db.read('crmUsers/uidNewSellerLogin').role).toBe('seller')
   })
 
+  test('create_agency keys the new record by the request id and stamps it (F-12)', async () => {
+    const req = await approve({
+      type: 'create_agency', operation: 'create', targetCollection: 'agencies', payload: AGENCY_PAYLOAD,
+    }, { requester: APP_ADMIN, reviewer: OWNER_A })
+    expect(req.status).toBe('approved')
+    const id = `REQ_${seq}`
+    expect(db.has(`agencies/${id}`)).toBe(true)
+    expect(db.read(`agencies/${id}`)._approvalRequestId).toBe(id)
+    expect(db.read(`agencies/${id}`)._approvedAt).toBeTruthy()
+  })
+
   test('a rejection applies nothing', async () => {
     const id = `REQ_${++seq}`
     const filed = {
@@ -388,5 +399,109 @@ describe('GOV-1 — still applied: what the CRM files, approved by another Owner
     )
     expect(db.read('appConfig/economy').beansPerRupee).toBe(100)
     expect(db.read(`approvalRequests/${id}`).appliedAt).toBeUndefined()
+  })
+})
+
+// ══ F-12 — at-least-once delivery cannot create a second agency or seller ════
+
+describe('F-12 — a re-delivered or concurrent trigger creates nothing twice', () => {
+  beforeEach(() => { db._docs.clear(); seedCast() })
+
+  /** The event the runtime delivers: same before/after on every delivery. */
+  function filedAndDecided(request, { requester = APP_ADMIN, reviewer = OWNER_A } = {}) {
+    const id = `REQ_${++seq}`
+    const filed = {
+      description: 'test', targetLabel: 'test', targetDocId: '', payload: {},
+      requestedBy: { uid: requester, name: requester, role: 'x' },
+      requestedAt: new Date(), status: 'pending', ...request,
+    }
+    const decided = { ...filed, status: 'approved', reviewedAt: new Date(), reviewNotes: '', reviewedBy: { uid: reviewer, name: reviewer } }
+    db.seed(`approvalRequests/${id}`, decided)
+    return { id, filed, decided }
+  }
+  const deliver = ({ id, filed, decided }) => onApprovalApproved.run(
+    { before: { data: () => filed }, after: { data: () => decided, ref: db.collection('approvalRequests').doc(id) } },
+    { params: { requestId: id } },
+  )
+  const agencyReq = () => filedAndDecided({ type: 'create_agency', operation: 'create', targetCollection: 'agencies', payload: AGENCY_PAYLOAD })
+  const sellerReq = () => filedAndDecided({ type: 'create_seller', operation: 'create', targetCollection: 'sellers', payload: SELLER_PAYLOAD }, { requester: OPS })
+  const newAgencies = () => db.all('agencies').filter((d) => d.agencyName === 'Queue Agency')
+
+  test('the same event delivered three times: one agency, one login, the request still approved', async () => {
+    const ev = agencyReq()
+    const castLogins = db.count('crmUsers')
+    await deliver(ev)
+    const writes = db.writes
+    await deliver(ev)
+    await deliver(ev)
+    expect(newAgencies()).toHaveLength(1)
+    expect(db.count('crmUsers')).toBe(castLogins + 1)    // the cast + the one new login
+    expect(db.read(`approvalRequests/${ev.id}`).status).toBe('approved')
+    expect(db.read(`approvalRequests/${ev.id}`).applyFailed).toBeUndefined()
+    expect(db.writes).toBe(writes)                        // the replays wrote nothing at all
+  })
+
+  test('a replay after the first delivery lost its appliedAt write still creates nothing (the record itself is the guard)', async () => {
+    const ev = agencyReq()
+    await deliver(ev)
+    const agencyBefore = db.read(`agencies/${ev.id}`)
+    const loginBefore = db.read('crmUsers/uidNewAgencyLogin')
+    // The first delivery's `appliedAt` update never landed.
+    db.seed(`approvalRequests/${ev.id}`, ev.decided)
+    await deliver(ev)
+    expect(newAgencies()).toHaveLength(1)
+    expect(db.read(`agencies/${ev.id}`)).toEqual(agencyBefore)
+    expect(db.read('crmUsers/uidNewAgencyLogin')).toEqual(loginBefore)
+    const req = db.read(`approvalRequests/${ev.id}`)
+    expect(req.status).toBe('approved')
+    expect(req.appliedAt).toBeTruthy()
+    expect(req.appliedNote).toContain('already existed')
+  })
+
+  test('two concurrent deliveries of one seller approval: exactly one seller and one login, neither marked failed', async () => {
+    const ev = sellerReq()
+    await Promise.all([deliver(ev), deliver(ev)])
+    expect(db.count('sellers')).toBe(1)
+    expect(db.read(`sellers/${ev.id}`).crmUid).toBe('uidNewSellerLogin')
+    expect(db.read('crmUsers/uidNewSellerLogin').role).toBe('seller')
+    const req = db.read(`approvalRequests/${ev.id}`)
+    expect(req.status).toBe('approved')
+    expect(req.applyFailed).toBeUndefined()
+  })
+
+  test('a request whose id names an existing record NOT created by it is refused and the record is untouched', async () => {
+    const ev = agencyReq()
+    db.seed(`agencies/${ev.id}`, { agencyName: 'Somebody Else', status: 'approved', isActive: true })
+    const before = db.read(`agencies/${ev.id}`)
+    await deliver(ev)
+    expect(db.read(`agencies/${ev.id}`)).toEqual(before)
+    expect(db.has('crmUsers/uidNewAgencyLogin')).toBe(false)
+    const req = db.read(`approvalRequests/${ev.id}`)
+    refused(req)
+    expect(req.applyError).toContain('not created by this approval')
+  })
+
+  test('the approver check is kept on the create path: a non-Owner reviewer creates nothing', async () => {
+    const ev = filedAndDecided(
+      { type: 'create_agency', operation: 'create', targetCollection: 'agencies', payload: AGENCY_PAYLOAD },
+      { requester: APP_ADMIN, reviewer: OPS },
+    )
+    await deliver(ev)
+    expect(newAgencies()).toHaveLength(0)
+    expect(db.has(`agencies/${ev.id}`)).toBe(false)
+    refused(db.read(`approvalRequests/${ev.id}`))
+  })
+
+  test('an approval already recorded as failed is not re-applied by a re-delivery', async () => {
+    const ev = filedAndDecided(
+      { type: 'create_agency', operation: 'create', targetCollection: 'agencies', payload: AGENCY_PAYLOAD },
+      { requester: APP_ADMIN, reviewer: OPS },
+    )
+    await deliver(ev)                                     // refused: non-Owner reviewer
+    const after = db.read(`approvalRequests/${ev.id}`)
+    const writes = db.writes
+    await deliver(ev)
+    expect(db.read(`approvalRequests/${ev.id}`)).toEqual(after)
+    expect(db.writes).toBe(writes)
   })
 })
