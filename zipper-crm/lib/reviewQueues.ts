@@ -48,6 +48,7 @@ import {
   changesOf, docUrlsOf, readPendingChanges,
   type FieldChange, type PendingChanges,
 } from '@/lib/pendingChanges'
+import { samePersonMatches, samePersonNote } from '@/lib/hostSamePerson'
 
 // ── Fetch caps ────────────────────────────────────────────────────────────────
 // Every one of these collections grows forever and is never archived, so each
@@ -129,6 +130,12 @@ export interface Item {
   linkageNote: string
   /** A contradiction in the record itself, shown rather than resolved. */
   conflict: string
+  /**
+   * FX-12: on a pending HOST application, the other applications of the same
+   * person (same account, phone or email) — shown as a badge on /kyc. Absent
+   * or '' everywhere else.
+   */
+  samePerson?: string
   href: string
   /**
    * Every field a proposed change would move, with both sides of it. Empty on
@@ -204,6 +211,12 @@ export function statusWord(raw: unknown): PartnerStatus | '' {
   if (s === 'approved' || s === 'active') return 'approved'
   if (s === 'rejected' || s === 'declined') return 'rejected'
   if (s === 'suspended' || s === 'deactivated') return 'suspended'
+  // UGP-G (I-11): revoked is a terminal status of its own, not "waiting on us".
+  if (s === 'revoked') return 'revoked'
+  // Decision 15 (RC): decided (approved by the Owner) but NOT started — the
+  // login still needs both verified contacts. Not "pending": nothing is left
+  // for a reviewer to decide. Not "approved": the role grants nothing yet.
+  if (s === 'awaiting_verification') return 'awaiting_verification'
   return 'pending'
 }
 
@@ -254,6 +267,11 @@ export function hostDecisionOf(
 ): { status: PartnerStatus; conflict: string } {
   const kyc = statusWord(raw.kycStatus)
   const plain = statusWord(raw.status)
+
+  // Decision 15 (RC): `status: awaiting_verification` with `kycStatus:
+  // approved` is ONE decision written by the server (documents approved, the
+  // role waiting for verified contacts) — not two screens disagreeing.
+  if (plain === 'awaiting_verification') return { status: 'awaiting_verification', conflict: '' }
 
   if (kyc && plain && kyc !== plain && kyc !== 'pending' && plain !== 'pending') {
     return {
@@ -595,12 +613,33 @@ export async function loadReviewQueues(): Promise<QueuesResult> {
 
   const hostItems: Item[] = []
   if (hostDocsRes.ok) {
+    // FX-12: who is the same person as whom, across every host application.
+    const matches = samePersonMatches(
+      hostDocsRes.snap.docs.map((d) => {
+        const raw = d.data() as Record<string, unknown>
+        return {
+          id: d.id,
+          uid: [raw.activatedByUid, raw.applicantUid].map(textOf).find((v) => v !== '') ?? '',
+          phone: raw.applicantPhone ?? raw.phone ?? raw.phoneNumber,
+          email: raw.applicantEmail ?? raw.email,
+          status: hostDecisionOf(raw).status,
+          isActivated: raw.isActivated === true,
+          name: textOf(raw.hostName ?? raw.name ?? raw.displayName),
+        }
+      }),
+    )
     hostDocsRes.snap.docs.forEach((d) => {
       const raw = d.data() as Record<string, unknown>
       // `activatedByUid` is the field the Android app writes when the applicant
       // redeems their referral code. `crmUid` is NOT an app account and must
       // never be used to grant host status.
-      const uid = textOf(raw.activatedByUid ?? raw.uid ?? raw.userId)
+      //
+      // UGP (2.4): a SELF-application — filed from the app by the signed-in
+      // person — carries `applicantUid` from the start. It is not an
+      // unredeemed invitation, and the server decides it on that uid
+      // (`decide_host_application` reads `activatedByUid or applicantUid`).
+      const uid = [raw.activatedByUid, raw.applicantUid, raw.uid, raw.userId]
+        .map(textOf).find((v) => v !== '') ?? ''
       const decision = hostDecisionOf(raw)
       hostItems.push({
         id: d.id,
@@ -621,6 +660,7 @@ export async function loadReviewQueues(): Promise<QueuesResult> {
         linkage: uid ? 'host' : 'host_unlinked',
         linkageNote: uid ? '' : HOST_UNLINKED_NOTE,
         conflict: decision.conflict,
+        samePerson: samePersonNote(matches.get(d.id)),
         href: uid ? `/users/${uid}` : '',
         changes: [],
         proposal: null,

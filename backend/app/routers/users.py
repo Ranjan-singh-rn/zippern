@@ -41,9 +41,14 @@ role the spec puts in charge:
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
+from google.api_core.exceptions import FailedPrecondition
+
+from app.core.firestore_errors import index_unavailable
 from app.core.deps import (
     current_user,
     enforce_permission,
@@ -60,22 +65,39 @@ from app.services.live import LiveError
 from app.services.money import Currency
 from app.services.users import (
     DeviceType,
+    OwnerOnly,
     ReportAction,
     ReportStatus,
     UserError,
     UserNotFound,
+    ProtectedTarget,
 )
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
 def _fail(exc: UserError) -> HTTPException:
-    code = (
-        status.HTTP_404_NOT_FOUND
-        if isinstance(exc, UserNotFound)
-        else status.HTTP_400_BAD_REQUEST
-    )
-    return HTTPException(status_code=code, detail=str(exc))
+    # 403 for a protected target, not 400: the request is well-formed and the
+    # caller is authenticated — they are simply not permitted against this
+    # subject. A 400 would read as "you sent something wrong" and send them
+    # looking for a typo.
+    if isinstance(exc, (ProtectedTarget, OwnerOnly)):
+        code = status.HTTP_403_FORBIDDEN
+    else:
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if isinstance(exc, UserNotFound)
+            else status.HTTP_400_BAD_REQUEST
+        )
+    # HT-2: a refusal that carries its own status says so — 409 "not recorded,
+    # decide again" or 503 "could not be confirmed". No older refusal sets one.
+    code = getattr(exc, "status_code", None) or code
+    # Decision 15 (RC): a refusal that carries a machine-readable detail (the
+    # both-contacts rule) keeps it, so the CRM can show what is missing.
+    structured = getattr(exc, "api_detail", None)
+    return HTTPException(status_code=code, detail=structured() if callable(structured) else str(exc))
 
 
 def _live_fail(exc: LiveError) -> HTTPException:
@@ -113,9 +135,24 @@ class Reason(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
-class HostGrant(BaseModel):
-    agency_id: str = Field(default="", max_length=128)
+class WarnDeduction(BaseModel):
+    """UGP-D: the optional deduction on a warning. The server decides whether
+    this currency is the right one for the person's roles, and whether the live
+    balance covers it — this only bounds the shape."""
+
+    currency: str = Field(pattern=r"^(diamonds|beans)$")
+    #: Strict (UGP review): JSON `true` is not 1 and `"5"` is not 5.
+    amount: int = Field(ge=1, le=10_000_000, strict=True)
+
+
+class Warn(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
+    deduction: WarnDeduction | None = None
+    #: One id per click in the CRM. A retried request with the same id returns
+    #: the first outcome instead of a second warning (UGP-D).
+    request_id: str | None = Field(
+        default=None, min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 class HostDecision(BaseModel):
@@ -442,10 +479,64 @@ async def list_appeals(
     user: dict = Depends(current_user),
 ):
     """The appeals queue, OLDEST first — the longest wait is a person still
-    locked out, and that is the most urgent row on the screen."""
-    return await appeals_svc.list_appeals(
-        str(appeal_status) if appeal_status else None, limit
-    )
+    locked out, and that is the most urgent row on the screen.
+
+    ── WHY THIS CATCHES FailedPrecondition ──────────────────────────────────
+
+    Filtering by `status` and ordering by `createdAt` needs a composite index,
+    and the one for `appeals` was never declared. Firestore raises
+    `FailedPrecondition`; nothing caught it; there is no global handler; so
+    the CRM got a bare `500 Internal Server Error` on four of its five tabs
+    and the page said "Could not load this" with nothing to act on. The index
+    now exists, but an undeployed index in some other environment must not
+    look like a bug in the API again.
+
+    503, not 500 and not a 4xx: the request was valid and the caller can do
+    nothing about it. The message carries the Firestore console URL, which is
+    the one piece of information that turns this from a mystery into a
+    two-minute fix.
+    """
+    try:
+        return await appeals_svc.list_appeals(
+            str(appeal_status) if appeal_status else None, limit
+        )
+    except FailedPrecondition as exc:
+        raise index_unavailable(exc, "the appeals queue") from exc
+
+
+@router.get(
+    "/appeals/{appeal_id}/evidence",
+    dependencies=[Depends(require_permission(Permission.CAN_BAN_USERS))],
+)
+async def appeal_evidence(appeal_id: str, user: dict = Depends(current_user)):
+    """Fifteen-minute signed links to an appeal's private attachments (UGP-F).
+
+    Public-web appeals store object PATHS, never download URLs, so the
+    attachments are readable only through this route.
+
+    UGP review: `can_ban_users` — the permission that DECIDES appeals, and the
+    tier the in-app evidence already has in `storage.rules` — rather than any
+    signed-in staff member; and every opening is audited. The statement stays
+    readable to whoever may read the queue, as before."""
+    from app.core import audit as audit_mod
+    from app.services import public_appeals as pub
+
+    try:
+        links = await pub.evidence_links(appeal_id)
+    except pub.PublicAppealError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    try:
+        await audit_mod.record(
+            actor=user,
+            action=audit_mod.Action.APPEAL_EVIDENCE_VIEWED,
+            subject_type="appeal",
+            subject_id=appeal_id,
+            reason="Opened the appeal's attachments.",
+            meta={"attachments": len(links)},
+        )
+    except Exception:  # noqa: BLE001 — the reviewer still gets to see what was sent
+        log.warning("appeal %s: evidence view not audited", appeal_id)
+    return {"evidence": links}
 
 
 @router.post(
@@ -476,8 +567,10 @@ async def decide_appeal(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
     except AppealError as exc:
+        # HT-2: `AppealDecisionNotRecorded` carries 409 / 503; every other
+        # appeal refusal stays a 400.
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            status_code=getattr(exc, "status_code", None) or status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
 
 
@@ -669,11 +762,29 @@ async def unban_user(uid: str, body: Reason, user: dict = Depends(require_write)
 
     **Refuses a suspended account** and says to use Resume. The two are not
     interchangeable: this one reaches for `bannedDevices` records and a
-    suspension never created any."""
+    suspension never created any.
+
+    A pending appeal from this account is closed as `resolved` — not
+    `overturned`, because nobody reviewed it. See `appeals.auto_resolve_pending`.
+    """
     try:
-        return await svc.unban_user(uid, body.reason, user)
+        result = await svc.unban_user(uid, body.reason, user)
     except UserError as exc:
         raise _fail(exc) from exc
+
+    # After the unban, and only on this path. The sweep and `decide_appeal`
+    # call the service directly, so neither can reach this. Failure here must
+    # not fail the unban — the restriction is already lifted, and an appeal
+    # left pending is a queue item, not a locked-out person.
+    try:
+        resolution = await appeals_svc.auto_resolve_pending(
+            uid, user, trigger="unban"
+        )
+        if resolution:
+            result = {**result, "appeal_resolved": resolution}
+    except Exception:  # noqa: BLE001 — never let this cost the unban
+        log.exception("unban %s: pending appeal could not be auto-resolved", uid)
+    return result
 
 
 @router.post("/{uid}/suspend", dependencies=[_BAN_USERS])
@@ -721,44 +832,87 @@ async def resume_user(uid: str, body: Reason, user: dict = Depends(require_write
 
     It DOES work on a suspension whose `isBanned` flag is somehow false, which
     `unban_user` refused outright — a stray suspension used to be unliftable by
-    any endpoint and simply stayed on the account for ever."""
+    any endpoint and simply stayed on the account for ever.
+
+    A pending appeal from this account is closed as `resolved`. A suspension
+    that EXPIRES on its own does not do this — `lift_expired_suspensions` calls
+    the service directly and leaves the appeal pending, because nobody has
+    answered the question the person asked.
+    """
     try:
-        return await svc.resume_user(uid, body.reason, user)
+        result = await svc.resume_user(uid, body.reason, user)
     except UserError as exc:
         raise _fail(exc) from exc
+
+    try:
+        resolution = await appeals_svc.auto_resolve_pending(
+            uid, user, trigger="resume"
+        )
+        if resolution:
+            result = {**result, "appeal_resolved": resolution}
+    except Exception:  # noqa: BLE001 — never let this cost the resume
+        log.exception("resume %s: pending appeal could not be auto-resolved", uid)
+    return result
 
 
 @router.post(
     "/{uid}/warn",
     dependencies=[Depends(require_permission(Permission.CAN_VIEW_USERS))],
 )
-async def warn_user(uid: str, body: Reason, user: dict = Depends(require_write)):
+async def warn_user(uid: str, body: Warn, user: dict = Depends(require_write)):
     """Record a formal warning, attributed to the person issuing it.
 
     `can_view_users`, not `can_ban_users` — see the note at the top of this
     module. Support issues most warnings and holds the first and not the second.
+
+    UGP-D: a warning may carry a deduction. That part is a balance decision, so
+    it costs `can_adjust_balance` on top — the same split, and the same
+    mechanism, as the reports queue's `deduct` verdict (`_REPORT_ACTION_
+    PERMISSION`). A warning without one costs what it always did.
     """
+    if body.deduction is not None:
+        await enforce_permission(user, _WARN_DEDUCTION_PERMISSION)
+        # A deduction is only accepted on a request that can be retried
+        # safely — see `services.users.warn_user`.
+        if not body.request_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A warning with a deduction needs a request_id.",
+            )
     try:
-        return await svc.warn_user(uid, body.reason, user)
+        return await svc.warn_user(
+            uid, body.reason, user,
+            request_id=body.request_id,
+            deduction=(
+                {"currency": body.deduction.currency, "amount": body.deduction.amount}
+                if body.deduction is not None else None
+            ),
+        )
     except UserError as exc:
         raise _fail(exc) from exc
 
 
-@router.post(
-    "/{uid}/grant-host",
-    dependencies=[Depends(require_permission(Permission.CAN_APPROVE_KYC))],
-)
-async def grant_host(uid: str, body: HostGrant, user: dict = Depends(require_write)):
-    """Make a user a host, optionally attaching them to an agency.
+#: A warning's deduction is a balance decision. Named rather than written inline
+#: so it reads as the same rule the reports queue applies to `deduct`.
+_WARN_DEDUCTION_PERMISSION = Permission.CAN_ADJUST_BALANCE
 
-    The same decision `POST /host-applications/{id}/decide` makes, reached from
-    the user screen instead of the queue, so it costs the same capability. Two
-    doors onto one grant that asked for two different levels of authority would
-    mean the queue's gate was decoration."""
-    try:
-        return await svc.grant_host(uid, body.agency_id, body.reason, user)
-    except UserError as exc:
-        raise _fail(exc) from exc
+
+# ── There is no direct "grant host" route any more ───────────────────────────
+#
+# `POST /users/{uid}/grant-host` made somebody a host from the user screen with
+# no application, no documents, no agency relationship and no record of why
+# beyond a free-text reason. The product's role lifecycle is application →
+# review → approval, for hosts as for every partner role: a host application
+# (filed by an agency from its dashboard, or by the person from the app) is
+# decided at `POST /users/host-applications/{id}/decide`, and THAT is the one
+# door onto `services.users.grant_host`. The service function is kept for it.
+#
+# A client that still calls the old path gets a 404, which is the honest
+# answer: the operation does not exist. The seller display flag below is the
+# same story for "Make seller" — `is_seller: true` is refused, because the
+# Coin Seller partner role is obtained through its application, and the
+# Diamond-Shop display flag follows the approved partner record rather than a
+# button.
 
 
 @router.post(
@@ -775,15 +929,64 @@ async def revoke_host(uid: str, body: Reason, user: dict = Depends(require_write
 
 
 @router.post(
+    "/{uid}/restore-host",
+    dependencies=[Depends(require_permission(Permission.CAN_APPROVE_KYC))],
+)
+async def restore_host(uid: str, body: Reason, user: dict = Depends(require_write)):
+    """Restore a revoked Host role from the person's EXISTING approved
+    application, roster row and verification record (UGP-B). The same
+    capability as revoking it — and, C2, the Owner only: anyone else gets 403
+    and recommends on the person's reinstatement request instead."""
+    try:
+        return await svc.restore_host(uid, body.reason, user)
+    except UserError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/{uid}/roles")
+async def user_roles(uid: str, user: dict = Depends(current_user)):
+    """What this person holds and which ROLE actions may be offered (UGP-B).
+
+    Read from the authoritative records only (Mongo `partners`, the Host flag
+    and `hostApplications`). The CRM user page renders Revoke / Restore from
+    `roles[].actions` and nothing else, so a guest with no roles is offered no
+    role action at all, and a person with ONE role is offered none — suspend
+    the account instead. The server applies the same count when pressed.
+
+    `current_user`, like the warnings and history reads beside it: any internal
+    session may read; the writes each carry their own capability.
+    """
+    from app.services import user_roles as roles_svc
+
+    return await roles_svc.roles_for_crm(uid)
+
+
+@router.post(
     "/{uid}/seller-flag",
     dependencies=[Depends(require_permission(Permission.CAN_APPROVE_SELLER))],
 )
 async def set_seller_flag(
     uid: str, body: SellerFlag, user: dict = Depends(require_write)
 ):
-    """Grant or remove seller status."""
+    """Remove the seller display flag. Granting it directly is refused.
+
+    `users.isSeller` is the Diamond-Shop display flag. It is NOT the Coin
+    Seller partner role — that is a Mongo `partners` record reached through
+    an application and a review — but a person reading the app badge cannot
+    tell the two apart, so the flag must follow the approved record and never
+    precede it. Clearing it remains available for cleanup.
+    """
+    if body.is_seller:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Seller status is not granted from here. A Coin Seller applies "
+                "and is approved through the review queue; the app badge follows "
+                "the approved record."
+            ),
+        )
     try:
-        return await svc.set_seller_flag(uid, body.is_seller, body.reason, user)
+        return await svc.set_seller_flag(uid, False, body.reason, user)
     except UserError as exc:
         raise _fail(exc) from exc
 

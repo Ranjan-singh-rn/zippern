@@ -2,7 +2,9 @@ package com.zipper.app.data.repository
 
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
+import com.zipper.app.util.ServerRefusals
 import kotlinx.coroutines.tasks.await
+import com.zipper.app.util.SessionManager
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,11 +21,25 @@ import javax.inject.Singleton
 @Singleton
 class HostFunctions @Inject constructor(
     private val functions: FirebaseFunctions,
+    /** Phase 1A (SESSION-001): the active session id travels with every call. */
+    private val sessionManager: SessionManager,
 ) {
 
     sealed interface Result<out T> {
         data class Ok<T>(val value: T) : Result<T>
-        data class Failed(val code: String, val userMessage: String) : Result<Nothing>
+        /**
+         * [detail] is the server's own name for the refusal, from the
+         * `details.code` of its `HttpsError` — the same field
+         * `MoneyFunctions.Result.Failed.detail` reads. C8: `recoverAccount`
+         * answers `RECOVERY_EXPIRED` there once the window has closed, which
+         * the status code (`failed-precondition`) cannot tell apart from any
+         * other precondition. Empty for every call that does not send one.
+         */
+        data class Failed(
+            val code: String,
+            val userMessage: String,
+            val detail: String = "",
+        ) : Result<Nothing>
     }
 
     // ── Referral code ────────────────────────────────────────────────────────
@@ -44,6 +60,10 @@ class HostFunctions @Inject constructor(
         RESTRICTED,
         /** Already a host somewhere else. Moving agency is a staff operation. */
         OTHER_AGENCY,
+        /** Phase 1A (AUTH-002): a guest account cannot become a host. */
+        GUEST,
+        /** C1 (B04): this account's Host role was revoked — reinstatement, not a code. */
+        ROLE_REVOKED,
         UNKNOWN,
     }
 
@@ -85,6 +105,8 @@ class HostFunctions @Inject constructor(
                         "account_mismatch" -> ReferralRefusal.ACCOUNT_MISMATCH
                         "restricted"       -> ReferralRefusal.RESTRICTED
                         "other_agency"     -> ReferralRefusal.OTHER_AGENCY
+                        "guest"            -> ReferralRefusal.GUEST
+                        "role_revoked"     -> ReferralRefusal.ROLE_REVOKED
                         else               -> ReferralRefusal.UNKNOWN
                     }
                 )
@@ -214,7 +236,8 @@ class HostFunctions @Inject constructor(
     // ── Account deletion and recovery ────────────────────────────────────────
 
     /**
-     * Undo a deletion request, within the thirty days.
+     * Undo a deletion request, within the recovery window (60 days; after the
+     * due date the server refuses with `details.code = RECOVERY_EXPIRED`).
      *
      * Server-side so that it is recorded and so the rules never have to let a
      * user edit their own deletion status.
@@ -239,12 +262,25 @@ class HostFunctions @Inject constructor(
         payload: Map<String, Any>,
         parse: (Map<String, Any?>) -> T,
     ): Result<T> = try {
-        val res = functions.getHttpsCallable(name).call(payload).await()
+        val res = functions.getHttpsCallable(name).call(sessionManager.withSession(payload)).await()
         val map = res.data as? Map<String, Any?> ?: emptyMap()
         Result.Ok(parse(map))
     } catch (e: FirebaseFunctionsException) {
-        Result.Failed(e.code.name, e.message ?: "Something went wrong.")
+        // P0-1: a session refusal also signs this device out (SessionViewModel).
+        ServerRefusals.report(e)
+        Result.Failed(e.code.name, e.message ?: "Something went wrong.", detailCode(e))
     } catch (e: Exception) {
         Result.Failed("unavailable", "Could not reach the server. Check your connection.")
+    }
+
+    /**
+     * `details.code` off the `HttpsError`, or "" — never a throw on a failure
+     * path. The same reading as `MoneyFunctions.detailCode`.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun detailCode(e: FirebaseFunctionsException): String = try {
+        ((e.details as? Map<String, Any?>)?.get("code") as? String).orEmpty()
+    } catch (_: Exception) {
+        ""
     }
 }

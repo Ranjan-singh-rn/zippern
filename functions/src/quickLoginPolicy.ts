@@ -188,12 +188,20 @@ export function credentialVerdict(
  *
  *   device ban  — bars the handset whoever is holding it, so it outranks
  *                 anything about the account
- *   banned      — the credential is destroyed; there is no way back in
+ *   suspended   — checked BEFORE ban (C9, B25): `suspend_user` sets
+ *                 `isBanned: true` as well as `isSuspended` and
+ *                 `accountState: 'suspended'`, so reading `isBanned` first
+ *                 told every suspended person they were banned. It keeps the
+ *                 credential, so the person can reach the suspension screen
+ *                 and appeal; it grants no application access at all
+ *   banned      — keeps the credential too, for the appeal (see
+ *                 `destroysCredential`); there is no way back in
  *   deleted     — including the recovery window, because recovery is an
  *                 explicit flow and must not be entered sideways
- *   suspended   — the ONE state that keeps the credential. It exists so the
- *                 person can reach the suspension screen and appeal; it grants
- *                 no application access at all
+ *
+ * Which moderation state it is follows the backend's `restriction_of`:
+ * `accountState` when it names one, then `isSuspended`, then `isBanned`. A
+ * ban that left a stale `isSuspended` behind says `accountState: 'banned'`.
  */
 export function accountVerdict(
   account: AccountRecord | null | undefined,
@@ -201,13 +209,13 @@ export function accountVerdict(
 ): QuickLoginOutcome {
   if (deviceBanned) return 'device_banned'
   if (!account) return 'refused'
-  if (account.isBanned === true) return 'banned'
-  if (account.isDeleted === true) return 'deleted'
   const state = String(account.accountState ?? '').trim()
-  if (state === 'permanently_deactivated' || state === 'recovery_pending') return 'deleted'
-  if (account.isSuspended === true) return 'suspended'
   if (state === 'suspended') return 'suspended'
   if (state === 'banned') return 'banned'
+  if (account.isSuspended === true) return 'suspended'
+  if (account.isBanned === true) return 'banned'
+  if (account.isDeleted === true) return 'deleted'
+  if (state === 'permanently_deactivated' || state === 'recovery_pending') return 'deleted'
   return 'allow'
 }
 

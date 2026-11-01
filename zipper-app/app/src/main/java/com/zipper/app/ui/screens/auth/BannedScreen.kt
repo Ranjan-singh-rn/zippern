@@ -21,9 +21,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -31,7 +33,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.google.firebase.auth.FirebaseAuth
+import com.zipper.app.data.repository.AppealStatement
+import com.zipper.app.data.repository.AppealStatus
+import com.zipper.app.ui.components.ButtonStyle
 import com.zipper.app.ui.components.ZipperButton
+import com.zipper.app.util.AppealRoute
+import com.zipper.app.util.PublicAppeal
 import com.zipper.app.ui.components.clickableNoRipple
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
@@ -230,7 +237,7 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
     }
 
     /*
-     * AN APPEAL IS A WRITE ABOUT THE SIGNED-IN ACCOUNT — SO THERE HAS TO BE ONE.
+     * AN APPEAL IS A WRITE ABOUT THE ACCOUNT — SO SOMETHING HAS TO PROVE WHOSE.
      *
      * Every other way into this panel keeps the session deliberately (see
      * SplashScreen), but a DEVICE ban does not: it is found before anybody has
@@ -238,41 +245,49 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
      * and the person sitting in front of it may hold no credential at all.
      *
      * `firestore.rules` requires `subjectUid == request.auth.uid`, so for them
-     * the form would accept a statement, accept photographs, and fail on submit
-     * with "You are not signed in" — after the typing, which is the worst
-     * possible moment to say it. They get the address instead.
+     * the ordinary form would accept a statement, accept photographs, and fail
+     * on submit with "You are not signed in" — after the typing, which is the
+     * worst possible moment to say it.
      *
-     * Remembered rather than read on each recomposition: this is a fact about
-     * how the screen was entered, and it must not flicker into a form halfway
+     * ── C9 (B26): THE DEVICE KEY IS PROOF TOO ───────────────────────────────
+     *
+     * This used to ask only "is anybody signed in", and answer the web address
+     * otherwise. But a ban or a suspension found by QUICK LOGIN never issues a
+     * session, and those are exactly the people `submitAccountAppeal` was built
+     * for: the saved credential plus a Keystore signature proves the handset,
+     * and the appeal is filed with no session at all. So the form is shown
+     * whenever `state.route` (AppealRoute) says it can be SENT — signed in, or
+     * holding both the credential and the key — and the web appeal only when
+     * neither is there. The device-key form carries the statement alone and
+     * grants nothing but the appeal.
+     *
+     * Decided once, by the view model, when the screen opens: a fact about how
+     * the screen was entered, which must not flicker into a form halfway
      * through somebody reading it.
      */
-    val signedIn = remember { FirebaseAuth.getInstance().currentUser != null }
+    val route = state.route
 
     Column(
         Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         when {
-            !signedIn -> {
-                NoticeCard {
-                    Text(
-                        "Think this is wrong?",
-                        style = ZipperTheme.type.labelL, color = c.textPrimary,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(Modifier.height(Space.sm))
-                    Text(
-                        "Write to support@zipperlive.app from the email address or " +
-                            "phone number on the account, and say what happened. A " +
-                            "person reads it.",
-                        style = ZipperTheme.type.bodyS, color = c.textSecondary,
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
-
             state.checking -> {
                 CircularProgressIndicator(color = c.brandPrimary, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+            }
+
+            !AppealRoute.showsForm(route) -> {
+                // UGP-F: nothing on this phone can send the in-app form — but the
+                // public web appeal can, with the account ID below. Support is
+                // still named as the other way.
+                WebAppealCard(accountId = PublicAppeal.accountIdToShow(null))
+                Spacer(Modifier.height(Space.md))
+                Text(
+                    "You can also write to support@zipperlive.app from the email address or " +
+                        "phone number on the account. A person reads it.",
+                    style = ZipperTheme.type.caption, color = c.textMuted,
+                    textAlign = TextAlign.Center,
+                )
             }
 
             // Already with a reviewer. Say so, and do not offer the form.
@@ -291,21 +306,64 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
                         "to do, and sending another one will not make it faster.",
                         style = ZipperTheme.type.bodyS, color = c.textSecondary, textAlign = TextAlign.Center,
                     )
+                    // Said out loud, and only when it happened. The appeal is
+                    // filed either way — but a reviewer seeing no screenshot
+                    // when the person believes they sent one is how a good
+                    // appeal gets refused.
+                    if (state.evidenceDropped > 0) {
+                        Spacer(Modifier.height(Space.sm))
+                        Text(
+                            if (state.evidenceDropped == 1)
+                                "One screenshot could not be attached, so the reviewer " +
+                                "will not see it. Your appeal was still sent."
+                            else
+                                "${state.evidenceDropped} screenshots could not be attached, " +
+                                "so the reviewer will not see them. Your appeal was still sent.",
+                            style = ZipperTheme.type.bodyS,
+                            color = c.statusWarning,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
             }
 
             else -> {
-                // A previous appeal, decided. Shown before the form, because
-                // somebody who was refused needs the reason more than they
-                // need another empty box.
-                if (state.lastVerdict.isNotBlank()) {
+                /*
+                 * A previous appeal, concluded. Shown before the form, because
+                 * somebody who was refused needs the reason more than they need
+                 * another empty box.
+                 *
+                 * ── WHY THIS IS A `when` AND NOT AN `if/else` ────────────────
+                 *
+                 * It was `if (verdict == "overturned") accepted else refused` —
+                 * an `else` over a string the SERVER owns, which silently
+                 * promised that `upheld` and `overturned` are the only outcomes
+                 * that will ever exist. The backend's `AppealStatus` is an enum
+                 * that is expected to grow, and the first new member would have
+                 * made this screen tell people their appeal "was not accepted"
+                 * when nobody had refused it.
+                 *
+                 * `AppealStatus.outcomeOf` is total, so UNRECOGNISED is a real
+                 * branch rather than a default. The reviewer's words are shown
+                 * for every outcome — on an unknown status they are the only
+                 * trustworthy thing on screen, so they carry it alone.
+                 */
+                val headline: String? = when (state.lastOutcome) {
+                    AppealStatus.Outcome.NONE -> null
+                    AppealStatus.Outcome.ACCEPTED -> "Your last appeal was accepted"
+                    AppealStatus.Outcome.REFUSED -> "Your last appeal was not accepted"
+                    // Deliberately neutral. Claims neither acceptance nor
+                    // refusal, because this build cannot tell which it was.
+                    AppealStatus.Outcome.UNRECOGNISED -> "About your last appeal"
+                }
+
+                if (headline != null) {
                     NoticeCard {
                         Text(
-                            if (state.lastVerdict == "overturned")
-                                "Your last appeal was accepted"
-                            else "Your last appeal was not accepted",
+                            headline,
                             style = ZipperTheme.type.labelL,
-                            color = if (state.lastVerdict == "overturned") c.statusSuccess else c.textPrimary,
+                            color = if (state.lastOutcome == AppealStatus.Outcome.ACCEPTED)
+                                c.statusSuccess else c.textPrimary,
                             textAlign = TextAlign.Center,
                         )
                         if (state.lastReason.isNotBlank()) {
@@ -358,58 +416,109 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
                     )
                 }
 
-                Spacer(Modifier.height(Space.md))
-
-                // Evidence. Optional, and capped at three — a reviewer who
-                // has to open twenty screenshots reads none of them.
+                // ── THE MINIMUM, ON SCREEN ────────────────────────────────
+                //
+                // `AppealStatement.MIN` is 20 and the Send button is gated on
+                // it, but the only place that number was ever written down
+                // was an error string the user could not reach: the button
+                // that would have triggered it was the thing disabled. People
+                // typed a short sentence, watched a grey button, and had no
+                // way to find out why — which, on the screen whose entire
+                // purpose is letting somebody say they were banned by
+                // mistake, means the appeal never arrives.
+                //
+                // A live count rather than a static hint, so the remedy is
+                // visible while they type. It turns red only once they have
+                // started, because an untouched field is not an error.
+                //
+                // Both values come from `AppealStatement`, the same object the
+                // button and the repository use, so the counter cannot read
+                // "20 / 20" beside a button that will not press.
+                Spacer(Modifier.height(Space.xs))
+                val typed = AppealStatement.length(state.statement)
+                val short = !AppealStatement.isSendable(state.statement)
                 Row(
                     Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    state.evidence.forEach { uri ->
-                        Box {
-                            AsyncImage(
-                                model = uri,
-                                contentDescription = "Evidence",
-                                modifier = Modifier
-                                    .size(64.dp)
-                                    .background(c.bgElevated, RoundedCornerShape(Radius.md)),
-                            )
-                            Box(
-                                Modifier
-                                    .align(Alignment.TopEnd)
-                                    .size(20.dp)
-                                    .background(c.bgBase, CircleShape)
-                                    .clickableNoRipple { viewModel.removeEvidence(uri) },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Icon(Icons.Outlined.Close, "Remove", tint = c.textSecondary, modifier = Modifier.size(13.dp))
+                    Text(
+                        if (short) "At least ${AppealStatement.MIN} characters"
+                        else "Ready to send",
+                        style = ZipperTheme.type.bodyS,
+                        color = if (short && typed > 0) c.statusDanger else c.textSecondary,
+                    )
+                    Text(
+                        "$typed / ${AppealStatement.MIN}",
+                        style = ZipperTheme.type.bodyS,
+                        color = if (short && typed > 0) c.statusDanger else c.textSecondary,
+                    )
+                }
+
+                Spacer(Modifier.height(Space.md))
+
+                // C9: sent by the device key, with no session — so there is no
+                // upload, and no picker that would collect screenshots only to
+                // drop them. Said once, plainly, instead.
+                if (!AppealRoute.carriesEvidence(route)) {
+                    Text(
+                        "Sent from this phone without signing in, so screenshots can't be " +
+                            "attached here. Your words are what the reviewer reads.",
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                        textAlign = TextAlign.Center,
+                    )
+                } else {
+                    // Evidence. Optional, and capped at three — a reviewer who
+                    // has to open twenty screenshots reads none of them.
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        state.evidence.forEach { uri ->
+                            Box {
+                                AsyncImage(
+                                    model = uri,
+                                    contentDescription = "Evidence",
+                                    modifier = Modifier
+                                        .size(64.dp)
+                                        .background(c.bgElevated, RoundedCornerShape(Radius.md)),
+                                )
+                                Box(
+                                    Modifier
+                                        .align(Alignment.TopEnd)
+                                        .size(20.dp)
+                                        .background(c.bgBase, CircleShape)
+                                        .clickableNoRipple { viewModel.removeEvidence(uri) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(Icons.Outlined.Close, "Remove", tint = c.textSecondary, modifier = Modifier.size(13.dp))
+                                }
                             }
                         }
-                    }
-                    if (state.evidence.size < 3) {
-                        Box(
-                            Modifier
-                                .size(64.dp)
-                                .background(c.bgElevated, RoundedCornerShape(Radius.md))
-                                .border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.md))
-                                .clickableNoRipple { picker.launch("image/*") },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                Icons.Outlined.AddPhotoAlternate, "Add a photo",
-                                tint = c.textMuted, modifier = Modifier.size(22.dp),
-                            )
+                        if (state.evidence.size < 3) {
+                            Box(
+                                Modifier
+                                    .size(64.dp)
+                                    .background(c.bgElevated, RoundedCornerShape(Radius.md))
+                                    .border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.md))
+                                    .clickableNoRipple { picker.launch("image/*") },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Outlined.AddPhotoAlternate, "Add a photo",
+                                    tint = c.textMuted, modifier = Modifier.size(22.dp),
+                                )
+                            }
                         }
+                        Spacer(Modifier.weight(1f))
                     }
-                    Spacer(Modifier.weight(1f))
+                    Spacer(Modifier.height(Space.xs))
+                    Text(
+                        "Screenshots help, up to three. Optional.",
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                    )
                 }
-                Spacer(Modifier.height(Space.xs))
-                Text(
-                    "Screenshots help, up to three. Optional.",
-                    style = ZipperTheme.type.caption, color = c.textMuted,
-                )
 
                 state.error?.let { err ->
                     Spacer(Modifier.height(Space.md))
@@ -422,7 +531,10 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
                     onClick = viewModel::submit,
                     gradient = true,
                     fullWidth = true,
-                    enabled = state.statement.trim().length >= 20 && !state.sending,
+                    // The same rule the repository enforces, through the same
+                    // function — a second copy of the comparison here is how
+                    // the UI and the validator drift apart.
+                    enabled = AppealStatement.isSendable(state.statement) && !state.sending,
                     loading = state.sending,
                 )
             }
@@ -432,13 +544,67 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
         // who has no form, because for them the address is the only route and
         // the card above has already given it; the word would be a lie about
         // what else they could have done.
-        if (signedIn) {
+        if (!state.checking && AppealRoute.showsForm(route)) {
             Spacer(Modifier.height(Space.xxl))
+            // UGP-F: the same appeal can be filed on the web, signed out, from
+            // any device — useful once this screen signs them out.
+            WebAppealCard(accountId = PublicAppeal.accountIdToShow(FirebaseAuth.getInstance().currentUser?.uid))
+            Spacer(Modifier.height(Space.md))
             Text(
                 "You can also write to support@zipperlive.app",
                 style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center,
             )
         }
+    }
+}
+
+/**
+ * UGP-F — the public web appeal: the address and THIS account's ID, copyable.
+ *
+ * The page needs no sign-in, so it works after this screen signs the person
+ * out, after a reinstall, or from a computer. It writes the same appeals queue
+ * as the form above and changes nothing on the account by itself.
+ */
+@Composable
+internal fun WebAppealCard(accountId: String) {
+    val c = ZipperTheme.colors
+    val clipboard = LocalClipboardManager.current
+    val uri = LocalUriHandler.current
+    NoticeCard {
+        Text(
+            "Appeal on the web",
+            style = ZipperTheme.type.labelL, color = c.textPrimary, textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(Space.sm))
+        Text(
+            "Go to ${PublicAppeal.DISPLAY} on any phone or computer — no sign-in needed — " +
+                "enter your account ID and say what happened. A person reviews it.",
+            style = ZipperTheme.type.bodyS, color = c.textSecondary, textAlign = TextAlign.Center,
+        )
+        if (accountId.isNotBlank()) {
+            Spacer(Modifier.height(Space.md))
+            Text("Your account ID", style = ZipperTheme.type.caption, color = c.textMuted)
+            Text(
+                accountId,
+                style = ZipperTheme.type.labelM, color = c.textPrimary, textAlign = TextAlign.Center,
+                modifier = Modifier.clickableNoRipple { clipboard.setText(AnnotatedString(accountId)) },
+            )
+            Text("Tap to copy", style = ZipperTheme.type.caption, color = c.textMuted)
+        } else {
+            Spacer(Modifier.height(Space.sm))
+            Text(
+                "If you cannot see your account ID, use your display name together with the " +
+                    "8-character ID from your profile.",
+                style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center,
+            )
+        }
+        Spacer(Modifier.height(Space.md))
+        ZipperButton(
+            "Open the appeal page",
+            onClick = { runCatching { uri.openUri(PublicAppeal.URL) } },
+            style = ButtonStyle.Secondary,
+            fullWidth = true,
+        )
     }
 }
 

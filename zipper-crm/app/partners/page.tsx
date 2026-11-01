@@ -18,6 +18,8 @@ import {
   Search, ShoppingBag, TrendingUp, Wallet, X,
 } from 'lucide-react'
 import api, { ApiError } from '@/lib/api'
+import { nameOrReference } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState, Loading } from '@/components/ui/States'
 
@@ -63,6 +65,8 @@ export default function Partners() {
   const [seller, setSeller] = useState<Awaited<ReturnType<typeof api.partners.sellerStatement>> | null>(null)
   const [exposure, setExposure] = useState<Awaited<ReturnType<typeof api.partners.creditExposure>> | null>(null)
   const [overdue, setOverdue] = useState<Awaited<ReturnType<typeof api.partners.overdueSellers>>>([])
+  // B1: each host_id is a Firebase uid — named from `users` (names only).
+  const hostNames = useIdentities({ people: hosts.map((h) => h.host_id) })
 
   const loadExposure = useCallback(async () => {
     if (!apiReady) return
@@ -225,7 +229,7 @@ export default function Partners() {
             <Panel title="Host performance" icon={<TrendingUp size={15} />}>
               {hosts.slice(0, 20).map((h) => (
                 <Row key={h.host_id}>
-                  <span className="text-slate-300 text-sm font-mono truncate">{h.host_id}</span>
+                  <span className="text-slate-300 text-sm truncate" title={h.host_id}>{nameOrReference(hostNames.people.get(h.host_id), h.host_id, 'host')}</span>
                   <span className="text-white text-sm">🫘 {h.beans_earned.toLocaleString('en-IN')}</span>
                 </Row>
               ))}

@@ -156,7 +156,14 @@ for admin_role in ADMINS:
 owner = actor(Role.OWNER, "owner-1")
 for role in ADMINS + MEMBERS:
     ok(f"an owner manages {role}", svc.manages(owner, person(role)))
-ok("an owner manages another owner", svc.manages(owner, person(Role.OWNER)))
+# Phase 1A (STAFF-001/002): CHANGED EXPECTATION — Owners manage departments,
+# not each other. Only the observer manages an Owner; nobody manages the observer.
+ok("an owner does NOT manage another owner", not svc.manages(owner, person(Role.OWNER)))
+ok("an owner does NOT manage the observer", not svc.manages(owner, person(Role.OBSERVER)))
+ok("the observer manages an owner",
+   svc.manages(actor(Role.OBSERVER, "obs-1"), person(Role.OWNER)))
+ok("the observer manages no department role",
+   not any(svc.manages(actor(Role.OBSERVER, "obs-1"), person(r)) for r in ADMINS + MEMBERS))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -43,6 +43,8 @@ import { DataTable, type Column } from '@/components/ui/DataTable'
 import { Denied, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
+import { nameOrReference, type IdentityFacts } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'app_admin', 'app_member',
@@ -123,6 +125,11 @@ export default function DeviceBansPage() {
 
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<Failure | null>(null)
+
+  // B1: the accounts holding a ban are Firebase uids — named from `users`
+  // (staff-readable). Names only: this screen never needed their contacts.
+  const holders = useIdentities({ enabled: canView, people: devices.flatMap(heldBy) })
+  const names = holders.people
 
   const [lookup, setLookup] = useState('')
 
@@ -275,9 +282,10 @@ export default function DeviceBansPage() {
               <Link
                 key={uid}
                 href={`/users/${uid}`}
-                className="font-mono text-[11px] text-pink-400 hover:text-pink-300 truncate max-w-[100px]"
+                title={uid}
+                className="text-[11px] text-pink-400 hover:text-pink-300 break-all"
               >
-                {uid}
+                {nameOrReference(names.get(uid), uid, 'account')}
               </Link>
             ))}
           </div>
@@ -312,7 +320,7 @@ export default function DeviceBansPage() {
         </button>
       ),
     },
-  ], [])
+  ], [names])
 
   // The one question this page exists to answer, answered as a yes or a no
   // rather than as an empty table the reader has to interpret.
@@ -436,7 +444,7 @@ export default function DeviceBansPage() {
                 <div className="mt-2">
                   <Origin record={exact} />
                 </div>
-                <HoldNote record={exact} className="text-slate-300 text-xs mt-1.5" />
+                <HoldNote record={exact} names={names} className="text-slate-300 text-xs mt-1.5" />
               </div>
             </div>
             <button
@@ -624,9 +632,9 @@ export default function DeviceBansPage() {
                       <Link
                         key={uid}
                         href={`/users/${uid}`}
-                        className="font-mono text-[11px] text-amber-200 underline underline-offset-2 hover:text-white break-all"
+                        className="text-[11px] text-amber-200 underline underline-offset-2 hover:text-white break-all"
                       >
-                        {uid}
+                        {nameOrReference(names.get(uid), uid, 'account')}
                       </Link>
                     ))}
                   </div>
@@ -714,9 +722,10 @@ function Origin({ record }: { record: DeviceBanRecord }) {
  * here because no account is named on the record at all.
  */
 function HoldNote({
-  record, className = '',
+  record, names, className = '',
 }: {
   record: DeviceBanRecord
+  names?: ReadonlyMap<string, IdentityFacts>
   className?: string
 }) {
   const uids = heldBy(record)
@@ -749,9 +758,9 @@ function HoldNote({
             <Link
               key={uid}
               href={`/users/${uid}`}
-              className="font-mono text-[11px] text-pink-400 hover:text-pink-300 break-all"
+              className="text-[11px] text-pink-400 hover:text-pink-300 break-all"
             >
-              {uid}
+              {nameOrReference(names?.get(uid), uid, 'account')}
             </Link>
           ))}
         </div>

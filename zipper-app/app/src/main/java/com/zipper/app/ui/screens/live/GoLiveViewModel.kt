@@ -1,5 +1,6 @@
 package com.zipper.app.ui.screens.live
 
+import com.zipper.app.util.LiveModeration
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -72,6 +73,16 @@ data class GoLiveUiState(
      */
     val totalBeansSession: Long = 0L,
     val isMicOn: Boolean = true,
+    /**
+     * B2: the live ended without the host pressing End — a staff End, the
+     * server closing the room, or the 2-minute no-face rule. The broadcast has already been stopped; the screen
+     * shows [remoteEndMessage] and then leaves to the summary.
+     */
+    val endedRemotely: Boolean = false,
+    val remoteEndMessage: String = "",
+    /** B2: a staff mute is in force; the mic is held off until it is lifted. */
+    val mutedByStaff: Boolean = false,
+    val staffMuteMessage: String = "",
     /**
      * Bumped whenever the ViewModel has moved the engine between channels — at
      * the moment a PK battle ends, today.
@@ -327,8 +338,28 @@ class GoLiveViewModel @Inject constructor(
                             else _state.value.pkState
                         }
                     }
+                    // B2: honour a staff End / Mute written to this room.
+                    if (LiveModeration.closedRemotely(_state.value.isLive, _state.value.endedRemotely, room.isActive)) {
+                        _state.update {
+                            it.copy(
+                                endedRemotely = true,
+                                remoteEndMessage = LiveModeration.endedMessage(room.endedByStaff, room.endReason),
+                            )
+                        }
+                        // The room is already closed: stop publishing, but do
+                        // not write the room again — that would overwrite the
+                        // staff `endedAt` with this phone's clock.
+                        endLive(roomAlreadyClosed = true)
+                        return@collect
+                    }
+                    if (LiveModeration.mustForceMicOff(room.hostMuted, _state.value.isMicOn)) {
+                        AgoraManager.muteLocalAudio(true)
+                        _state.update { it.copy(isMicOn = false) }
+                    }
                     _state.update {
                         it.copy(
+                            mutedByStaff = room.hostMuted,
+                            staffMuteMessage = if (room.hostMuted) LiveModeration.mutedMessage(room.hostMuteReason) else "",
                             viewerCount = room.viewerCount,
                             totalGiftsReceived = room.totalGiftsReceived,
                             totalBeansSession = room.totalBeansEarned,
@@ -412,7 +443,10 @@ class GoLiveViewModel @Inject constructor(
                 // Check if face came back
                 if (_state.value.faceDetected) return@launch
             }
-            // 2 minutes elapsed with no face — auto end
+            // 2 minutes elapsed with no face — auto end.
+            // B2: and say so. The screen used to drop the host back on the
+            // pre-live setup form with no explanation and no summary.
+            _state.update { it.copy(endedRemotely = true, remoteEndMessage = LiveModeration.FACE_TIMEOUT_MESSAGE) }
             endLive()
         }
     }
@@ -456,7 +490,7 @@ class GoLiveViewModel @Inject constructor(
      * a viewModelScope job here died with the PK end still in flight and left
      * the room active.
      */
-    fun endLive() {
+    fun endLive(roomAlreadyClosed: Boolean = false) {
         val s = _state.value
         if (s.roomId.isBlank()) return
         durationJob?.cancel()
@@ -478,7 +512,9 @@ class GoLiveViewModel @Inject constructor(
                 if (s.pkState == PKState.ACTIVE) pkRepo.endPK(s.roomId, s.pkPartnerId)
                 if (s.pkState == PKState.WAITING) pkRepo.cancelPKQueue(s.roomId)
             } catch (_: Exception) {}
-            try { repo.endLive(s.roomId, s.liveDurationSeconds) } catch (_: Exception) {}
+            if (!roomAlreadyClosed) {
+                try { repo.endLive(s.roomId, s.liveDurationSeconds) } catch (_: Exception) {}
+            }
         }
     }
 
@@ -489,6 +525,11 @@ class GoLiveViewModel @Inject constructor(
     // ── Mic toggle ────────────────────────────────────────────────────────────
 
     fun toggleMic() {
+        // B2: a staff mute holds the mic off; say why instead of reopening it.
+        if (!_state.value.isMicOn && !LiveModeration.mayUnmute(_state.value.mutedByStaff)) {
+            _state.update { it.copy(error = it.staffMuteMessage.ifBlank { LiveModeration.mutedMessage(null) }) }
+            return
+        }
         val new = !_state.value.isMicOn
         _state.update { it.copy(isMicOn = new) }
         AgoraManager.muteLocalAudio(!new)

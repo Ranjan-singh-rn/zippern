@@ -5,6 +5,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
+import com.zipper.app.util.ServerRefusals
 import com.zipper.app.data.model.PartyRoom
 import com.zipper.app.data.model.PartySeat
 import com.zipper.app.data.model.PartySeatInvite
@@ -134,6 +135,8 @@ class PartyRepository @Inject constructor(
     private val firestore: FirebaseFirestore,
     private val functions: FirebaseFunctions,
     private val money: MoneyFunctions,
+    /** Phase 1A (SESSION-001): the active session id travels with every callable. */
+    private val sessionManager: com.zipper.app.util.SessionManager,
 ) {
 
     /** What a callable said. Mirrors [HostFunctions.Result] so call sites read alike. */
@@ -662,10 +665,12 @@ class PartyRepository @Inject constructor(
         payload: Map<String, Any>,
         parse: (Map<String, Any?>) -> T,
     ): Result<T> = try {
-        val res = functions.getHttpsCallable(name).call(payload).await()
+        val res = functions.getHttpsCallable(name).call(sessionManager.withSession(payload)).await()
         val map = res.data as? Map<String, Any?> ?: emptyMap()
         Result.Ok(parse(map))
     } catch (e: FirebaseFunctionsException) {
+        // P0-1: a session refusal also signs this device out (SessionViewModel).
+        ServerRefusals.report(e)
         Result.Failed(e.code.name, e.message ?: "Something went wrong.")
     } catch (e: Exception) {
         Result.Failed("unavailable", "Could not reach the server. Check your connection.")

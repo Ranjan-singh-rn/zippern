@@ -36,6 +36,7 @@
  */
 
 import UploadField from '@/components/UploadField'
+import SecureDocLink from '@/components/SecureDocLink'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import {
@@ -46,6 +47,7 @@ import {
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
+import { referenceOf } from '@/lib/identity'
 import {
   getDiamondPacks, DEFAULT_DIAMOND_PACKS, type DiamondPack,
 } from '@/lib/appConfig'
@@ -487,6 +489,10 @@ export default function CoinPurchases() {
               key={card.id}
               card={card}
               sellerName={nameOf(card.subject?.id ?? '')}
+              sellerNameOf={(id) => {
+                const n = nameOf(id)
+                return n && n !== id ? `${n} (${referenceOf('seller', id)})` : referenceOf('seller', id)
+              }}
               pack={packFor(packs, num(card.payload, 'coins') || card.amount)}
               rates={rates}
               isOwner={isOwner}
@@ -670,15 +676,15 @@ function SellerRequestRow({
           Reference:{' '}
           <span className="font-mono text-slate-200">{ref || '— none given —'}</span>
         </p>
+        {/* Through the API behind a 15-minute signed URL.
+            `request.paymentProofUrl` is the `getDownloadURL()` result stored
+            when the seller uploaded their bank screenshot — a permanent
+            bearer credential Storage Rules are never consulted for. */}
         {request.paymentProofUrl && (
-          <a
-            href={request.paymentProofUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 text-pink-400 hover:text-pink-300 text-xs"
-          >
-            <ExternalLink size={10} /> Payment proof
-          </a>
+          <SecureDocLink
+            kind="coin_purchase" recordId={request.id} slot="proof"
+            label="Payment proof"
+          />
         )}
       </div>
 
@@ -862,7 +868,7 @@ function ConvertDialog({
                 {hits.map((d) => (
                   <li key={d.card_id} className="text-red-200/80 text-xs">
                     {coinText(Number(d.amount ?? 0))} · {when(d.created_at)} · {d.stage} ·
-                    seller {d.subject_id}
+                    seller {sellerRef(sellers, d.subject_id)}
                   </li>
                 ))}
               </ul>
@@ -970,14 +976,11 @@ function ConvertDialog({
           {request.paymentProofUrl ? (
             <p className="text-slate-500 text-xs">
               The seller&rsquo;s proof image is attached to the card as evidence.{' '}
-              <a
-                href={request.paymentProofUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="text-pink-400 hover:text-pink-300 underline underline-offset-2"
-              >
-                Open it first
-              </a>
+              <SecureDocLink
+                kind="coin_purchase" recordId={request.id} slot="proof"
+                label="Open it first"
+                className="text-pink-400 hover:text-pink-300 underline underline-offset-2 inline-flex items-center gap-1"
+              />
               .
             </p>
           ) : (
@@ -1028,9 +1031,20 @@ function ConvertDialog({
 
 // ── One purchase request ──────────────────────────────────────────────────────
 
+/**
+ * B1: a duplicate-reference hit names the seller record it belongs to. The
+ * name comes from the sellers list this page already loaded; the labelled
+ * Seller ID stays beside it so two records are never confused.
+ */
+function sellerRef(sellers: ReadonlyArray<{ id: string; name?: string }>, id: string): string {
+  const name = (sellers.find((s) => s.id === id)?.name ?? '').trim()
+  return name ? `${name} (${referenceOf('seller', id)})` : referenceOf('seller', id)
+}
+
 function PurchaseCard({
   card,
   sellerName,
+  sellerNameOf,
   pack,
   rates,
   isOwner,
@@ -1039,6 +1053,8 @@ function PurchaseCard({
 }: {
   card: PartnerCard
   sellerName: string
+  /** B1: names the seller record of each duplicate-reference hit. */
+  sellerNameOf?: (id: string) => string
   pack: DiamondPack | null
   rates: Rates | null
   /** Only an owner may execute. The API refuses everyone else with a 403. */
@@ -1172,7 +1188,7 @@ function PurchaseCard({
                     {' · '}
                     <span className="text-red-200/70">
                       {String(d.type ?? '').replace(/_/g, ' ')} · {d.stage} · seller{' '}
-                      {d.subject_id}
+                      {sellerNameOf ? sellerNameOf(d.subject_id) : referenceOf('seller', d.subject_id)}
                     </span>
                     <span className="block text-red-200/50 font-mono">{d.card_id}</span>
                   </li>
@@ -1733,7 +1749,7 @@ function RaiseDialog({
                 {refHits.map((d) => (
                   <li key={d.card_id} className="text-red-200/80 text-xs">
                     {coinText(Number(d.amount ?? 0))} · {when(d.created_at)} ·{' '}
-                    {d.stage} · seller {d.subject_id}
+                    {d.stage} · seller {sellerRef(sellers, d.subject_id)}
                   </li>
                 ))}
               </ul>

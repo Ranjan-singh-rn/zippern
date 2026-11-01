@@ -76,6 +76,8 @@ import {
   attempt, failureCode, ok, toFailure, type ReadFailure, type ReadResult,
 } from '@/lib/readState'
 import api, { ApiError, type Sale } from '@/lib/api'
+import { IdentityBlock } from '@/components/ui/Identity'
+import { useIdentities } from '@/lib/useIdentities'
 import { partnerRecordId, partnerRolesOf } from '@/lib/auth'
 import { getSeller, getSellerRechargeRequests, type RechargeRequest, type Seller } from '@/lib/sellers'
 import { getSellerCoinPurchases, type CoinPurchaseRequest } from '@/lib/coinPurchases'
@@ -1591,6 +1593,9 @@ function SalesTab({
   onFile: () => void
   canFile: boolean
 }) {
+  // B1: buyers are Firebase uids. A seller may know a buyer's NAME (the public
+  // profile) but has no right to their email or phone — never shown here.
+  const buyers = useIdentities({ publicPeople: sales?.ok ? sales.value.map((s) => s.buyer_uid) : [] })
   return (
     <div className="space-y-4">
       <Panel
@@ -1632,7 +1637,13 @@ function SalesTab({
                 {sales.value.map((s) => (
                   <tr key={s.id} className="border-b border-slate-800/60 last:border-0">
                     <td className="px-3 sm:px-5 py-3">
-                      <p className="text-slate-300 text-xs font-mono break-all">{s.buyer_uid}</p>
+                      <IdentityBlock
+                        facts={buyers.publicPeople.get(s.buyer_uid)}
+                        id={s.buyer_uid}
+                        kind="buyer"
+                        state={buyers.state}
+                        className="text-xs"
+                      />
                       <p className="text-slate-600 text-xs">{when(s.created_at)}</p>
                     </td>
                     <td className="px-3 sm:px-5 py-3 text-sm text-yellow-300 font-semibold text-right whitespace-nowrap">

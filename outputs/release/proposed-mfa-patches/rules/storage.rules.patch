@@ -1,0 +1,49 @@
+# PROPOSED — not applied. Base: deployed ruleset 27a73af8-d1d3-4740-a7a9-0b452f024c5b (20 Oct 08:54Z)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+# Note: BLOCKED ON AN IAM DECISION: the deployed Storage rules make no cross-service call today; this hunk adds the first one, which needs roles/firebaserules.firestoreServiceAgent on service-239458555881@gcp-sa-firebasestorage.iam.gserviceaccount.com. Without it every Owner Storage request is denied (fail closed).
+--- a/storage.rules
++++ b/storage.rules
+@@ -49,10 +49,42 @@
+     // — every app user, every guest — must evaluate to '' rather than error
+     // out, because an error denies the whole request and would have masked a
+     // missing grant as a working deny.
+-    function roleClaim() {
++    function rawRoleClaim() {
+       return request.auth != null && 'role' in request.auth.token
+            ? request.auth.token.role
+            : '';
++    }
++
++    // P1-A3b — OWNER MFA BOUNDARY. The `owner` claim is account-wide and is set
++    // when the account is provisioned; it says nothing about whether THIS
++    // sign-in passed MFA. So an `owner` claim counts only when the backend has
++    // bound this Firebase sign-in (its per-session `mfa_sid`) to an API session
++    // that passed MFA, in Firestore `ownerMfaSessions/{uid}` — a cross-service read,
++    // evaluated ONLY for an owner claim. Every other claim value is unchanged.
++    // Revocation (sign-out, Observer reset, suspension, deactivation) removes
++    // the binding and takes effect on the next request, not at token refresh.
++    // `mfa_sid` is a per-session developer claim from the custom token the
++    // backend mints after Owner MFA; the binding must be ACTIVE (confirmed),
++    // for THIS sign-in's auth_time, unexpired. See ownerMfaOk() in
++    // firestore.rules for the full argument.
++    function ownerMfaOk() {
++      let sid = request.auth.token.get('mfa_sid', '');
++      let p = /databases/(default)/documents/ownerMfaSessions/$(request.auth.uid);
++      return sid is string && sid != ''
++          && request.auth.token.get('firebase', {}).get('sign_in_provider', '') == 'custom'
++          && firestore.exists(p)
++          && ownerMfaBindingLive(firestore.get(p).data.get('bindings', {}).get(sid, {}));
++    }
++
++    function ownerMfaBindingLive(b) {
++      return b.get('state', '') == 'active'
++          && b.get('authTime', -1) == request.auth.token.get('auth_time', -2)
++          && b.get('expiresAt', timestamp.value(0)) > request.time;
++    }
++
++    function roleClaim() {
++      let r = rawRoleClaim();
++      return (r != 'owner' || ownerMfaOk()) ? r : '';
+     }
+ 
+     // The agency a partner login is scoped to. '' for everyone else.

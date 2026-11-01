@@ -1,0 +1,77 @@
+"""P1-G — READ-ONLY survey of legacy role strings. Changes nothing.
+
+Before the department system, `crmUsers.role` could be `admin`, `ops`, `tech`,
+`finance` or `support`. The CRM front end and the backend read those as
+`app_admin` / `*_member` (`LEGACY_ROLE_MAP`, `crm_directory.LEGACY_CRM_ROLE`),
+but `firestore.rules` still honours them literally — and gives `admin`
+EVERY department's helper (`isApp/isOps/isTech/isFinance/isSupport`) plus
+`isAdmin()`. A stale `admin` document therefore holds more Firestore authority
+than the role its holder sees in the CRM. This script measures how many exist
+so the removal plan (outputs/p1-exec/P1-G-LEGACY-ROLE-PLAN.md) can be approved
+with numbers, not guesses.
+
+    python3 -m scripts.survey_legacy_roles
+
+Reads `crmUsers` (Firestore) and `staff` (Mongo). Prints counts and an 8-char
+fingerprint per flagged document — never a uid, name, email or phone.
+Exit code 0 = no legacy strings, 3 = some found (for scripting).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from collections import Counter
+
+LEGACY = {"admin": "app_admin", "ops": "ops_member", "tech": "tech_member",
+          "finance": "finance_member", "support": "support_member"}
+
+
+def _fp(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()[:8]
+
+
+async def _run() -> int:
+    from app.db import firebase, mongo
+    from app.db.mongo import C, get_db
+
+    firebase.init()
+    await mongo.connect()
+    client = firebase.firestore_client()
+    print(f"project: {getattr(client, 'project', '')}  (read-only)")
+
+    staff_role = {}
+    async for row in get_db()[C.STAFF].find({}, {"uid": 1, "role": 1}):
+        if row.get("uid"):
+            staff_role[str(row["uid"])] = str(row.get("role", ""))
+
+    roles: Counter = Counter()
+    flagged: list[tuple[str, str, str, str]] = []
+    for d in client.collection("crmUsers").stream():
+        data = d.to_dict() or {}
+        raw = str(data.get("role", ""))
+        roles[raw] += 1
+        legacy_in_roles = [r for r in (data.get("roles") or []) if r in LEGACY]
+        if raw in LEGACY or legacy_in_roles:
+            mongo_role = staff_role.get(d.id, "")
+            flagged.append((_fp(d.id), raw, mongo_role or "(no staff row)", ",".join(legacy_in_roles)))
+
+    print("\ncrmUsers.role values:")
+    for k, v in sorted(roles.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {k or '(empty)'}: {v}{'   ← LEGACY' if k in LEGACY else ''}")
+    print(f"\nlegacy documents: {len(flagged)}")
+    for fp, raw, mrole, extra in flagged:
+        print(f"  doc #{fp}  crmUsers.role={raw!r} → reads as {LEGACY.get(raw, raw)!r} in CRM/API; "
+              f"Mongo staff.role={mrole!r}{'; legacy in roles[]: ' + extra if extra else ''}")
+    legacy_mongo = Counter(r for r in staff_role.values() if r in LEGACY)
+    if legacy_mongo:
+        print(f"\nMongo staff rows with a legacy string (should be none): {dict(legacy_mongo)}")
+    return 3 if flagged or legacy_mongo else 0
+
+
+def main() -> int:
+    return asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

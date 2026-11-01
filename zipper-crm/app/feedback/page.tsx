@@ -34,9 +34,9 @@ import { db } from '@/lib/firebase'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
 import {
-  getDocs, collection, query, orderBy, limit, updateDoc, doc,
-  serverTimestamp, Timestamp,
+  getDocs, collection, query, orderBy, limit, Timestamp,
 } from 'firebase/firestore'
+import { tickets as apiTickets } from '@/lib/api'
 import {
   MessageSquare, ChevronDown, ChevronUp, Search, AlertCircle, Clock,
   CheckCircle2, User, Send, X, UserCheck, Filter, History, AlertTriangle,
@@ -159,6 +159,8 @@ interface FeedbackDoc {
   status?: string
   priority?: string
   assignedTo?: string
+  /** B1: written next to `assignedTo` when a ticket is claimed — the staff member's name. */
+  assignedToName?: string
   assignedTeam?: string
   response?: string
   statusNote?: string
@@ -309,14 +311,15 @@ export default function FeedbackPage() {
   }, [tickets])
 
   async function writeStatus(ticket: Ticket, next: Status, note: string, extra: Record<string, unknown> = {}) {
-    await updateDoc(doc(db, 'feedbackTickets', ticket.id), {
-      status: next,                       // always canonical — this is the migration
-      statusNote: note,
-      statusChangedAt: serverTimestamp(),
-      statusChangedByName: actorName,
-      ...(next === 'resolved' || next === 'closed' ? { resolvedAt: serverTimestamp() } : {}),
-      ...extra,
-    })
+    // P1-D: the API writes the ticket, audits it and names the actor from the
+    // session. A `response` resolves the ticket server-side; anything else is a
+    // status move whose note is the audit reason. The status is always written
+    // canonical — this is still the migration.
+    if (typeof extra.response === 'string') {
+      await apiTickets.update('feedback', ticket.id, { response: extra.response })
+    } else {
+      await apiTickets.update('feedback', ticket.id, { status: next }, note)
+    }
     setTickets((prev) => prev.map((t) => (
       t.id === ticket.id
         ? { ...t, ...extra, status: next, statusNote: note, norm: { status: next, raw: next, legacy: false } }
@@ -331,17 +334,14 @@ export default function FeedbackPage() {
     try {
       // Claiming work is not destructive and the actor is recorded, so it does
       // not stop for a reason prompt — the status move it implies is `assigned`.
-      await updateDoc(doc(db, 'feedbackTickets', ticket.id), {
-        assignedTo: crmUser.email || crmUser.uid,
-        assignedToName: actorName,
-        assignedAt: serverTimestamp(),
-        status: 'assigned',
-      })
+      // The server assigns the session's own staff record ("me").
+      await apiTickets.update('feedback', ticket.id, { assignedTo: 'me' })
       setTickets((prev) => prev.map((t) => (
         t.id === ticket.id
           ? {
             ...t,
             assignedTo: crmUser.email || crmUser.uid,
+            assignedToName: actorName,
             status: 'assigned',
             norm: { status: 'assigned', raw: 'assigned', legacy: false },
           }
@@ -358,7 +358,7 @@ export default function FeedbackPage() {
     setBusyId(ticket.id)
     setActionError('')
     try {
-      await updateDoc(doc(db, 'feedbackTickets', ticket.id), { priority })
+      await apiTickets.update('feedback', ticket.id, { priority })
       setTickets((prev) => prev.map((t) => (
         t.id === ticket.id ? { ...t, priority, priorityKey: priority } : t
       )))
@@ -642,12 +642,19 @@ export default function FeedbackPage() {
                     )}
 
                     <div className="text-slate-400 text-xs mb-3">
-                      <span className="text-slate-500">Ticket</span> {ticket.id}
+                      <span className="text-slate-500">Ticket ID</span> {ticket.id}
                       {ticket.assignedTo && (
                         <>
                           {' · '}
                           <span className="text-slate-500">assigned to</span>{' '}
-                          <span className="text-slate-200">{ticket.assignedTo}</span>
+                          {ticket.assignedToName?.trim() ? (
+                            <>
+                              <span className="text-slate-200">{ticket.assignedToName.trim()}</span>{' '}
+                              <span className="text-slate-500">({ticket.assignedTo})</span>
+                            </>
+                          ) : (
+                            <span className="text-slate-200">{ticket.assignedTo}</span>
+                          )}
                         </>
                       )}
                       {ticket.assignedTeam && <span className="ml-1 text-slate-500">({ticket.assignedTeam})</span>}

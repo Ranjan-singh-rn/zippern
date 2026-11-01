@@ -125,6 +125,11 @@ object AgoraManager {
     fun joinAsBroadcaster(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
         eng.setClientRole(Constants.CLIENT_ROLE_BROADCASTER)
+        // Mobile parity (stream quality): publish a second, low-resolution
+        // stream next to the main one, so a viewer can choose "Low" — or fall
+        // back to it on a weak connection — instead of buffering. Best effort:
+        // a refusal leaves the single stream exactly as before.
+        runCatching { @Suppress("DEPRECATION") eng.enableDualStreamMode(true) }
         val options = ChannelMediaOptions().apply {
             clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
             channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
@@ -317,6 +322,22 @@ object AgoraManager {
     fun stopPreview() { engine?.stopPreview() }
 
     fun muteLocalAudio(mute: Boolean) { engine?.muteLocalAudioStream(mute) }
+
+    /**
+     * The viewer's stream-quality choice, applied to the host's video.
+     *   Auto — the main stream, falling back to the low stream when the link is weak;
+     *   High — always the main stream;   Low — always the low stream.
+     * Has an effect only on a host whose app publishes the low stream (above).
+     */
+    fun setRemoteQuality(remoteUid: Int, quality: String) {
+        val eng = engine ?: return
+        val type = if (quality == "Low") Constants.VIDEO_STREAM_LOW else Constants.VIDEO_STREAM_HIGH
+        runCatching {
+            eng.setRemoteSubscribeFallbackOption(if (quality == "Auto") Constants.STREAM_FALLBACK_OPTION_VIDEO_STREAM_LOW else Constants.STREAM_FALLBACK_OPTION_DISABLED)
+            eng.setRemoteDefaultVideoStreamType(type)
+            if (remoteUid != 0) eng.setRemoteVideoStreamType(remoteUid, type)
+        }
+    }
     fun muteLocalVideo(mute: Boolean) { engine?.muteLocalVideoStream(mute) }
     fun switchCamera() { engine?.switchCamera() }
 

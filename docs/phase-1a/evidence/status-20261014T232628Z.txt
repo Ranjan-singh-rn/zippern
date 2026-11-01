@@ -1,0 +1,221 @@
+ D zipper-app/app/src/main/java/com/zipper/app/ui/screens/host/JoinAgencyScreen.kt
+ D zipper-app/app/src/main/java/com/zipper/app/ui/screens/host/JoinAgencyViewModel.kt
+ M CRM-FLOW.md
+ M backend/app/config.py
+ M backend/app/core/audit.py
+ M backend/app/core/deps.py
+ M backend/app/core/security.py
+ M backend/app/db/firebase.py
+ M backend/app/db/mongo.py
+ M backend/app/main.py
+ M backend/app/routers/partner_ops.py
+ M backend/app/routers/partners.py
+ M backend/app/routers/staff.py
+ M backend/app/routers/users.py
+ M backend/app/services/appeals.py
+ M backend/app/services/crm_directory.py
+ M backend/app/services/money.py
+ M backend/app/services/partner_ops.py
+ M backend/app/services/partners.py
+ M backend/app/services/staff.py
+ M backend/app/services/users.py
+ M backend/app/services/verification.py
+ M backend/scripts/backfill_partners.py
+ M backend/scripts/retarget_project.py
+ M backend/tests/fakes.py
+ M backend/tests/harness.py
+ M backend/tests/test_attach_login.py
+ M backend/tests/test_auth_hardening.py
+ M backend/tests/test_host_provisioning.py
+ M backend/tests/test_moderation.py
+ M backend/tests/test_money_permissions.py
+ M backend/tests/test_observer_owner.py
+ M backend/tests/test_partner_app_login.py
+ M backend/tests/test_partner_create.py
+ M backend/tests/test_partner_registration.py
+ M backend/tests/test_partner_session.py
+ M backend/tests/test_permissions.py
+ M backend/tests/test_second_role.py
+ M backend/tests/test_security_phase1.py
+ M backend/tests/test_service_credential.py
+ M backend/tests/test_staff_directory.py
+ M backend/tests/test_staff_hierarchy.py
+ M backend/tests/test_virtual_accounts.py
+ M firebase.json
+ M firestore.indexes.json
+ M firestore.rules
+ M functions/scripts/backfill-public-sellers.mjs
+ M functions/src/accounts.ts
+ M functions/src/calls.ts
+ M functions/src/crmRoles.ts
+ M functions/src/guestBinding.ts
+ M functions/src/hostEligibility.ts
+ M functions/src/hosts.ts
+ M functions/src/identity.ts
+ M functions/src/index.ts
+ M functions/src/mobileSession.ts
+ M functions/src/party.ts
+ M functions/src/publicSeller.ts
+ M functions/src/quickLogin.ts
+ M functions/src/social.ts
+ M functions/src/wallet.ts
+ M functions/test/backfillPublicSellers.test.js
+ M functions/test/crmRoles.test.js
+ M functions/test/fakeFirestore.js
+ M functions/test/guestBinding.test.js
+ M functions/test/publicSeller.test.js
+ M functions/test/quickLoginWiring.test.js
+ M storage.rules
+ M zipper-app/app/build.gradle.kts
+ M zipper-app/app/src/main/java/com/zipper/app/data/model/User.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/AgoraTokenRepository.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/AppealRepository.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/AuthRepository.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/ChatRepository.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/HostFunctions.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/MoneyFunctions.kt
+ M zipper-app/app/src/main/java/com/zipper/app/data/repository/PartyRepository.kt
+ M zipper-app/app/src/main/java/com/zipper/app/navigation/Screen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/navigation/ZipperNavGraph.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/agency/AgencyDashboardScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/BannedScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/BannedViewModel.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/LoginScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/ProfileSetupScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/SecureAccountScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/SecureEmailScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/SecureEmailViewModel.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/SplashScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/auth/SplashViewModel.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/diamond/ResellerListScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/main/MainScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/messages/MessagesScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/messages/MessagesViewModel.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/profile/MyProfileScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/seller/SellerDashboardScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/ui/screens/settings/SettingsScreen.kt
+ M zipper-app/app/src/main/java/com/zipper/app/util/SessionManager.kt
+ M zipper-crm/app/agencies/[id]/Client.tsx
+ M zipper-crm/app/agencies/register/page.tsx
+ M zipper-crm/app/agency-dashboard/HostEarnings.tsx
+ M zipper-crm/app/agency-dashboard/page.tsx
+ M zipper-crm/app/agency-signup/page.tsx
+ M zipper-crm/app/approvals/[id]/Client.tsx
+ M zipper-crm/app/coin-purchases/page.tsx
+ M zipper-crm/app/hosts/page.tsx
+ M zipper-crm/app/kyc/page.tsx
+ M zipper-crm/app/layout.tsx
+ M zipper-crm/app/operations/appeals/page.tsx
+ M zipper-crm/app/profile/page.tsx
+ M zipper-crm/app/seller-dashboard/FileSaleDialog.tsx
+ M zipper-crm/app/seller-signup/page.tsx
+ M zipper-crm/app/sellers/[id]/Client.tsx
+ M zipper-crm/app/sellers/register/page.tsx
+ M zipper-crm/app/users/[uid]/Client.tsx
+ M zipper-crm/app/users/[uid]/HostRecord.tsx
+ M zipper-crm/app/users/[uid]/UserActions.tsx
+ M zipper-crm/app/users/page.tsx
+ M zipper-crm/components/SecondRoleCard.tsx
+ M zipper-crm/components/UserSearchPicker.tsx
+ M zipper-crm/lib/agencies.ts
+ M zipper-crm/lib/api.ts
+ M zipper-crm/lib/apiPartners.ts
+ M zipper-crm/lib/auth.ts
+ M zipper-crm/lib/firestore.ts
+ M zipper-crm/lib/partnerRoles.ts
+ M zipper-crm/lib/partnerRouting.spec.ts
+ M zipper-crm/lib/partnerRouting.ts
+ M zipper-crm/lib/sellers.ts
+ M zipper-crm/package.json
+?? backend/app/core/firestore_errors.py
+?? backend/app/routers/documents.py
+?? backend/app/services/documents.py
+?? backend/app/services/notices.py
+?? backend/app/services/partner_applications.py
+?? backend/app/services/partner_roles.py
+?? backend/app/services/recharges.py
+?? backend/app/services/storage_claims.py
+?? backend/reset-plan-applied-20261007T204625Z.json
+?? backend/reset-plan-applied-20261007T213132Z.json
+?? backend/reset-plan-applied-20261008T212258Z.json
+?? backend/reset-plan-applied-20261008T214237Z.json
+?? backend/reset-plan-applied-20261008T215127Z.json
+?? backend/reset-plan-applied-20261008T220200Z.json
+?? backend/reset-plan-applied.json
+?? backend/reset-plan.json
+?? backend/reset-postcheck.json
+?? backend/scripts/backfill_storage_claims.py
+?? backend/scripts/diagnose_app_identity.py
+?? backend/scripts/execute_test_data_reset.py
+?? backend/scripts/inspect_partner_identity.py
+?? backend/scripts/plan_test_data_reset.py
+?? backend/scripts/print_owner_uids.py
+?? backend/scripts/repair_app_role_flags.py
+?? backend/scripts/verify_deployed_firestore_rules.py
+?? backend/scripts/verify_deployed_storage_rules.py
+?? backend/scripts/verify_storage_claims.py
+?? backend/tests/test_appeal_auto_resolve.py
+?? backend/tests/test_appeals_queue.py
+?? backend/tests/test_backfill_storage_claims.py
+?? backend/tests/test_buyer_lookup.py
+?? backend/tests/test_documents.py
+?? backend/tests/test_firestore_indexes.py
+?? backend/tests/test_official_warning.py
+?? backend/tests/test_partner_lifecycle.py
+?? backend/tests/test_partner_roles.py
+?? backend/tests/test_phase1a_identity.py
+?? backend/tests/test_protected_targets.py
+?? backend/tests/test_recharge_money.py
+?? backend/tests/test_recharges.py
+?? backend/tests/test_repair_app_role_flags.py
+?? backend/tests/test_reset_plan.py
+?? backend/tests/test_storage_claims.py
+?? backend/tests/test_verify_storage_claims.py
+?? docs/phase-1a/
+?? functions/entry-lotties/
+?? functions/entry-thumbnails/
+?? functions/entry-video/
+?? functions/src/emailAdoption.ts
+?? functions/src/storageClaims.ts
+?? functions/test/activateHostPhase1a.test.js
+?? functions/test/emailAdoption.test.js
+?? functions/test/guestBindingRuntime.test.js
+?? functions/test/notificationAddressing.test.js
+?? functions/test/partnerApplicationCallables.test.js
+?? functions/test/sessionCoveragePhase1a.test.js
+?? functions/test/sessionPhase1a.test.js
+?? functions/test/storageClaims.test.js
+?? functions/test/storageClaimsLifecycle.test.js
+?? functions/test/syncMyRolesAgency.test.js
+?? tests/
+?? zipper-app/app/src/main/java/com/zipper/app/data/model/UserNotification.kt
+?? zipper-app/app/src/main/java/com/zipper/app/data/repository/AppealStatement.kt
+?? zipper-app/app/src/main/java/com/zipper/app/data/repository/AppealStatus.kt
+?? zipper-app/app/src/main/java/com/zipper/app/data/repository/PartnerFunctions.kt
+?? zipper-app/app/src/main/java/com/zipper/app/data/repository/PartnerRepository.kt
+?? zipper-app/app/src/main/java/com/zipper/app/ui/screens/partner/
+?? zipper-app/app/src/test/java/com/zipper/app/data/repository/AppealStatementTest.kt
+?? zipper-app/app/src/test/java/com/zipper/app/data/repository/AppealStatusTest.kt
+?? zipper-app/app/src/test/java/com/zipper/app/data/repository/SessionPayloadCoverageTest.kt
+?? zipper-app/app/src/test/java/com/zipper/app/ui/
+?? zipper-crm/.eslintrc.hooks.json
+?? zipper-crm/app/recharges/
+?? zipper-crm/app/users/[uid]/PartnerApplications.tsx
+?? zipper-crm/components/PhoneInput.tsx
+?? zipper-crm/components/SecureDocLink.tsx
+?? zipper-crm/components/SecureDocuments.tsx
+?? zipper-crm/components/useSecureThumbs.ts
+?? zipper-crm/lib/appealStatus.spec.ts
+?? zipper-crm/lib/appealStatus.ts
+?? zipper-crm/lib/countryCodes.ts
+?? zipper-crm/lib/crmRoles.spec.ts
+?? zipper-crm/lib/crmRoles.ts
+?? zipper-crm/lib/defaultAvatars.generated.ts
+?? zipper-crm/lib/profilePhoto.spec.ts
+?? zipper-crm/lib/profilePhoto.ts
+?? zipper-crm/lib/secondRoleHeld.spec.ts
+?? zipper-crm/lib/secondRoleRule.ts
+?? zipper-crm/lib/signupDocName.ts
+?? zipper-crm/lib/useRegisteredCheck.ts
+?? zipper-crm/scripts/generate-avatars.mjs
+?? zipper-crm/scripts/verify-out.mjs

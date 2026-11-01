@@ -222,7 +222,7 @@ private fun NumberStep(
         ) { Icon(Icons.Outlined.Phone, null, tint = c.textBrand, modifier = Modifier.size(32.dp)) }
 
         Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
-            Text("Keep this account", style = ZipperTheme.type.headingL, color = c.textPrimary)
+            Text("Add your phone number", style = ZipperTheme.type.headingL, color = c.textPrimary)
             /*
              * Says what is at stake in one sentence, in the words of the thing
              * they would lose rather than the mechanism that loses it. "Your
@@ -231,10 +231,8 @@ private fun NumberStep(
              * fact and is the reason they are here.
              */
             Text(
-                "You are signed in as a guest, so this account only exists on this " +
-                    "phone — lose the phone and it is gone. Add your number and you " +
-                    "can sign back into it, with your diamonds and your history, from " +
-                    "anywhere.",
+                "Add your phone number and you can sign in to this account with it — " +
+                    "with your diamonds and your history — from anywhere.",
                 style = ZipperTheme.type.bodyM, color = c.textSecondary,
             )
         }
@@ -271,8 +269,9 @@ private fun CodeStep(
     val c = ZipperTheme.colors
 
     StepColumn {
+        // FX-15: not while the number is being added (it would unlink it mid-bind).
         IconButtonCircle(
-            Icons.AutoMirrored.Filled.ArrowBack, "Back", onChangeNumber,
+            Icons.AutoMirrored.Filled.ArrowBack, "Back", { if (!busy) onChangeNumber() },
             background = c.bgRaised,
         )
         Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {

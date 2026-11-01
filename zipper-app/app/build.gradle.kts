@@ -34,7 +34,6 @@ fun agoraSecret(propertyKey: String, envKey: String): String =
     (localProperties.getProperty(propertyKey) ?: System.getenv(envKey) ?: "").trim()
 
 val agoraAppId: String = agoraSecret("agora.appId", "AGORA_APP_ID")
-val agoraPrimaryCert: String = agoraSecret("agora.appCertificate", "AGORA_APP_CERTIFICATE")
 
 if (agoraAppId.isEmpty()) {
     logger.warn(
@@ -43,13 +42,25 @@ if (agoraAppId.isEmpty()) {
             "or the AGORA_APP_ID environment variable."
     )
 }
-if (agoraPrimaryCert.isEmpty()) {
-    logger.warn(
-        "WARNING: Agora Primary Certificate is not set. BuildConfig.AGORA_PRIMARY_CERT will " +
-            "be empty. This is expected for release builds — tokens are minted server-side. " +
-            "Set agora.appCertificate in zipper-app/local.properties only if a local build needs it."
-    )
-}
+
+// ── Zipper API (the CRM's business core) — mobile parity ────────────────────
+//
+// The app's partner and staff work screens call the same permission-checked
+// API the CRM calls, with a session exchanged from the Firebase sign-in.
+//
+//     zipper.apiBase=https://<host>          (zipper-app/local.properties)
+//     ZIPPER_API_BASE=https://<host>          (environment, for CI)
+//
+// There is no staging project and the default host IS production, so the two
+// build types differ on purpose:
+//   * release — defaults to the production CRM host when nothing is set;
+//   * debug   — defaults to EMPTY: the work screens say the API is not
+//               configured and make no request. A developer opts in by setting
+//               the property — to a local backend (backend/LOCAL_DEVELOPMENT.md)
+//               for anything that writes.
+val zipperApiBase: String =
+    (localProperties.getProperty("zipper.apiBase") ?: System.getenv("ZIPPER_API_BASE") ?: "").trim().trimEnd('/')
+val zipperApiBaseRelease: String = zipperApiBase.ifEmpty { "https://zipperlive.web.app" }
 
 android {
     namespace = "com.zipper.app"
@@ -82,14 +93,21 @@ android {
         //
         // `versionName` is what the user reads (and what the dialog shows). This
         // is what the machine compares. Move both.
-        versionCode = 14
-        versionName = "1.2.1"
+        //
+        // 19 / 1.2.5 — the release candidate (2026-10-20). 18 / 1.2.4 is already
+        // on testers' handsets as a debug build, so nothing at or below 18 could
+        // replace it. 19 is also the first build that pins appeal ids and
+        // reports its versionCode to the sign-in gate (D18): the forced-update
+        // cutoff `minSupportedVersionCode` is set to it, never lower.
+        versionCode = 19
+        versionName = "1.2.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 
         // Agora credentials — supplied above from local.properties / environment.
         buildConfigField("String", "AGORA_APP_ID", "\"$agoraAppId\"")
-        buildConfigField("String", "AGORA_PRIMARY_CERT", "\"$agoraPrimaryCert\"")
+        // The Primary Certificate is deliberately NOT a BuildConfig field: anything
+        // in BuildConfig ships in the APK. Tokens are minted by Cloud Functions.
 
         // ── THE ABI RESTRICTION MOVED TO `splits` ────────────────────────────
         //
@@ -242,10 +260,13 @@ android {
             // True today because a release APK is still something a human mails
             // to a tester. Set false for anything going to Play.
             buildConfigField("boolean", "OTA_ENABLED", "true")
+            buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
         }
         debug {
             isMinifyEnabled = false
             buildConfigField("boolean", "OTA_ENABLED", "true")
+            // Opt-in only — see `zipperApiBase` above.
+            buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBase\"")
         }
     }
 

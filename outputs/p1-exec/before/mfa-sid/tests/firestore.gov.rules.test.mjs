@@ -1,0 +1,595 @@
+/**
+ * firestore.rules — GOV (account governance) regression tests, against the
+ * Firestore emulator.
+ *
+ *   GOV-C6 / B30  `bannedDevices` is SERVER-ONLY: no client — not an ops login,
+ *                 not an Owner — creates, edits or deletes a device ban. The
+ *                 CRM bans and unbans through `POST /users/devices/bans` and
+ *                 `POST /users/devices/bans/{id}/unban`. The single-document
+ *                 read the app makes before sign-in, and the ops list, stay.
+ *   GOV-B35       the `second_role` arm on `agencies` create no longer lets a
+ *                 CRM login — a sub-agency's included — create a `type: 'sub'`
+ *                 record under an arbitrary parent. Mirrors the seller arm:
+ *                 the record names the caller in `crmUid` and
+ *                 `secondRoleOwnerUid`, and it is a MAIN agency.
+ *   GOV-C4 / B06  a partner login whose app account is suspended or banned
+ *                 (`crmUsers/{uid}.accountRestricted == true`, written by the
+ *                 server) writes nothing partner-owned; the same login
+ *                 unrestricted still does. A browser cannot clear the flag.
+ *   GOV-B41       a withdrawal request is filed by a CURRENT, unrestricted Host
+ *                 only — not a revoked Host, not a suspended or banned one.
+ *   GOV-B42       the owner arm of `users/{uid}` update requires `notBanned()`,
+ *                 and NOT a current session — profile setup on an older token
+ *                 still works. A restricted account may still REMOVE its
+ *                 legacy `fcmToken` on sign-out, and nothing else.
+ *   GOV-B07       a sub-agency created from the agency dashboard is linked to
+ *                 its own new login: that login (unverified password account)
+ *                 may write `crmUid = <itself>` once on the pending record its
+ *                 parent made — nobody else, nothing else, never re-pointed,
+ *                 and not from a deactivated or restricted login (C4).
+ *
+ * Each `no(...)` is a path the rules must refuse; each `ok(...)` the legitimate
+ * flow beside it, so a rule that "fixes" a hole by refusing everything fails.
+ *
+ * ZIPPER_RULES_FILE=<path> runs the same checks against another rules file
+ * (the pre-change copy) to show the new `no(...)` checks fail there.
+ *
+ * ── WHAT A FAILURE SAYS, AND WHY IT IS CLASSIFIED ───────────────────────────
+ *
+ *   FAIL [no:allowed]  a request the rules must refuse was ALLOWED — the only
+ *                      failure that is evidence about the rules in a RED run
+ *   FAIL [ok:denied]   a legitimate request was refused
+ *   FAIL [no:error] / [ok:error]
+ *                      the request did not reach a rules decision at all (a
+ *                      harness or emulator problem). Never counted as RED.
+ *
+ * Every check is passed as a THUNK and run inside the try, so a synchronous
+ * throw while building a request becomes a classified FAIL line instead of
+ * killing the run; and the last line is always one `GOV-RESULT …` summary
+ * (with `aborted=1` if the run stopped early).
+ *
+ * ── ONE FIRESTORE HANDLE PER CONTEXT ────────────────────────────────────────
+ *
+ * `RulesTestContext.firestore()` (rules-unit-testing 3.x) calls `useEmulator()`
+ * on EVERY call, which throws once an instance has been used. Handles are
+ * therefore memoised per context, exactly as `firestore.ugp.rules.test.mjs`
+ * does. Seeding is unaffected: `withSecurityRulesDisabled` builds a fresh
+ * context per call.
+ *
+ * Run (needs Java 21 + firebase CLI), from the repository root:
+ *     firebase emulators:exec --only firestore --project demo-zipper \
+ *         "node tests/firestore.gov.rules.test.mjs"
+ * `demo-` project ids never reach a real project.
+ */
+
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { initializeTestEnvironment } from '@firebase/rules-unit-testing'
+import {
+  doc, setDoc, getDoc, updateDoc, deleteDoc, deleteField, collection, getDocs,
+} from 'firebase/firestore'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const RULES_PATH = process.env.ZIPPER_RULES_FILE || join(here, '..', 'firestore.rules')
+const RULES = readFileSync(RULES_PATH, 'utf8')
+const RULES_SHA256 = createHash('sha256').update(RULES, 'utf8').digest('hex')
+console.log(`rules under test: ${RULES_PATH}`)
+// The exact bytes uploaded to the emulator below — the runner compares this
+// with the file it meant to test.
+console.log(`rules sha256: ${RULES_SHA256}`)
+
+// ── The check harness ───────────────────────────────────────────────────────
+const tally = { checks: 0, failures: 0, ok_denied: 0, ok_error: 0, no_allowed: 0, no_error: 0 }
+const failed = []
+
+function isPermissionDenied(err) {
+  const code = String(err?.code ?? '').toLowerCase()
+  const msg = String(err?.message ?? '').toLowerCase()
+  return code === 'permission-denied' || code === 'permission_denied'
+    || msg.includes('permission_denied') || msg.includes('permission denied')
+}
+
+/** Run one request: 'allowed', 'denied' (by the rules), or 'error' (anything else). */
+async function outcomeOf(run) {
+  try {
+    await run()
+    return { kind: 'allowed' }
+  } catch (err) {
+    return { kind: isPermissionDenied(err) ? 'denied' : 'error', err }
+  }
+}
+
+async function expect(claim, run, shouldPass) {
+  tally.checks += 1
+  const o = await outcomeOf(run)
+  const passed = shouldPass ? o.kind === 'allowed' : o.kind === 'denied'
+  if (passed) return
+  tally.failures += 1
+  const tag = `${shouldPass ? 'ok' : 'no'}:${o.kind}`
+  if (tag === 'ok:denied') tally.ok_denied += 1
+  else if (tag === 'ok:error') tally.ok_error += 1
+  else if (tag === 'no:allowed') tally.no_allowed += 1
+  else tally.no_error += 1
+  failed.push(`[${tag}] ${claim}`)
+  const why = o.kind === 'allowed'
+    ? 'the request was ALLOWED'
+    : String(o.err?.message ?? o.err).split('\n')[0]
+  console.error(`  FAIL  [${tag}] ${claim}\n        ${why}`)
+}
+const ok = (claim, run) => expect(claim, run, true)
+const no = (claim, run) => expect(claim, run, false)
+
+function printResult(aborted) {
+  console.log(
+    `GOV-RESULT checks=${tally.checks} failures=${tally.failures} ok_denied=${tally.ok_denied} ` +
+    `ok_error=${tally.ok_error} no_allowed=${tally.no_allowed} no_error=${tally.no_error} ` +
+    `aborted=${aborted ? 1 : 0} rules_sha256=${RULES_SHA256}`,
+  )
+}
+
+// ── The environment ─────────────────────────────────────────────────────────
+const testEnv = await initializeTestEnvironment({
+  projectId: 'demo-zipper',
+  firestore: { rules: RULES, host: '127.0.0.1', port: 8080 },
+})
+
+async function seed(path, data) {
+  await testEnv.withSecurityRulesDisabled(async (c) => {
+    await setDoc(doc(c.firestore(), path), data)
+  })
+}
+
+// P1-A3b — Owner authority in the rules holds only for a Firebase sign-in the
+// backend bound to an MFA-verified session (ownerMfaSessions/{uid}). The mock
+// token's defaults are auth_time 0 and provider 'custom', so that is the key
+// the Owners in this suite are bound under. Pending/unbound Owners are covered
+// in tests/firestore.p1mfa.rules.test.mjs.
+const OWNER_MFA_BOUND = { active: { '0:custom': new Date(Date.now() + 7 * 864e5) } }
+// One handle per context — see the note at the top.
+const handles = new Map()
+function fs(ctx) {
+  if (!handles.has(ctx)) handles.set(ctx, ctx.firestore())
+  return handles.get(ctx)
+}
+const D = (ctx, path) => doc(fs(ctx), path)
+const C = (ctx, path) => collection(fs(ctx), path)
+
+async function main() {
+  await testEnv.clearFirestore()
+
+  // The staff cast. `role` is what crmRole() reads; absent `accountRestricted`
+  // reads as unrestricted, the way every existing login is stored.
+  const STAFF = (uid, role) => ({ uid, role, isActive: true, status: 'approved' })
+  await seed('crmUsers/uidOpsMember', STAFF('uidOpsMember', 'ops_member'))
+  await seed('crmUsers/uidOpsAdmin', STAFF('uidOpsAdmin', 'ops_admin'))
+  await seed('crmUsers/uidOwnerG', STAFF('uidOwnerG', 'superadmin'))
+  await seed('ownerMfaSessions/uidOwnerG', OWNER_MFA_BOUND)  // P1-A3b
+  await seed('crmUsers/uidFinG', STAFF('uidFinG', 'finance_admin'))
+  const opsMember = testEnv.authenticatedContext('uidOpsMember', { email: 'om@zipper.test', email_verified: true })
+  const opsAdmin = testEnv.authenticatedContext('uidOpsAdmin', { email: 'oa@zipper.test', email_verified: true })
+  const ownerG = testEnv.authenticatedContext('uidOwnerG', { email: 'og@zipper.test', email_verified: true })
+  const finG = testEnv.authenticatedContext('uidFinG', { email: 'fg@zipper.test', email_verified: true })
+  const nobody = testEnv.unauthenticatedContext()
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-C6 (B30) — device bans are written by the server only')
+  // ══════════════════════════════════════════════════════════════════════════
+  const BAN = (deviceId, over = {}) => ({
+    deviceId, deviceType: 'android_id', reason: 'fraud ring', userUids: ['uidX'],
+    bannedBy: 'uidOpsAdmin', bannedAt: new Date(), isActive: true, manualBan: true, ...over,
+  })
+  await seed('bannedDevices/DEV_SEEDED', BAN('DEV_SEEDED'))
+  await seed('bannedDevices/DEV_TO_DELETE', BAN('DEV_TO_DELETE'))
+  await no('an ops_member cannot bar a device from a browser',
+    () => setDoc(D(opsMember, 'bannedDevices/DEV_NEW_1'), BAN('DEV_NEW_1')))
+  await no('…nor can an ops_admin',
+    () => setDoc(D(opsAdmin, 'bannedDevices/DEV_NEW_2'), BAN('DEV_NEW_2')))
+  await no('…nor an Owner — the audited endpoint is the only way in',
+    () => setDoc(D(ownerG, 'bannedDevices/DEV_NEW_3'), BAN('DEV_NEW_3')))
+  await no('an ops login cannot edit an existing ban (reason, manual mark)',
+    () => updateDoc(D(opsAdmin, 'bannedDevices/DEV_SEEDED'), { manualBan: false, reason: 'edited' }))
+  await no('an ops login cannot lift a ban by deleting the document',
+    () => deleteDoc(D(opsMember, 'bannedDevices/DEV_TO_DELETE')))
+  await ok('the app still asks "is THIS device banned?" before anybody signs in (get, unauthenticated)',
+    () => getDoc(D(nobody, 'bannedDevices/DEV_SEEDED')))
+  await ok('ops still LIST the bans (the operations overview reads them)',
+    () => getDocs(C(opsMember, 'bannedDevices')))
+  await no('…and a non-staff caller still cannot list them',
+    () => getDocs(C(nobody, 'bannedDevices')))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-B35 — the second-capability arm creates a MAIN agency naming the caller')
+  // ══════════════════════════════════════════════════════════════════════════
+  const AGENCY = (over = {}) => ({
+    agencyName: 'A', ownerEmail: 'a@example.test', status: 'approved', isActive: true,
+    kycStatus: 'approved', ...over,
+  })
+  await seed('agencies/AGG_MAIN', AGENCY({ type: 'main', parentAgencyId: null, crmUid: 'uidGMainAg', referralCode: 'GMAIN1' }))
+  await seed('crmUsers/uidGMainAg', {
+    uid: 'uidGMainAg', role: 'agency', isActive: true, status: 'approved', agencyId: 'AGG_MAIN',
+    roleStatus: { agency: 'approved' },
+  })
+  await seed('agencies/AGG_SUB', AGENCY({ type: 'sub', parentAgencyId: 'AGG_MAIN', crmUid: 'uidGSubAg' }))
+  await seed('crmUsers/uidGSubAg', {
+    uid: 'uidGSubAg', role: 'agency', isActive: true, status: 'approved', agencyId: 'AGG_SUB',
+    roleStatus: { agency: 'approved' },
+  })
+  await seed('agencies/AGG_OTHER', AGENCY({ type: 'main', parentAgencyId: null, crmUid: 'uidSomebody' }))
+  // A coin seller who will apply for the agency capability on the same login.
+  await seed('sellers/SLG_1', { crmUid: 'uidGSeller', status: 'approved', isApproved: true, isActive: true })
+  await seed('crmUsers/uidGSeller', {
+    uid: 'uidGSeller', role: 'seller', isActive: true, status: 'approved', sellerId: 'SLG_1',
+    roleStatus: { seller: 'approved' },
+  })
+  // No verified contact on these tokens, on purpose: the separate signed-in
+  // signup arm (`hasContactIdentity()`) would otherwise admit a MAIN record on
+  // its own, and the ok(...) below would prove nothing about this arm.
+  const subAgG = testEnv.authenticatedContext('uidGSubAg', { email: 'gsub@example.test', email_verified: false })
+  const sellerG = testEnv.authenticatedContext('uidGSeller', { email: 'gsel@example.test', email_verified: false })
+
+  /** The shape lib/partnerRoles.ts writes for a second capability, with overrides. */
+  const SECOND = (uid, over = {}) => ({
+    crmId: 'GOV00001', crmUid: uid, agencyName: 'Second', ownerName: 'S', ownerPhone: '+919800000700',
+    ownerEmail: 'second@example.test', type: 'main', parentAgencyId: null, status: 'pending',
+    kycStatus: 'pending', kycDocUrls: [], isActive: false, totalHosts: 0, totalSubAgencies: 0,
+    source: 'second_role', secondRoleOwnerUid: uid, secondRoleOfPartnerId: 'SLG_1',
+    secondRoleReason: 'I also run an agency', createdAt: new Date(), ...over,
+  })
+  await no('a SUB-agency login cannot create a second_role SUB-agency under its own parent',
+    () => setDoc(D(subAgG, 'agencies/G2_SUB_OWNPARENT'),
+      SECOND('uidGSubAg', { type: 'sub', parentAgencyId: 'AGG_MAIN' })))
+  await no('…nor under an arbitrary agency',
+    () => setDoc(D(subAgG, 'agencies/G2_SUB_OTHER'),
+      SECOND('uidGSubAg', { type: 'sub', parentAgencyId: 'AGG_OTHER' })))
+  await no('a seller login cannot create a second_role SUB-agency under any parent',
+    () => setDoc(D(sellerG, 'agencies/G2_SELLER_SUB'),
+      SECOND('uidGSeller', { type: 'sub', parentAgencyId: 'AGG_MAIN' })))
+  const { type: _droppedType, ...UNTYPED } = SECOND('uidGSeller', { parentAgencyId: 'AGG_MAIN' })
+  await no('…nor one spelled as a parent link with no type (the API reads it as a sub)',
+    () => setDoc(D(sellerG, 'agencies/G2_SELLER_PARENTED'), UNTYPED))
+  await no('a second_role record that does not name the caller as its login is refused',
+    () => setDoc(D(sellerG, 'agencies/G2_SELLER_NOLINK'), SECOND('uidGSeller', { crmUid: '' })))
+  await ok('a seller still applies for the agency capability (a MAIN agency naming itself)',
+    () => setDoc(D(sellerG, 'agencies/G2_SELLER_MAIN'), SECOND('uidGSeller')))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-C4 (B06) — a restricted partner login writes nothing partner-owned')
+  // ══════════════════════════════════════════════════════════════════════════
+  // Two main agencies, identical but for `accountRestricted` on the login.
+  for (const [id, uid, code, restricted] of [
+    ['AGR_R', 'uidAgRestricted', 'RCODER', true],
+    ['AGR_U', 'uidAgUnrestricted', 'RCODEU', false],
+  ]) {
+    await seed(`agencies/${id}`, AGENCY({
+      type: 'main', parentAgencyId: null, crmUid: uid, referralCode: code, description: 'before',
+    }))
+    await seed(`crmUsers/${uid}`, {
+      uid, role: 'agency', isActive: true, status: 'approved', agencyId: id,
+      roleStatus: { agency: 'approved' }, accountRestricted: restricted,
+    })
+  }
+  const agR = testEnv.authenticatedContext('uidAgRestricted', { email: 'agr@example.test', email_verified: true })
+  const agU = testEnv.authenticatedContext('uidAgUnrestricted', { email: 'agu@example.test', email_verified: true })
+
+  await no('a restricted agency login cannot edit its own agency record',
+    () => updateDoc(D(agR, 'agencies/AGR_R'), { description: 'after' }))
+  await ok('the same edit by an unrestricted agency login is allowed (unchanged)',
+    () => updateDoc(D(agU, 'agencies/AGR_U'), { description: 'after' }))
+
+  const INVITE = (agencyId, code) => ({
+    referralCode: code, agencyId, agencyName: 'A', hostName: 'Invited', applicantPhone: '+919800000710',
+    applicantEmail: 'inv@example.test', isActivated: false, status: 'pending', kycStatus: 'submitted',
+    createdAt: new Date(),
+  })
+  await no('a restricted agency login cannot file a host invitation',
+    () => setDoc(D(agR, 'hostApplications/HA_R'), INVITE('AGR_R', 'RCODER')))
+  await ok('an unrestricted one can (Invite Host, unchanged)',
+    () => setDoc(D(agU, 'hostApplications/HA_U'), INVITE('AGR_U', 'RCODEU')))
+
+  const SALARY = (agencyId) => ({
+    agencyId, hostUid: 'uidSomeHost', hostName: 'H', periodStart: '2026-10-01', periodEnd: '2026-10-07',
+    beansEarned: 2000, amountInr: 200, notes: '', status: 'pending', createdAt: new Date(),
+  })
+  await no('a restricted agency login cannot raise a salary request',
+    () => setDoc(D(agR, 'salaryRequests/SR_R'), SALARY('AGR_R')))
+  await ok('an unrestricted one can',
+    () => setDoc(D(agU, 'salaryRequests/SR_U'), SALARY('AGR_U')))
+
+  const NEW_SUB = (parent, creator) => ({
+    agencyName: 'New sub', ownerName: 'S', ownerEmail: 'newsub@example.test', type: 'sub',
+    parentAgencyId: parent, status: 'pending', kycStatus: 'submitted', isActive: false,
+    source: 'agency_created', createdByUid: creator,
+  })
+  await no('a restricted main agency cannot create a sub-agency',
+    () => setDoc(D(agR, 'agencies/SUB_BY_R'), NEW_SUB('AGR_R', 'uidAgRestricted')))
+  await ok('an unrestricted main agency can (Add Sub-Agency, unchanged)',
+    () => setDoc(D(agU, 'agencies/SUB_BY_U'), NEW_SUB('AGR_U', 'uidAgUnrestricted')))
+
+  // Sellers, the same pair.
+  for (const [id, uid, restricted] of [
+    ['SLR_R', 'uidSlRestricted', true],
+    ['SLR_U', 'uidSlUnrestricted', false],
+  ]) {
+    await seed(`sellers/${id}`, {
+      crmUid: uid, ownerUid: '', status: 'approved', isApproved: true, isActive: true,
+      city: 'Pune', coinBalance: 0, totalCoinsSold: 0,
+    })
+    await seed(`crmUsers/${uid}`, {
+      uid, role: 'seller', isActive: true, status: 'approved', sellerId: id,
+      roleStatus: { seller: 'approved' }, accountRestricted: restricted,
+    })
+  }
+  const slR = testEnv.authenticatedContext('uidSlRestricted', { email: 'slr@example.test', email_verified: true })
+  const slU = testEnv.authenticatedContext('uidSlUnrestricted', { email: 'slu@example.test', email_verified: true })
+  await no('a restricted seller login cannot edit its own seller record',
+    () => updateDoc(D(slR, 'sellers/SLR_R'), { city: 'Delhi' }))
+  await ok('an unrestricted seller login can (unchanged)',
+    () => updateDoc(D(slU, 'sellers/SLR_U'), { city: 'Delhi' }))
+  await no('a restricted seller login cannot file a coin-purchase request',
+    () => setDoc(D(slR, 'coinPurchaseRequests/CPR_R'), { sellerUid: 'SLR_R', status: 'pending', coins: 1000 }))
+  await ok('an unrestricted seller login can',
+    () => setDoc(D(slU, 'coinPurchaseRequests/CPR_U'), { sellerUid: 'SLR_U', status: 'pending', coins: 1000 }))
+
+  // The flag itself is the server's.
+  await no('an Owner browser cannot clear accountRestricted on a partner login',
+    () => updateDoc(D(ownerG, 'crmUsers/uidAgRestricted'), { accountRestricted: false }))
+  await ok('…while an Owner still edits a cosmetic field on it (unchanged)',
+    () => updateDoc(D(ownerG, 'crmUsers/uidAgRestricted'), { fieldCharge: 'Partner desk' }))
+  await no('the restricted partner cannot clear its own flag',
+    () => updateDoc(D(agR, 'crmUsers/uidAgRestricted'), { accountRestricted: false }))
+  // The second capability is a partner act too.
+  await seed('sellers/SLR_SECOND', {
+    crmUid: 'uidAgRestricted', status: 'pending', isApproved: false, isActive: false,
+    secondRoleOwnerUid: 'uidAgRestricted', source: 'second_role', coinBalance: 0, totalCoinsSold: 0,
+  })
+  await no('a restricted agency login cannot claim a second capability on its login',
+    () => updateDoc(D(agR, 'crmUsers/uidAgRestricted'), {
+      roles: ['agency', 'seller'], roleStatus: { agency: 'approved', seller: 'pending' }, sellerId: 'SLR_SECOND',
+    }))
+  await ok('a restricted login still records its own sign-in time (sign-in reaches the API refusal)',
+    () => updateDoc(D(agR, 'crmUsers/uidAgRestricted'), { lastLoginAt: new Date() }))
+  // C4 narrows WRITES only; the API refuses the restricted session itself.
+  await ok('a restricted agency login still READS its own agency record (writes only are narrowed)',
+    () => getDoc(D(agR, 'agencies/AGR_R')))
+
+  // The other agency-owned writes, each as a restricted / unrestricted pair.
+  const AGENCY_APPEAL = (uid, agencyId) => ({
+    subjectUid: 'uidSomeHost', subjectName: 'H', raisedByUid: uid, raisedByName: 'Agency',
+    raisedByRole: 'agency', agencyId, kind: 'ban',
+    statement: 'Our host was banned by mistake; please review the recording.',
+    status: 'pending', createdAt: new Date(),
+  })
+  await no('a restricted agency login cannot file an appeal for its host',
+    () => setDoc(D(agR, 'appeals/APL_R'), AGENCY_APPEAL('uidAgRestricted', 'AGR_R')))
+  await ok('an unrestricted one can (unchanged)',
+    () => setDoc(D(agU, 'appeals/APL_U'), AGENCY_APPEAL('uidAgUnrestricted', 'AGR_U')))
+
+  await seed('salaryRequests/SR_PAID_R', { ...SALARY('AGR_R'), status: 'paid', cardId: 'C9' })
+  await seed('salaryRequests/SR_PAID_U', { ...SALARY('AGR_U'), status: 'paid', cardId: 'C9' })
+  await no('a restricted agency login cannot mark a paid salary request distributed',
+    () => updateDoc(D(agR, 'salaryRequests/SR_PAID_R'), { status: 'distributed', distributedAt: new Date() }))
+  await ok('an unrestricted one can (agency dashboard, unchanged)',
+    () => updateDoc(D(agU, 'salaryRequests/SR_PAID_U'), { status: 'distributed', distributedAt: new Date() }))
+
+  await seed('hostApplications/HA_DEL_R', INVITE('AGR_R', 'RCODER'))
+  await seed('hostApplications/HA_DEL_U', INVITE('AGR_U', 'RCODEU'))
+  await no('a restricted agency login cannot withdraw a pending invitation',
+    () => deleteDoc(D(agR, 'hostApplications/HA_DEL_R')))
+  await ok('an unrestricted one can (orphan clean-up, unchanged)',
+    () => deleteDoc(D(agU, 'hostApplications/HA_DEL_U')))
+
+  // Applying for the second capability, both halves: the partner record
+  // (lib/partnerRoles.ts, `sellers` create) and then the claim on the login.
+  const SECOND_SELLER = (uid, partnerId) => ({
+    crmId: 'GOVS0001', crmUid: uid, ownerUid: '', displayName: 'Second coins',
+    phone: '+919800000720', email: 'second-seller@example.test', description: 'I also sell coins',
+    registrationFeePaid: false, registrationProofUrl: '', isApproved: false, isActive: false,
+    status: 'pending', coinBalance: 0, totalCoinsSold: 0, qrCodeUrl: '', source: 'second_role',
+    secondRoleOwnerUid: uid, secondRoleOfPartnerId: partnerId, secondRoleReason: 'I also sell coins',
+    createdAt: new Date(),
+  })
+  await no('a restricted agency login cannot file a second_role seller record',
+    () => setDoc(D(agR, 'sellers/SLR_SECOND_NEW'), SECOND_SELLER('uidAgRestricted', 'AGR_R')))
+  await ok('an unrestricted one can (lib/partnerRoles.ts, unchanged)',
+    () => setDoc(D(agU, 'sellers/SLU_SECOND'), SECOND_SELLER('uidAgUnrestricted', 'AGR_U')))
+  await ok('…and then claims the pending capability on its own login (the control for the refusal above)',
+    () => updateDoc(D(agU, 'crmUsers/uidAgUnrestricted'), {
+      roles: ['agency', 'seller'], roleStatus: { agency: 'approved', seller: 'pending' }, sellerId: 'SLU_SECOND',
+    }))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-B07 — a new sub-agency login links itself to its record, once')
+  // ══════════════════════════════════════════════════════════════════════════
+  // The shape app/agency-dashboard writes (Add Sub-Agency), made by the parent
+  // AGG_MAIN's live login — the record `createSubAgencyAccount` links.
+  const SUB_RECORD = (over = {}) => ({
+    type: 'sub', parentAgencyId: 'AGG_MAIN', agencyName: 'Sub B07', ownerName: 'O',
+    ownerEmail: 'subowner@example.test', status: 'pending', kycStatus: 'submitted', isActive: false,
+    source: 'agency_created', createdByUid: 'uidGMainAg', createdAt: new Date(), ...over,
+  })
+  await seed('agencies/SUB_B07', SUB_RECORD())
+  await seed('agencies/SUB_B07_LINKED', SUB_RECORD({ crmUid: 'uidSomebodyElse' }))
+  await seed('agencies/SUB_B07_FORGED', SUB_RECORD({ createdByUid: 'uidNotTheParent' }))
+  await seed('crmUsers/uidNotTheParent', {
+    uid: 'uidNotTheParent', role: 'agency', isActive: true, status: 'approved', agencyId: 'AGG_OTHER',
+    roleStatus: { agency: 'approved' },
+  })
+  const SUB_LOGIN = (uid, agencyId) => ({
+    uid, email: 'subowner@example.test', name: 'O', role: 'agency', agencyId,
+    isActive: true, status: 'pending', createdBy: 'agency_created', createdAt: new Date(),
+  })
+  await seed('crmUsers/uidSubOwner', SUB_LOGIN('uidSubOwner', 'SUB_B07'))
+  await seed('crmUsers/uidSubOwnerLinked', SUB_LOGIN('uidSubOwnerLinked', 'SUB_B07_LINKED'))
+  await seed('crmUsers/uidSubOwnerForged', SUB_LOGIN('uidSubOwnerForged', 'SUB_B07_FORGED'))
+  // A brand-new password login: the address is NOT verified, which is why the
+  // existing email back-link arm cannot be the one that admits this write.
+  const subLogin = (uid) => testEnv.authenticatedContext(uid, {
+    email: 'subowner@example.test', email_verified: false, firebase: { sign_in_provider: 'password' },
+  })
+  const subOwner = subLogin('uidSubOwner')
+  const mainAgG = testEnv.authenticatedContext('uidGMainAg', { email: 'gmain@example.test', email_verified: true })
+
+  await no('the new login cannot link the record to somebody ELSE',
+    () => updateDoc(D(subOwner, 'agencies/SUB_B07'), { crmUid: 'uidSomebodyElse' }))
+  await no('…nor move anything else in the same write',
+    () => updateDoc(D(subOwner, 'agencies/SUB_B07'), { crmUid: 'uidSubOwner', status: 'approved' }))
+  await no('the PARENT login cannot write the sub-agency\'s owner link itself',
+    () => updateDoc(D(mainAgG, 'agencies/SUB_B07'), { crmUid: 'uidGMainAg' }))
+  await no('a record that already names a login is not re-pointed (write-once)',
+    () => updateDoc(D(subLogin('uidSubOwnerLinked'), 'agencies/SUB_B07_LINKED'), { crmUid: 'uidSubOwnerLinked' }))
+  await no('a record NOT made by a login of its parent cannot be claimed this way',
+    () => updateDoc(D(subLogin('uidSubOwnerForged'), 'agencies/SUB_B07_FORGED'), { crmUid: 'uidSubOwnerForged' }))
+  await no('a login whose crmUsers document names another agency cannot claim this one',
+    () => updateDoc(D(subLogin('uidSubOwnerLinked'), 'agencies/SUB_B07'), { crmUid: 'uidSubOwnerLinked' }))
+  // Each of these differs from the passing case below in ONE thing: the login.
+  await seed('agencies/SUB_B07_R', SUB_RECORD())
+  await seed('crmUsers/uidSubOwnerR', { ...SUB_LOGIN('uidSubOwnerR', 'SUB_B07_R'), accountRestricted: true })
+  await no('a login whose human is suspended or banned cannot link itself (GOV C4)',
+    () => updateDoc(D(subLogin('uidSubOwnerR'), 'agencies/SUB_B07_R'), { crmUid: 'uidSubOwnerR' }))
+  await seed('agencies/SUB_B07_OFF', SUB_RECORD())
+  await seed('crmUsers/uidSubOwnerOff', { ...SUB_LOGIN('uidSubOwnerOff', 'SUB_B07_OFF'), isActive: false })
+  await no('…nor a deactivated login (isActive false)',
+    () => updateDoc(D(subLogin('uidSubOwnerOff'), 'agencies/SUB_B07_OFF'), { crmUid: 'uidSubOwnerOff' }))
+  await seed('agencies/SUB_B07_NOLOGIN', SUB_RECORD())
+  await no('…nor a token with the right address and no crmUsers document at all',
+    () => updateDoc(D(subLogin('uidNoCrmDoc'), 'agencies/SUB_B07_NOLOGIN'), { crmUid: 'uidNoCrmDoc' }))
+  await ok('the new sub-agency login writes its OWN crmUid back-link (createSubAgencyAccount)',
+    () => updateDoc(D(subOwner, 'agencies/SUB_B07'), { crmUid: 'uidSubOwner' }))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-B41 — only a current, unrestricted Host files a withdrawal request')
+  // ══════════════════════════════════════════════════════════════════════════
+  const WR = (hostUid, over = {}) => ({
+    hostUid, uid: hostUid, hostName: 'Host', beans: 4000, inrAmount: 400,
+    status: 'pending', requestedAt: new Date(), processedAt: null, ...over,
+  })
+  const HOSTS = [
+    ['uidWrLive', { isHost: true }],
+    ['uidWrRevoked', { isHost: false, hostRevokedAt: new Date() }],
+    ['uidWrSuspended', { isHost: true, isSuspended: true, isBanned: true, accountState: 'suspended' }],
+    ['uidWrBanned', { isHost: true, isBanned: true, accountState: 'banned' }],
+    ['uidWrNever', {}],
+  ]
+  const hostCtx = {}
+  for (const [uid, fields] of HOSTS) {
+    await seed(`users/${uid}`, { uid, name: uid, isProfileComplete: true, ...fields })
+    hostCtx[uid] = testEnv.authenticatedContext(uid, {
+      phone_number: '+919800000800', firebase: { sign_in_provider: 'phone' },
+    })
+  }
+  await ok('a current Host files their own pending withdrawal request',
+    () => setDoc(D(hostCtx.uidWrLive, 'withdrawalRequests/WR_LIVE'), WR('uidWrLive')))
+  await no('a REVOKED Host (isHost false) cannot',
+    () => setDoc(D(hostCtx.uidWrRevoked, 'withdrawalRequests/WR_REVOKED'), WR('uidWrRevoked')))
+  await no('a SUSPENDED Host cannot',
+    () => setDoc(D(hostCtx.uidWrSuspended, 'withdrawalRequests/WR_SUSPENDED'), WR('uidWrSuspended')))
+  await no('a BANNED Host cannot',
+    () => setDoc(D(hostCtx.uidWrBanned, 'withdrawalRequests/WR_BANNED'), WR('uidWrBanned')))
+  await no('an account that was never a Host cannot',
+    () => setDoc(D(hostCtx.uidWrNever, 'withdrawalRequests/WR_NEVER'), WR('uidWrNever')))
+  await no('a current Host still cannot file one for somebody else (unchanged)',
+    () => setDoc(D(hostCtx.uidWrLive, 'withdrawalRequests/WR_OTHER'), WR('uidWrRevoked')))
+  await no('…nor one born approved (unchanged)',
+    () => setDoc(D(hostCtx.uidWrLive, 'withdrawalRequests/WR_BORN_APPROVED'), WR('uidWrLive', { status: 'approved' })))
+  await ok('Finance still files one as pending (unchanged)',
+    () => setDoc(D(finG, 'withdrawalRequests/WR_FIN'), WR('uidWrLive')))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('GOV-B42 — a restricted account no longer edits its own profile; profile setup does')
+  // ══════════════════════════════════════════════════════════════════════════
+  const PROFILE_CASES = [
+    ['uidPfActive', {}, true, 'an active account edits its own bio (unchanged)'],
+    ['uidPfBanned', { isBanned: true, accountState: 'banned' }, false, 'a BANNED account cannot edit its own profile'],
+    ['uidPfSuspended', { isSuspended: true, isBanned: true, accountState: 'suspended' }, false,
+      'a SUSPENDED account cannot'],
+    ['uidPfDeleting', { isDeleted: true, accountState: 'recovery_pending' }, false,
+      'an account inside its deletion window cannot'],
+  ]
+  for (const [uid, fields, allowed, claim] of PROFILE_CASES) {
+    await seed(`users/${uid}`, { uid, name: 'Before', bio: 'before', isProfileComplete: true, ...fields })
+    const who = testEnv.authenticatedContext(uid, {
+      phone_number: '+919800000900', firebase: { sign_in_provider: 'phone' },
+    })
+    await (allowed ? ok : no)(claim, () => updateDoc(D(who, `users/${uid}`), { bio: 'after' }))
+  }
+  // No session requirement: `credentialsValidAfter` far in the future would fail
+  // `sessionCurrent()` for any token, and profile setup must still go through.
+  await seed('users/uidPfSetup', {
+    uid: 'uidPfSetup', name: '', isProfileComplete: false, credentialsValidAfter: 9999999999,
+  })
+  const setupUser = testEnv.authenticatedContext('uidPfSetup', {
+    phone_number: '+919800000901', firebase: { sign_in_provider: 'phone' },
+  })
+  await ok('profile setup still completes on a token older than the session stamp (no session check)',
+    () => updateDoc(D(setupUser, 'users/uidPfSetup'), {
+      name: 'Set Up', gender: 'female', city: 'Pune', isProfileComplete: true,
+    }))
+  // Presence is the most frequent owner write (`AuthRepository.updateOnlineStatus`).
+  await seed('users/uidPfPresence', { uid: 'uidPfPresence', name: 'P', isProfileComplete: true, isOnline: false })
+  await seed('users/uidPfPresenceBanned', {
+    uid: 'uidPfPresenceBanned', name: 'P', isProfileComplete: true, isOnline: false,
+    isBanned: true, accountState: 'banned',
+  })
+  const presence = (uid) => testEnv.authenticatedContext(uid, {
+    phone_number: '+919800000904', firebase: { sign_in_provider: 'phone' },
+  })
+  await ok('an active account still writes its presence (isOnline, lastSeen)',
+    () => updateDoc(D(presence('uidPfPresence'), 'users/uidPfPresence'), { isOnline: true, lastSeen: Date.now() }))
+  await no('a banned account no longer does',
+    () => updateDoc(D(presence('uidPfPresenceBanned'), 'users/uidPfPresenceBanned'), { isOnline: true, lastSeen: Date.now() }))
+  await seed('users/uidPfStaffTarget', { uid: 'uidPfStaffTarget', name: 'T', isBanned: true, accountState: 'banned' })
+  await ok('staff still edit a banned account\'s ordinary fields (the staff arm is unchanged)',
+    () => updateDoc(D(opsAdmin, 'users/uidPfStaffTarget'), { bio: 'note' }))
+
+  // Sign-out hygiene. `PushNotifications.clearToken` deletes the legacy
+  // `fcmToken` field, and `push.ts` falls back to it when `fcmTokens/` is
+  // empty — so a restricted account must still be able to REMOVE it.
+  await seed('users/uidPfTokActive', { uid: 'uidPfTokActive', name: 'A', isProfileComplete: true })
+  const tokActive = testEnv.authenticatedContext('uidPfTokActive', {
+    phone_number: '+919800000902', firebase: { sign_in_provider: 'phone' },
+  })
+  await ok('an active account still records its legacy push token on sign-in (saveToken, unchanged)',
+    () => updateDoc(D(tokActive, 'users/uidPfTokActive'), { fcmToken: 'tok-active' }))
+  for (const [uid, fields] of [
+    ['uidPfTokBanned', { isBanned: true, accountState: 'banned' }],
+    ['uidPfTokDeleting', { isDeleted: true, accountState: 'recovery_pending' }],
+  ]) {
+    await seed(`users/${uid}`, { uid, name: 'R', isProfileComplete: true, fcmToken: 'tok-old', ...fields })
+    const who = testEnv.authenticatedContext(uid, {
+      phone_number: '+919800000903', firebase: { sign_in_provider: 'phone' },
+    })
+    await no(`a restricted account (${fields.accountState}) cannot smuggle a profile edit into the token removal`,
+      () => updateDoc(D(who, `users/${uid}`), { fcmToken: deleteField(), bio: 'after' }))
+    await ok(`a restricted account (${fields.accountState}) still REMOVES its legacy push token on sign-out`,
+      () => updateDoc(D(who, `users/${uid}`), { fcmToken: deleteField() }))
+    await no(`…but cannot write one (${fields.accountState})`,
+      () => updateDoc(D(who, `users/${uid}`), { fcmToken: 'tok-new' }))
+  }
+}
+
+// ── Result ──────────────────────────────────────────────────────────────────
+let aborted = false
+try {
+  await main()
+} catch (err) {
+  // Seeding or the harness itself failed: the run is incomplete, and says so.
+  aborted = true
+  console.error(`ABORTED: ${String(err?.message ?? err).split('\n')[0]}`)
+} finally {
+  await testEnv.cleanup().catch(() => undefined)
+}
+if (tally.failures > 0) {
+  console.error(`\n${tally.failures} of ${tally.checks} GOV rule checks FAILED:`)
+  for (const f of failed) console.error(`  · ${f}`)
+}
+if (!aborted && tally.failures === 0) console.log(`\nAll ${tally.checks} GOV rule checks passed.`)
+printResult(aborted)
+// Not `process.exit()` here: stdout to a pipe is asynchronous on macOS, and an
+// immediate exit can drop the GOV-RESULT line. The exit code is set and the
+// process ends once the output has drained; the unref'd timer only matters if
+// a stray handle would otherwise keep the emulator run waiting.
+const code = aborted || tally.failures > 0 ? 1 : 0
+process.exitCode = code
+setTimeout(() => process.exit(code), 2000).unref()

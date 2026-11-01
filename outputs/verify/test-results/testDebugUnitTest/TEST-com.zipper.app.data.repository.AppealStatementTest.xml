@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.AppealStatementTest" tests="14" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.783Z" hostname="CW253.local" time="0.011">
+  <properties/>
+  <testcase name="every length below the minimum is refused" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.001"/>
+  <testcase name="an empty statement cannot be sent" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="internal whitespace counts, because it is part of what they wrote" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="the too-short message names the number" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.001"/>
+  <testcase name="the minimum is short enough for one honest sentence" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="a sufficient statement survives its own padding" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.001"/>
+  <testcase name="anything longer can be sent" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="the statements from the bug report are refused, a real one is not" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="whitespace alone is not a statement" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.005"/>
+  <testcase name="the counter and the gate never disagree" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.001"/>
+  <testcase name="it explains why the statement matters, not only that it is invalid" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="evidence is capped low enough that a reviewer reads all of it" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="padding does not buy length" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <testcase name="exactly the minimum can be sent" classname="com.zipper.app.data.repository.AppealStatementTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

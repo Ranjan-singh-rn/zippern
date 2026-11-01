@@ -50,10 +50,24 @@ async def run() -> int:
         else "\nDRY RUN — nothing will be changed. Re-run with --confirm.\n"
     )
 
+    # P0-10 (OPS-C): the target, named and confirmed, before anything connects.
+    from app.core.destructive import DestructiveRefused, require_data_canary, require_destructive_target
+    try:
+        print(require_destructive_target("purge_app_balances", writes=confirm))
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        return 2
+
     firebase.init()
     await mongo.connect()
     try:
         db = mongo.get_db()
+        if confirm:
+            try:
+                await require_data_canary(db, "purge_app_balances")
+            except DestructiveRefused as exc:
+                print(f"\n  ✗ {exc}\n")
+                return 2
         client = firebase.firestore_client()
 
         rows = await db[C.BALANCES].find({"holder_type": "user"}).to_list(length=None)

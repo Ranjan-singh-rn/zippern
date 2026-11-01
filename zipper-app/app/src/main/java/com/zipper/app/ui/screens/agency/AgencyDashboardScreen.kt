@@ -4,8 +4,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Groups
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,6 +27,7 @@ import com.zipper.app.ui.screens.profile.GlassCard
 import com.zipper.app.ui.screens.profile.ProfileViewModel
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.AgencyIdentity
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -35,20 +38,29 @@ import kotlinx.coroutines.tasks.await
  *   Agency card: name, status chip, referral code (numeric M) with copy.
  *   Stats: hosts · sub-agencies · last payout.
  *   Host rows: avatar, name. Empty state tells the owner to share the code.
+ *
+ * B1: the title is the agency's NAME (`agencyName`), the referral code is the
+ * one issued to the AGENCY RECORD, host rows show the roster name with a
+ * labelled Host ID, and the host count is the current roster. Sub-agencies are
+ * not counted by anything this screen may read (no writer keeps a count on the
+ * record), so the stat says "—" rather than a made-up 0. See util/AgencyIdentity.
  *   Weekly payout card with the "Submit report" action.
  */
 
 // ─── Data classes ────────────────────────────────────────────────────────────
 
 private data class AgencyDoc(
-    val name: String = "",
+    /** `agencyName` (fallback `name`); null when the record carries neither. */
+    val name: String? = null,
     val status: String = "",        // "pending" | "approved" | "rejected"
-    val totalHosts: Long = 0L,
-    val subAgenciesCount: Long = 0L,
+    /** `agencies/{id}.referralCode` — blank until the backend issues one. */
+    val referralCode: String = "",
 )
 
 private data class AgencyHostItem(
     val uid: String = "",
+    /** The roster row's `name`, as the grant wrote it; blank if the row has none. */
+    val name: String = "",
 )
 
 private data class WeeklyPayoutReport(
@@ -63,13 +75,28 @@ private data class WeeklyPayoutReport(
 @Composable
 fun AgencyDashboardScreen(
     onBack: () -> Unit = {},
+    /**
+     * B2: a host row opens that host's profile — the same public profile
+     * (`publicProfiles`, no contact, no earnings) any signed-in user can open
+     * from Home. Nothing private is reached through it.
+     */
+    onOpenHost: (uid: String) -> Unit = {},
+    /**
+     * Mobile parity: the OPERATIONAL host view (bean earnings per host) from the
+     * partner-scoped API route `GET /api/partners/agencies/{id}/hosts` — only
+     * this agency's own hosts, enforced on the server.
+     */
+    onOpenHostEarnings: (agencyId: String) -> Unit = {},
     profileViewModel: ProfileViewModel = hiltViewModel(),
 ) {
     val profileState by profileViewModel.state.collectAsStateWithLifecycle()
     val currentUser = profileState.user
     val currentUid = FirebaseAuth.getInstance().currentUser?.uid ?: ""
-    val agencyId = currentUser?.agencyId ?: ""
-    val referralCode = currentUser?.referralCode ?: ""
+    // The agency this person OWNS. `ownAgencyId` is written by the server; the
+    // fallback to `agencyId` covers a profile not yet re-synced, and only for a
+    // non-Host, because a Host's `agencyId` is the agency they work under.
+    val agencyId = currentUser?.ownAgencyId?.takeIf { it.isNotBlank() }
+        ?: currentUser?.takeIf { !it.isHost }?.agencyId.orEmpty()
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val c = ZipperTheme.colors
@@ -91,15 +118,18 @@ fun AgencyDashboardScreen(
             // Fetch agency doc
             val agSnap = Firebase.firestore.collection("agencies").document(agencyId).get().await()
             agencyDoc = AgencyDoc(
-                name = agSnap.getString("name") ?: "",
+                name = AgencyIdentity.agencyName(agSnap.getString("agencyName"), agSnap.getString("name")),
                 status = agSnap.getString("status") ?: "pending",
-                totalHosts = agSnap.getLong("totalHosts") ?: 0L,
-                subAgenciesCount = agSnap.getLong("subAgenciesCount") ?: 0L,
+                referralCode = AgencyIdentity.referralCode(agSnap.getString("referralCode")),
             )
 
             // Fetch agencyHosts subcollection
             val hostsSnap = Firebase.firestore.collection("agencies").document(agencyId).collection("agencyHosts").get().await()
-            hosts = hostsSnap.documents.map { doc -> AgencyHostItem(uid = doc.getString("uid") ?: doc.id) }
+            // FX-10 (RF-15): current hosts only. A row `revoke_host` or the
+            // account purge marked `active: false` is history, not a host; a
+            // row with no `active` field predates the marker and is current.
+            hosts = AgencyIdentity.roster(hostsSnap.documents.map { doc -> doc.id to (doc.data ?: emptyMap()) })
+                .map { row -> AgencyHostItem(uid = row.uid, name = row.name) }
 
             // Fetch latest weeklyPayoutReport for this agency owner
             val reportSnap = Firebase.firestore.collection("weeklyPayoutReports")
@@ -131,6 +161,7 @@ fun AgencyDashboardScreen(
             else -> LazyColumn(contentPadding = PaddingValues(horizontal = Space.lg, vertical = Space.md), verticalArrangement = Arrangement.spacedBy(Space.md)) {
                 // ── Agency card ───────────────────────────────────────────────
                 item {
+                    val referralCode = agencyDoc?.referralCode.orEmpty()
                     val (tint, label) = when (agencyDoc?.status) {
                         "approved" -> c.statusSuccess to "Approved"
                         "rejected" -> c.statusDanger to "Rejected"
@@ -138,14 +169,18 @@ fun AgencyDashboardScreen(
                     }
                     GlassCard {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
-                            Text(agencyDoc?.name?.ifBlank { agencyId } ?: agencyId, style = ZipperTheme.type.headingM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Column(Modifier.weight(1f)) {
+                                Text(agencyDoc?.name ?: AgencyIdentity.NO_NAME, style = ZipperTheme.type.headingM, color = if (agencyDoc?.name != null) c.textPrimary else c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(AgencyIdentity.reference(AgencyIdentity.AGENCY_ID, agencyId), style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
                             Chip(label, tint = tint.copy(0.14f), contentColor = tint)
                         }
                         HairlineDivider()
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
                             Column(Modifier.weight(1f)) {
                                 Text("Referral code", style = ZipperTheme.type.caption, color = c.textSecondary)
-                                Text(referralCode.ifBlank { "—" }, style = ZipperTheme.type.numericM, color = c.textPrimary)
+                                Text(referralCode.ifBlank { AgencyIdentity.NOT_ISSUED }, style = ZipperTheme.type.numericM, color = c.textPrimary)
+                                if (referralCode.isBlank()) Text("Not issued yet", style = ZipperTheme.type.caption, color = c.textMuted)
                             }
                             if (referralCode.isNotBlank()) {
                                 IconButtonCircle(Icons.Outlined.ContentCopy, "Copy referral code", { clipboard.setText(AnnotatedString(referralCode)) }, size = 36.dp, tint = c.textBrand)
@@ -160,26 +195,35 @@ fun AgencyDashboardScreen(
                 item {
                     GlassCard(padding = PaddingValues(Space.md)) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Stat("Hosts", indianGrouping(agencyDoc?.totalHosts ?: 0L))
-                            Stat("Sub-agencies", indianGrouping(agencyDoc?.subAgenciesCount ?: 0L))
+                            // The current roster — the same rows listed below, not a stored counter nobody updates.
+                            Stat("Hosts", indianGrouping(hosts.size.toLong()))
+                            // No count this screen may read: "—", never an invented 0.
+                            Stat("Sub-agencies", AgencyIdentity.NOT_COUNTED)
                             Stat("Last payout", "₹" + indianGrouping((payoutReport?.totalPayout ?: 0.0).toLong()))
                         }
                     }
                 }
 
                 // ── Hosts ─────────────────────────────────────────────────────
-                item { SectionHeader("My hosts", Modifier.padding(top = Space.sm)) }
+                item { SectionHeader("My hosts", Modifier.padding(top = Space.sm), action = "Earnings", onAction = { onOpenHostEarnings(agencyId) }) }
                 if (hosts.isEmpty()) {
                     item { EmptyState(Icons.Outlined.Groups, "No hosts yet", "Share your referral code — every host who signs up with it appears here.") }
                 } else {
                     items(hosts, key = { it.uid }) { host ->
-                        // TODO(design): name, LevelChip, beans this week and verified Chip — agencyHosts rows carry only the uid; join to users/{uid} before showing them.
-                        Row(Modifier.fillMaxWidth().padding(vertical = Space.sm), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
-                            Avatar(null, size = AvatarSize.MD, initial = host.uid)
+                        // TODO(design): LevelChip, beans this week and verified Chip — not on the roster row.
+                        val openable = AgencyIdentity.canOpenProfile(host.uid)
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .then(if (openable) Modifier.clickableNoRipple { onOpenHost(host.uid) } else Modifier)
+                                .padding(vertical = Space.sm),
+                            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md),
+                        ) {
+                            Avatar(null, size = AvatarSize.MD, initial = AgencyIdentity.initial(host.name))
                             Column(Modifier.weight(1f)) {
-                                Text("Host", style = ZipperTheme.type.labelM, color = c.textPrimary)
-                                Text(host.uid, style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(AgencyIdentity.displayName(host.name), style = ZipperTheme.type.labelM, color = if (host.name.isNotBlank()) c.textPrimary else c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(AgencyIdentity.reference(AgencyIdentity.HOST_ID, host.uid), style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
+                            if (openable) Icon(Icons.Default.ChevronRight, "Open profile", tint = c.textMuted, modifier = Modifier.size(18.dp))
                         }
                         HairlineDivider()
                     }

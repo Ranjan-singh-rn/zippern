@@ -1,12 +1,14 @@
 'use client'
 
-import { Fragment, useState, useEffect } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import { useSecureThumbs } from '@/components/useSecureThumbs'
+import SecureDocuments from '@/components/SecureDocuments'
 import { useAuth } from '@/components/AuthProvider'
 import { createSubAgencyAccount, partnerRolesOf } from '@/lib/auth'
 import { SecondRoleCard } from '@/components/SecondRoleCard'
 import { AgencyMoney } from './AgencyMoney'
 import HostReports from './HostReports'
-import { db, storage } from '@/lib/firebase'
+import { auth, db, storage } from '@/lib/firebase'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
 import {
   collection,
@@ -16,9 +18,12 @@ import {
   getDoc,
   doc,
   addDoc,
+  setDoc,
+  deleteDoc,
   updateDoc,
   serverTimestamp,
   Timestamp,
+  type FirestoreError,
 } from 'firebase/firestore'
 import { AlertTriangle, Building2, Users, Shield, Plus, X, CheckCircle2, Clock, Banknote, Star, Hash, Copy, UserPlus, Loader2, Upload, Globe, IndianRupee, FileText, ChevronRight, ChevronLeft, Camera } from 'lucide-react'
 import { getEconomyConfig } from '@/lib/economyConfig'
@@ -26,6 +31,15 @@ import { fromSettled, toFailure, type ReadFailure } from '@/lib/readState'
 import { Unavailable, UnavailablePanel, Warning } from '@/components/ui/States'
 import { PendingChangesNotice } from '@/components/PendingChangesNotice'
 import { submitPartnerUpdate, type Proposer } from '@/lib/pendingChanges'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
+import PhoneInput from '@/components/PhoneInput'
+import {
+  linkedPersonUid, personStatusOf, primaryApplication, reconcileHostRows,
+} from '@/lib/hostRows'
+import { duplicateSubAgencyMessage, findDuplicateSubAgency, isAddressInUse, reappliedMessage, reapplyFormFrom } from '@/lib/subAgencyCreation'
+import { partnerOps } from '@/lib/apiPartners'
+import { currentRosterRows, hostsFromRoster, rosterRowUid } from '@/lib/agencyDashboardHosts'
+import { duplicateInvitationMessage, findOpenInvitation, isWithdrawableInvitation, runInvitationCreate } from '@/lib/hostInvitation'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +103,12 @@ interface HostApplication {
   isActivated?: boolean
   /** Set when the applicant redeems the code. Joins this to a live host row. */
   activatedByUid?: string
+  /**
+   * GOV B08: set on a SELF-application, from the moment it is filed. It joins
+   * this to the host row too — an approved self-application never gets
+   * `activatedByUid`, which is how one host was listed twice.
+   */
+  applicantUid?: string
   /** Written by the KYC review screen when it rejects. */
   rejectionReason?: string
 
@@ -141,6 +161,8 @@ interface Host {
   name: string
   /** The app writes `phoneNumber`. There is no `phone` field on a user. */
   phoneNumber?: string
+  /** The account's verified email — read only to flag an invitation (GOV B08). */
+  email?: string
   /**
    * The HOST ladder (0–10, beans-based) — `users/{uid}.hostLevel`.
    *
@@ -252,23 +274,12 @@ function HostApplicationPanel({
       </div>
 
       <p className="text-slate-400 text-xs font-medium mb-2">KYC documents</p>
-      {docs.length === 0 ? (
-        <p className="text-slate-500 text-xs">None were uploaded with this invitation.</p>
-      ) : (
-        <div className="grid grid-cols-3 gap-3 max-w-lg">
-          {docs.map((url, i) => (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              key={url}
-              src={url}
-              alt={labels[i] ?? `Document ${i + 1}`}
-              title={labels[i] ?? `Document ${i + 1}`}
-              onClick={() => setZoom(url)}
-              className="w-full h-20 object-cover bg-slate-950 rounded-lg border border-slate-700 hover:border-pink-500/50 cursor-zoom-in transition-colors"
-            />
-          ))}
-        </div>
-      )}
+      {/* Through the API behind short-lived signed URLs. The agency is
+          entitled to see the invitation it filed — `services/documents`
+          scopes it on `partner_ids_of` — but not via the permanent bearer
+          URL stored at upload. */}
+      <SecureDocuments kind="host" recordId={app.id}
+        emptyHint="None were uploaded with this invitation." />
 
       <p className="text-slate-600 text-xs mt-3">
         To change any of this, use <span className="text-slate-400">Update KYC &amp; payment details</span> —
@@ -567,7 +578,26 @@ function AddHostModal({
 
       const crmUid = generateCrmUid()
 
-      const appRef = await addDoc(collection(db, 'hostApplications'), {
+      /*
+       * FX-12 (RF-18): one OPEN invitation per person. First a fresh look at
+       * this agency's invitations — the same phone OR the same email is the
+       * same person, so a re-invite after a typo in one of them is caught —
+       * then the write itself goes to an id derived from (agency, email,
+       * phone) with create-only semantics: two submits at once aim at the
+       * same document, and the rules refuse the second (to an agency login it
+       * is an update of fields it may not change). See lib/hostInvitation.ts.
+       */
+      const mine = await getDocs(query(collection(db, 'hostApplications'), where('agencyId', '==', agencyId)))
+      const openOne = findOpenInvitation(
+        mine.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, unknown>) })),
+        email.trim(), phone.trim(),
+      )
+      if (openOne) {
+        setSaveError(duplicateInvitationMessage(openOne))
+        return
+      }
+
+      const invitation = {
         // Identity
         referralCode:   referralCode.trim().toUpperCase(),
         agencyId,
@@ -594,7 +624,42 @@ function AddHostModal({
         createdAt:      serverTimestamp(),
         createdBy:      crmUser.uid,
         createdByName:  crmUser.name,
+      }
+
+      const isRefused = (e: unknown) => (e as FirestoreError | undefined)?.code === 'permission-denied'
+      const created = await runInvitationCreate(agencyId, email.trim(), phone.trim(), {
+        sha256Hex: async (key) => {
+          const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key))
+          return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+        },
+        createIfAbsent: async (id) => {
+          const ref = doc(db, 'hostApplications', id)
+          // An agency may read its own invitation; reading one that does not
+          // exist is refused by the rules, which here means "free".
+          const seen = await getDoc(ref).catch((e: unknown) => {
+            if (isRefused(e)) return null
+            throw e
+          })
+          if (seen && seen.exists()) return { created: false, existing: seen.data() as Record<string, unknown> }
+          try {
+            await setDoc(ref, invitation)
+            return { created: true }
+          } catch (e) {
+            if (!isRefused(e)) throw e
+            // Created by somebody else between the look and the write.
+            const again = await getDoc(ref).catch(() => null)
+            if (again && again.exists()) return { created: false, existing: again.data() as Record<string, unknown> }
+            throw e
+          }
+        },
+        // Only for a person with more refused invitations than there are
+        // slots: invited the old way, after the duplicate check above.
+        createAuto: async () => (await addDoc(collection(db, 'hostApplications'), invitation)).id,
       })
+      if (!created.ok) {
+        setSaveError(duplicateInvitationMessage({ id: created.id, ...created.existing }))
+        return
+      }
 
       /*
        * NO APPROVAL REQUEST IS FILED.
@@ -700,7 +765,7 @@ function AddHostModal({
                   </div>
                   <div>
                     <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">Phone Number</label>
-                    <input value={phone} onChange={e => setPhone(e.target.value)} placeholder="+91 9876543210" className={inputCls} />
+                    <PhoneInput value={phone} onChange={setPhone} placeholder="Mobile number" className={inputCls} />
                     <p className="text-slate-500 text-xs mt-1">Must match the phone used to log in to the app</p>
                   </div>
                   <div>
@@ -1668,6 +1733,14 @@ function AddSubAgencyModal({
 
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  /**
+   * GOV B07: set when the sub-agency and its login were BOTH created and only
+   * the owner link was refused. The form then offers Close and nothing else —
+   * creating again would make a second record.
+   */
+  const [createdUnlinked, setCreatedUnlinked] = useState(false)
+  /** Decision 16 (RC): set when a FRESH application was filed for an existing login. */
+  const [reapplied, setReapplied] = useState('')
 
   const inputCls = "w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm placeholder-slate-500 focus:outline-none focus:border-pink-500"
   const setB = (k: keyof typeof basic) => (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -1718,6 +1791,23 @@ function AddSubAgencyModal({
     setError('')
     setSaving(true)
     try {
+      // FX-03: the same owner must not get a second sub-agency here — a second
+      // click, another tab, or an orphan an earlier attempt left behind. Read
+      // fresh (the dashboard's list may be stale); the parent's own
+      // sub-agencies are what this login may list (firestore.rules).
+      const siblings = await getDocs(query(collection(db, 'agencies'), where('parentAgencyId', '==', parentAgencyId)))
+      const duplicate = findDuplicateSubAgency(
+        siblings.docs.map((d) => ({
+          id: d.id,
+          ownerEmail: d.get('ownerEmail'),
+          ownerPhone: d.get('ownerPhone'),
+          status: d.get('status'),
+        })),
+        basic.ownerEmail,
+        basic.ownerPhone,
+      )
+      if (duplicate) { setError(duplicateSubAgencyMessage(duplicate)); return }
+
       const nameSlug = basic.agencyName.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3) || 'SUB'
       const referralCode = nameSlug + Math.random().toString(36).toUpperCase().slice(2, 6)
 
@@ -1739,6 +1829,10 @@ function AddSubAgencyModal({
         totalSubAgencies: 0,
         createdAt: serverTimestamp(),
         source: 'agency_created',
+        // P0-5: the sub-agency's own login is a brand-new, unverified password
+        // account, so `firestore.rules` binds it to this record by WHO MADE
+        // the record — a login of the parent agency — not by its address.
+        createdByUid: auth.currentUser?.uid ?? '',
       }
 
       if (paymentType === 'foreign') {
@@ -1754,17 +1848,41 @@ function AddSubAgencyModal({
         agencyData.currency          = 'INR'
       }
 
-      const agencyRef = await addDoc(collection(db, 'agencies'), agencyData)
-
-      await createSubAgencyAccount({
-        email:    basic.ownerEmail.trim().toLowerCase(),
-        password: basic.password,
-        name:     basic.ownerName.trim(),
-        phone:    basic.ownerPhone.trim(),
-        agencyId: agencyRef.id,
-      })
+      // FX-03: the LOGIN is created first; the record is written only once it
+      // exists (`writeRecord`), and the login is removed again if the record
+      // write fails — so a failed or repeated attempt leaves nothing behind.
+      // GOV B07: the new login then writes the record's `crmUid` back-link, so
+      // the sub-agency is not owned by nobody (see createSubAgencyAccount).
+      let account: Awaited<ReturnType<typeof createSubAgencyAccount>>
+      try {
+        account = await createSubAgencyAccount({
+          email:    basic.ownerEmail.trim().toLowerCase(),
+          password: basic.password,
+          name:     basic.ownerName.trim(),
+          phone:    basic.ownerPhone.trim(),
+          writeRecord: async () => (await addDoc(collection(db, 'agencies'), agencyData)).id,
+        })
+      } catch (err: unknown) {
+        // Decision 16 (RC): the address already has a login — typically the
+        // person's earlier Sub-agency application was rejected. Nothing was
+        // written; ask the API to file a FRESH application for that login.
+        // It refuses (with the reason) if the login does not qualify.
+        if (!isAddressInUse(err)) throw err
+        const email = basic.ownerEmail.trim().toLowerCase()
+        const filed = await partnerOps.reapplySubAgency(parentAgencyId, {
+          email, form: reapplyFormFrom(agencyData),
+        })
+        onCreated()
+        setError('')
+        setReapplied(reappliedMessage(email, filed.reapplication_of))
+        return
+      }
 
       onCreated()
+      if (!account.linked) {
+        setCreatedUnlinked(true)
+        return
+      }
       onClose()
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to create sub-agency.')
@@ -1820,7 +1938,7 @@ function AddSubAgencyModal({
               </div>
               <div>
                 <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">Owner Phone</label>
-                <input value={basic.ownerPhone} onChange={setB('ownerPhone')} className={inputCls} placeholder="+91 9876543210" />
+                <PhoneInput value={basic.ownerPhone} onChange={v => setBasic(f => ({ ...f, ownerPhone: v }))} className={inputCls} placeholder="Mobile number" />
               </div>
               <div>
                 <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">Owner Email</label>
@@ -1947,18 +2065,37 @@ function AddSubAgencyModal({
               <p className="text-red-400 text-sm">{error}</p>
             </div>
           )}
+
+          {reapplied && (
+            <div className="bg-green-500/10 border border-green-500/30 rounded-lg px-4 py-3">
+              <p className="text-green-200 text-sm">{reapplied}</p>
+            </div>
+          )}
+
+          {createdUnlinked && (
+            <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-4 py-3">
+              <p className="text-amber-200 text-sm">
+                The sub-agency and its login were created, but the login could not
+                be linked to the record. Do not create it again — ask the
+                administrator to attach the login to the record. It is listed
+                below as pending either way.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Footer */}
         <div className="flex gap-3 px-6 py-4 border-t border-slate-700 shrink-0">
-          {step > 1 ? (
+          {createdUnlinked || reapplied ? (
+            <button onClick={onClose} className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors">Close</button>
+          ) : step > 1 ? (
             <button onClick={() => { setError(''); setStep(s => s - 1) }} className="flex items-center gap-1.5 bg-slate-700 hover:bg-slate-600 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors">
               <ChevronLeft size={15} /> Back
             </button>
           ) : (
             <button onClick={onClose} className="flex-1 bg-slate-700 hover:bg-slate-600 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors">Cancel</button>
           )}
-          {step < 3 ? (
+          {createdUnlinked || reapplied ? null : step < 3 ? (
             <button onClick={nextStep} className="flex-1 bg-pink-500 hover:bg-pink-600 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors flex items-center justify-center gap-1.5">
               Next <ChevronRight size={15} />
             </button>
@@ -2041,6 +2178,10 @@ export default function AgencyDashboardPage() {
   const [showAddSubAgency, setShowAddSubAgency] = useState(false)
   const [subAgencies, setSubAgencies] = useState<SubAgency[]>([])
   const [markingId, setMarkingId] = useState<string | null>(null)
+  // FX-12: withdrawing one of our own PENDING invitations (the rules allow an
+  // agency exactly that: its own, still pending, never redeemed).
+  const [withdrawingId, setWithdrawingId] = useState<string | null>(null)
+  const [withdrawFailure, setWithdrawFailure] = useState<{ id: string; message: string } | null>(null)
 
   /**
    * Why each of the four lists above may be empty.
@@ -2078,6 +2219,32 @@ export default function AgencyDashboardPage() {
     role: crmUser?.role ?? '',
   }
 
+  /**
+   * FX-12 (RF-18): the "withdraw" the rules always allowed and no screen
+   * offered. Without it the only way out of a wrong invitation was a second
+   * one — which is how the duplicates piled up.
+   */
+  async function withdrawInvitation(app: HostApplication) {
+    const who = app.hostName || 'this host'
+    if (!window.confirm(
+      `Withdraw the invitation for ${who}? They will not be able to join with your code ` +
+      'unless you invite them again. The photo and documents you uploaded for it are deleted.',
+    )) return
+    setWithdrawingId(app.id)
+    setWithdrawFailure(null)
+    try {
+      await deleteDoc(doc(db, 'hostApplications', app.id))
+      await loadData()
+    } catch (err: unknown) {
+      setWithdrawFailure({
+        id: app.id,
+        message: err instanceof Error ? err.message : 'The invitation could not be withdrawn.',
+      })
+    } finally {
+      setWithdrawingId(null)
+    }
+  }
+
   async function loadData() {
     if (!agencyId) { setLoading(false); return }
     setFailures({})
@@ -2112,7 +2279,12 @@ export default function AgencyDashboardPage() {
       // allSettled, not all: one failing query must not blank the whole page.
       const [agencyRes, hostsRes, salaryRes, subRes] = await Promise.allSettled([
         getDoc(doc(db, 'agencies', agencyId)),
-        getDocs(query(collection(db, 'users'), where('agencyId', '==', agencyId))),
+        // FX-11 (RF-16): the agency's OWN roster, which an agency login may
+        // read. This used to LIST `users where agencyId == …`, and the rules
+        // allow listing users to staff only — so every agency login was
+        // refused its own host list. Each current row is completed from its
+        // user document below, by a single GET, which the rules allow.
+        getDocs(collection(db, 'agencies', agencyId, 'agencyHosts')),
         getDocs(query(collection(db, 'salaryRequests'), where('agencyId', '==', agencyId))),
         getDocs(query(collection(db, 'agencies'), where('parentAgencyId', '==', agencyId))),
       ])
@@ -2140,9 +2312,28 @@ export default function AgencyDashboardPage() {
         setAgency({ id: agencyRead.value.id, ...(agencyRead.value.data() as Omit<Agency, 'id'>) })
       }
 
-      // Hosts
+      // Hosts — current roster rows (FX-10: `active: false` is history), each
+      // completed from its user document. A user document that cannot be read
+      // still leaves the host listed, from the roster row.
       if (hostsRead.ok) {
-        setHosts(hostsRead.value.docs.map((d) => ({ uid: d.id, ...(d.data() as Omit<Host, 'uid'>) })))
+        const rows = currentRosterRows(
+          hostsRead.value.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, unknown> })),
+        )
+        const reads = await Promise.allSettled(
+          rows.map((r) => {
+            const uid = rosterRowUid(r)
+            return getDoc(doc(db, 'users', uid))
+          }),
+        )
+        const usersByUid = new Map<string, Record<string, unknown> | null>()
+        rows.forEach((r, i) => {
+          const res = reads[i]
+          usersByUid.set(
+            rosterRowUid(r),
+            res.status === 'fulfilled' && res.value.exists() ? (res.value.data() as Record<string, unknown>) : null,
+          )
+        })
+        setHosts(hostsFromRoster<Host>(rows, usersByUid))
       }
 
       // Salary requests
@@ -2175,6 +2366,59 @@ export default function AgencyDashboardPage() {
       setLoading(false)
     }
   }, [crmUser, agencyId, isAgencyUser])
+
+  // ── EVERY HOOK MUST SIT ABOVE EVERY `return` ──────────────────────────────
+  //
+  // These two lived at the bottom of the component, below three conditional
+  // returns (`!isAgencyUser`, `!agencyId && !loading`, and `loading`). React
+  // counts hooks positionally, so the first render — which returns the
+  // spinner at `loading === true` — ran 17 hooks, and the render after
+  // `setLoading(false)` ran 23. That is
+  //
+  //     Error: Rendered more hooks than during the previous render.
+  //
+  // thrown during render, which Next's built-in GlobalError turns into
+  // "Application error: a client-side exception has occurred" — the whole
+  // agency dashboard, blank, for every agency owner whose `crmUsers.agencyId`
+  // is set. It was in the shipped bundle, not just in source.
+  //
+  // Moving them changes no rendering behaviour: all three dependencies are
+  // `useState` values declared far above, and `useSecureThumbs` already
+  // no-ops on an empty id list. It is purely about running unconditionally.
+  //
+  // `app.photoUrl` points at `hostPhotos/{agencyId}/` and is stored as a
+  // permanent `?alt=media&token=` URL — a bearer credential Storage Rules are
+  // never consulted for. The three tables below render up to a few dozen of
+  // them, so they are signed in one batch rather than one request per row.
+  //
+  // The agency is entitled to these: `services/documents._may_see` scopes a
+  // partner to its own records, so this returns photographs for the hosts
+  // this agency invited and nothing for anybody else's.
+  const hostPhotoIds = useMemo(
+    () => [...pendingHostApps, ...approvedHostApps, ...rejectedHostApps].map((a) => a.id),
+    [pendingHostApps, approvedHostApps, rejectedHostApps],
+  )
+  const hostPhotos = useSecureThumbs('host', hostPhotoIds, 'photo')
+
+  // ── GOV B08: one row per PERSON (above every return, like the two above) ──
+  //
+  // A pending or approved application whose `activatedByUid || applicantUid`
+  // is one of this agency's hosts is that host — it is not listed again as
+  // "Pending Approval" / "Awaiting Activation" and not counted again. An
+  // invitation nobody has redeemed that carries one of your hosts' own phone
+  // or email stays listed, flagged. `panelApp` is the application each host's
+  // inline panel shows: the redeemed one, else the approved, else the pending.
+  const reconciledHosts = useMemo(() => {
+    const rows = reconcileHostRows(hosts, [...pendingHostApps, ...approvedHostApps])
+    const status = new Map(hosts.map((h) => [h.uid, personStatusOf(h.isHost)] as const))
+    const panelApp = new Map<string, HostApplication>()
+    for (const h of hosts) {
+      const mine = allHostApps.filter((a) => linkedPersonUid(a, (uid) => status.get(uid)) === h.uid)
+      const best = primaryApplication(mine)
+      if (best) panelApp.set(h.uid, best)
+    }
+    return { rows, panelApp }
+  }, [hosts, pendingHostApps, approvedHostApps, allHostApps])
 
   async function handleMarkDistributed(req: SalaryRequest) {
     setMarkingId(req.id)
@@ -2261,7 +2505,12 @@ export default function AgencyDashboardPage() {
   // A host count is three reads added together, and two of them can fail
   // independently. If either did, the sum is not a count of anything.
   const hostCountUnread = failures.hosts ?? failures.applications
-  const totalHostCount = hosts.length + approvedHostApps.length + pendingHostApps.length
+  // GOV B08: people, not rows — an application that is one of your hosts, or
+  // that carries one of your hosts' own contact, is not somebody new.
+  const separateRows = reconciledHosts.rows.applicationRows
+  const shownPending = separateRows.filter((r) => r.app.status === 'pending')
+  const shownApproved = separateRows.filter((r) => r.app.status === 'approved')
+  const totalHostCount = hosts.length + reconciledHosts.rows.separateApplicants
 
   return (
     <div className="max-w-7xl mx-auto">
@@ -2388,14 +2637,14 @@ export default function AgencyDashboardPage() {
           <h2 className="text-white font-semibold flex items-center gap-2">
             <Users size={18} className="text-slate-400" />
             Hosts {hostCountUnread ? '' : `(${totalHostCount})`}
-            {pendingHostApps.length > 0 && (
+            {shownPending.length > 0 && (
               <span className="text-xs font-bold bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 rounded-full px-2 py-0.5">
-                {pendingHostApps.length} pending
+                {shownPending.length} pending
               </span>
             )}
-            {approvedHostApps.length > 0 && (
+            {shownApproved.length > 0 && (
               <span className="text-xs font-bold bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-full px-2 py-0.5">
-                {approvedHostApps.length} awaiting activation
+                {shownApproved.length} awaiting activation
               </span>
             )}
           </h2>
@@ -2449,21 +2698,27 @@ export default function AgencyDashboardPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {/* Pending approval — from hostApplications */}
-                  {pendingHostApps.map(app => (
+                  {/* Pending approval — from hostApplications. GOV B08: only
+                      the ones that are not already one of your hosts. */}
+                  {shownPending.map(({ app, sameContactAs }) => (
                     <tr key={`app-pending-${app.id}`} className="border-b border-slate-800/50 bg-yellow-500/3">
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
                           <div className="w-8 h-8 rounded-full bg-yellow-500/20 flex items-center justify-center flex-shrink-0">
-                            {app.photoUrl
+                            {hostPhotos.url('host', app.id)
                               // eslint-disable-next-line @next/next/no-img-element
-                              ? <img src={app.photoUrl} alt={app.hostName} className="w-8 h-8 rounded-full object-cover" />
+                              ? <img src={hostPhotos.url('host', app.id)} alt={app.hostName} className="w-8 h-8 rounded-full object-cover" />
                               : <span className="text-yellow-300 text-xs font-bold">{app.hostName?.[0]?.toUpperCase() ?? '?'}</span>
                             }
                           </div>
                           <div>
                             <p className="text-white text-sm font-medium">{app.hostName}</p>
                             <p className="text-slate-500 text-xs">{app.applicantEmail}</p>
+                            {sameContactAs && (
+                              <p className="text-amber-300 text-xs mt-0.5">
+                                Same phone or email as your host {sameContactAs.name || sameContactAs.uid} — not counted again
+                              </p>
+                            )}
                           </div>
                         </div>
                       </td>
@@ -2475,6 +2730,23 @@ export default function AgencyDashboardPage() {
                         <span className="text-xs bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 px-2 py-1 rounded font-medium flex items-center gap-1 w-fit">
                           <Clock size={10} />Pending Approval
                         </span>
+                        {/* FX-12: withdraw a pending invitation that is wrong.
+                            RC: only an invitation this agency filed — a
+                            self-filed application is the applicant's, and
+                            staff decide it (the rules refuse the delete). */}
+                        {isWithdrawableInvitation(app as unknown as Record<string, unknown>) && (
+                        <button
+                          type="button"
+                          onClick={() => withdrawInvitation(app)}
+                          disabled={withdrawingId === app.id}
+                          className="mt-2 text-xs text-slate-400 hover:text-red-300 underline disabled:opacity-50"
+                        >
+                          {withdrawingId === app.id ? 'Withdrawing…' : 'Withdraw'}
+                        </button>
+                        )}
+                        {withdrawFailure?.id === app.id && (
+                          <p className="text-red-300 text-xs mt-1">{withdrawFailure.message}</p>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -2487,9 +2759,9 @@ export default function AgencyDashboardPage() {
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
                           <div className="w-8 h-8 rounded-full bg-red-500/20 flex items-center justify-center flex-shrink-0">
-                            {app.photoUrl
+                            {hostPhotos.url('host', app.id)
                               // eslint-disable-next-line @next/next/no-img-element
-                              ? <img src={app.photoUrl} alt={app.hostName} className="w-8 h-8 rounded-full object-cover opacity-60" />
+                              ? <img src={hostPhotos.url('host', app.id)} alt={app.hostName} className="w-8 h-8 rounded-full object-cover opacity-60" />
                               : <span className="text-red-300 text-xs font-bold">{app.hostName?.[0]?.toUpperCase() ?? '?'}</span>
                             }
                           </div>
@@ -2514,21 +2786,28 @@ export default function AgencyDashboardPage() {
                     </tr>
                   ))}
 
-                  {/* Approved, awaiting host activation */}
-                  {approvedHostApps.map(app => (
+                  {/* Approved, awaiting host activation. GOV B08: an approved
+                      self-application of one of your hosts is that host, so it
+                      is on their row, not here. */}
+                  {shownApproved.map(({ app, sameContactAs }) => (
                     <tr key={`app-approved-${app.id}`} className="border-b border-slate-800/50 bg-blue-500/3">
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
                           <div className="w-8 h-8 rounded-full bg-blue-500/20 flex items-center justify-center flex-shrink-0">
-                            {app.photoUrl
+                            {hostPhotos.url('host', app.id)
                               // eslint-disable-next-line @next/next/no-img-element
-                              ? <img src={app.photoUrl} alt={app.hostName} className="w-8 h-8 rounded-full object-cover" />
+                              ? <img src={hostPhotos.url('host', app.id)} alt={app.hostName} className="w-8 h-8 rounded-full object-cover" />
                               : <span className="text-blue-300 text-xs font-bold">{app.hostName?.[0]?.toUpperCase() ?? '?'}</span>
                             }
                           </div>
                           <div>
                             <p className="text-white text-sm font-medium">{app.hostName}</p>
                             <p className="text-slate-500 text-xs">{app.applicantEmail}</p>
+                            {sameContactAs && (
+                              <p className="text-amber-300 text-xs mt-0.5">
+                                Same phone or email as your host {sameContactAs.name || sameContactAs.uid} — not counted again
+                              </p>
+                            )}
                           </div>
                         </div>
                       </td>
@@ -2562,9 +2841,9 @@ export default function AgencyDashboardPage() {
                       <td className="px-6 py-4">
                         <div className="flex items-center gap-3">
                           <div className="w-8 h-8 rounded-full bg-blue-500/20 flex items-center justify-center flex-shrink-0">
-                            {host.photoUrl ? (
+                            {profilePhotoSrc(host.photoUrl) ? (
                               // eslint-disable-next-line @next/next/no-img-element
-                              <img src={host.photoUrl} alt={host.name} className="w-8 h-8 rounded-full object-cover" />
+                              <img src={profilePhotoSrc(host.photoUrl)} alt={host.name} className="w-8 h-8 rounded-full object-cover" />
                             ) : (
                               <span className="text-blue-300 text-xs font-bold">{host.name?.[0]?.toUpperCase() ?? '?'}</span>
                             )}
@@ -2616,7 +2895,7 @@ export default function AgencyDashboardPage() {
                               contact details, where they are paid, and the
                               three documents the agency uploaded itself. */}
                           <HostApplicationPanel
-                            app={allHostApps.find((a) => a.activatedByUid === host.uid)}
+                            app={reconciledHosts.panelApp.get(host.uid)}
                             applicationsUnread={!!failures.applications}
                           />
                           {!host.isVerifiedHost && !host.isBanned && (

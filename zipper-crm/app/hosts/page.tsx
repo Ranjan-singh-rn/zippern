@@ -1,9 +1,11 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
+import { useSecureThumbs } from '@/components/useSecureThumbs'
+import SecureDocuments from '@/components/SecureDocuments'
 import Link from 'next/link'
 import { Star, Loader2, Search, ShieldOff, Shield, StarOff, X, Check, AlertTriangle, Clock, Eye, ExternalLink, IndianRupee, Globe, Pencil, Save } from 'lucide-react'
-import { getHosts, makeHost, removeHost, UserRecord } from '@/lib/firestore'
+import { getHosts, UserRecord } from '@/lib/firestore'
 import api from '@/lib/api'
 import { db } from '@/lib/firebase'
 // `doc` and `updateDoc` are gone from this file. Nothing here writes a host
@@ -16,6 +18,12 @@ import { canAccess } from '@/lib/auth'
 import { fromSettled, type ReadFailure } from '@/lib/readState'
 import { UnavailablePanel, Warning } from '@/components/ui/States'
 import { labelOf, submitPartnerUpdate, type Proposer } from '@/lib/pendingChanges'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
+import { getAgencyNames } from '@/lib/agencies'
+import {
+  hostTabCounts, linkedApplicationLabel, reconcileHostRows, resolveAgencyName,
+  type AgencyLabel,
+} from '@/lib/hostRows'
 
 // Host application record (from hostApplications collection)
 interface HostApplication {
@@ -55,6 +63,10 @@ interface HostApplication {
   pendingChangesRejectionReason?: string
   status: 'pending' | 'approved'
   isActivated: boolean
+  /** GOV B08: who redeemed the code — the account this invitation became. */
+  activatedByUid?: string
+  /** GOV B08: who filed it, on a SELF-application. Never on an invitation. */
+  applicantUid?: string
   createdAt?: Timestamp
 }
 
@@ -70,10 +82,18 @@ function Field({ label, value }: { label: string; value?: string | number | null
   )
 }
 
-function HostAppModal({ app, onClose, onSaved }: {
+function HostAppModal({ app, onClose, onSaved, linkedHostName, agency }: {
   app: HostApplication
   onClose: () => void
   onSaved?: (updated: HostApplication) => void
+  /**
+   * GOV B08: set when this application is a current Host's own (opened from
+   * that Host's row). An approved one is then the application that MADE them
+   * a Host, not one "awaiting activation".
+   */
+  linkedHostName?: string
+  /** GOV B20: the agency by its current name, resolved from `agencyId`. */
+  agency?: AgencyLabel
 }) {
   const { crmUser } = useAuth()
   const [editing, setEditing] = useState(false)
@@ -214,21 +234,30 @@ function HostAppModal({ app, onClose, onSaved }: {
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-5 border-b border-slate-800 shrink-0">
           <div className="flex items-center gap-4">
-            {app.photoUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={app.photoUrl} alt={app.hostName} className="w-12 h-12 rounded-full object-cover border border-slate-700" />
-            ) : (
-              <div className="w-12 h-12 rounded-full bg-slate-700 flex items-center justify-center text-white font-bold text-lg">
-                {app.hostName?.[0]?.toUpperCase() ?? '?'}
-              </div>
-            )}
+            {/* Initials, not `app.photoUrl`. That field is the host's
+                reference photograph in `hostPhotos/{agencyId}/` — identity
+                data about a third party, stored as a permanent
+                `?alt=media&token=` URL that Storage Rules are never consulted
+                for. The photograph itself is still available to a reviewer:
+                it comes down labelled "Reference photo" in the signed-URL
+                block below, which is the only place it should be rendered. */}
+            <div className="w-12 h-12 rounded-full bg-slate-700 flex items-center justify-center text-white font-bold text-lg">
+              {app.hostName?.[0]?.toUpperCase() ?? '?'}
+            </div>
             <div>
               <h2 className="text-white text-lg font-semibold">{hostName}</h2>
               <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${
                 app.status === 'approved' ? 'bg-blue-500/20 text-blue-300' : 'bg-yellow-500/20 text-yellow-400'
               }`}>
-                {app.status === 'approved' ? 'Awaiting Activation' : 'Pending Approval'}
+                {app.status === 'approved'
+                  ? (linkedHostName ? 'Approved · Host active' : 'Awaiting Activation')
+                  : 'Pending Approval'}
               </span>
+              {linkedHostName && (
+                <p className="text-slate-500 text-xs mt-1">
+                  {linkedHostName}&rsquo;s own application — the same person as their Host row.
+                </p>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -368,7 +397,10 @@ function HostAppModal({ app, onClose, onSaved }: {
               </div>
             ) : (
               <div className="space-y-2">
-                <Field label="Agency"        value={app.agencyName} />
+                {/* GOV B20: the agency document's current name; the name copied
+                    onto the application is shown beside it only when it differs. */}
+                <Field label="Agency"        value={agency?.label || app.agencyName} />
+                <Field label="Name when filed" value={agency?.staleName} />
                 <Field label="Agency ID"     value={app.agencyId} />
                 <Field label="Call Rate"     value={callRate ? `${callRate} beans/min` : undefined} />
                 <Field label="Referral Code" value={app.referralCode} />
@@ -443,34 +475,18 @@ function HostAppModal({ app, onClose, onSaved }: {
             )}
           </div>
 
-          {/* KYC Docs */}
-          {app.kycDocUrls && app.kycDocUrls.length > 0 && (
-            <div>
-              <p className="text-slate-400 text-xs font-semibold uppercase tracking-wide mb-3">KYC Documents</p>
-              <div className="grid grid-cols-3 gap-3">
-                {app.kycDocUrls.map((url, i) => {
-                  const isPdf = url.toLowerCase().includes('.pdf') || url.includes('%2Fpdf')
-                  return (
-                    <div key={i} className="space-y-1">
-                      <p className="text-slate-500 text-xs">{docLabels[i]}</p>
-                      {isPdf ? (
-                        <a href={url} target="_blank" rel="noopener noreferrer"
-                          className="flex items-center gap-1.5 text-pink-400 hover:text-pink-300 text-xs underline">
-                          <ExternalLink size={11} /> Open PDF
-                        </a>
-                      ) : (
-                        <a href={url} target="_blank" rel="noopener noreferrer">
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img src={url} alt={docLabels[i]}
-                            className="w-full h-28 object-cover rounded-lg border border-slate-700 hover:opacity-90 transition-opacity bg-slate-950" />
-                        </a>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )}
+          {/* KYC Docs.
+
+              Fetched from the API behind 15-minute signed URLs rather than
+              rendered from `app.kycDocUrls`. Those stored strings are
+              `?alt=media&token=` download URLs — permanent bearer credentials
+              Storage Rules are never consulted for, so an <img src> here is a
+              forever-link to somebody's Aadhaar in the page source. */}
+          <div>
+            <p className="text-slate-400 text-xs font-semibold uppercase tracking-wide mb-3">KYC Documents</p>
+            <SecureDocuments kind="host" recordId={app.id}
+              emptyHint="No documents were uploaded with this application." />
+          </div>
         </div>
       </div>
     </div>
@@ -509,6 +525,15 @@ export default function HostsPage() {
   const [hostAppsTruncated, setHostAppsTruncated] = useState(false)
   const [hostsFailure, setHostsFailure] = useState<ReadFailure | null>(null)
   const [hostAppsFailure, setHostAppsFailure] = useState<ReadFailure | null>(null)
+  /**
+   * GOV B20: agency id → the agency document's CURRENT name. A Host row used
+   * to print the raw `users.agencyId`, and an application row the name copied
+   * onto the application at filing — a Mongo name that never follows a
+   * rename. Both are now named from the agency document, with the id / the
+   * copy as the fallback when it cannot be read.
+   */
+  const [agencyNames, setAgencyNames] = useState<Map<string, string>>(() => new Map())
+  const [agencyNamesFailure, setAgencyNamesFailure] = useState<ReadFailure | null>(null)
 
   // per-row loading and ban-input state
   const [actingUids, setActingUids] = useState<Set<string>>(new Set())
@@ -551,6 +576,28 @@ export default function HostsPage() {
     })
     return () => { cancelled = true }
   }, [])
+
+  // The agencies named on this page, as one stable key — so a ban or an edit
+  // that does not move an agency does not re-read the names.
+  const agencyIdKey = useMemo(
+    () => Array.from(new Set([
+      ...hosts.map((h) => h.agencyId),
+      ...hostApps.map((a) => a.agencyId ?? ''),
+    ].map((id) => String(id ?? '').trim()).filter(Boolean))).sort().join(','),
+    [hosts, hostApps],
+  )
+  useEffect(() => {
+    if (loading) return
+    let cancelled = false
+    // Never rejects: a refused read leaves the map empty for those ids, and
+    // every cell then shows the id or the stored copy exactly as before.
+    getAgencyNames(agencyIdKey ? agencyIdKey.split(',') : []).then(({ names, failure }) => {
+      if (cancelled) return
+      setAgencyNames(names)
+      setAgencyNamesFailure(failure)
+    })
+    return () => { cancelled = true }
+  }, [loading, agencyIdKey])
 
   function flash(m: MsgState) {
     setMsg(m)
@@ -612,74 +659,100 @@ export default function HostsPage() {
     }
   }
 
-  async function handleMakeHost(uid: string) {
-    setActing(uid, true)
-    try {
-      await makeHost(uid)
-      updateHost(uid, { isHost: true })
-      flash({ type: 'success', text: 'Host status granted.' })
-    } catch {
-      flash({ type: 'error', text: 'Failed to make host.' })
-    } finally {
-      setActing(uid, false)
-    }
-  }
+  /*
+   * Phase 1A (SECURITY-004 / ROLE-001): host status is changed through the API
+   * only. `makeHost` / `removeHost` wrote `users.isHost` straight from the
+   * browser — no eligibility matrix, no agency roster, no audit — and the rules
+   * now refuse that write for every staff role. `revoke-host` is the one path
+   * that checks, writes the roster and records who did it. There is no
+   * "make host" button: a host is created by an approved application.
+   *
+   * Success is reported only after the server answers, and the server's own
+   * refusal text is shown rather than a generic "failed".
+   */
+  // UGP-B: there is no Remove button on this list any more. Revoking Host is
+  // role-aware — refused when Host is the person's only role, offered only
+  // once their roles are known — so it lives in the Roles block of the
+  // person's page (`/users/[uid]`), which this list links to.
 
-  async function handleRemoveHost(uid: string) {
-    setActing(uid, true)
-    try {
-      await removeHost(uid)
-      setHosts(prev => prev.filter(h => h.uid !== uid))
-      flash({ type: 'success', text: 'Host status removed.' })
-    } catch {
-      flash({ type: 'error', text: 'Failed to remove host.' })
-    } finally {
-      setActing(uid, false)
-    }
-  }
+  // ── GOV B08: one row per PERSON ───────────────────────────────────────────
+  //
+  // The two reads used to be concatenated with no join, so an approved
+  // SELF-application (it carries `applicantUid`, never `activatedByUid`, and
+  // approval did not stamp `isActivated`) listed its Host twice — "Active" and
+  // "Awaiting Activation" — and every tab added both. An application whose
+  // `activatedByUid || applicantUid` is a current Host is now on that Host's
+  // row ("via application <id>"); an invitation carrying a Host's own phone or
+  // email is shown flagged and not counted again. Nothing is dropped.
+  const reconciled = useMemo(() => reconcileHostRows(hosts, hostApps), [hosts, hostApps])
 
   const filteredHosts = useMemo(() => {
-    let list = hosts
-    if (filter === 'active') list = list.filter(h => !h.isBanned)
-    if (filter === 'banned') list = list.filter(h => h.isBanned)
+    let list = reconciled.hostRows
+    if (filter === 'active') list = list.filter(r => !r.host.isBanned)
+    if (filter === 'banned') list = list.filter(r => r.host.isBanned)
     if (filter === 'invited') list = []
     if (search.trim()) {
       const q = search.toLowerCase().trim()
-      list = list.filter(h =>
+      list = list.filter(({ host: h }) =>
         h.name.toLowerCase().includes(q) ||
         h.phoneNumber.includes(q) ||
         h.email.toLowerCase().includes(q)
       )
     }
     return list
-  }, [hosts, filter, search])
+  }, [reconciled, filter, search])
 
   const filteredApps = useMemo(() => {
     if (filter === 'active' || filter === 'banned') return []
     if (search.trim()) {
       const q = search.toLowerCase().trim()
-      return hostApps.filter(a =>
+      return reconciled.applicationRows.filter(({ app: a }) =>
         a.hostName.toLowerCase().includes(q) ||
         a.applicantPhone.includes(q) ||
         a.applicantEmail.toLowerCase().includes(q) ||
-        (a.agencyName ?? '').toLowerCase().includes(q)
+        (a.agencyName ?? '').toLowerCase().includes(q) ||
+        (agencyNames.get(a.agencyId ?? '') ?? '').toLowerCase().includes(q)
       )
     }
-    return hostApps
-  }, [hostApps, filter, search])
+    return reconciled.applicationRows
+  }, [reconciled, filter, search, agencyNames])
 
-  const totalInvited = hostApps.length
+
+  // ── Reference photographs, one request for the whole page ────────────────
+  //
+  // `app.photoUrl` is the host's reference photograph in
+  // `hostPhotos/{agencyId}/` — identity data about a third party, stored as a
+  // permanent `?alt=media&token=` URL that Storage Rules are never consulted
+  // for. Rendering it put a forever-link to somebody's face in the page
+  // source, fifty at a time.
+  //
+  // One batch request per page rather than one per row: the per-row cost is
+  // precisely why this list was still on the insecure URL.
+  const appPhotos = useSecureThumbs(
+    'host',
+    useMemo(() => filteredApps.map((r) => r.app.id), [filteredApps]),
+    'photo',
+  )
 
   // A tally over a list that was never read is not a tally. When either read
   // failed the tabs carry their labels alone rather than a count of nothing.
+  // GOV B08: the counts are PEOPLE — `All` is Active + Banned + Invited, and a
+  // flagged invitation (an existing Host's contact) is in none of them.
+  const counts = hostTabCounts(reconciled, (h) => h.isBanned)
   const countsAreReal = !hostsFailure && !hostAppsFailure
   const n = (value: number) => (countsAreReal ? ` (${value})` : '')
   const tabs: { key: Filter; label: string }[] = [
-    { key: 'all',     label: `All${n(hosts.length + totalInvited)}` },
-    { key: 'active',  label: `Active${n(hosts.filter(h => !h.isBanned).length)}` },
-    { key: 'banned',  label: `Banned${n(hosts.filter(h => h.isBanned).length)}` },
-    { key: 'invited', label: `Invited${n(totalInvited)}` },
+    { key: 'all',     label: `All${n(counts.all)}` },
+    { key: 'active',  label: `Active${n(counts.active)}` },
+    { key: 'banned',  label: `Banned${n(counts.banned)}` },
+    { key: 'invited', label: `Invited${n(counts.invited)}` },
   ]
+  const shownPeople = filteredHosts.length + filteredApps.filter((r) => !r.sameContactAs).length
+  const shownFlagged = filteredApps.length - filteredApps.filter((r) => !r.sameContactAs).length
+  /** The Host row an open application belongs to, if it is a Host's own. */
+  const viewingHost = viewingApp
+    ? reconciled.hostRows.find((r) => r.applications.some((a) => a.id === viewingApp.id))?.host ?? null
+    : null
 
   return (
     <div>
@@ -774,8 +847,22 @@ export default function HostsPage() {
       ) : (
         <>
           <div className="mb-3 text-sm text-slate-400">
-            Showing {filteredHosts.length + filteredApps.length} of {hosts.length + totalInvited} hosts
+            Showing {shownPeople} of {counts.all} {counts.all === 1 ? 'person' : 'people'}
             {hostAppsFailure && ' (pending invitations not included — they could not be read)'}
+            {shownFlagged > 0 && (
+              <span className="text-amber-300/90">
+                {' '}· {shownFlagged} invitation{shownFlagged === 1 ? '' : 's'} below
+                {shownFlagged === 1 ? ' carries' : ' carry'} an existing Host&rsquo;s phone or email —
+                flagged, and not counted again
+              </span>
+            )}
+            {/* Said, not silent: the cells fall back to the agency id or the
+                name copied onto the application, which may be out of date. */}
+            {agencyNamesFailure && (
+              <span className="text-slate-500">
+                {' '}· current agency names could not be read, so agencies show by id or by the name on the application
+              </span>
+            )}
           </div>
 
           <div className="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden">
@@ -803,14 +890,18 @@ export default function HostsPage() {
                     </tr>
                   ) : null}
 
-                  {/* Invited / pending application rows */}
-                  {filteredApps.map(app => (
+                  {/* Invited / pending application rows — GOV B08: only those
+                      that are nobody's Host row. One carrying an existing
+                      Host's own phone or email is flagged here, not hidden. */}
+                  {filteredApps.map(({ app, sameContactAs }) => {
+                    const ag = resolveAgencyName(app.agencyId, agencyNames, app.agencyName)
+                    return (
                     <tr key={`app-${app.id}`} className="border-b border-slate-700/50 bg-yellow-500/3 hover:bg-yellow-500/5 transition-colors">
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2.5">
-                          {app.photoUrl ? (
+                          {appPhotos.url('host', app.id) ? (
                             // eslint-disable-next-line @next/next/no-img-element
-                            <img src={app.photoUrl} alt="" className="w-8 h-8 rounded-full object-cover flex-shrink-0" />
+                            <img src={appPhotos.url('host', app.id)} alt="" className="w-8 h-8 rounded-full object-cover flex-shrink-0" />
                           ) : (
                             <div className="w-8 h-8 rounded-full bg-slate-600 flex items-center justify-center text-slate-300 text-xs font-bold flex-shrink-0">
                               {app.hostName?.[0]?.toUpperCase() ?? '?'}
@@ -819,14 +910,31 @@ export default function HostsPage() {
                           <div>
                             <span className="font-medium text-white">{app.hostName || '—'}</span>
                             <p className="text-slate-500 text-xs">{app.applicantEmail}</p>
+                            {sameContactAs && (
+                              <p className="text-amber-300 text-xs mt-0.5 flex items-center gap-1">
+                                <AlertTriangle size={10} className="shrink-0" />
+                                <span>
+                                  Same phone or email as Host{' '}
+                                  <Link href={`/users/${sameContactAs.uid}`} className="underline underline-offset-2 hover:text-amber-200">
+                                    {sameContactAs.name || sameContactAs.uid}
+                                  </Link>
+                                  {' '}— their invitation, not counted again
+                                </span>
+                              </p>
+                            )}
                           </div>
                         </div>
                       </td>
                       <td className="px-4 py-3 text-slate-300">{app.applicantPhone || '—'}</td>
                       <td className="px-4 py-3">
-                        {app.agencyName
-                          ? <span className="text-purple-300 text-xs">{app.agencyName}</span>
-                          : <span className="text-slate-500">—</span>}
+                        {ag.label ? (
+                          <>
+                            <span className="text-purple-300 text-xs" title={app.agencyId}>{ag.label}</span>
+                            {ag.staleName && (
+                              <p className="text-slate-500 text-xs">filed as {ag.staleName}</p>
+                            )}
+                          </>
+                        ) : <span className="text-slate-500">—</span>}
                       </td>
                       <td className="px-4 py-3 text-slate-500">—</td>
                       <td className="px-4 py-3 text-slate-500">—</td>
@@ -853,19 +961,25 @@ export default function HostsPage() {
                         </td>
                       )}
                     </tr>
-                  ))}
+                    )
+                  })}
 
-                  {/* Active / banned host rows from users collection */}
-                  {filteredHosts.map(host => {
+                  {/* Active / banned host rows from users collection — each
+                      with the applications that are this same person. */}
+                  {filteredHosts.map(({ host, applications }) => {
                     const acting = actingUids.has(host.uid)
                     const isBanInput = banInputUid === host.uid
+                    // GOV B20: by `users.agencyId` — where the Host IS — under
+                    // the agency document's current name, not the name copied
+                    // onto whichever application they came from.
+                    const ag = resolveAgencyName(host.agencyId, agencyNames)
                     return (
                       <tr key={host.uid} className="border-b border-slate-700/50 hover:bg-slate-700/20 transition-colors">
                         {/* Host name */}
                         <td className="px-4 py-3">
                           <Link href={`/users/${host.uid}`} className="flex items-center gap-2.5 hover:text-pink-400 transition-colors">
-                            {host.photoUrl ? (
-                              <img src={host.photoUrl} alt="" className="w-8 h-8 rounded-full object-cover flex-shrink-0" />
+                            {profilePhotoSrc(host.photoUrl) ? (
+                              <img src={profilePhotoSrc(host.photoUrl)} alt="" className="w-8 h-8 rounded-full object-cover flex-shrink-0" />
                             ) : (
                               <div className="w-8 h-8 rounded-full bg-yellow-500/20 flex items-center justify-center text-yellow-400 text-xs font-bold flex-shrink-0">
                                 {host.name?.[0]?.toUpperCase() ?? '?'}
@@ -873,12 +987,27 @@ export default function HostsPage() {
                             )}
                             <span className="font-medium text-white">{host.name || '—'}</span>
                           </Link>
+                          {applications.map((a) => (
+                            <p key={a.id} className="text-slate-500 text-xs mt-1 ml-[42px] flex items-center gap-1.5">
+                              <span className="font-mono">{linkedApplicationLabel(a)}</span>
+                              {canAct && (
+                                <button
+                                  onClick={() => setViewingApp(a)}
+                                  className="text-pink-400 hover:text-pink-300 underline underline-offset-2"
+                                >
+                                  View
+                                </button>
+                              )}
+                            </p>
+                          ))}
                         </td>
                         <td className="px-4 py-3 text-slate-300">{host.phoneNumber || '—'}</td>
                         <td className="px-4 py-3">
-                          {host.agencyId
-                            ? <span className="text-purple-300 text-xs font-mono">{host.agencyId}</span>
-                            : <span className="text-slate-500">—</span>}
+                          {!host.agencyId
+                            ? <span className="text-slate-500">—</span>
+                            : ag.current
+                              ? <span className="text-purple-300 text-xs" title={host.agencyId}>{ag.label}</span>
+                              : <span className="text-purple-300 text-xs font-mono">{host.agencyId}</span>}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1">
@@ -959,15 +1088,14 @@ export default function HostsPage() {
                                   </button>
                                 )}
 
-                                {/* Remove Host */}
-                                <button
-                                  onClick={() => handleRemoveHost(host.uid)}
-                                  disabled={acting}
-                                  title="Remove Host"
-                                  className="p-1.5 rounded bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 hover:bg-yellow-500/20 disabled:opacity-40 transition"
+                                {/* Host role — on the person's page, where their roles are known (UGP-B) */}
+                                <Link
+                                  href={`/users/${host.uid}`}
+                                  title="Host role and other roles"
+                                  className="p-1.5 rounded bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 hover:bg-yellow-500/20 transition"
                                 >
-                                  {acting ? <Loader2 size={13} className="animate-spin" /> : <StarOff size={13} />}
-                                </button>
+                                  <StarOff size={13} />
+                                </Link>
                               </div>
                             )}
                           </td>
@@ -986,6 +1114,8 @@ export default function HostsPage() {
       {viewingApp && (
         <HostAppModal
           app={viewingApp}
+          linkedHostName={viewingHost ? (viewingHost.name || viewingHost.uid) : undefined}
+          agency={resolveAgencyName(viewingApp.agencyId, agencyNames, viewingApp.agencyName)}
           onClose={() => setViewingApp(null)}
           onSaved={updated => {
             setHostApps(prev => prev.map(a => a.id === updated.id ? updated : a))

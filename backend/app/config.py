@@ -1,12 +1,31 @@
 """Application settings, loaded from environment."""
 
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core import isolation
+
+
+def _env_file() -> str:
+    """Which dotenv file this process reads. Exactly one, never a merge.
+
+    `ZIPPER_ENV_FILE` names it explicitly. Otherwise `.env.local` — the local
+    development configuration (emulators, a MongoDB on this machine) — is used
+    whenever it exists, and `.env` only when it does not. One file rather than
+    `.env` overlaid with `.env.local`, so a value left out of the local file can
+    never fall through to whatever `.env` holds. Relative to the working
+    directory, as before. Containers ship neither file (see backend/Dockerfile).
+    """
+    chosen = os.environ.get("ZIPPER_ENV_FILE", "").strip()
+    if chosen:
+        return chosen
+    return ".env.local" if os.path.exists(".env.local") else ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_env_file(), extra="ignore")
 
     environment: str = "development"
     api_port: int = 8080
@@ -24,6 +43,14 @@ class Settings(BaseSettings):
     #: this project uses the newer `.firebasestorage.app` suffix, not
     #: `.appspot.com`. It matches the bucket in firebase.json.
     firebase_storage_bucket: str = "zipper-83816.firebasestorage.app"
+
+    #: The local emulators, outside production only. Read from the environment
+    #: or the env file; `firebase.init()` refuses to start a non-production
+    #: process unless all three are set and on this machine, and then exports
+    #: them for the SDKs. See app/core/isolation.py. Never set in production.
+    firestore_emulator_host: str = ""
+    firebase_auth_emulator_host: str = ""
+    storage_emulator_host: str = ""
 
     # ── Session tokens ───────────────────────────────────────────────────────
     jwt_secret: str = "change-me"
@@ -56,6 +83,23 @@ class Settings(BaseSettings):
     #: Making a one-time code into a week-long credential would undo the control
     #: it exists to be. Twelve hours is exactly what it was before this change.
     observer_session_ttl_minutes: int = 720
+
+    # ── Owner MFA (P1-A3) ───────────────────────────────────────────────────
+    #: An Owner session is limited to the MFA routes until it has passed a TOTP
+    #: (or recovery-code) check. Replaces the browser-only three-question gate.
+    owner_mfa_required: bool = True
+    #: Fernet key (urlsafe base64, 32 bytes) that encrypts TOTP secrets at rest.
+    #: Generate with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+    #: and deliver it like JWT_SECRET (Secret Manager). Unset = enrolment is
+    #: refused (fail closed): an Owner cannot finish signing in until it is set.
+    owner_mfa_encryption_key: str = ""
+    #: Shown in the authenticator app beside the account name.
+    owner_mfa_issuer: str = "Zipper CRM"
+    #: Consecutive wrong codes before the account's MFA is locked for a while.
+    owner_mfa_max_failures: int = 5
+    owner_mfa_lock_minutes: int = 15
+    #: How long a started-but-unconfirmed enrolment stays valid.
+    owner_mfa_enrol_minutes: int = 15
 
     #: How long after a token's `exp` it may still be renewed silently.
     #:
@@ -592,6 +636,9 @@ PLACEHOLDER_SECRETS = frozenset({"", "change-me", "changeme", "secret", "test"})
 #: force regardless of how carefully it was generated.
 MIN_SECRET_CHARS = 32
 
+#: The only accepted values of ENVIRONMENT. Anything else refuses to start.
+VALID_ENVIRONMENTS = frozenset({"development", "test", "production", "prod"})
+
 
 class InsecureConfiguration(RuntimeError):
     """A required secret is missing, placeholder, or too short to be a secret."""
@@ -605,10 +652,24 @@ def secret_problems(s: "Settings") -> list[str]:
 
     Returns an empty list for a development environment: see the note above.
     """
-    if not s.is_production:
-        return []
-
     problems: list[str] = []
+
+    # Fail closed on the environment itself. `is_production` gates every check
+    # below, so a missing or misspelled ENVIRONMENT used to silently select the
+    # development path — placeholder JWT secret accepted, wildcard CORS.
+    env = (s.environment or "").strip().lower()
+    if env not in VALID_ENVIRONMENTS:
+        problems.append(
+            f"ENVIRONMENT={s.environment!r} is not one of {sorted(VALID_ENVIRONMENTS)}."
+        )
+    # Cloud Run always sets K_SERVICE. A container running there is production,
+    # whatever ENVIRONMENT says.
+    if os.environ.get("K_SERVICE") and not s.is_production:
+        problems.append(
+            "Running on Cloud Run (K_SERVICE is set) but ENVIRONMENT is not 'production'."
+        )
+    if not s.is_production:
+        return problems
 
     value = (s.jwt_secret or "").strip()
     if value.lower() in PLACEHOLDER_SECRETS:
@@ -643,7 +704,11 @@ def assert_secure_configuration(s: "Settings | None" = None) -> None:
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    # Outside production no email leaves this process, whatever the env file
+    # holds: the key is dropped here and every delivery records not_configured.
+    isolation.disable_outbound_email_outside_production(s)
+    return s
 
 
 settings = get_settings()

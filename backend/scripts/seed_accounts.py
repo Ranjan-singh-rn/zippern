@@ -268,8 +268,23 @@ async def main() -> int:
             return 1
         seen.add(email)
 
+    # P0-10 (OPS-C): seeding writes Owner and Observer accounts — the target is
+    # named and confirmed before anything connects, and the database must name it.
+    from app.core.destructive import DestructiveRefused, require_data_canary, require_destructive_target
+    try:
+        print(require_destructive_target("seed_accounts", writes=True))
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        return 2
+
     firebase.init()
     await mongo.connect()
+    try:
+        await require_data_canary(mongo.get_db(), "seed_accounts")
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        await mongo.disconnect()
+        return 2
 
     print(f"\nOwners — {len(OWNERS)} configured of the {OWNERS_BY_DESIGN} the")
     print("governance model calls for (spec 1.2).")

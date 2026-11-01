@@ -1,0 +1,68 @@
+"""P1-A3 — remove the retired Owner "security gate" answers from `crmUsers`.
+
+The gate stored three answers (full name, phone number, nickname) in PLAIN TEXT
+on `crmUsers/{uid}.gateAnswers`, and `crmUsers` is readable by every member of
+staff. The gate is gone — Owners pass server-enforced TOTP
+(`app/services/owner_mfa.py`) — and no client may write the field any more
+(firestore.rules). The values already stored are personal data with no reader;
+this deletes them.
+
+    python3 -m scripts.remove_gate_answers                         # report only
+    python3 -m scripts.remove_gate_answers --apply --project <id>  # delete the field
+
+Dry by default. `--apply` also needs `--project`, which must equal the project
+the Admin SDK is pointed at — so a production run is a deliberate act, typed
+out, never the result of a stale environment. It prints counts and a short
+fingerprint per document, never a uid, a name, a phone number or an answer.
+
+Only the `gateAnswers` field is deleted (`DELETE_FIELD`); nothing else on the
+document is touched. Re-running is safe: documents without the field are skipped.
+
+NOT RUN as part of Phase 1 — it is a production data change and needs approval.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+
+
+def _fingerprint(doc_id: str) -> str:
+    return hashlib.sha256(doc_id.encode()).hexdigest()[:8]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="delete the field (default: report only)")
+    ap.add_argument("--project", default="", help="required with --apply; must match the Admin SDK project")
+    args = ap.parse_args(argv)
+
+    from firebase_admin import firestore as fb_firestore
+
+    from app.db import firebase
+
+    firebase.init()
+    client = firebase.firestore_client()
+    actual = str(getattr(client, "project", "") or "")
+    if args.apply and (not args.project or args.project != actual):
+        print(f"Refusing to write: --project {args.project!r} does not match the connected project "
+              f"{actual!r}.", file=sys.stderr)
+        return 2
+
+    holders = [d for d in client.collection("crmUsers").stream() if "gateAnswers" in (d.to_dict() or {})]
+    print(f"project: {actual}")
+    print(f"crmUsers documents carrying gateAnswers: {len(holders)}")
+    for d in holders:
+        print(f"  doc #{_fingerprint(d.id)}  role={str((d.to_dict() or {}).get('role', ''))!r}")
+    if not args.apply:
+        print("Report only. Re-run with --apply --project <id> to delete the field.")
+        return 0
+    for d in holders:
+        d.reference.update({"gateAnswers": fb_firestore.DELETE_FIELD})
+    print(f"Deleted gateAnswers from {len(holders)} document(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

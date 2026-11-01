@@ -52,6 +52,8 @@ import {
 
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, CrmRole } from '@/lib/auth'
+import { nameOrReference, referenceOf } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import api, {
   ApiError,
   type PendingVerification,
@@ -136,6 +138,8 @@ function ReviewDialog({
   onDecided: (message: string) => void
 }) {
   const [detail, setDetail] = useState<VerificationCase | null>(null)
+  // B1: name the agency on the case (an agencies/{id} record id).
+  const caseAgency = useIdentities({ partners: detail?.agencyId ? [detail.agencyId] : [] })
   const [loadError, setLoadError] = useState('')
   const [verdict, setVerdict] = useState<'verified' | 'rejected' | null>(null)
   const [reason, setReason] = useState('')
@@ -265,7 +269,7 @@ function ReviewDialog({
 
             {/* The facts the verdict is read back against */}
             <div className="mx-6 mt-4 bg-slate-800/60 border border-slate-700 rounded-xl p-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-              <Fact label="Agency" value={detail.agencyId || 'none on record'} />
+              <Fact label="Agency" value={detail.agencyId ? nameOrReference(caseAgency.partners.get(detail.agencyId), detail.agencyId, 'agency') : 'none on record'} />
               <Fact label="Attempts" value={String(detail.attemptCount)} />
               <Fact
                 label="Comparison"
@@ -477,6 +481,8 @@ export default function HostVerificationPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [reviewing, setReviewing] = useState<PendingVerification | null>(null)
+  // B1: name each row's agency (an agencies/{id} record id), in one batched read.
+  const agencies = useIdentities({ enabled: allowed, partners: rows.map((r) => r.agencyId) })
   const [flash, setFlash] = useState('')
 
   const load = useCallback(() => {
@@ -518,7 +524,9 @@ export default function HostVerificationPage() {
       hideOnMobile: true,
       render: (r) =>
         r.agencyId ? (
-          <span className="text-purple-300 text-xs font-mono">{r.agencyId}</span>
+          <span className="text-purple-300 text-xs" title={referenceOf('agency', r.agencyId)}>
+            {nameOrReference(agencies.partners.get(r.agencyId), r.agencyId, 'agency')}
+          </span>
         ) : (
           <span className="text-slate-600 text-xs">none on record</span>
         ),

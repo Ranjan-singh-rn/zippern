@@ -29,8 +29,12 @@ import { DataTable, type Column } from '@/components/ui/DataTable'
 import { Denied, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
+import { nameOrReference, referenceOf } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import { UserActions } from './UserActions'
 import HostRecord from './HostRecord'
+import PartnerApplications from './PartnerApplications'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member',
@@ -48,12 +52,17 @@ const TABS: { key: TabKey; label: string; icon: LucideIcon }[] = [
 
 interface UserDoc {
   uid: string
+  /** Denormalised from `crmUsers`. Hides the moderation controls on an
+   *  internal identity; the enforcing check is server-side. */
+  crmRole: string
   name: string
   email: string
   phoneNumber: string
   photoUrl: string
   diamonds: number
   beans: number
+  /** Released beans — what a payout or a warning deduction may take (UGP-D). */
+  beansAvailable: number
   /** USER ladder, 0–20, from `totalXp`. Has no writer — see the note at its read. */
   level: number
   /** HOST ladder, 0–10, from beans earned. Server-maintained, absent means 0. */
@@ -83,6 +92,9 @@ interface UserDoc {
   previousBanReason: string
   bannedByName: string
   bannedAt: Timestamp | null
+  /** `suspend_user` stamps these, not `bannedBy*` (UGP: the banner named the wrong actor). */
+  suspendedByName: string
+  suspendedAt: Timestamp | null
   warningCount: number
   createdAt: Timestamp | null
 }
@@ -205,8 +217,10 @@ export default function UserDetailPage() {
         email: d.email ?? '',
         phoneNumber: d.phoneNumber ?? '',
         photoUrl: d.photoUrl ?? '',
+        crmRole: typeof d.crmRole === 'string' ? d.crmRole : '',
         diamonds: d.diamonds ?? 0,
         beans: d.beans ?? 0,
+        beansAvailable: typeof d.beansAvailable === 'number' ? d.beansAvailable : 0,
         /*
          * 0, not 1 — and `hostLevel` alongside it, because they are two ladders.
          *
@@ -237,6 +251,8 @@ export default function UserDetailPage() {
         previousBanReason: d.previousBanReason ?? '',
         bannedByName: d.bannedByName ?? '',
         bannedAt: d.bannedAt ?? null,
+        suspendedByName: d.suspendedByName ?? '',
+        suspendedAt: d.suspendedAt ?? null,
         warningCount: d.warnings ?? 0,
         createdAt: d.createdAt ?? null,
       })
@@ -436,6 +452,9 @@ export default function UserDetailPage() {
     },
   ], [])
 
+  // B1: `agencyId` is an agencies/{id} record id — named from `agencies`.
+  const agencyOfUser = useIdentities({ enabled: canView, partners: user?.agencyId ? [user.agencyId] : [] })
+
   if (authLoading) return <Loading label="Checking your access…" />
   if (!canView) return <Denied what="user records" />
 
@@ -462,10 +481,10 @@ export default function UserDetailPage() {
           {/* Identity */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 sm:p-6">
             <div className="flex items-start gap-4">
-              {user.photoUrl ? (
+              {profilePhotoSrc(user.photoUrl) ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
-                  src={user.photoUrl}
+                  src={profilePhotoSrc(user.photoUrl)}
                   alt=""
                   className="w-16 h-16 rounded-full object-cover ring-2 ring-pink-500/60"
                 />
@@ -497,7 +516,7 @@ export default function UserDetailPage() {
                 user.isHost
                   ? { label: 'Host level', value: `Level ${user.hostLevel}` }
                   : { label: 'Level', value: `Level ${user.level}` },
-                { label: 'Agency', value: user.agencyId || '—' },
+                { label: 'Agency', value: user.agencyId ? nameOrReference(agencyOfUser.partners.get(user.agencyId), user.agencyId, 'agency') : '—' },
                 { label: 'Diamonds', value: user.diamonds.toLocaleString('en-IN'), tone: 'text-blue-300' },
                 { label: 'Beans', value: user.beans.toLocaleString('en-IN'), tone: 'text-green-300' },
                 { label: 'Warnings', value: String(user.warningCount) },
@@ -522,8 +541,12 @@ export default function UserDetailPage() {
                   {user.isSuspended ? 'Suspended' : 'Banned'} — locked out of the app
                 </p>
                 <p className="text-red-100/90 text-sm mt-1">{user.banReason || 'No reason recorded.'}</p>
+                {/* A suspension is stamped `suspendedBy*` and a ban `bannedBy*`.
+                    Reading `bannedBy*` for both printed "unknown", or the actor
+                    of an EARLIER ban, on every suspended account. */}
                 <p className="text-slate-400 text-xs mt-1">
-                  by {user.bannedByName || 'unknown'} · {fmtStamp(user.bannedAt)}
+                  by {(user.isSuspended ? user.suspendedByName : user.bannedByName) || 'unknown'} ·{' '}
+                  {fmtStamp(user.isSuspended ? user.suspendedAt : user.bannedAt)}
                 </p>
               </div>
             </div>
@@ -546,8 +569,16 @@ export default function UserDetailPage() {
             isSuspended={user.isSuspended}
             isHost={user.isHost}
             isSeller={user.isSeller}
+            crmRole={user.crmRole}
+            actorUid={crmUser?.uid}
+            diamonds={user.diamonds}
+            beansAvailable={user.beansAvailable}
             onDone={loadAll}
           />
+
+          {/* Partner-role applications — pending ones carry the decision.
+              This is what replaced the Grant host / Make seller buttons. */}
+          <PartnerApplications uid={user.uid} onChanged={loadAll} />
 
           {/* The application, the documents and the payout details. Renders
               nothing for somebody who is neither a host nor an applicant. */}

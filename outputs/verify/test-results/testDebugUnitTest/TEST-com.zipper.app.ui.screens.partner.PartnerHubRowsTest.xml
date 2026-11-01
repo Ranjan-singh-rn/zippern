@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" tests="15" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.061Z" hostname="CW253.local" time="0.003">
+  <properties/>
+  <testcase name="an active host record is still a host, and an older response parses as before" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="eligibility parses revoked roles and a revoked host is not a host" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="revoked agency plus approved seller - agency revoked with reinstatement, seller held, no apply for agency" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a role appeal parses its public fields" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.001"/>
+  <testcase name="nothing revoked changes nothing" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="the Host card never offers an agency role (B36)" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a status this build does not know offers no second request" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a request the eligibility read did not carry is taken from my requests" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a revoked Host is a revoked row, not a Host chip and not an application" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="the reinstatement statement must be 20 to 2000 characters, trimmed" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a request kept revoked offers a new one and says why" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="the hub uses the mapping, refreshes on return and after a request" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.001"/>
+  <testcase name="a recommended request is still open" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="a revoked record the list did not name still reads as revoked" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <testcase name="an open request is shown as pending and offers nothing to tap" classname="com.zipper.app.ui.screens.partner.PartnerHubRowsTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

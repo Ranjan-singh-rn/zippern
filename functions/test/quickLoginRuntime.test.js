@@ -781,6 +781,24 @@ describe('the session-less appeal', () => {
     expect(db.count('appeals')).toBe(2)
   })
 
+  test('a pending appeal from the PUBLIC web form does not block the owner (UGP review)', async () => {
+    // Anybody who knows the account id can file on the web; the owner, proven
+    // by this device's key, must still be able to file their own.
+    const { secret, keys, uid } = seedAccount({ account: { isBanned: true } })
+    db.seed('appeals/public1', {
+      subjectUid: uid, status: 'pending', source: 'public_web',
+      createdAt: Timestamp.fromMillis(Date.now() - 1000),
+    })
+    const c = await challengeAndSign(keys.privateKey)
+    const res = await appeal({ token: secret, challengeId: c.challengeId, signature: c.signature, statement: STATEMENT })
+    expect(res.status).toBe('submitted')
+    expect(db.count('appeals')).toBe(2)
+    // …while the owner's OWN pending appeal still blocks a second one.
+    const c2 = await challengeAndSign(keys.privateKey)
+    const again = await appeal({ token: secret, challengeId: c2.challengeId, signature: c2.signature, statement: STATEMENT })
+    expect(again.status).toBe('already_pending')
+  })
+
   test('a signature from the wrong key is refused, and nothing is stored', async () => {
     const { secret } = seedAccount({ account: { isBanned: true } })
     const thief = keypair()

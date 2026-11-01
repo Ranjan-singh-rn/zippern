@@ -28,6 +28,9 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from google.api_core.exceptions import FailedPrecondition
+
+from app.core.firestore_errors import index_unavailable
 from app.core import roles as R
 from app.core.deps import current_user, own_partner_id_or_403, require_internal
 from app.core.roles import Role
@@ -113,6 +116,10 @@ async def agency_appeals(
     aid = own_partner_id_or_403(user, agency_id, kind="agency")
     try:
         return await appeals_svc.appeals_for_agency(aid, limit)
+    except FailedPrecondition as exc:
+        # Same shape as the staff queue: `agencyId ==` plus an order on
+        # `createdAt` needs a composite index, and that one was missing too.
+        raise index_unavailable(exc, "this agency's appeals") from exc
     except AppealError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.partner.FilingConfirmationTest" tests="9" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.053Z" hostname="CW253.local" time="0.002">
+  <properties/>
+  <testcase name="the recharge form sends one request id, the same on every retry" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.001"/>
+  <testcase name="the sentences never claim it failed" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="the application form looks before it speaks" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="a Host application is found on the same list" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="a pending application of the kind just submitted confirms it" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="the look-again budget is small" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="another kind, or anything not pending, confirms nothing" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="a reinstatement request that may have been filed re-reads the hub" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.0"/>
+  <testcase name="a UUID is a request id the bridge and the API accept" classname="com.zipper.app.ui.screens.partner.FilingConfirmationTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

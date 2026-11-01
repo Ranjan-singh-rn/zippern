@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.AppBuildTest" tests="3" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.067Z" hostname="CW253.local" time="0.003">
+  <properties/>
+  <testcase name="the server reads the same field name" classname="com.zipper.app.util.AppBuildTest" time="0.001"/>
+  <testcase name="the installed versionCode comes from PackageManager, never BuildConfig" classname="com.zipper.app.util.AppBuildTest" time="0.002"/>
+  <testcase name="resolveIdentity carries the build, and only when it is known" classname="com.zipper.app.util.AppBuildTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

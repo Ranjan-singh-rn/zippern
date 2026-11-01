@@ -113,8 +113,12 @@ apps = strip_comments(block("hostApplications"))
 # KYC document URLs.
 ok("the unbound activation clause is gone",
    "hasOnly(['isActivated', 'activatedByUid'])" not in apps)
+# Phase 1A (SECURITY-002): the applicant update arm is gone entirely, and both
+# fields are on `hostDecisionFields()`, which no client arm may touch.
 ok("an app user still cannot touch those two fields",
-   "hasAny(['isActivated', 'activatedByUid'])" in apps)
+   "'isActivated', 'activatedByUid'" in apps
+   and "hostAppDecisionUntouched()" in apps
+   and "resource.data.applicantUid == request.auth.uid" not in apps)
 ok("the read clause on activatedByUid is unchanged, now that it cannot be forged",
    "resource.data.get('activatedByUid', '') == request.auth.uid" in apps)
 
@@ -297,8 +301,12 @@ ok("suspension does too", "_revoke_partner_sessions" in deact_fn)
 
 react_fn = ops_src[ops_src.index("async def reactivate_partner") :]
 react_fn = react_fn[: react_fn.index("\nasync def ", 10)]
-ok("reactivation does NOT revoke — they are being let back in",
-   "_revoke_partner_sessions" not in react_fn)
+# B39: reactivation revokes too — not to shut them out but because the session
+# they hold was minted while the capability was withdrawn and does not carry
+# it. The CRM signs them back in and the new session does. Approval has always
+# done the same for the same reason.
+ok("reactivation revokes too, so the restored capability reaches a fresh session (B39)",
+   "_revoke_partner_sessions" in react_fn)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,11 +1,19 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
+import * as crypto from 'crypto'
 import { getHostLadder, hostLevelFor } from './hostStats'
 // The two eligibility rules live in a file that imports nothing, so they can
 // be required from a test without an initialised Firebase app. See the header
 // of ./hostEligibility.
-import { heldByAnotherAgency, restrictionOn } from './hostEligibility'
+import {
+  heldByAnotherAgency, restrictionOn, decisionRefusal, agencyCodeRefusal, guestRefusal,
+  hostRoleRevoked, hostOfSameAgency, activeHostRefusal, HOST_REVOKED_REFUSAL, ROLE_REVOKED,
+} from './hostEligibility'
 import { sameNumber } from './phone'
+import { hostBlockedFor } from './crmRoles'
+import { assertActiveSession } from './mobileSession'
+import { CONTACT_VERIFICATION_REQUIRED, contactProofFor } from './contactProof'
+import { ROSTER_ACTIVE, ROSTER_REMOVED_AT, ROSTER_REMOVED_REASON } from './roster'
 
 const db = admin.firestore()
 
@@ -130,7 +138,11 @@ function writeAgencyMembership(
   uid: string,
   fields: {
     name: string
-    applicationId: string
+    /**
+     * Omitted when the row is repaired from a DUPLICATE invitation (B09): the
+     * row keeps naming the application the host actually joined on.
+     */
+    applicationId?: string
     callRateBeans?: number
     /** False when this is repairing a row for a host activated earlier. */
     joining: boolean
@@ -146,8 +158,15 @@ function writeAgencyMembership(
     uid,
     name: fields.name,
     agencyId,
-    applicationId: fields.applicationId,
+    // FX-10 (RF-15): a membership written here is CURRENT. `revoke_host` and
+    // the account purge mark a row `active: false` (with when and why) rather
+    // than leaving it to be counted; an activation — or the re-entry repair
+    // below, which a revoked Host never reaches — makes it current again.
+    [ROSTER_ACTIVE]: true,
+    [ROSTER_REMOVED_AT]: admin.firestore.FieldValue.delete(),
+    [ROSTER_REMOVED_REASON]: admin.firestore.FieldValue.delete(),
   }
+  if (fields.applicationId) doc.applicationId = fields.applicationId
   if (fields.joining) doc.joinedAt = admin.firestore.FieldValue.serverTimestamp()
   if (fields.callRateBeans !== undefined) doc.callRateBeans = fields.callRateBeans
 
@@ -158,6 +177,49 @@ function writeAgencyMembership(
   )
 }
 
+// ── FX-12: superseding the person's other open applications ────────────────
+
+/** The text the backend writes on one (`users.SUPERSEDED_REASON`), kept in step. */
+export const SUPERSEDED_REASON =
+  'Closed: this person became a Host through another application ({by}), so this ' +
+  'one was not decided on its merits. Nothing else changed.'
+
+/**
+ * Which of a person's own applications an activation closes: every OTHER one
+ * still pending and never redeemed. Pure — `fxHostSupersede.test.js` runs it.
+ */
+export function supersededApplications(
+  own: { id: string; data: Record<string, unknown> }[],
+  keepId: string,
+): string[] {
+  return own
+    .filter((a) => a.id !== keepId)
+    // Decision 15 (RC): an application the Owner approved that is still
+    // WAITING for verified contacts is open too — once the person is a Host
+    // through this redemption it can never start, so it is closed with the rest.
+    .filter((a) => ['pending', 'awaiting_verification'].includes(String(a.data.status ?? 'pending'))
+      && a.data.isActivated !== true)
+    .map((a) => a.id)
+}
+
+/** The stamp on a superseded application: a refusal in both status fields, saying why. */
+export function supersededStamp(byId: string, now: unknown): Record<string, unknown> {
+  const note = SUPERSEDED_REASON.replace('{by}', byId)
+  return {
+    status: 'rejected',
+    kycStatus: 'rejected',
+    rejectionReason: note,
+    decisionReason: note,
+    decidedAt: now,
+    decidedBy: 'activateHost',
+    decidedByUid: '',
+    decidedByRole: 'system',
+    supersededBy: byId,
+    supersededAt: now,
+    updatedAt: now,
+  }
+}
+
 export const activateHost = functions
   .region('asia-south1')
   .https.onCall(async (data: ActivateRequest, context) => {
@@ -166,6 +228,12 @@ export const activateHost = functions
 
     const code = String(data?.referralCode ?? '').trim().toUpperCase()
     if (!code) throw new functions.https.HttpsError('invalid-argument', 'A referral code is required.')
+
+    // Phase 1A (AUTH-002): a guest is refused before anything is looked up.
+    const guest = guestRefusal(context.auth?.token)
+    if (guest) throw new functions.https.HttpsError('permission-denied', guest)
+    // Phase 1A (SESSION-001/003): a protected operation.
+    await assertActiveSession(uid, data, 'activateHost', context.auth?.token)
 
     // Token first, then what was saved at profile setup, then the form. See
     // `identityFor` — the stored half is what lets somebody redeem a code with
@@ -190,13 +258,45 @@ export const activateHost = functions
     const userRef = db.collection('users').doc(uid)
     const verRef = db.collection('hostVerification').doc(uid)
 
+    // Decision 15 (RC): read once, before the transaction, and enforced only
+    // where a redemption STARTS the Host role (below). `identityFor` already
+    // insists on a verified phone and email to match the invitation; this is
+    // the stricter question the backend asks as well — an address Firebase
+    // marked verified on a password account (a reset link) is not proof
+    // without our own code. See contactProof.ts.
+    const proof = await contactProofFor(uid)
+
     return db.runTransaction(async (tx) => {
-      const [appSnap, userSnap] = await Promise.all([tx.get(appRef), tx.get(userRef)])
+      const [appSnap, userSnap, crmSnap] = await Promise.all([
+        tx.get(appRef), tx.get(userRef), tx.get(db.collection('crmUsers').doc(uid)),
+      ])
       if (!appSnap.exists) throw new functions.https.HttpsError('not-found', 'That referral code does not exist.')
       if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Finish setting up your profile first.')
 
       const app = appSnap.data() as Record<string, any>
       const agencyId = String(app.agencyId ?? '').trim()
+
+      // The role table, on the one path that grants Host without the backend.
+      // RC (confirmed role rule): a Sub-agency of main Agency X may also be a
+      // Host directly under X — so the login's own Sub-agency (its main
+      // agency) and the inviting agency (main or not) are read to decide.
+      const crm = crmSnap.exists ? (crmSnap.data() as Record<string, unknown>) : null
+      const ownAgencyId = String(crm?.agencyId ?? '').trim()
+      const [ownAgencySnap, invitingSnap] = await Promise.all([
+        ownAgencyId ? tx.get(db.collection('agencies').doc(ownAgencyId)) : Promise.resolve(null),
+        agencyId ? tx.get(db.collection('agencies').doc(agencyId)) : Promise.resolve(null),
+      ])
+      const own = ownAgencySnap && ownAgencySnap.exists ? (ownAgencySnap.data() as Record<string, unknown>) : null
+      const ownIsSub = String(own?.type ?? '').trim().toLowerCase() === 'sub'
+      const inviting = invitingSnap && invitingSnap.exists ? (invitingSnap.data() as Record<string, unknown>) : null
+      const invitingIsMain = !!inviting && String(inviting.type ?? 'main').trim().toLowerCase() !== 'sub'
+        && !String(inviting.parentAgencyId ?? '').trim()
+      const blocked = hostBlockedFor(crm, {
+        subParentId: ownIsSub ? String(own?.parentAgencyId ?? '').trim() : '',
+        invitationAgencyId: agencyId,
+        invitationAgencyIsMain: invitingIsMain,
+      })
+      if (blocked) throw new functions.https.HttpsError('failed-precondition', blocked)
       const hostName = String(app.hostName ?? userSnap.get('name') ?? '').trim()
 
       /*
@@ -214,6 +314,19 @@ export const activateHost = functions
       const restriction = restrictionOn(userSnap)
       if (restriction) {
         throw new functions.https.HttpsError('permission-denied', restriction)
+      }
+
+      /*
+       * ── A REVOKED HOST IS NOT A NEW APPLICANT (C1, B04) ────────────────────
+       *
+       * `hostRevokedAt` used to be ignored here, so a Host removed by staff
+       * became a Host again by redeeming any invitation — including their own
+       * old one, whose re-entry path below rewrites the roster row. Refused
+       * before both: the way back is a reinstatement request, decided by an
+       * Owner, not a referral code.
+       */
+      if (hostRoleRevoked(userSnap)) {
+        throw new functions.https.HttpsError('failed-precondition', HOST_REVOKED_REFUSAL, { code: ROLE_REVOKED })
       }
 
       /*
@@ -238,6 +351,21 @@ export const activateHost = functions
         )
       }
 
+      // Both must match. The code alone is a six-character string that can be
+      // guessed or shared; tying it to the contact details the agency
+      // registered is what makes it a claim about a person.
+      //
+      // The phone goes through `samePhone`, exactly as the candidate search
+      // did — the two must ask the same question or a code goes green in the
+      // form and is refused on submit, which is indistinguishable from the app
+      // doing nothing at all.
+      //
+      // Computed here and refused further down, after the decision and the
+      // agency, as before — B09 below needs the answer earlier.
+      const appEmail = String(app.applicantEmail ?? '').trim().toLowerCase()
+      const phoneOk = samePhone(app.applicantPhone, phone)
+      const emailOk = appEmail !== '' && email !== '' && appEmail === email
+
       if (app.isActivated === true) {
         // Re-running it for the same account is harmless; for a different one
         // it is someone else's code.
@@ -254,6 +382,45 @@ export const activateHost = functions
         }
         throw new functions.https.HttpsError('failed-precondition', 'That referral code has already been used.')
       }
+
+      /*
+       * ── B09: ALREADY A HOST OF THIS AGENCY ─────────────────────────────────
+       *
+       * An agency that invites one of its own Hosts again — a re-invite after a
+       * typo, a second Invite Host from another staff member — leaves a second
+       * invitation under the same code, and `candidateRank` puts an unredeemed
+       * one AHEAD of the invitation this person already redeemed. Redeeming it
+       * ran the full activation below: `isVerifiedHost` back to false, the
+       * agreed rate replaced, the verification record reopened at
+       * pending_capture — a verified, payable Host reset to unverified by
+       * typing their own code.
+       *
+       * It is a duplicate, not an activation. A server-approved duplicate is
+       * marked used and linked to this Host, so the CRM shows one person and
+       * not a second "Awaiting Activation" row; a rejected or undecided one is
+       * left exactly as it is. The user document (badge, rate, agency), the
+       * verification record and the roster's join date and rate are not
+       * touched — the roster row is only repaired, as on any re-entry.
+       */
+      if (hostOfSameAgency(userSnap, agencyId)) {
+        if (!phoneOk || !emailOk) {
+          throw new functions.https.HttpsError(
+            'permission-denied',
+            'This code was issued to a different phone number or email address.',
+          )
+        }
+        if (decisionRefusal(app) === '') {
+          tx.update(appRef, {
+            isActivated: true,
+            activatedByUid: uid,
+            activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            linkedToExistingHost: true,
+          })
+        }
+        writeAgencyMembership(tx, agencyId, uid, { name: hostName, joining: false })
+        return { alreadyActivated: true, agencyId }
+      }
+
       /*
        * APPROVED, not merely "not rejected".
        *
@@ -266,32 +433,39 @@ export const activateHost = functions
        * The decision now comes first (`decide_host_application` marks the
        * application without needing an account) and this is what enforces it.
        */
-      if (app.status === 'rejected') {
-        throw new functions.https.HttpsError('failed-precondition', 'That application was not approved.')
-      }
-      if (app.status !== 'approved') {
-        throw new functions.https.HttpsError(
-          'failed-precondition',
-          'This invitation has not been approved yet. Your agency has sent it ' +
-          'for review — you will be able to use the code once it is approved.',
-        )
-      }
+      // Phase 1A (SECURITY-002): the SERVER's decision stamp, not a status
+      // string a client could have written. See `decisionRefusal`.
+      const undecided = decisionRefusal(app)
+      if (undecided) throw new functions.https.HttpsError('failed-precondition', undecided)
 
-      // Both must match. The code alone is a six-character string that can be
-      // guessed or shared; tying it to the contact details the agency
-      // registered is what makes it a claim about a person.
-      //
-      // The phone goes through `samePhone`, exactly as the candidate search
-      // did — the two must ask the same question or a code goes green in the
-      // form and is refused on submit, which is indistinguishable from the app
-      // doing nothing at all.
-      const appEmail = String(app.applicantEmail ?? '').trim().toLowerCase()
-      const phoneOk = samePhone(app.applicantPhone, phone)
-      const emailOk = appEmail !== '' && email !== '' && appEmail === email
+      // Phase 1A (SECURITY-002): the code must be the named agency's real code,
+      // and that agency must be live — a forged code or a re-pointed agencyId
+      // on the application is refused here.
+      const agencySnap = agencyId
+        ? await tx.get(db.collection('agencies').doc(agencyId))
+        : null
+      const badAgency = agencyCodeRefusal(
+        agencySnap && agencySnap.exists ? (agencySnap.data() as Record<string, any>) : null,
+        code,
+      )
+      if (badAgency) throw new functions.https.HttpsError('failed-precondition', badAgency)
+
+      // The contact match computed above (see "Both must match").
       if (!phoneOk || !emailOk) {
         throw new functions.https.HttpsError(
           'permission-denied',
           'This code was issued to a different phone number or email address.',
+        )
+      }
+
+      // Decision 15 (RC): the role starts only with BOTH contacts verified on
+      // this account, by the definition every service shares.
+      if (!proof.complete) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Your Host role starts once both your phone number and your email address are verified on this account.',
+          { code: CONTACT_VERIFICATION_REQUIRED, requirement: 'both', missing: proof.missing,
+            emailUnproved: proof.emailUnproved },
         )
       }
 
@@ -305,9 +479,29 @@ export const activateHost = functions
       const requested = Number(app.callRate ?? min)
       const callRateBeans = Math.min(Math.max(requested, min), max)
 
+      // FX-12 (RF-05 / DUP-06): the person's own OTHER open host applications
+      // — read here, with the rest of the transaction's reads, and closed
+      // below in the same write as the activation. A pending self-application
+      // left beside a redeemed invitation sat in /kyc as a second application
+      // for somebody who was already a Host, and refusing it later was how the
+      // role got taken away (RF-04).
+      const ownApps = await tx.get(
+        db.collection('hostApplications').where('applicantUid', '==', uid),
+      )
+      const supersede = supersededApplications(
+        ownApps.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, unknown> })),
+        appRef.id,
+      )
+
       const now = admin.firestore.FieldValue.serverTimestamp()
 
       tx.update(appRef, { isActivated: true, activatedByUid: uid, activatedAt: now })
+      for (const otherId of supersede) {
+        // The B32 lock on a superseded application is released by the backend
+        // the next time it is consulted: a lock whose application is no
+        // longer pending is stale by definition (`_host_lock_is_stale`).
+        tx.update(db.collection('hostApplications').doc(otherId), supersededStamp(appRef.id, now))
+      }
       tx.update(userRef, {
         isHost: true,
         agencyId,
@@ -342,7 +536,7 @@ export const activateHost = functions
         joining: true,
       })
 
-      return { alreadyActivated: false, agencyId, callRateBeans }
+      return { alreadyActivated: false, agencyId, callRateBeans, supersededApplications: supersede }
     })
   })
 
@@ -385,6 +579,7 @@ export const setCallRate = functions
     const uid = context.auth?.uid
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
 
+    await assertActiveSession(uid, data, 'setCallRate', context.auth?.token)   // Phase 1A
     const requested = Math.floor(Number(data?.callRateBeans))
     if (!Number.isFinite(requested) || requested <= 0) {
       throw new functions.https.HttpsError('invalid-argument', 'A call rate in beans per minute is required.')
@@ -537,26 +732,40 @@ function samePhone(a: unknown, b: unknown): boolean {
 async function identityFor(
   uid: string,
   token: Record<string, any> | undefined,
-  data: { phone?: string; email?: string } | undefined,
+  // Kept in the signature so callers compile; deliberately IGNORED. See below.
+  _data?: { phone?: string; email?: string } | undefined,
 ): Promise<{ phone: string; email: string }> {
+  /*
+   * ── Phase 1A (SECURITY-002 / CONTACT-001): VERIFIED SOURCES ONLY ─────────
+   *
+   * This used to fall back to the user document and then to the request body.
+   * Both are typed values: anyone could put a victim's phone and email in the
+   * request (or, before the rules change, on their own user document) and
+   * redeem the invitation addressed to that victim. A claim about a person
+   * must come from something that person proved.
+   *
+   *   1. the ID token — verified by Firebase;
+   *   2. the Firebase Auth RECORD for this uid — phone numbers on it were
+   *      OTP-verified to get there, and the email is used only when
+   *      `emailVerified` is true. This covers a token minted before a
+   *      `bindVerifiedIdentity` link.
+   *
+   * Nothing else. An applicant missing a half adds it through the verified
+   * bind flow and tries again.
+   */
   let phone = String(token?.phone_number ?? '').trim()
   let email = String(token?.email ?? '').trim().toLowerCase()
+  if (email && token?.email_verified === false) email = ''
 
   if (!phone || !email) {
-    // One read, and only when the token is actually missing something.
-    const snap = await db.collection('users').doc(uid).get()
-    if (snap.exists) {
-      // `phoneNumber` is what the app writes — `createUserDocument` and
-      // `saveUserProfile` both use that spelling. `phone` is read too so a
-      // record written by anything else is not silently ignored.
-      if (!phone) phone = String(snap.get('phoneNumber') ?? snap.get('phone') ?? '').trim()
-      if (!email) email = String(snap.get('email') ?? '').trim().toLowerCase()
+    try {
+      const rec = await admin.auth().getUser(uid)
+      if (!phone) phone = String(rec.phoneNumber ?? '').trim()
+      if (!email && rec.emailVerified) email = String(rec.email ?? '').trim().toLowerCase()
+    } catch {
+      // No record: nothing verified to add. The comparison below refuses.
     }
   }
-
-  if (!phone) phone = String(data?.phone ?? '').trim()
-  if (!email) email = String(data?.email ?? '').trim().toLowerCase()
-
   return { phone, email }
 }
 
@@ -619,6 +828,7 @@ export const checkReferralCode = functions
 
     const code = String(data?.referralCode ?? '').trim().toUpperCase()
     if (!code) return { valid: false, reason: 'not_found' }
+    if (guestRefusal(context.auth?.token)) return { valid: false, reason: 'guest' }
 
     // The same three sources, in the same order, as redemption. If this check
     // resolved the applicant differently from `activateHost` the code would go
@@ -650,6 +860,12 @@ export const checkReferralCode = functions
     const userSnap = await db.collection('users').doc(uid).get()
     if (userSnap.exists) {
       if (restrictionOn(userSnap)) return { valid: false, reason: 'restricted' }
+      // C1 (B04): redemption refuses a revoked Host, so the pre-flight does.
+      // The sentence travels with the reason; `code` matches the refusal's
+      // `details.code` on `activateHost`.
+      if (hostRoleRevoked(userSnap)) {
+        return { valid: false, reason: 'role_revoked', code: ROLE_REVOKED, message: HOST_REVOKED_REFUSAL }
+      }
       if (heldByAnotherAgency(userSnap, String(app.agencyId ?? ''))) {
         return { valid: false, reason: 'other_agency' }
       }
@@ -660,22 +876,61 @@ export const checkReferralCode = functions
     // The check has to ask the same question redemption does, or the code goes
     // green and is then refused on save — which is precisely the mismatch that
     // made host signup look broken for a week.
-    if (app.status !== 'approved') return { valid: false, reason: 'not_approved' }
+    if (decisionRefusal(app)) return { valid: false, reason: 'not_approved' }
+    // Phase 1A: the same agency/code check redemption makes.
+    const agencyId = String(app.agencyId ?? '').trim()
+    const agencySnap = agencyId ? await db.collection('agencies').doc(agencyId).get() : null
+    if (agencyCodeRefusal(agencySnap && agencySnap.exists ? (agencySnap.data() as Record<string, any>) : null, code)) {
+      return { valid: false, reason: 'not_found' }
+    }
 
     return { valid: true, agencyName: app.agencyName ?? '' }
   })
 
 // ── submitHostCapture ────────────────────────────────────────────────────────
 
+/**
+ * Where the app uploads the live capture: `AuthRepository.submitHostCapture`,
+ * and the owner-write slot in `storage.rules`. The host overwrites it on
+ * every try, so it is a scratch slot — never what a decision is made on.
+ */
+export function captureObjectPath(uid: string): string {
+  return `hostVerification/${uid}/capture.jpg`
+}
+
+/**
+ * Where a submitted attempt is kept: written once, here, with the Admin SDK.
+ * `storage.rules` lets no client read or write under `attempts/`.
+ */
+export function attemptObjectPath(uid: string, attemptId: string): string {
+  return `hostVerification/${uid}/attempts/${attemptId}.jpg`
+}
+
+/**
+ * B24/B41: the capture is the server's, and only a current Host submits one.
+ *
+ * `captureUrl` from the client used to be stored as sent and shown to the
+ * reviewer: any URL at all, and the object behind it overwritable after the
+ * comparison ran. It is now IGNORED. The server reads the capture at the one
+ * path it knows, copies it to a per-attempt path nothing else can write, and
+ * stores THAT path — which the review reads (`verification.py` signs a bare
+ * object path as readily as a URL). A repeat while the record is with a human
+ * changes nothing: the stored attempt is the one under review.
+ *
+ * And a revoked or removed Host, or one whose account is restricted, does not
+ * submit a face at all.
+ */
 export const submitHostCapture = functions
   .region('asia-south1')
-  .https.onCall(async (data: { captureUrl: string }, context) => {
+  .https.onCall(async (data: { captureUrl?: string }, context) => {
     const uid = context.auth?.uid
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
+    await assertActiveSession(uid, data, 'submitHostCapture', context.auth?.token)   // Phase 1A (SESSION-001/003)
 
-    const captureUrl = String(data?.captureUrl ?? '').trim()
-    if (!captureUrl) {
-      throw new functions.https.HttpsError('invalid-argument', 'No capture was uploaded.')
+    const userRef = db.collection('users').doc(uid)
+    const notHost = activeHostRefusal(await userRef.get())
+    if (notHost) {
+      throw new functions.https.HttpsError('permission-denied', notHost.message, { code: notHost.code })
     }
 
     const verRef = db.collection('hostVerification').doc(uid)
@@ -695,6 +950,14 @@ export const submitHostCapture = functions
       return { status: 'pending_manual', alreadyVerified: false }
     }
 
+    // B24: the capture at the path the server knows, not whatever URL was sent.
+    const bucket = admin.storage().bucket()
+    const capture = bucket.file(captureObjectPath(uid))
+    const [uploaded] = await capture.exists()
+    if (!uploaded) {
+      throw new functions.https.HttpsError('invalid-argument', 'No capture was uploaded.')
+    }
+
     const agencyPhotoUrl = String(ver.agencyPhotoUrl ?? '')
     if (!agencyPhotoUrl) {
       // Nothing to compare against. This is the agency's gap, not the host's,
@@ -707,11 +970,20 @@ export const submitHostCapture = functions
       return { status: 'pending_manual', reason: 'no_agency_photo' }
     }
 
-    const match = await compareFaces(agencyPhotoUrl, captureUrl)
+    // The immutable copy this attempt is decided on. `ifGenerationMatch: 0`
+    // means "only if nothing is there yet", so an attempt is never replaced.
+    const attemptId = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}`
+    const capturePath = attemptObjectPath(uid, attemptId)
+    await capture.copy(bucket.file(capturePath), { preconditionOpts: { ifGenerationMatch: 0 } })
+
+    const match = await compareFaces(agencyPhotoUrl, capturePath)
     const now = admin.firestore.FieldValue.serverTimestamp()
 
     const base: Record<string, any> = {
-      captureUrl,
+      // The server's copy, never the client's URL. Field name kept: the review
+      // (`verification.py`) and the CRM read `captureUrl`.
+      captureUrl: capturePath,
+      captureAttemptId: attemptId,
       capturedAt: now,
       updatedAt: now,
       attemptCount: admin.firestore.FieldValue.increment(1),
@@ -724,18 +996,26 @@ export const submitHostCapture = functions
       aiRanAt: match ? now : null,
     }
 
-    if (match && match.score >= match.threshold) {
-      await db.runTransaction(async (tx) => {
-        tx.set(verRef, { ...base, status: 'verified', verifiedAt: now, verifiedBy: 'ai' }, { merge: true })
-        tx.update(db.collection('users').doc(uid), { isVerifiedHost: true })
-      })
-      return { status: 'verified', aiScore: match.score }
-    }
+    // Re-read in the transaction: a second submission that raced this one, or
+    // a decision that landed meanwhile, keeps what it stored — the attempt
+    // under review is never overwritten.
+    return db.runTransaction(async (tx) => {
+      const current = String((await tx.get(verRef)).get('status') ?? '')
+      if (current === 'verified' || current === 'pending_manual') {
+        return { status: current, alreadyVerified: current === 'verified' }
+      }
 
-    // Below threshold, or no comparator. Either way a human decides — an AI
-    // that is unsure must not reject someone's livelihood on its own.
-    await verRef.set({ ...base, status: 'pending_manual' }, { merge: true })
-    return { status: 'pending_manual', aiScore: match?.score ?? null }
+      if (match && match.score >= match.threshold) {
+        tx.set(verRef, { ...base, status: 'verified', verifiedAt: now, verifiedBy: 'ai' }, { merge: true })
+        tx.update(userRef, { isVerifiedHost: true })
+        return { status: 'verified', aiScore: match.score }
+      }
+
+      // Below threshold, or no comparator. Either way a human decides — an AI
+      // that is unsure must not reject someone's livelihood on its own.
+      tx.set(verRef, { ...base, status: 'pending_manual' }, { merge: true })
+      return { status: 'pending_manual', aiScore: match?.score ?? null }
+    })
   })
 
 // ── Manual review lives in the Python backend ────────────────────────────────
@@ -781,7 +1061,17 @@ export const onAgencyPhotoReplaced = functions
     const after = change.after.data() as Record<string, any>
     if (before.photoUrl === after.photoUrl) return null
 
-    const uid = after.activatedByUid
+    /*
+     * B38: the Host behind the application, however they got there.
+     *
+     * `activatedByUid` is stamped by redeeming an invitation. A SELF-applied
+     * Host (Join as Host → approval) was granted without one, and their
+     * application names them only as `applicantUid` — so a re-uploaded photo
+     * reached nobody and the host stayed told to "ask your agency to re-upload"
+     * after it had been done.
+     */
+    const redeemedBy = String(after.activatedByUid ?? '').trim()
+    const uid = redeemedBy || String(after.applicantUid ?? '').trim()
     if (!uid) return null
 
     const verRef = db.collection('hostVerification').doc(String(uid))
@@ -790,6 +1080,19 @@ export const onAgencyPhotoReplaced = functions
     // A verified host does not lose the badge because their agency tidied up a
     // photograph. Re-verification is a deliberate act, not a side effect.
     if (verSnap.get('status') === 'verified') return null
+
+    // `applicantUid` is on every application a person ever filed, including
+    // one rejected or superseded since. Only the application the record was
+    // opened from (or, for a record naming none, one from the same agency)
+    // may replace the photograph the host is compared against.
+    if (!redeemedBy) {
+      const recordApp = String(verSnap.get('applicationId') ?? '').trim()
+      const recordAgency = String(verSnap.get('agencyId') ?? '').trim()
+      const linked = recordApp !== ''
+        ? recordApp === change.after.id
+        : recordAgency !== '' && recordAgency === String(after.agencyId ?? '').trim()
+      if (!linked) return null
+    }
 
     await verRef.update({
       agencyPhotoUrl: after.photoUrl ?? '',

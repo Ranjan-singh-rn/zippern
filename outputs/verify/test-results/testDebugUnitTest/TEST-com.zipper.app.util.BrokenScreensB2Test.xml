@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.BrokenScreensB2Test" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.074Z" hostname="CW253.local" time="0.003">
+  <properties/>
+  <testcase name="a staff mute holds the mic off until it is lifted" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.001"/>
+  <testcase name="seller name is taken as Navigation decoded it, and the placeholder is blank" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="a roster uid that fits the profile route is openable, anything else is not" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="call history reports a failure with a retry" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="the tab reads feedbackTickets by owner and createdAt, the indexed query" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="a room closed from outside ends the host's broadcast once" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="gift details shows loading until the first answer" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <testcase name="host rows are wired to the existing PUBLIC profile route" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.001"/>
+  <testcase name="a feedback ticket maps message, response and timestamps from the writer's fields" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.001"/>
+  <testcase name="the host screen reads the staff fields and does not overwrite a staff end" classname="com.zipper.app.util.BrokenScreensB2Test" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

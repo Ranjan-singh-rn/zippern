@@ -45,6 +45,17 @@ import {
 import { db } from './firebase'
 import { generateCrmId } from './auth'
 import type { CrmUser } from './auth'
+import { findPartnersByEmail } from './partnerDuplicates'
+import {
+  availableSecondRole,
+  stillHeld,
+  type HeldPartnerRecords,
+} from './secondRoleRule'
+
+// Re-exported so every existing caller keeps importing the rule from here,
+// while the rule itself stays free of the Firebase import that made it
+// impossible to test.
+export { availableSecondRole, type HeldPartnerRecords }
 import {
   PARTNER_ROLE_LABEL,
   partnerRecordId,
@@ -75,23 +86,59 @@ export class SecondRoleError extends Error {}
 const MIN_REASON = 3
 
 /**
- * The capability this login could still apply for, or null.
+ * What this login actually holds, read from the partner RECORDS.
  *
- * Null for staff, for a partner that already holds both, for one whose existing
- * capability has not been approved yet — you cannot open a second business on
- * the strength of an application nobody has read — and for one whose second
- * application is already outstanding or has been refused.
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * The question "does this person already have an agency?" was answered by
+ * `partnerRecordId(user, 'agency')`, which reads `crmUsers.agencyId`. That is
+ * a DENORMALISED copy of the link, and `createAgencyAccount` /
+ * `createSellerAccount` write that document with `setDoc` and no
+ * `{merge: true}` — so either of them can blank the field the check depends
+ * on. A guard that reads a field another writer can erase is not a guard, and
+ * this is one of the three ways the production duplicate got in.
+ *
+ * So the records answer for themselves.
+ *
+ * ── Matched on the verified email, not the uid ──────────────────────────────
+ *
+ * `crmUid` appears in no read clause in `firestore.rules`, so
+ * `where('crmUid','==',me)` is refused for every document and the list query
+ * fails outright. `ownerEmail == request.auth.token.email` IS a read clause,
+ * and the address is one Firebase verified, so that is the shape the rules
+ * permit a partner to ask. `findPartnersByEmail` already issues exactly it.
+ *
+ * This is a client-side pre-check and is NOT the enforcement. The API claims
+ * the role family in Mongo, keyed on the Firebase uid, before any partner
+ * record is written (`backend/app/services/partner_roles.py`), and refuses a
+ * second agency whatever the browser believed. What this buys is a sentence
+ * instead of a 400, and a card that does not offer something that cannot work.
+ *
+ * The decision itself — `availableSecondRole` — is in `lib/secondRoleRule.ts`,
+ * which has no Firebase import and so can be run on its own. Re-exported
+ * below so callers keep importing it from here.
  */
-export function availableSecondRole(user: CrmUser | null): PartnerRole | null {
-  const primary = primaryPartnerRole(user)
-  if (!user || !primary) return null
-  if (partnerRoleStatus(user, primary) !== 'approved') return null
+export async function heldPartnerRecords(
+  user: CrmUser | null,
+): Promise<HeldPartnerRecords> {
+  if (!user) return { checked: false, reason: 'There is no signed-in account.' }
+  const email = (user.email || '').trim().toLowerCase()
+  if (!email) {
+    return { checked: false, reason: 'This login carries no email address.' }
+  }
 
-  const other: PartnerRole = primary === 'agency' ? 'seller' : 'agency'
-  if (partnerRolesOf(user).includes(other)) return null
-  if (user.roleStatus?.[other]) return null
-  if (partnerRecordId(user, other)) return null
-  return other
+  const [agency, seller] = await Promise.all([
+    findPartnersByEmail('agency', email),
+    findPartnersByEmail('seller', email),
+  ])
+  if (!agency.checked) return { checked: false, reason: agency.reason }
+  if (!seller.checked) return { checked: false, reason: seller.reason }
+
+  return {
+    checked: true,
+    agency: stillHeld(agency.matches),
+    seller: stillHeld(seller.matches),
+  }
 }
 
 export function secondRoleLabel(role: PartnerRole): string {
@@ -110,12 +157,44 @@ export async function requestSecondRole(
   user: CrmUser,
   application: SecondRoleApplication,
 ): Promise<SecondRoleResult> {
-  const role = availableSecondRole(user)
-  if (!role) {
+  // ── THE RECORDS DECIDE, AND A LOOKUP THAT DID NOT RUN IS NOT A CLEAN
+  //    RESULT ────────────────────────────────────────────────────────────────
+  //
+  // Read before anything else, because every other check here is about the
+  // shape of the application and this one is about whether it may exist at
+  // all. Failing closed is the whole point: the version of this that asked
+  // `crmUsers.agencyId` could be told "no agency" by a document another writer
+  // had blanked, and went ahead.
+  const held = await heldPartnerRecords(user)
+  if (!held.checked) {
     throw new SecondRoleError(
-      'This account cannot apply for a second capability right now. It either ' +
-        'holds both already, has an application outstanding, or is still waiting ' +
-        'on its first approval.',
+      'The check for businesses you already hold could not be run, so nothing ' +
+        `was created: ${held.reason}. Please try again in a moment.`,
+    )
+  }
+
+  const role = availableSecondRole(user, held)
+  if (!role) {
+    const already = held.agency.length > 0 && held.seller.length > 0
+    throw new SecondRoleError(
+      already
+        ? 'This account already holds both an agency and a coin seller, so ' +
+          'there is no second capability left to apply for.'
+        : 'This account cannot apply for a second capability right now. It ' +
+          'either holds both already, has an application outstanding, or is ' +
+          'still waiting on its first approval.',
+    )
+  }
+
+  // One human holds one agency-family record. The API enforces this against
+  // Mongo and will refuse the write regardless; saying so here turns a 400
+  // into a sentence that names the business already held.
+  if (held[role].length > 0) {
+    const existing = held[role][0]
+    throw new SecondRoleError(
+      `This account already holds ${existing.name ? `"${existing.name}"` : 'a record'} ` +
+        `as a ${role === 'agency' ? 'agency' : 'coin seller'}. One person holds ` +
+        'one of each, so nothing was created.',
     )
   }
 
@@ -132,7 +211,17 @@ export async function requestSecondRole(
   }
 
   const email = user.email.trim().toLowerCase()
-  const held = partnerRecordId(user, role === 'agency' ? 'seller' : 'agency')
+
+  // The business they already run, recorded on the new application as
+  // `secondRoleOfPartnerId`. Taken from the RECORD, with `crmUsers` only as a
+  // fallback: this was `partnerRecordId(user, …)`, the same denormalised field
+  // the guard above used to trust, and a non-merging `setDoc` elsewhere can
+  // blank it. That failure is quiet — the application is still filed, just
+  // with an empty `secondRoleOfPartnerId`, so the reviewer cannot see which
+  // existing partner it belongs to.
+  const alreadyHolds: PartnerRole = role === 'agency' ? 'seller' : 'agency'
+  const heldPartnerId =
+    held[alreadyHolds][0]?.id ?? partnerRecordId(user, alreadyHolds)
 
   const created =
     role === 'seller'
@@ -156,7 +245,7 @@ export async function requestSecondRole(
           qrCodeUrl: '',
           source: 'second_role',
           secondRoleOwnerUid: user.uid,
-          secondRoleOfPartnerId: held,
+          secondRoleOfPartnerId: heldPartnerId,
           secondRoleReason: reason,
           createdAt: serverTimestamp(),
         })
@@ -177,7 +266,7 @@ export async function requestSecondRole(
           totalSubAgencies: 0,
           source: 'second_role',
           secondRoleOwnerUid: user.uid,
-          secondRoleOfPartnerId: held,
+          secondRoleOfPartnerId: heldPartnerId,
           secondRoleReason: reason,
           createdAt: serverTimestamp(),
         })

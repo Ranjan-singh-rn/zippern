@@ -26,6 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import SecureDocuments from '@/components/SecureDocuments'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import {
@@ -39,7 +40,10 @@ import {
 } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
+import { nameOrReference } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import api, { ApiError } from '@/lib/api'
+import { roleButtons, type UserRoles } from '@/lib/userRoleActions'
 import {
   getAgency, getAgencyRoster, rosterCountOf, rosterFailureOf,
   type Agency, type AgencyRoster, type RosterMember, type RosterState,
@@ -50,6 +54,9 @@ import {
   STATUS_TONE,
   type AgencyStatement, type Partner, type PartnerCard, type SubAgency,
 } from '@/lib/apiPartners'
+import { restoreGate, revokeTransferNote } from '@/lib/governanceRequests'
+import { awaitingLabel } from '@/lib/contactVerification'
+import { TransferRecommendation } from '@/components/TransferRecommendation'
 
 const PAGE_ROLES = [
   'superadmin', 'app_admin', 'ops_admin', 'finance_admin', 'finance_member',
@@ -145,7 +152,7 @@ function readPayout(raw: Record<string, unknown>): SubPayout {
 
 // ── Onboarding decisions ──────────────────────────────────────────────────────
 
-type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate'
+type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate' | 'revoke'
 
 const DECISION_COPY: Record<
   Decision,
@@ -170,10 +177,26 @@ const DECISION_COPY: Record<
     tone: 'bg-amber-600 hover:bg-amber-500',
   },
   reactivate: {
-    title: 'Lift this suspension',
-    hint: 'They can earn commission again. Nothing about the existing balance changes.',
-    verb: 'Reactivate',
+    title: 'Restore this agency role',
+    hint:
+      'The SAME record is re-activated — no new application. The role table and, for a ' +
+      'sub-agency, its main agency are re-checked first. They can earn commission again. ' +
+      'Nothing about the existing balance changes. Sub-agencies and hosts moved away when the ' +
+      'role was revoked are not moved back.',
+    verb: 'Restore',
     tone: 'bg-green-600 hover:bg-green-500',
+  },
+  revoke: {
+    title: 'Revoke this agency role',
+    hint:
+      'The ROLE ends; the person does not. Their account stays active, any other role they hold ' +
+      '(a Coin Seller, say) stays active, and every record and every rupee of history stays. To ' +
+      'get the role back they file a reinstatement request, which the Owner decides — a revoked ' +
+      'role is not re-applied for. Different from Suspend, which is temporary and keeps their place. ' +
+      'Sub-agencies and hosts under this agency must be moved to another live main agency — name ' +
+      'it below, or the revocation is refused and nothing changes.',
+    verb: 'Revoke role',
+    tone: 'bg-red-700 hover:bg-red-600',
   },
 }
 
@@ -245,12 +268,17 @@ export default function AgencyDetail() {
   const [cardsTruncated, setCardsTruncated] = useState(false)
   const [profile, setProfile] = useState<Agency | null>(null)
   const [parentName, setParentName] = useState('')
+  /** UGP-B: what the OWNER holds — Revoke is offered only beside a second role. */
+  const [ownerRoles, setOwnerRoles] = useState<UserRoles | null>(null)
+  /** The roles request failed — so no revoke is offered, and the page says why. */
+  const [ownerRolesFailed, setOwnerRolesFailed] = useState(false)
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [tab, setTab] = useState<Tab>('statement')
   const [decision, setDecision] = useState<Decision | null>(null)
+  const [transferTo, setTransferTo] = useState('')
   const [raisingPayout, setRaisingPayout] = useState(false)
   const [payingSub, setPayingSub] = useState<SubAgency | null>(null)
 
@@ -261,6 +289,16 @@ export default function AgencyDetail() {
       const p = await partnerOps.get(id)
       setPartner(p)
       setLoading(false)
+
+      if (p.owner_crm_uid) {
+        setOwnerRolesFailed(false)
+        api.users.roles(p.owner_crm_uid)
+          .then((r) => { setOwnerRoles(r); setOwnerRolesFailed(false) })
+          .catch(() => { setOwnerRoles(null); setOwnerRolesFailed(true) })
+      } else {
+        setOwnerRoles(null)
+        setOwnerRolesFailed(false)
+      }
 
       // Everything below is additive: a failure in one panel must not blank the
       // record. Each lands on its own and says so if it could not be read.
@@ -351,6 +389,9 @@ export default function AgencyDetail() {
   const hostCount = rosterCountOf(roster)
   const rosterFailure = rosterFailureOf(roster)
 
+  // B1: earners off the roster have no roster name — name them from `users` (names only).
+  const offRosterNames = useIdentities({ enabled: allowed, people: earningsOffRoster.map((h) => h.host_id) })
+
   if (!allowed) return <Denied what="agency records" />
 
   if (loading) {
@@ -392,9 +433,12 @@ export default function AgencyDetail() {
           </h1>
           <div className="flex flex-wrap items-center gap-2 mt-2">
             <span className={`text-xs px-2 py-1 rounded ${STATUS_TONE[partner.status] ?? 'bg-slate-700 text-slate-300'}`}>
-              {partner.status}
+              {partner.status === 'awaiting_verification' ? 'approved · waiting for verified contacts' : partner.status}
               {partner.status === 'approved' && !partner.is_active ? ' · inactive' : ''}
             </span>
+            {partner.status === 'awaiting_verification' && (
+              <span className="text-sky-300 text-xs">{awaitingLabel(partner.activation?.missing ?? [])}</span>
+            )}
             <span
               className={`text-xs px-2 py-1 rounded ${
                 isSub ? 'bg-slate-700 text-slate-300' : 'bg-purple-500/15 text-purple-300'
@@ -434,7 +478,32 @@ export default function AgencyDetail() {
           >
             <RefreshCw size={14} /> Refresh
           </button>
-          {partner.status !== 'approved' && (
+          {/* UGP-B: each decision on its own case. Approve decides an
+              application (pending, or a rejected one reconsidered); Reject is
+              for a PENDING application only; Restore re-activates a suspended
+              or revoked record; Revoke only beside a second role. The API
+              refuses every other combination by name. */}
+          {/* Decision 15 (RC): approved, NOT started — the role waits for BOTH
+              verified contacts on the login and starts by itself; "Check and
+              start" asks the API to re-read them now. Never bypasses them. */}
+          {partner.status === 'awaiting_verification' && (
+            <button
+              onClick={async () => {
+                try {
+                  const out = await partnerOps.activate(id)
+                  setNotice(out.activated ? 'Both contacts are verified — the role has started.'
+                    : out.already_active ? 'This role had already started.' : 'Checked.')
+                } catch (err) {
+                  setNotice(err instanceof Error ? err.message : 'Could not check just now.')
+                }
+                load()
+              }}
+              className="flex items-center gap-2 bg-sky-600/80 hover:bg-sky-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
+            >
+              <CheckCircle2 size={15} /> Check and start
+            </button>
+          )}
+          {(partner.status === 'pending' || partner.status === 'rejected') && (
             <button
               onClick={() => setDecision('approve')}
               className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
@@ -442,7 +511,7 @@ export default function AgencyDetail() {
               <CheckCircle2 size={15} /> Approve
             </button>
           )}
-          {partner.status !== 'rejected' && (
+          {partner.status === 'pending' && (
             <button
               onClick={() => setDecision('reject')}
               className="flex items-center gap-2 bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
@@ -450,20 +519,69 @@ export default function AgencyDetail() {
               <XCircle size={15} /> Reject
             </button>
           )}
-          {partner.is_active ? (
+          {partner.status === 'approved' && partner.is_active && (
             <button
               onClick={() => setDecision('deactivate')}
               className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
             >
               Suspend
             </button>
-          ) : (
+          )}
+          {/* GOV C2: restoring a REVOKED record is the Owner's decision (the
+              server answers anybody else with 403). Lifting a role-level
+              suspension keeps its current permission. */}
+          {(partner.status === 'suspended' || partner.status === 'revoked') && (() => {
+            const gate = restoreGate(partner.status, isOwner)
+            return (
+              <>
+                <button
+                  onClick={() => { if (gate.allowed) setDecision('reactivate') }}
+                  disabled={!gate.allowed}
+                  title={gate.hint || undefined}
+                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Restore
+                </button>
+                {!gate.allowed && (
+                  <Link href="/role-appeals" className="text-slate-500 hover:text-pink-300 text-xs max-w-[16rem]">
+                    {gate.hint}
+                  </Link>
+                )}
+              </>
+            )
+          })()}
+          {/* GOV C3: moving a Sub-agency to another main agency is a request
+              the Owner decides on /transfers. Renders nothing for a role that
+              may not recommend one. */}
+          {isSub && partner.status === 'approved' && (
+            <TransferRecommendation
+              kind="sub_agency"
+              subjectId={partner.id}
+              currentAgencyId={partner.parent_id ?? ''}
+              subjectLabel={partner.name || partner.id}
+            />
+          )}
+          {(partner.status === 'approved' || partner.status === 'suspended') &&
+            roleButtons(ownerRoles).some((b) => b.kind === 'revoke' && b.targetId === partner.id) && (
             <button
-              onClick={() => setDecision('reactivate')}
-              className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
+              onClick={() => { setTransferTo(''); setDecision('revoke') }}
+              className="flex items-center gap-2 bg-red-900/30 hover:bg-red-900/50 border border-red-900/50 text-red-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
+              title="End the role. The person, their other roles and their history stay."
             >
-              Reactivate
+              Revoke role
             </button>
+          )}
+          {(partner.status === 'approved' || partner.status === 'suspended') &&
+            !roleButtons(ownerRoles).some((b) => b.kind === 'revoke' && b.targetId === partner.id) && (
+            ownerRolesFailed ? (
+              <span className="text-amber-400/80 text-xs" title="Revoke is offered only once the owner's roles are known (UGP-B)">
+                The owner's roles could not be read, so Revoke is not offered — reload to try again
+              </span>
+            ) : (
+              <span className="text-slate-500 text-xs" title="One role → suspend only (UGP-B)">
+                Only role — suspend rather than revoke
+              </span>
+            )
           )}
         </div>
       </div>
@@ -548,7 +666,10 @@ export default function AgencyDetail() {
               ? `Could not be read — not zero. ${rosterFailure.reason}`
               : roster
                 ? `${roster.active} joined, ${roster.awaiting + roster.pending} invited and ` +
-                  `not yet redeemed${roster.former > 0 ? `, ${roster.former} former and not counted` : ''}`
+                  `not yet redeemed${roster.former > 0 ? `, ${roster.former} former and not counted` : ''}` +
+                  (roster.flagged > 0
+                    ? `, ${roster.flagged} invitation${roster.flagged === 1 ? '' : 's'} for a host already listed`
+                    : '')
                 : 'Reading the roster…'
           }
         />
@@ -787,9 +908,10 @@ export default function AgencyDetail() {
               <li key={h.host_id} className="flex items-center justify-between gap-3 text-xs">
                 <Link
                   href={`/users/${h.host_id}`}
-                  className="text-amber-100 hover:text-white font-mono truncate"
+                  title={h.host_id}
+                  className="text-amber-100 hover:text-white truncate"
                 >
-                  {h.host_id}
+                  {nameOrReference(offRosterNames.people.get(h.host_id), h.host_id, 'host')}
                 </Link>
                 <span className="text-amber-300 shrink-0 whitespace-nowrap">
                   🫘 {h.beans_earned.toLocaleString('en-IN')} over{' '}
@@ -924,10 +1046,67 @@ export default function AgencyDetail() {
           tone={DECISION_COPY[decision].tone}
           subject={partner.name || partner.id}
           onClose={() => setDecision(null)}
+          extra={decision === 'revoke' ? (
+            <div className="space-y-2">
+              {/* GOV C3: a revocation that MOVES dependents is the Owner's
+                  decision — the server answers anybody else with 403. Said
+                  before the button is pressed, with where to go instead. */}
+              {(() => {
+                const note = revokeTransferNote(
+                  { subAgencies: subs.length, hosts: roster?.active ?? 0 },
+                  isOwner,
+                )
+                return note ? (
+                  <p className="text-amber-200 text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 leading-relaxed">
+                    {note}{' '}
+                    <Link href="/transfers" className="underline underline-offset-2 hover:text-white">
+                      Transfer requests
+                    </Link>
+                  </p>
+                ) : null
+              })()}
+              <div>
+                <label className="block text-slate-400 text-xs font-medium mb-1.5">
+                  Move sub-agencies and hosts to (main agency id)
+                  <span className="text-slate-500"> — required if any are attached</span>
+                </label>
+                <input
+                  value={transferTo}
+                  onChange={(e) => setTransferTo(e.target.value)}
+                  placeholder="Agency id of an approved, active main agency"
+                  className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+            </div>
+          ) : undefined}
           onConfirm={async (reason) => {
-            if (decision === 'approve') await partnerOps.approve(id, reason)
+            if (decision === 'approve') {
+              const out = await partnerOps.approve(id, reason)
+              // Decision 15 (RC): the Owner's approval of a login without both
+              // verified contacts leaves the role WAITING — say so plainly.
+              if (out?.awaiting_verification) {
+                setDecision(null)
+                setNotice(awaitingLabel(out.missing ?? []))
+                load()
+                return
+              }
+            }
             else if (decision === 'reject') await partnerOps.reject(id, reason)
             else if (decision === 'deactivate') await partnerOps.deactivate(id, reason)
+            else if (decision === 'revoke') {
+              const out = await partnerOps.revoke(id, reason, transferTo.trim() || undefined)
+              const moved = out.dependents_moved
+              setDecision(null)
+              setNotice(
+                `Role revoked. ${out.note} ` +
+                (moved && (moved.sub_agencies.length || moved.hosts.length)
+                  ? `${moved.sub_agencies.length} sub-agenc${moved.sub_agencies.length === 1 ? 'y' : 'ies'} and ` +
+                    `${moved.hosts.length} host${moved.hosts.length === 1 ? '' : 's'} moved to ${moved.to_name || moved.to}.`
+                  : 'Nothing was attached, so nothing was moved.'),
+              )
+              load()
+              return
+            }
             else await partnerOps.reactivate(id, reason)
             setDecision(null)
             setNotice(
@@ -1272,8 +1451,6 @@ function LegBox({
 function ProfilePanel({ partner, profile }: { partner: Partner; profile: Agency | null }) {
   const [zoom, setZoom] = useState('')
 
-  const docs = profile?.kycDocUrls ?? []
-  const labels = ['Aadhaar card', 'PAN card', 'Bank passbook']
   const foreign = profile?.paymentType === 'foreign'
 
   return (
@@ -1333,20 +1510,14 @@ function ProfilePanel({ partner, profile }: { partner: Partner; profile: Agency 
         <p className="text-slate-500 text-sm mb-4">
           Shown inline. Click one to enlarge — verification means looking at it.
         </p>
-        {docs.length === 0 ? (
-          <p className="text-slate-600 text-sm">No documents were uploaded.</p>
-        ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {docs.map((url, i) => (
-              <DocThumb
-                key={i}
-                url={url}
-                label={labels[i] ?? `Document ${i + 1}`}
-                onZoom={() => setZoom(url)}
-              />
-            ))}
-          </div>
-        )}
+        {/* Through the API, not from `profile.kycDocUrls`. Those are
+            permanent `?alt=media&token=` bearer URLs that Storage Rules are
+            never consulted for — see components/SecureDocuments.tsx. */}
+        <SecureDocuments
+          kind="agency"
+          recordId={partner.id}
+          emptyHint="No documents were uploaded."
+        />
       </div>
 
       {zoom && <Lightbox url={zoom} onClose={() => setZoom('')} />}
@@ -1436,6 +1607,20 @@ function RosterRow({
             {member.phone || 'no number on record'}
             {member.uid ? '' : member.referralCode ? ` · code ${member.referralCode}` : ''}
           </p>
+          {/* GOV B08: shown, never hidden — but it is a host already on this
+              roster, so it is not counted again. */}
+          {member.sameContactAs && (
+            <p className="text-amber-300/90 text-xs">
+              same phone or email as{' '}
+              <Link
+                href={`/users/${member.sameContactAs}`}
+                className="underline underline-offset-2 hover:text-amber-200"
+              >
+                {member.sameContactName || member.sameContactAs}
+              </Link>
+              {' '}— that host&rsquo;s invitation, not counted again
+            </p>
+          )}
           {/* The two things that stop a joined host earning at all, shown here
               because an agency asking why its commission is flat is usually
               looking at one of them. */}
@@ -1591,7 +1776,7 @@ function Lightbox({ url, onClose }: { url: string; onClose: () => void }) {
 
 /** Every decision carries a reason, validated before it is sent. */
 function ReasonDialog({
-  title, hint, verb, tone, subject, onClose, onConfirm,
+  title, hint, verb, tone, subject, onClose, onConfirm, extra,
 }: {
   title: string
   hint: string
@@ -1600,6 +1785,8 @@ function ReasonDialog({
   subject: string
   onClose: () => void
   onConfirm: (reason: string) => Promise<void>
+  /** An extra field above the reason — the revoke dialog's transfer target. */
+  extra?: React.ReactNode
 }) {
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
@@ -1633,6 +1820,7 @@ function ReasonDialog({
 
         <div className="p-5 space-y-3">
           <p className="text-slate-400 text-sm">{hint}</p>
+          {extra}
           <textarea
             value={reason}
             onChange={(e) => setReason(e.target.value)}

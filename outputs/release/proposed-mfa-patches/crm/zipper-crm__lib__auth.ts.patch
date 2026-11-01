@@ -1,0 +1,45 @@
+# PROPOSED — not applied. Base: pre-P1 copy (P1 stage A3 backup)
+# Base confidence: UNCERTAIN: pre-P1 copy, but the file may have changed between 20 Oct and P1; needs the downloaded source
+--- a/zipper-crm/lib/auth.ts
++++ b/zipper-crm/lib/auth.ts
+@@ -334,12 +334,6 @@
+ }
+ 
+ // ── CrmUser type ────────────────────────────────────────────────────────────
+-
+-export interface GateAnswers {
+-  q1: string   // Who are you? (full name)
+-  q2: string   // Phone number
+-  q3: string   // Called name / nickname
+-}
+ 
+ /** Generates a human-readable 8-character uppercase alphanumeric ID, e.g. "A1B2C3D4" */
+ export function generateCrmId(): string {
+@@ -412,7 +406,6 @@
+   createdBy:    string
+   createdAt:    Timestamp | null
+   lastLoginAt:  Timestamp | null
+-  gateAnswers?: GateAnswers  // per-user security gate answers (set on first superadmin login)
+ }
+ 
+ // ── Superadmin seeding lives in the backend, not here ────────────────────────
+@@ -1089,16 +1082,9 @@
+   })
+ }
+ 
+-// ── Save per-user gate answers (called after first superadmin login) ─────────
+-
+-export async function saveGateAnswers(uid: string, answers: GateAnswers): Promise<void> {
+-  const normalized: GateAnswers = {
+-    q1: answers.q1.trim().toLowerCase().replace(/\s+/g, ' '),
+-    q2: answers.q2.trim(),
+-    q3: answers.q3.trim().toLowerCase().replace(/\s+/g, ' '),
+-  }
+-  await updateDoc(doc(db, 'crmUsers', uid), { gateAnswers: normalized })
+-}
++// P1-A3: the Owner "security gate" (three questions stored in plain text on
++// crmUsers.gateAnswers and checked in the browser) was removed. Owners use
++// server-enforced TOTP — see backend/app/services/owner_mfa.py.
+ 
+ // ── Send password reset email to a CRM team member ──────────────────────────
+ 

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.SecureEmailFlowTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.044Z" hostname="CW253.local" time="0.002">
+  <properties/>
+  <testcase name="a client-side timeout is a retry with the same code, not a dead code" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.0"/>
+  <testcase name="already bound refreshes the session exactly like a fresh bind" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.001"/>
+  <testcase name="the code step and the refusal use the server's own words" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.0"/>
+  <testcase name="use a different address waits for the request in flight" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.0"/>
+  <testcase name="the flow survives process death and never saves the code" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.001"/>
+  <testcase name="settings no longer promises that an email signs you in" classname="com.zipper.app.ui.SecureEmailFlowTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

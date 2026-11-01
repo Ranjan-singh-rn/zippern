@@ -25,6 +25,11 @@ import {
   ApiError, getSessionToken, reportUnauthorized,
   type Appeal, type UserReport,
 } from '@/lib/api'
+import {
+  idOf, listFrom,
+  type RoleAppealOutcome, type RoleAppealStatus, type RoleKind,
+  type TransferKind, type TransferStatus,
+} from '@/lib/governanceRequests'
 
 // Mirrors lib/api.ts — in production the API is same-origin via a Hosting
 // rewrite, locally it runs on its own port.
@@ -110,7 +115,17 @@ function query(params: Record<string, string | number | undefined | null>) {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type PartnerKind = 'agency' | 'sub_agency' | 'seller'
-export type PartnerStatus = 'pending' | 'approved' | 'rejected' | 'suspended'
+/**
+ * `suspended` is temporary and keeps the person's place in the
+ * one-agency-per-human rule; `revoked` is the role taken away — the record
+ * stays as history, the person may apply again. See
+ * `backend/app/services/partners.py::PartnerStatus`.
+ */
+export type PartnerStatus =
+  | 'pending' | 'approved' | 'rejected' | 'suspended' | 'revoked'
+  // Decision 15 (RC): approved by the Owner, NOT started — the login does not
+  // yet hold both a verified phone and a verified email. Grants nothing.
+  | 'awaiting_verification'
 
 /** Spec 4.3.11 — `overdue` blocks the seller from taking new inventory. */
 export type CreditStanding =
@@ -180,6 +195,13 @@ export interface Partner {
   crm_id?: string
   /** Set on a sub-agency. Its money is routed through this parent. Spec 4.2.4. */
   parent_id?: string | null
+  /**
+   * Decision 15 (RC): set when the Owner approved the role before the login
+   * held both verified contacts. `state` is `awaiting_verification` until the
+   * role starts, then `started`; `missing` names what was still needed at
+   * approval (the live answer is `verificationOf(owner_crm_uid)`).
+   */
+  activation?: { state?: string; missing?: Array<'phone' | 'email'>; started_at?: string } | null
 
   // ── The second capability ───────────────────────────────────────────────────
   // One login can hold both an agency and a coin-seller record. These name the
@@ -200,6 +222,9 @@ export interface Partner {
   total_coins_sold?: number
   cash_paid_minor?: number
   rejection_reason?: string
+  revocation_reason?: string
+  revoked_at?: string
+  parent_name?: string
   created_at?: string
   updated_at?: string
 
@@ -693,8 +718,41 @@ export const partnerOps = {
       { partner_id: id, reason },
     ),
 
+  /**
+   * Decision 15 (RC): with BOTH contacts verified on the login this is the
+   * approval it always was. Without both, only the Owner may approve — the
+   * record then WAITS (`awaiting_verification`, `awaiting_verification: true`
+   * and `missing` on the response) and starts by itself once both are
+   * verified. Anyone else gets an ApiError whose `detail` carries
+   * `code: 'CONTACT_VERIFICATION_REQUIRED'` (read it with
+   * `verificationRefusal` from lib/contactVerification).
+   */
   approve: (id: string, reason: string) =>
-    post<Partner>(`/partner-ops/partners/${encodeURIComponent(id)}/approve`, { reason }),
+    post<Partner & { awaiting_verification?: boolean; missing?: Array<'phone' | 'email'>; warnings?: string[] }>(
+      `/partner-ops/partners/${encodeURIComponent(id)}/approve`, { reason }),
+
+  /**
+   * Decision 15 (RC): start an Owner-approved role whose login now holds both
+   * verified contacts. Re-reads the verification on the server and never
+   * bypasses it; refuses with CONTACT_VERIFICATION_REQUIRED otherwise.
+   */
+  activate: (id: string) =>
+    post<Partner & { activated?: boolean; already_active?: boolean }>(
+      `/partner-ops/partners/${encodeURIComponent(id)}/activate`, {}),
+
+  /**
+   * Decision 16 (RC): a FRESH Sub-agency application under `agencyId` for a
+   * person whose earlier one was rejected (their login already exists). The
+   * API decides whether the login qualifies; the rejected record is kept.
+   */
+  reapplySubAgency: (agencyId: string, body: { email: string; form: Record<string, unknown>; reason?: string }) =>
+    post<{ id: string; status: string; reapplication_of: string; warnings?: string[] }>(
+      `/partner-ops/agencies/${encodeURIComponent(agencyId)}/sub-agencies/reapply`, body),
+
+  /** Decision 15 (RC): what is verified on a person's login (masked), and what waits for it. */
+  verificationOf: (uid: string) =>
+    get<import('@/lib/contactVerification').VerificationOverview>(
+      `/partner-ops/applications/verification/${encodeURIComponent(uid)}`),
 
   /**
    * Give an existing partner their second capability — an agency that should
@@ -810,6 +868,255 @@ export const partnerOps = {
 
   reactivate: (id: string, reason: string) =>
     post<Partner>(`/partner-ops/partners/${encodeURIComponent(id)}/reactivate`, { reason }),
+
+  /**
+   * Take the role away — and only the role. The person's account, their other
+   * roles and every historical record are untouched. GOV C1/C2: the revoked
+   * record still holds its place (it is not re-applied for; the way back is a
+   * reinstatement request the Owner decides). An agency with sub-agencies or
+   * hosts is refused unless `transferTo` names a live main agency to receive
+   * them — and GOV C3 makes that case Owner-only (403 for anybody else).
+   */
+  revoke: (id: string, reason: string, transferTo?: string) =>
+    post<Partner & {
+      dependents_moved: { sub_agencies: string[]; hosts: string[]; to: string | null; to_name?: string }
+      role_family_released: boolean
+      notified: boolean
+      note: string
+    }>(`/partner-ops/partners/${encodeURIComponent(id)}/revoke`, {
+      reason, transfer_to: transferTo || null,
+    }),
+
+  /** Every partner-role application a user has filed, newest first. */
+  applicationsOf: (uid: string) =>
+    get<PartnerApplicationRow[]>(`/partner-ops/applications/of/${encodeURIComponent(uid)}`),
+}
+
+export interface PartnerApplicationRow {
+  id: string
+  kind: 'agency' | 'sub_agency' | 'seller' | 'host'
+  status: string
+  name: string
+  parent_id: string | null
+  created_at: string | null
+  rejection_reason: string | null
+  revocation_reason: string | null
+}
+
+// ── Reinstatement requests for a REVOKED role (GOV C2) ────────────────────────
+//
+// The person asks for a revoked role back (from the app, through Functions);
+// a reviewer RECOMMENDS an outcome here; the Owner DECIDES. A `restore`
+// decision runs the existing restore on the SAME record — `restore_host` for a
+// Host, `reactivate_partner` for an agency, sub-agency or seller — and nothing
+// else in the CRM may turn a revoked role back on.
+//
+//   GET  /partner-ops/role-appeals?status=open|all     reviewers + Owner
+//   POST /partner-ops/role-appeals/{id}/recommend      {outcome, note ≥ 10}
+//   POST /partner-ops/role-appeals/{id}/decide         {outcome, note} — Owner only (403 otherwise)
+//
+// Shapes are read defensively (`listFrom`, `idOf` in lib/governanceRequests):
+// the list may come back bare or as `{appeals: [...]}`, a row may carry `id`
+// or `_id`. Every refusal is the server's sentence, shown as written.
+
+export interface RoleAppealRecommendation {
+  by_uid: string
+  by_role: string
+  outcome: RoleAppealOutcome
+  note: string
+  at: string
+}
+
+export interface RoleAppealDecision {
+  by_uid: string
+  outcome: RoleAppealOutcome
+  note: string
+  at: string
+}
+
+export interface RoleAppeal {
+  id: string
+  _id?: string
+  uid: string
+  kind: RoleKind
+  record_id: string
+  status: RoleAppealStatus
+  statement: string
+  created_at: string
+  updated_at: string
+  recommendation: RoleAppealRecommendation | null
+  decision: RoleAppealDecision | null
+}
+
+/** Whatever else a write answered with — a `note` is shown when present. */
+export interface RoleAppealWrite {
+  appeal?: RoleAppeal
+  note?: string
+  notified?: boolean
+}
+
+/**
+ * Decision 15 (RC) — a partner's OWN login, in the waiting room.
+ *
+ * All three act on the signed-in session's own uid (the API takes no id),
+ * re-read the verification from Firebase Auth and the server ledger, and
+ * start nothing on the caller's word.
+ */
+export const myVerification = {
+  get: () => get<import('@/lib/contactVerification').VerificationOverview>('/partner-ops/me/verification'),
+  check: () => post<import('@/lib/contactVerification').VerificationOverview>('/partner-ops/me/verification/check'),
+  /** Same answer whether or not the contact belongs to anybody. */
+  conflict: (contact: 'phone' | 'email', value: string) =>
+    post<{ received: boolean }>('/partner-ops/me/verification/conflict', { contact, value }),
+}
+
+/** RC (confirmed, CRM-FLOW 9.48): money frozen by a suspension, ban or revocation. */
+export interface FrozenMoney {
+  id: string
+  subject: { type: 'user' | 'partner'; id: string }
+  owner_uid?: string
+  kinds: string[]
+  status: 'frozen' | 'withheld' | 'released' | 'adjusted'
+  causes: Array<{ action: string; label: string; reason: string; at: string; by?: { uid: string; name: string } }>
+  snapshot?: { cards?: Array<{ id: string; type: string; amount?: number; currency?: string; stage?: string }>;
+    beans?: number; beansAvailable?: number; balance?: unknown; kind?: string }
+  frozen_at: string
+  decisions?: Array<{ at: string; decision: string; note: string; by?: { name: string };
+    adjustment?: { amount: number; direction: string; currency?: string } }>
+}
+
+/** The Owner's queue. Both routes are Owner-only on the server. */
+export const frozenMoney = {
+  list: (status?: string) =>
+    get<{ freezes: FrozenMoney[] }>(`/partner-ops/frozen-money${query({ status })}`),
+  decide: (key: string, body: { decision: 'release' | 'withhold' | 'adjust'; note: string;
+    adjustment?: { amount: number; direction: 'increase' | 'decrease'; currency?: string } }) =>
+    post<FrozenMoney>(`/partner-ops/frozen-money/${encodeURIComponent(key)}/decide`, body),
+}
+
+export const roleAppeals = {
+  list: async (status: 'open' | 'all' = 'open'): Promise<RoleAppeal[]> =>
+    listFrom<RoleAppeal>(
+      await get<unknown>(`/partner-ops/role-appeals${query({ status })}`),
+      'appeals',
+    ).map((a) => ({ ...a, id: idOf(a) })),
+
+  recommend: (id: string, outcome: RoleAppealOutcome, note: string) =>
+    post<RoleAppealWrite>(
+      `/partner-ops/role-appeals/${encodeURIComponent(id)}/recommend`,
+      { outcome, note },
+    ),
+
+  /** Owner only. The server answers anybody else with 403. */
+  decide: (id: string, outcome: RoleAppealOutcome, note: string) =>
+    post<RoleAppealWrite>(
+      `/partner-ops/role-appeals/${encodeURIComponent(id)}/decide`,
+      { outcome, note },
+    ),
+}
+
+// ── Transfer requests: staff recommend, the Owner decides (GOV C3) ───────────
+//
+// Moving a Host, or a Sub-agency, to another agency. A `can_approve_kyc`
+// reviewer (or the Owner) RECOMMENDS; only the Owner DECIDES, and an approval
+// runs the existing move helper — no balance and no ledger row moves.
+//
+//   POST /partner-ops/transfers                  {kind, subject_id, to_agency_id, note ≥ 10}
+//   GET  /partner-ops/transfers?status=open|all
+//   POST /partner-ops/transfers/{id}/decide      {approve, note} — Owner only (403 otherwise)
+
+export interface TransferRequest {
+  id: string
+  _id?: string
+  kind: TransferKind
+  /** A Host's uid, or a Sub-agency's partner id. */
+  subject_id: string
+  from_agency_id: string
+  to_agency_id: string
+  note: string
+  status: TransferStatus
+  requested_by: { uid: string; role: string; name?: string }
+  requested_at: string
+  decision: { by_uid: string; note: string; at: string; approve?: boolean } | null
+}
+
+export const transfers = {
+  list: async (status: 'open' | 'all' = 'open'): Promise<TransferRequest[]> =>
+    listFrom<TransferRequest>(
+      // The backend answers `{requests: [...]}` (services/transfer_requests.list_requests).
+      await get<unknown>(`/partner-ops/transfers${query({ status })}`),
+      'requests',
+    ).map((t) => ({ ...t, id: idOf(t) })),
+
+  /** Files the recommendation. Nothing moves until the Owner decides it. */
+  recommend: (body: { kind: TransferKind; subject_id: string; to_agency_id: string; note: string }) =>
+    post<unknown>('/partner-ops/transfers', body),
+
+  /** Owner only. The server answers anybody else with 403. */
+  decide: (id: string, approve: boolean, note: string) =>
+    post<unknown>(
+      `/partner-ops/transfers/${encodeURIComponent(id)}/decide`,
+      { approve, note },
+    ),
+}
+
+// ── Manual recharge through a Coin Seller ────────────────────────────────────
+//
+// The buyer files from the app; staff verify the payment here and the API
+// credits through the ledger, once. See backend/app/services/recharges.py.
+
+export type RechargeStatus =
+  | 'pending' | 'approving' | 'approved' | 'rejected'
+  | 'refund_pending' | 'refunding' | 'refunded' | 'reversed'
+
+export interface Recharge {
+  id: string
+  buyer_uid: string
+  seller_id: string
+  seller_owner_uid: string
+  seller_name: string
+  diamonds: number
+  amount_minor: number
+  currency: string
+  payment_method: string
+  reference?: string
+  proof_url: string
+  status: RechargeStatus
+  credited_diamonds: number
+  refunded_diamonds: number
+  unrecoverable_diamonds: number
+  created_at: string
+  approved_at?: string
+  approved_by?: CardWho
+  reviewed_at?: string
+  reviewed_by?: CardWho
+  rejection_reason?: string
+  refund_reason?: string
+  refund_decision_reason?: string
+  shortfall?: { available: number; needed: number; at: string }
+  history?: Array<{ at: string; status: string; by?: CardWho; reason?: string;
+                    taken?: number; unrecoverable?: number; available_before?: number }>
+}
+
+export const recharges = {
+  list: (status?: RechargeStatus | '', sellerId?: string) => {
+    const q = new URLSearchParams()
+    if (status) q.set('status', status)
+    if (sellerId) q.set('seller_id', sellerId)
+    const qs = q.toString()
+    return get<Recharge[]>(`/partner-ops/recharges${qs ? `?${qs}` : ''}`)
+  },
+  get: (id: string) => get<Recharge>(`/partner-ops/recharges/${encodeURIComponent(id)}`),
+  approve: (id: string, reason: string) =>
+    post<Recharge & { notified: { buyer: boolean; seller: boolean } }>(
+      `/partner-ops/recharges/${encodeURIComponent(id)}/approve`, { reason }),
+  reject: (id: string, reason: string) =>
+    post<Recharge>(`/partner-ops/recharges/${encodeURIComponent(id)}/reject`, { reason }),
+  requestRefund: (id: string, reason: string) =>
+    post<Recharge>(`/partner-ops/recharges/${encodeURIComponent(id)}/refund`, { reason }),
+  decideRefund: (id: string, approve: boolean, reason: string) =>
+    post<Recharge & { taken: number; unrecoverable: number; available_before: number }>(
+      `/partner-ops/recharges/${encodeURIComponent(id)}/refund/decide`, { approve, reason }),
 }
 
 // ── Seller inventory. Spec 4.3.5 / 4.3.6 ─────────────────────────────────────
@@ -1263,6 +1570,9 @@ export const STATUS_TONE: Record<PartnerStatus, string> = {
   approved: 'bg-green-500/15 text-green-300',
   rejected: 'bg-red-500/15 text-red-300',
   suspended: 'bg-slate-700 text-slate-400',
+  revoked: 'bg-red-900/30 text-red-400',
+  // Decision 15 (RC): approved, not started — waiting for both verified contacts.
+  awaiting_verification: 'bg-sky-500/15 text-sky-300',
 }
 
 /**
@@ -1297,6 +1607,8 @@ const apiPartners = {
   credit,
   board,
   live,
+  roleAppeals,
+  transfers,
 }
 
 export default apiPartners

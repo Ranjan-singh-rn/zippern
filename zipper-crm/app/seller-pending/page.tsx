@@ -2,10 +2,16 @@
 
 import { useAuth } from '@/components/AuthProvider'
 import { crmSignOut } from '@/lib/auth'
+import { partnerRoleStatus } from '@/lib/partnerRouting'
+import ContactVerificationPanel from '@/components/ContactVerificationPanel'
 import { Clock, ShoppingBag, Mail, LogOut, CheckCircle2 } from 'lucide-react'
 
 export default function SellerPendingPage() {
   const { crmUser } = useAuth()
+  // Decision 15 (RC): approved by the Owner, waiting for BOTH verified
+  // contacts. The same room, with the verification steps instead of
+  // "under review" — the role starts once both are verified.
+  const waiting = partnerRoleStatus(crmUser, 'seller') === 'awaiting_verification'
 
   return (
     <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
@@ -22,7 +28,7 @@ export default function SellerPendingPage() {
             <div className="w-14 h-14 rounded-full bg-yellow-500/20 border border-yellow-500/30 flex items-center justify-center mx-auto mb-3">
               <Clock size={28} className="text-yellow-400" />
             </div>
-            <h1 className="text-white text-xl font-bold">Application Under Review</h1>
+            <h1 className="text-white text-xl font-bold">{waiting ? 'Approved — Verify to Start' : 'Application Under Review'}</h1>
             <p className="text-yellow-300/70 text-sm mt-1">We have received your coin seller application</p>
           </div>
 
@@ -51,6 +57,8 @@ export default function SellerPendingPage() {
                 <p className="text-slate-300 text-sm leading-relaxed">After approval, log back in to access your seller dashboard</p>
               </div>
             </div>
+
+            {waiting && <ContactVerificationPanel />}
 
             {crmUser && (
               <div className="flex items-center gap-3 p-3 bg-slate-800 border border-slate-700 rounded-lg">

@@ -37,6 +37,11 @@ from pymongo.errors import DuplicateKeyError
 
 from app.config import settings
 from app.core import audit
+from app.services import notices
+from app.core import roles as R
+from app.services import partner_roles
+from app.services import contact_verification
+from app.services import money_freeze
 from app.core.roles import Team, partner_role_for
 from app.db import firebase
 from app.db.mongo import C, get_db
@@ -70,11 +75,49 @@ class PartnerOpsError(Exception):
     """Refused by a partner rule. The message is safe to show the caller."""
 
 
+class PartnerOpsForbidden(PartnerOpsError):
+    """Refused because of WHO is asking, not what was asked (C2 / C3).
+
+    A subclass, so every existing `except PartnerOpsError` still catches it;
+    `routers/partner_ops._fail` answers it with `status_code` (403) rather
+    than 400.
+    """
+
+    status_code = 403
+
+
+#: C2 — turning a REVOKED role back to approved is the Owner's decision.
+OWNER_ONLY_RESTORE = (
+    "Only the Owner can restore a revoked role. Recommend it on the person's "
+    "reinstatement request instead."
+)
+
+#: C3 — a revocation that moves dependents is a transfer, and transfers are
+#: decided by the Owner. `{n}` is how many hosts and sub-agencies would move.
+OWNER_ONLY_TRANSFER = (
+    "This revocation moves {n} hosts/sub-agencies. Transfers are decided by the "
+    "Owner — file a transfer recommendation instead."
+)
+
+
+def _is_owner(actor: Mapping | None) -> bool:
+    """Is this actor a business Owner? A raw session claim is accepted."""
+    return R.is_owner_value((actor or {}).get("role"))
+
+
 class Act:
     """Audit actions this module adds to the ones in `app.core.audit`."""
 
     PARTNER_CREATED = "partner.created"
     PARTNER_REACTIVATED = "partner.reactivated"
+    #: Decision 15 (RC): approved by the Owner while the login's contacts were
+    #: not both verified — the role waits, granting nothing.
+    PARTNER_APPROVED_PENDING_VERIFICATION = "partner.approved_pending_verification"
+    #: Decision 15 (RC): both contacts verified; the approved role started.
+    PARTNER_ACTIVATED = "partner.activated"
+    #: D17: an ACTIVE legacy role whose login lacks a verified phone or email,
+    #: moved into `awaiting_verification` by the reviewed migration.
+    PARTNER_HELD_FOR_VERIFICATION = "partner.held_for_verification"
     SALE_RECORDED = "sale.recorded"
     SALE_APPROVED = "sale.approved"
     SUBAGENCY_PAID_PARENT = "subagency.paid_parent"
@@ -217,7 +260,14 @@ async def _card(card_id: str, expected: CardType) -> dict:
 
 
 async def _card_ready(card_id: str, expected: CardType) -> dict:
-    """A card an owner has signed and nobody has executed yet."""
+    """A card an owner has signed and nobody has executed yet.
+
+    RC (confirmed, CRM-FLOW 9.48): and whose money is not FROZEN — a payout,
+    withdrawal, coin purchase or loan for a subject whose money was frozen by a
+    suspension, ban or revocation waits for the Owner's decision
+    (`services/money_freeze`). This is the one place each such card is taken
+    for execution, so no execute path can forget the check.
+    """
     doc = await _card(card_id, expected)
     stage = doc.get("stage")
     if stage == str(Stage.EXECUTED):
@@ -226,7 +276,17 @@ async def _card_ready(card_id: str, expected: CardType) -> dict:
         raise PartnerOpsError(
             f"Card is {stage}. Only a card signed by an owner can be executed."
         )
+    try:
+        await money_freeze.assert_card_not_frozen(doc, db=get_db())
+    except money_freeze.MoneyFrozen as exc:
+        raise MoneyFrozenError(str(exc)) from exc
     return doc
+
+
+class MoneyFrozenError(PartnerOpsError):
+    """RC: refused because the subject's money is frozen for the Owner's review."""
+
+    status_code = 409
 
 
 async def _raise(card: NewCard, actor: dict) -> dict:
@@ -451,6 +511,14 @@ def _fs_status_fields(
     if str(kind) == str(PartnerKind.SELLER):
         fields["isApproved"] = approved
 
+    if status is PartnerStatus.AWAITING_VERIFICATION:
+        # Decision 15 (RC): the documents WERE decided (approved), the role has
+        # not started. `isActive`/`isApproved` stay false above, so no rules
+        # helper, trigger email or public listing treats it as live.
+        if verified_documents:
+            fields["kycStatus"] = "approved"
+        return fields
+
     if approved and verified_documents:
         fields["kycStatus"] = "approved"
     elif approved:
@@ -472,6 +540,9 @@ def _fs_status_fields(
         # about something else. It goes back to needing a decision, which is
         # the honest state and puts them back in the queue.
         fields["kycStatus"] = "pending"
+    # REVOKED leaves `kycStatus` exactly where it was. The identity was
+    # verified; what has been withdrawn is the role, and the record is now
+    # history rather than a file awaiting a decision.
     return fields
 
 
@@ -700,14 +771,114 @@ def _creation_warnings(doc: dict) -> list[str]:
     return warnings
 
 
+async def _validate_parent_agency(parent_id: str, applicant_uid: str) -> dict:
+    """The parent a new sub-agency may hang under — or a refusal saying why not.
+
+    ── NEVER THE CLIENT'S WORD ─────────────────────────────────────────────
+
+    `parentAgencyId` arrives on the Firestore document, which the browser or
+    the app wrote. Until now it was copied straight into Mongo as `parent_id`
+    with no check of any kind — not that it existed, not that it was an
+    agency, not that it was a MAIN agency. The only things stopping a
+    sub-agency under a sub-agency were two JSX conditionals that hid a button.
+    A client that did not render the button could nest agencies arbitrarily
+    deep, and the payout path at `request_subagency_payout` would have paid
+    the nested one from a parent that is itself paid from a parent.
+
+    The business rule is exactly one level: a Sub-agency sits under a MAIN
+    Agency and nowhere else. So the parent must:
+
+      * exist as a Mongo partner record (an id that names no record, or only
+        a Firestore document nobody registered, is not an agency that can
+        accept anyone);
+      * be `kind: agency` — not `sub_agency` (no sub-sub-agency), not `seller`;
+      * be `approved` and `is_active` — a pending, rejected, suspended or
+        revoked agency cannot take on a sub-agency;
+      * not belong to the applicant — one human cannot be a sub-agency of
+        their own agency (and the role-family rule would refuse the pair
+        anyway; this just says it in the right words).
+
+    Reads Mongo only. The authoritative state of a partner is the Mongo
+    record; the Firestore document is the replica the app reads.
+    """
+    pid = str(parent_id or "").strip()
+    if not pid:
+        raise PartnerOpsError(
+            "A sub-agency must name the main agency it belongs to. Nothing was "
+            "created."
+        )
+    parent = await get_db()[C.PARTNERS].find_one({"_id": pid})
+    if parent is None:
+        raise PartnerOpsError(
+            f"'{pid}' is not a registered agency, so a sub-agency cannot be "
+            "created under it. Nothing was created."
+        )
+    if str(parent.get("kind") or "") != str(PartnerKind.AGENCY):
+        if str(parent.get("kind") or "") == str(PartnerKind.SUB_AGENCY):
+            raise PartnerOpsError(
+                f"'{parent.get('name') or pid}' is itself a sub-agency. A "
+                "sub-agency sits exactly one level under a main agency; it "
+                "cannot have sub-agencies of its own. Nothing was created."
+            )
+        raise PartnerOpsError(
+            f"'{parent.get('name') or pid}' is a {parent.get('kind') or 'partner'}, "
+            "not a main agency, so it cannot have a sub-agency. Nothing was created."
+        )
+    if (
+        str(parent.get("status") or "") != str(PartnerStatus.APPROVED)
+        or not parent.get("is_active", False)
+    ):
+        raise PartnerOpsError(
+            f"'{parent.get('name') or pid}' is {parent.get('status') or 'not approved'}"
+            + ("" if parent.get("is_active", False) else " and inactive")
+            + ", so it cannot accept a sub-agency right now. Nothing was created."
+        )
+    uid = str(applicant_uid or "").strip()
+    # B07: the parent's owner as resolved — Mongo first, its Firestore
+    # document second — so an agency whose owner link never reached Mongo is
+    # still recognised as the applicant's own.
+    if uid and await partner_roles.owner_uid_of(parent, db=get_db()) == uid:
+        raise PartnerOpsError(
+            "You cannot register a sub-agency under your own agency. Nothing "
+            "was created."
+        )
+    return parent
+
+
+#: Sources a CLIENT writes when it creates an `agencies` / `sellers` document
+#: itself (the signed-in CRM public signup forms). `firestore.rules` pins every
+#: non-staff create arm to this value; `ensure_partner_record` holds documents
+#: carrying it to the full application eligibility (approved contact rule).
+CLIENT_CREATED_SOURCES = frozenset({"self_signup"})
+
+
+def _is_service_actor(actor: Mapping[str, object] | None) -> bool:
+    """Resolved from a service key rather than a session — the same test as
+    `app.core.security.is_service_actor`, without importing the security layer
+    into this service module."""
+    return str((actor or {}).get("role") or "") == R.SYSTEM_ROLE
+
+
 async def ensure_partner_record(
     partner_id: str,
     actor: dict,
     reason: str,
     kind: PartnerKind | None = None,
+    *,
+    enforce_role_family: bool = True,
 ) -> tuple[dict, bool, list[str]]:
     """The Mongo partner record for `partner_id`, created from Firestore if it
     does not exist yet. Returns `(document, created, warnings)`.
+
+    `enforce_role_family=False` is for `scripts/backfill_partners.py` and
+    nothing else: a MIRROR of records that already exist must represent what
+    it finds, duplicates included, so they can be seen and corrected. Every
+    path that CREATES a partner — a staff member registering one, the
+    Firestore triggers behind the public signup forms, the application route
+    the app calls — leaves it True and is held to the one-agency-per-human
+    rule and to parent validation. It used to be keyed on "is the actor the
+    system role", which the signup triggers also are, so every self-signed-up
+    partner since launch skipped the rule. That was the hole.
 
     **A second call is a no-op, not an error.** It returns the record that is
     already there, untouched, with `created` False. That is deliberate: this
@@ -751,22 +922,194 @@ async def ensure_partner_record(
 
     warnings = _creation_warnings(doc)
 
+    # ── ONE HUMAN, ONE AGENCY-FAMILY RECORD ─────────────────────────────────
+    #
+    # Claimed BEFORE the insert, because the claim is the lock. Two concurrent
+    # creates for the same person reach `claim_role_family` and exactly one
+    # gets past it — the other raises `RoleConflict` having written nothing.
+    #
+    # The owner is the Firebase uid off the Firestore record, never the email:
+    # an address is mutable, is absent on some records, and `crmUid` is what
+    # every partner document already carries. `ownerUid` is tried first
+    # because the app-side signup writes that one; `crmUid` is what the CRM
+    # paths write; `secondRoleOwnerUid` is what the second-capability flow
+    # writes, and that flow is how the production duplicate was created.
+    owner_uid = ""
+    for field in ("ownerUid", "crmUid", "secondRoleOwnerUid"):
+        owner_uid = str(source.get(field) or "").strip()
+        if owner_uid:
+            break
+
+    # ── FX-06: A DOCUMENT WITH NO OWNER AND NO SOURCE IS NOT AN APPLICATION ──
+    #
+    # Every real creator stamps `source` (the app path `self_app`, the public
+    # forms `self_signup`, staff `crm` / `crm_admin`, a parent's dashboard
+    # `agency_created`, the second-capability flow `second_role`) or names a
+    # human. A document with neither is what a failed registration-trigger
+    # outcome write used to leave when it re-created a deleted application as
+    # a stub (DUP-02). Registering it gave a nameless, ownerless pending
+    # partner that a reviewer could approve. Refused for the registration
+    # SERVICE actor — staff creating a record by hand from /kyc or a retry
+    # are making a deliberate decision and keep that ability.
+    if _is_service_actor(actor) and not owner_uid and not str(source.get("source") or "").strip():
+        raise PartnerOpsError(
+            f"'{pid}' names no owner and no source, so it is not an application "
+            "anybody filed — most likely a document re-created by a failed "
+            "write. Nothing was created."
+        )
+
+    # ── APPROVED CONTACT RULE: NO BYPASS THROUGH A CLIENT-CREATED DOCUMENT ──
+    #
+    # A document a client created straight in Firestore (`self_signup`, the
+    # only source the rules allow a non-staff create to carry) is held to the
+    # same eligibility the app's application path applies before writing:
+    # restriction, staff, the contact rule and the whole combination table.
+    # Not applied to a mirror (`enforce_role_family=False`).
+    if (
+        enforce_role_family
+        and owner_uid
+        and str(source.get("source") or "").strip() in CLIENT_CREATED_SOURCES
+    ):
+        from app.services import partner_applications as apps  # local: apps imports this module
+
+        await apps.refuse_client_created_registration(owner_uid, doc["kind"])
+
+    # ── An UNLINKED record belongs to no human yet ──────────────────────────
+    #
+    # `/agencies/register` creates the Firestore agency deliberately without
+    # `crmUid` — "if the two writes below fail, the record is left with no
+    # login attached, which is exactly what /agencies badges, so the state is
+    # visible rather than invisible". So an agency with no owner is a designed
+    # state, not corruption, and refusing to create its partner record would
+    # break staff onboarding to enforce a rule that cannot even apply: a
+    # record attached to nobody is not a second agency for anybody.
+    #
+    # It is warned about rather than waved through, because the rule has to be
+    # applied at the moment somebody DOES link it — see the note in
+    # `services/partner_roles`. That link happens in the browser today, which
+    # is the remaining gap in this fix and is reported as one.
+    # ── MIRRORING IS NOT CREATING ───────────────────────────────────────────
+    #
+    # `ensure_partner_record` serves two callers. A person registering a new
+    # partner must be held to the one-agency-per-human rule. A SYSTEM actor —
+    # `scripts/backfill_partners.py` — is mirroring Firestore records that
+    # already exist into Mongo, and a mirror that refuses to represent the
+    # data it finds is useless: it would stop partway through, and the
+    # duplicate it baulked at would be the one thing you could no longer see
+    # in Mongo.
+    #
+    # This matters right now, not hypothetically. Production holds two main
+    # agencies for `ZJ2xFSw6bDOCNzuuY1Pkv1zkXIr2`, so a claiming backfill
+    # would fail on the second one. The rule governs what may be CREATED from
+    # here on; existing data is surfaced and corrected deliberately.
+    #
+    # The distinction is the EXPLICIT `enforce_role_family` flag, which only
+    # the backfill script clears. It used to be "is the actor the system
+    # role" — and the partner-registration service credential behind the
+    # public signup triggers is ALSO the system role, so every agency and
+    # seller who applied through `/agency-signup` or `/seller-signup` since
+    # launch was mirrored in, unchecked, as though they were historical data.
+    if not enforce_role_family:
+        warnings.append(
+            "Mirrored without enforcement, so the one-agency-per-human rule "
+            "and parent validation were not applied. Existing duplicates are "
+            "reported, not blocked."
+        )
+    else:
+        # ── THE PARENT IS VALIDATED BEFORE ANYTHING IS CLAIMED ──────────────
+        #
+        # A sub-agency whose parent is not a live main agency is refused
+        # outright. Before the claim so nothing has to be given back.
+        if doc["kind"] == str(PartnerKind.SUB_AGENCY):
+            parent = await _validate_parent_agency(doc["parent_id"], owner_uid)
+            doc["parent_name"] = str(parent.get("name") or "")
+
+        if not owner_uid:
+            warnings.append(
+                "This partner record names no Firebase login, so the "
+                "one-agency-per-human rule could not be applied to it. It "
+                "will be checked when a login is attached."
+            )
+
+    if enforce_role_family and owner_uid:
+        # ── A REVOKED ROLE IS NOT RE-CREATED AS A NEW RECORD (C1 / B04) ─────
+        #
+        # Every creation path lands here — the CRM register screens through
+        # `create_partner`, the registration triggers, approval of a record
+        # that has no Mongo row yet. A person whose role of this kind was
+        # revoked asks for it back; a fresh record would be the revoked role
+        # treated as though it had never existed.
+        for held in await partner_roles.records_owned_by(owner_uid, db=db):
+            if (
+                str(held.get("kind") or "") == doc["kind"]
+                and str(held.get("status") or "") == str(PartnerStatus.REVOKED)
+            ):
+                raise PartnerOpsError(
+                    partner_roles.revoked_refusal(doc["kind"]) + " Nothing was created."
+                )
+        try:
+            await partner_roles.claim_role_family(
+                owner_uid, doc["kind"], pid, actor=actor
+            )
+        except partner_roles.RoleConflict as exc:
+            # ── A REFUSAL IS A 400, NOT A CRASH ─────────────────────────────
+            #
+            # Every router here does `except PartnerOpsError` -> 400 with the
+            # message. `RoleConflict` is its own class and nothing catches
+            # it, so without this it leaves as an unhandled 500: the caller
+            # sees "Internal Server Error", the message explaining WHICH
+            # agency they already hold is swallowed, and a rule working
+            # exactly as designed reads as the server falling over.
+            #
+            # Re-raised rather than renamed at the source because
+            # `partner_roles` must not import `partner_ops` — `partner_ops`
+            # imports it.
+            raise PartnerOpsError(str(exc)) from exc
+
+    # ── OWNERSHIP IS WRITTEN AT BIRTH ───────────────────────────────────────
+    #
+    # `owner_crm_uid` is the field everything resolves a partner's human by:
+    # sign-in (`resolve_partner_login`), session revocation, the login
+    # mirror, and — decisively — `_live_record_in_family`, which is how the
+    # one-agency-per-human rule sees records that predate the sentinel. It
+    # was set only by `attach_login` and the second-role flow, never here. So
+    # a record created with a perfectly good owner uid on its Firestore
+    # document went into Mongo belonging to nobody, and the rule could not
+    # see it the next time that human applied. Written now, on the same
+    # insert, from the same uid the claim above was taken for.
+    if owner_uid:
+        doc["owner_crm_uid"] = owner_uid
+        login_email = str(source.get("ownerEmail") or source.get("email") or "").strip().lower()
+        if login_email:
+            doc["login_email"] = login_email
+
     try:
         await db[C.PARTNERS].insert_one(doc)
     except DuplicateKeyError as exc:
         raced = await db[C.PARTNERS].find_one({"_id": pid})
         if raced is not None:
-            # Another caller won. One record exists, which is the point.
+            # Another caller won the race on the partner record itself. One
+            # record exists, which is the point. The claim stays: it now
+            # names the human who holds this family, which is true either way.
             return raced, False, []
         # Not the `_id` index, then — the only other unique index on this
         # collection is `crm_id`, and two partners cannot share one.
         clash = await db[C.PARTNERS].find_one({"crm_id": doc.get("crm_id")})
+        if enforce_role_family and owner_uid:
+            await partner_roles.release_role_family(owner_uid, doc["kind"])
         raise PartnerOpsError(
             f"CRM id '{doc.get('crm_id')}' already belongs to partner "
             f"'{clash['_id'] if clash else 'unknown'}'. Two partners cannot "
             "share one CRM id, so nothing was created — fix the duplicate crmId "
             "in Firestore first."
         ) from exc
+    except Exception:
+        # The claim is a lock, not a record. Leaving one behind after a failed
+        # insert would bar this person from ever holding the family — a worse
+        # outcome than the duplicate it exists to prevent.
+        if enforce_role_family and owner_uid:
+            await partner_roles.release_role_family(owner_uid, doc["kind"])
+        raise
 
     await audit.record(
         actor=actor,
@@ -792,6 +1135,19 @@ async def ensure_partner_record(
             "warnings": warnings,
         },
     )
+
+    # ── THE FIRESTORE DOCUMENT LEARNS ITS OWNER TOO ─────────────────────────
+    #
+    # `onAgencyApproved` in the Functions reads `ownerUid` off the agency
+    # document to address the approval notice, and `/agency-signup` never
+    # wrote that field — only `crmUid`, and only after the trigger had already
+    # fired. Mirroring the resolved uid back as `ownerUid` means every record
+    # that reached Mongo with a human attached carries that human on both
+    # sides, whichever field the form happened to write. Best effort, like
+    # every replica write here; the Mongo record is already authoritative.
+    if owner_uid and not str(source.get("ownerUid") or "").strip():
+        await asyncio.to_thread(_sync_partner_doc, doc, {"ownerUid": owner_uid})
+
     return doc, True, warnings
 
 
@@ -915,12 +1271,18 @@ async def attach_login(
       * a login is **already** attached, on either side of the link. Re-pointing
         a partner at a different person is not a repair, it is a handover, and
         it would silently orphan whoever held it;
-      * the address belongs to somebody else — a staff account, a `crmUsers`
-        document naming a different partner, or another `partners` record whose
-        `owner_crm_uid` is the same uid.
+      * the address belongs to somebody else — a staff account, or a
+        `crmUsers` document naming a different partner;
+      * the human behind the address already holds a record in this record's
+        ROLE FAMILY. This is the one-agency-per-human rule, and linking is the
+        second way a human becomes an agency's owner: creating claims the
+        family, and now so does attaching. One agency-family record (Agency
+        *or* Sub-agency) plus one Coin Seller — so an agency owner may be
+        given a coin-seller login, and may not be given a second agency.
 
-    None of those creates anything: every check runs before the Firebase account
-    does.
+    Every check but the last runs before the Firebase account is resolved. The
+    family claim needs the uid, so it runs immediately after — before anything
+    on the partner record is written, and released again if that write fails.
     """
     reason = _require_reason(reason)
     email = _normalise_email(email)
@@ -980,31 +1342,92 @@ async def attach_login(
         _resolve_or_create_login, email, name.strip() or str(partner.get("name") or "")
     )
 
-    clash = await db[C.PARTNERS].find_one({"owner_crm_uid": uid})
-    if clash is not None and str(clash["_id"]) != pid:
-        raise PartnerOpsError(
-            f"That address already signs in as partner '{clash['_id']}'. A "
-            "login holds at most one agency record and one seller record, and "
-            "they are granted through the second-capability application, not by "
-            "attaching a login twice. Nothing was changed."
+    # ── LINKING IS GOVERNED BY THE SAME RULE AS CREATING ────────────────────
+    #
+    # This is the moment a partner record acquires a human, and until now it
+    # was the one such moment the one-agency-per-human rule did not reach.
+    # Creating a record claims the family (`ensure_partner_record`); linking
+    # an already-created one did not, so an unlinked agency could be attached
+    # to somebody who already ran one — the duplicate this whole fix exists
+    # to prevent, arriving through a different door.
+    #
+    # WHAT THIS REPLACES, AND WHY IT WAS WRONG. The check here was:
+    #
+    #     clash = await db[C.PARTNERS].find_one({"owner_crm_uid": uid})
+    #     if clash is not None and str(clash["_id"]) != pid: refuse
+    #
+    # which refuses if the uid holds ANY other partner record. Its own
+    # message said "a login holds at most one agency record and one seller
+    # record" — the correct rule — but the code refused the second of those
+    # outright. An agency being given a coin-seller login, or the reverse,
+    # was rejected with a message describing it as permitted. The combination
+    # the business requires was unreachable through this route.
+    #
+    # `claim_role_family` is the rule, in one place, for both doors: one
+    # agency-family record (Agency *or* Sub-agency) per human, plus one Coin
+    # Seller, enforced by `_id` uniqueness so two simultaneous links cannot
+    # both win. Re-affirming a claim this same record already holds is not a
+    # conflict and returns quietly.
+    try:
+        await partner_roles.claim_role_family(
+            uid, str(partner.get("kind", "")), pid, actor=actor
         )
+    except partner_roles.RoleConflict as exc:
+        raise PartnerOpsError(str(exc)) from exc
+
+    # B16: and the REST of the role table, exactly as approval applies it — the
+    # lock alone let a Host be given an agency's login, or a Coin Seller a
+    # second seller's. Run after the claim so a family conflict keeps its own
+    # sentence; a refusal here gives the claim straight back. The guest rule is
+    # not applied: the login being attached is created by staff, which is not
+    # the app-guest case that rule exists for.
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    try:
+        await apps.recheck_at_decision(
+            uid, str(partner.get("kind", "")), exclude_partner_id=pid, ignore_guest=True,
+            # RC role rule: the same parent pin approval applies.
+            parent_id=(str(partner.get("parent_id") or "")
+                       if str(partner.get("kind", "")) == str(PartnerKind.SUB_AGENCY) else ""),
+        )
+    except apps.ApplicationError as exc:
+        await partner_roles.release_role_family(uid, str(partner.get("kind", "")))
+        raise PartnerOpsError(
+            str(exc).replace(" Nothing was approved.", "") + " No login was attached."
+        ) from exc
 
     # ── The grant. Mongo first, audited immediately. ─────────────────────────
+    #
+    # Everything from here to the end of the audit entry runs under a
+    # rollback: the claim was taken above, and a failure after it that left
+    # it standing would bar this human from ever holding the family — worse
+    # than the duplicate it prevents, and silent.
     now = _now()
-    updated = await db[C.PARTNERS].find_one_and_update(
-        {"_id": pid},
-        {
-            "$set": {
-                "owner_crm_uid": uid,
-                "login_attached_at": now,
-                "login_attached_by": _who(actor),
-                "login_attach_reason": reason,
-                "login_email": email,
-                "updated_at": now,
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+    try:
+        updated = await db[C.PARTNERS].find_one_and_update(
+            {"_id": pid},
+            {
+                "$set": {
+                    "owner_crm_uid": uid,
+                    "login_attached_at": now,
+                    "login_attached_by": _who(actor),
+                    "login_attach_reason": reason,
+                    "login_email": email,
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is None:
+            # The record went away between `_partner(pid)` above and here.
+            # Nothing was linked, so the claim must not stand.
+            raise PartnerOpsError(
+                f"Partner '{pid}' no longer exists, so no login was attached "
+                "and nothing was changed."
+            )
+    except Exception:
+        await partner_roles.release_role_family(uid, str(partner.get("kind", "")))
+        raise
 
     await audit.record(
         actor=actor,
@@ -1394,7 +1817,48 @@ async def _revoke_partner_sessions(partner: dict) -> int:
     return int(getattr(result, "modified_count", 0) or 0)
 
 
-def _mirror_login_status(partner: dict, status: str) -> bool:
+async def _other_live_role(partner: dict) -> bool:
+    """Does this partner's login hold ANOTHER approved, active record?
+
+    Decides `crmUsers.isActive` when one of a dual-role login's capabilities
+    is refused, suspended or revoked. `isActive` is per LOGIN: it gates the
+    CRM shell, and `syncStorageRoleClaim` clears the Storage claim when it is
+    false. Writing it from the status of the one record being decided —
+    which is what happened before — meant that revoking the Agency from an
+    Agency + Coin Seller human switched off the seller's portal and their KYC
+    document access as collateral. The spec's own example: "Seller remains
+    active". So it is computed across every record the login holds, in the
+    async context, and handed to `_mirror_login_status`.
+    """
+    uid = str(partner.get("owner_crm_uid") or "").strip()
+    if not uid:
+        return False
+    pid = str(partner.get("_id") or "")
+    cursor = get_db()[C.PARTNERS].find(
+        {"owner_crm_uid": uid, "status": str(PartnerStatus.APPROVED), "is_active": True}
+    )
+    async for row in cursor:
+        if str(row.get("_id") or "") != pid:
+            return True
+    return False
+
+
+async def _mirror_login(partner: dict, status: str) -> bool:
+    """`_mirror_login_status`, with the other-live-role fact resolved first —
+    then the app's role flags pushed from the updated login document, so the
+    Android Agency / Seller tag follows the decision immediately rather than
+    at the person's next sign-in."""
+    other = await _other_live_role(partner)
+    ok = await asyncio.to_thread(_mirror_login_status, partner, status, other)
+    uid = await asyncio.to_thread(_login_uid_of, partner)
+    if uid:
+        note = await asyncio.to_thread(crm.push_app_role_flags, uid)
+        if note:
+            log.warning("Partner %s: %s", partner.get("_id"), note)
+    return ok
+
+
+def _mirror_login_status(partner: dict, status: str, other_live_role: bool = False) -> bool:
     """Put the partner's decided status onto their `crmUsers` login.
 
     **This is what makes an approval reach the person it is about.**
@@ -1431,6 +1895,21 @@ def _mirror_login_status(partner: dict, status: str) -> bool:
 
     fields = _second_role_crm_fields(partner.get("kind", ""), status)
     name = str(fields.pop("role_name"))
+    # FX-04: a login document with no `role` is "not usable" to every reader of
+    # role flags, so an approval that created (or met) one never reached the
+    # app (RF-01). When the document names no role yet, it is given the one
+    # this decision is about — `roles` too — and never over a role it has.
+    try:
+        existing_login = _read_crm_user(uid)
+    except Exception:  # noqa: BLE001 — unknown: write the status as before
+        existing_login = None
+    if existing_login is not None and not str(existing_login.get("role") or "").strip():
+        fields["role"] = name
+        held = [r for r in (existing_login.get("roles") or []) if r]
+        fields["roles"] = held + ([name] if name not in held else [])
+        link_field = "sellerId" if name == "seller" else "agencyId"
+        if not str(existing_login.get(link_field) or "").strip():
+            fields[link_field] = str(partner.get("_id") or "")
     try:
         from firebase_admin import firestore as fb_firestore
 
@@ -1445,9 +1924,24 @@ def _mirror_login_status(partner: dict, status: str) -> bool:
                 # `status` is what every legacy predicate and the routing table
                 # read. `roleStatus.<name>` is the per-capability form a
                 # dual-role login needs. Both, so neither reader is surprised.
-                "status": status,
+                #
+                # `status` is the LOGIN's: refusing, suspending or revoking one
+                # capability while another is live must not route the person
+                # to the waiting room for the one they still run. Their
+                # per-capability `roleStatus` carries the refusal.
+                "status": status if (other_live_role is False or status == str(PartnerStatus.APPROVED)) else str(PartnerStatus.APPROVED),
                 **fields,
-                "isActive": status in (str(PartnerStatus.APPROVED), "approved"),
+                # The LOGIN stays active while any of its capabilities is
+                # live. See `_other_live_role`.
+                "isActive": status in (
+                    str(PartnerStatus.APPROVED), "approved",
+                    # Decision 15 (RC): approved, waiting for verified contacts.
+                    # The login must still sign in — to the waiting room, where
+                    # the verification is done — so it stays active; its
+                    # per-capability `roleStatus` grants nothing.
+                    str(PartnerStatus.AWAITING_VERIFICATION),
+                )
+                or other_live_role,
             },
             merge=True,
         )
@@ -2524,6 +3018,128 @@ async def identify_payer(line: Mapping) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+async def _refuse_single_role_revocation(partner: dict) -> None:
+    """UGP-B: ONE active role → suspend, never a separate revoke. Raises PartnerOpsError.
+
+    Counted from the authoritative records — every `partners` row the owner
+    holds approved or suspended, plus Host — through `user_roles`, the same
+    count the CRM renders from. A record with no owner is a person holding
+    exactly this one role.
+    """
+    from app.services import user_roles  # local: user_roles imports partner helpers lazily
+
+    kind = str(partner.get("kind") or "")
+    pid = str(partner.get("_id") or "")
+    uid = await partner_roles.owner_uid_of(partner, db=get_db())  # B07
+    count, counted_ids = 0, set()
+    if uid:
+        inv = await user_roles.role_inventory(uid, db=get_db())
+        count = inv["held_count"]
+        counted_ids = {r.get("id") for r in inv["roles"] if r.get("role") != "host"}
+    if pid not in counted_ids and str(partner.get("status") or "") in user_roles.HELD_PARTNER_STATUSES:
+        count += 1
+    if count < 2:
+        raise PartnerOpsError(
+            user_roles.SINGLE_ROLE_REFUSAL.format(label=user_roles.ROLE_LABELS.get(kind, "This role"))
+            + " Nothing was revoked."
+        )
+
+
+async def _refuse_restricted_owner(partner: dict, *, doing: str = "restoring this role") -> None:
+    """UGP review: a role is not RESTORED onto a banned or suspended account.
+
+    The rule `users.restore_host` already applies to a Host; reactivating a
+    suspended or revoked partner record — directly, or through Approve, which
+    delegates here — is the same act for the other roles. Lift the account's
+    restriction first. A record whose owner has no app account has no account
+    restriction to respect.
+
+    FX-09: a FIRST approval is held to the same rule (`doing` names the act in
+    the refusal) — granting a role to a suspended or banned account is no
+    different from restoring one onto it.
+    """
+    uid = await partner_roles.owner_uid_of(partner, db=get_db())  # B07
+    if not uid:
+        return
+    from app.services import users as users_svc  # local: users imports this module's peers
+
+    try:
+        owner = await users_svc.load_user(uid)
+    except users_svc.UserNotFound:
+        return
+    if users_svc.restriction_of(owner):
+        raise PartnerOpsError(
+            "The owner's account is restricted. Lift the suspension or ban before "
+            f"{doing}. Nothing was changed."
+        )
+
+
+async def _recheck_sub_agency_parent(partner: dict) -> None:
+    """UGP-G: a sub-agency is approved or restored only under a LIVE main agency.
+
+    The parent was validated when the record was created; it can have been
+    suspended or revoked since, and approving a sub-agency under it would hang
+    a live business off a dead one.
+    """
+    if str(partner.get("kind") or "") != str(PartnerKind.SUB_AGENCY):
+        return
+    try:
+        await _validate_parent_agency(
+            str(partner.get("parent_id") or ""),
+            await partner_roles.owner_uid_of(partner, db=get_db()),  # B07
+        )
+    except PartnerOpsError as exc:
+        raise PartnerOpsError(
+            "This sub-agency's main agency cannot take it right now — "
+            + str(exc).replace(" Nothing was created.", "")
+            + " Nothing was changed."
+        ) from exc
+
+
+async def _enforce_role_rules_at_decision(
+    partner: dict, actor: dict, *, ignore_guest: bool = False
+) -> None:
+    """Approval and reactivation re-check the role rules. Raises PartnerOpsError.
+
+    1. The role table, against what the person holds NOW (not when they
+       applied) — Host + Agency, Agency + Sub-agency and the rest stay
+       impossible even if two applications were filed at once.
+    2. The one-agency-family lock, through `partner_roles.claim_role_family` —
+       the same lock creation takes. A REVOKED record's slot was released when
+       it was revoked; approving or reactivating it must take the slot again,
+       and is refused if another live agency-family record now holds it.
+
+    Skipped only for a record that names no login yet: there is no human to
+    apply a per-human rule to (it is applied when a login is attached).
+
+    B07: the human is resolved from `owner_crm_uid`, falling back to the
+    Firestore document's `crmUid` / `ownerUid` (and persisted when found), so a
+    record whose Mongo link was never written is still held to the rules.
+    C1: a REVOKED record of the same kind is part of what the person holds, so
+    approving a NEW record of a revoked kind is refused with REVOKED_REFUSAL.
+    """
+    uid = await partner_roles.owner_uid_of(partner, db=get_db())
+    kind = str(partner.get("kind") or "")
+    pid = str(partner.get("_id") or "")
+    if not uid or partner_roles.family_of(kind) is None:
+        return
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    # `ignore_guest`: Decision 15 (RC) — where the both-contacts gate decides
+    # contacts (a first approval, an activation, a restoration), the older
+    # one-contact guest rule is not asked a second, weaker question.
+    await apps.recheck_at_decision(
+        uid, kind, exclude_partner_id=pid, ignore_guest=ignore_guest,
+        # RC role rule: a Sub-agency sits only under the main agency its
+        # holder is a Host under (when they are one).
+        parent_id=str(partner.get("parent_id") or "") if kind == str(PartnerKind.SUB_AGENCY) else "",
+    )
+    try:
+        await partner_roles.claim_role_family(uid, kind, pid, actor=actor, decision=True)
+    except partner_roles.RoleConflict as exc:
+        raise PartnerOpsError(str(exc)) from exc
+
+
 async def approve_partner(
     partner_id: str,
     reason: str,
@@ -2534,6 +3150,14 @@ async def approve_partner(
 
     No owner signature: nothing moves at approval, so this is skilled team work
     rather than a money decision (9.2).
+
+    **Decision 15 (RC): approval is not activation.** The role starts only
+    when the login holds BOTH a verified phone and a verified email
+    (`services/contact_verification`). Without both, only the Owner may
+    approve; the record then waits in `awaiting_verification` — approved,
+    holding its slot, granting nothing — and `activate_partner_if_verified`
+    starts it, audited, once both are verified. Anyone else gets a
+    machine-readable `CONTACT_VERIFICATION_REQUIRED` refusal.
 
     **Approval is also where the business record comes into existence.** A
     partner approved in the CRM but absent from Mongo is approved in name only —
@@ -2566,6 +3190,368 @@ async def approve_partner(
     ):
         raise PartnerOpsError("This partner is already approved and active.")
 
+    # Decision 15 (RC): already approved by the Owner and waiting for verified
+    # contacts. "Approve" again is only the activation check — it never starts
+    # the role around the verification.
+    if str(partner.get("status") or "") == str(PartnerStatus.AWAITING_VERIFICATION):
+        return await activate_partner_if_verified(partner_id, actor, reason=reason)
+
+    # UGP-B: ONE restore path. A suspended or revoked record was approved once;
+    # "Approve" on it used to re-run first-approval side effects (referral
+    # code, virtual account, second role, the "approved" notice and email). It
+    # is a restoration, so it goes through `reactivate_partner` — the same
+    # record, re-checked against the role table, with the restore notice.
+    if str(partner.get("status") or "") in (
+        str(PartnerStatus.SUSPENDED), str(PartnerStatus.REVOKED)
+    ):
+        restored = await reactivate_partner(partner_id, reason, actor)
+        restored["restored"] = True
+        return restored
+
+    # ── FX-09: A FIRST APPROVAL NEEDS A LOGIN, AND AN UNRESTRICTED ONE ──────
+    #
+    # A record that names no login is a business nobody is held to: the
+    # one-agency-per-person rule and the contact rule both skip it
+    # (`_enforce_role_rules_at_decision` returns early), so approving it made
+    # it live with no check at all. Attach a login first — attach-login runs
+    # the full re-check — then approve. And a suspended or banned owner is not
+    # granted a role, exactly as one is not restored onto them.
+    if not await partner_roles.owner_uid_of(partner, db=get_db()):
+        raise PartnerOpsError(
+            "This record names no login, so nobody can be held to the "
+            "one-agency-per-person rule or the contact rule. Attach a login "
+            "first (Attach login on the record), then approve. Nothing was approved."
+        )
+    await _refuse_restricted_owner(partner, doing="approving it")
+
+    await _enforce_role_rules_at_decision(partner, actor, ignore_guest=True)
+    await _recheck_sub_agency_parent(partner)
+
+    # ── Decision 15 (RC): approval is not activation ────────────────────────
+    #
+    # The role STARTS only when the login holds both a verified phone and a
+    # verified email (`services/contact_verification`). With both, this is
+    # the approval it always was. Without both, only the Owner may approve,
+    # and the record waits — approved, holding its slot, granting nothing —
+    # until `activate_partner_if_verified` starts it. Anyone else is told
+    # what is missing, machine-readably.
+    login_uid = await partner_roles.owner_uid_of(partner, db=get_db())
+    verification = await asyncio.to_thread(contact_verification.status, login_uid)
+    if not verification.complete:
+        if not _is_owner(actor):
+            raise ContactVerificationRequired(
+                verification,
+                "This role can start only once the applicant's login has BOTH a verified "
+                "phone number and a verified email address"
+                f" (missing: {', '.join(verification.missing)}). The Owner can approve it now, "
+                "and it will start by itself as soon as both are verified. Nothing was approved.",
+            )
+        return await _approve_pending_verification(
+            partner, reason, actor, verification,
+            record_created=record_created, warnings=warnings,
+        )
+
+    return await _start_role(
+        partner, reason, actor,
+        expect_status=str(partner.get("status") or ""),
+        action=audit.Action.PARTNER_APPROVED,
+        record_created=record_created,
+        warnings=warnings,
+    )
+
+
+class ContactVerificationRequired(PartnerOpsError):
+    """Decision 15: both contacts are not verified yet. Carries the machine-readable detail."""
+
+    def __init__(self, verification: "contact_verification.Verification", message: str):
+        super().__init__(message)
+        self.verification = verification
+
+    def api_detail(self) -> dict:
+        return contact_verification.refusal_detail(self.verification, str(self))
+
+
+async def _approve_pending_verification(
+    partner: dict,
+    reason: str,
+    actor: dict,
+    verification: "contact_verification.Verification",
+    *,
+    record_created: bool,
+    warnings: list[str],
+) -> dict:
+    """Decision 15 — the Owner approved; the role waits for verified contacts.
+
+    The record is APPROVED in substance (`approved_at`, `approved_by`, the
+    documents decided) but its status is `awaiting_verification` and it is
+    inactive, so every privilege check that requires `approved` refuses it.
+    The login stays signable, in the waiting room, so the person can verify.
+    No referral code, no virtual account, no second-role grant, no "you're
+    live" notice: those belong to the start of the role.
+    """
+    pid = str(partner["_id"])
+    kind = str(partner.get("kind") or "")
+    has_documents = await asyncio.to_thread(_has_kyc_documents, partner)
+    now = _now()
+    before = {"status": partner.get("status"), "is_active": partner.get("is_active", False)}
+    updated = await get_db()[C.PARTNERS].find_one_and_update(
+        {"_id": pid, "status": partner.get("status")},
+        {
+            "$set": {
+                "status": str(PartnerStatus.AWAITING_VERIFICATION),
+                "is_active": False,
+                "approved_at": now,
+                "approved_by": _who(actor),
+                "approval_reason": reason,
+                "activation": {
+                    "state": str(PartnerStatus.AWAITING_VERIFICATION),
+                    "missing": verification.missing,
+                    "approved_at": now,
+                    "approved_by": _who(actor),
+                },
+                "updated_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise PartnerOpsError(
+            "This record changed while it was being approved. Reload it and try again."
+        )
+
+    await audit.record(
+        actor=actor,
+        action=Act.PARTNER_APPROVED_PENDING_VERIFICATION,
+        subject_type="partner",
+        subject_id=pid,
+        reason=reason,
+        before=before,
+        after={"status": str(PartnerStatus.AWAITING_VERIFICATION), "is_active": False},
+        meta={"kind": kind, "missing": verification.missing},
+    )
+    # The waiting room must show the new state, so the old session goes.
+    await _revoke_partner_sessions(updated)
+
+    synced = _sync_partner_doc(
+        updated,
+        {
+            **_fs_status_fields(
+                kind, PartnerStatus.AWAITING_VERIFICATION, False,
+                verified_documents=has_documents,
+            ),
+            "approvedAt": now,
+            "approvedBy": actor.get("uid", ""),
+            "rejectionReason": "",
+            "activationPending": verification.missing,
+        },
+    )
+    login_synced = await _mirror_login(updated, str(PartnerStatus.AWAITING_VERIFICATION))
+
+    out = _public(updated)
+    out["replica_synced"] = synced
+    out["login_synced"] = login_synced
+    out["awaiting_verification"] = True
+    out["missing"] = verification.missing
+    out["partner_record_created"] = record_created
+    out["warnings"] = warnings + [
+        "Approved, but the role has NOT started: the login still needs a verified "
+        + " and a verified ".join(verification.missing)
+        + ". It starts by itself once both are verified."
+    ]
+    out["notified"] = await _notify_owner(
+        updated,
+        lambda uid, k, p: notices.partner_awaiting_verification(uid, k, p, verification.missing),
+    )
+    return out
+
+
+async def hold_for_verification(partner_id: str, reason: str, actor: dict) -> dict:
+    """D17 — an ACTIVE legacy role whose login lacks a verified phone or email waits.
+
+    Decision 15 holds a NEW approval in `awaiting_verification` until both
+    contacts are verified; D17 applies the same state to roles that started
+    before the rule existed. The state is exactly the D15 one — inactive, so
+    every privilege check that requires `approved` refuses it; the login stays
+    signable, in the waiting room — and the way back is the D15 way back:
+    `activate_partner_if_verified`, which re-reads the verification and starts
+    the role again (its referral code and virtual account are `_ensure_*`, so
+    nothing is minted twice). The original approval stays the approval on
+    record; the hold is written beside it.
+
+    Refused unless the record is APPROVED and ACTIVE and its login really does
+    lack a verified contact — re-read here, never taken from a plan. The move is
+    conditional on the status, so a record that changed since it was read is
+    left alone. Only `scripts/d17_legacy_partners.py --apply` calls this, after
+    the dry-run was reviewed and approved.
+    """
+    partner = await _partner(partner_id)
+    pid = str(partner["_id"])
+    kind = str(partner.get("kind") or "")
+    if kind not in (str(PartnerKind.AGENCY), str(PartnerKind.SUB_AGENCY), str(PartnerKind.SELLER)):
+        raise PartnerOpsError(f"{pid} is a {kind or 'record'}; only an agency, sub-agency or seller is held here.")
+    if str(partner.get("status") or "") != str(PartnerStatus.APPROVED) or not partner.get("is_active", False):
+        raise PartnerOpsError(f"{pid} is not an approved, active role; nothing to hold.")
+    reason = _require_reason(reason)
+    login_uid = await partner_roles.owner_uid_of(partner, db=get_db())
+    if not login_uid:
+        raise PartnerOpsError(f"{pid} has no login attached; there is nobody who could verify.")
+    verification = await asyncio.to_thread(contact_verification.status, login_uid)
+    if verification.complete:
+        raise PartnerOpsError(f"{pid}: both contacts are verified on the login; nothing to hold.")
+
+    has_documents = await asyncio.to_thread(_has_kyc_documents, partner)
+    now = _now()
+    before = {"status": partner.get("status"), "is_active": partner.get("is_active", False)}
+    updated = await get_db()[C.PARTNERS].find_one_and_update(
+        {"_id": pid, "status": str(PartnerStatus.APPROVED), "is_active": True},
+        {
+            "$set": {
+                "status": str(PartnerStatus.AWAITING_VERIFICATION),
+                "is_active": False,
+                "activation": {
+                    "state": str(PartnerStatus.AWAITING_VERIFICATION),
+                    "missing": verification.missing,
+                    "held_at": now,
+                    "held_by": _who(actor),
+                    "held_reason": reason,
+                },
+                "updated_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise PartnerOpsError(f"{pid} changed while it was being held. Nothing was changed.")
+
+    await audit.record(
+        actor=actor,
+        action=Act.PARTNER_HELD_FOR_VERIFICATION,
+        subject_type="partner",
+        subject_id=pid,
+        reason=reason,
+        before=before,
+        after={"status": str(PartnerStatus.AWAITING_VERIFICATION), "is_active": False},
+        meta={"kind": kind, "missing": verification.missing, "migration": "D17"},
+    )
+    # The capability is gone, so the session that carried it goes too.
+    await _revoke_partner_sessions(updated)
+    synced = _sync_partner_doc(
+        updated,
+        {
+            **_fs_status_fields(kind, PartnerStatus.AWAITING_VERIFICATION, False,
+                                verified_documents=has_documents),
+            "activationPending": verification.missing,
+        },
+    )
+    login_synced = await _mirror_login(updated, str(PartnerStatus.AWAITING_VERIFICATION))
+    out = _public(updated)
+    out["held"] = True
+    out["missing"] = verification.missing
+    out["replica_synced"] = synced
+    out["login_synced"] = login_synced
+    out["notified"] = await _notify_owner(
+        updated,
+        lambda uid, k, p: notices.partner_held_for_verification(uid, k, p, verification.missing),
+    )
+    return out
+
+
+async def activate_partner_if_verified(partner_id: str, actor: dict, *, reason: str = "") -> dict:
+    """Decision 15 — start an approved role once both contacts are verified.
+
+    The ONLY way out of `awaiting_verification`. Verification is re-read from
+    the authoritative sources (never trusted from the caller), the person's
+    restriction and the role table are re-checked as at any approval, and the
+    move is conditional on the status — so two simultaneous calls start the
+    role once. A role that already started is returned as it is.
+    """
+    partner = await _partner(partner_id)
+    status = str(partner.get("status") or "")
+    if status == str(PartnerStatus.APPROVED) and partner.get("is_active", False):
+        out = _public(partner)
+        out["activated"] = False
+        out["already_active"] = True
+        return out
+    if status != str(PartnerStatus.AWAITING_VERIFICATION):
+        raise PartnerOpsError("This role is not waiting for contact verification.")
+
+    login_uid = await partner_roles.owner_uid_of(partner, db=get_db())
+    verification = await asyncio.to_thread(contact_verification.status, login_uid)
+    if not verification.complete:
+        raise ContactVerificationRequired(
+            verification,
+            "The role starts once both a verified phone number and a verified email "
+            f"address are on the login (missing: {', '.join(verification.missing)}).",
+        )
+    await _refuse_restricted_owner(partner, doing="starting it")
+    await _enforce_role_rules_at_decision(partner, actor, ignore_guest=True)
+    await _recheck_sub_agency_parent(partner)
+    await asyncio.to_thread(contact_verification.record_phone, login_uid, verification.phone)
+
+    trigger = str(actor.get("triggered_by") or "").strip()
+    default_reason = "Both contacts verified; the role approved earlier has started." + (
+        f" Checked at the request of account {trigger}." if trigger else ""
+    )
+    try:
+        out = await _start_role(
+            partner,
+            reason or default_reason,
+            actor,
+            expect_status=str(PartnerStatus.AWAITING_VERIFICATION),
+            action=Act.PARTNER_ACTIVATED,
+            record_created=False,
+            warnings=[],
+        )
+    except PartnerOpsError:
+        # A concurrent call started it first: that is success, said once.
+        now_row = await _partner(partner_id)
+        if str(now_row.get("status") or "") == str(PartnerStatus.APPROVED) and now_row.get("is_active", False):
+            out = _public(now_row)
+            out["activated"] = False
+            out["already_active"] = True
+            return out
+        raise
+    out["activated"] = True
+    return out
+
+
+async def activate_for_login(uid: str, actor: dict) -> list[dict]:
+    """Decision 15 — start every awaiting role of this login whose contacts are verified."""
+    uid = str(uid or "").strip()
+    results: list[dict] = []
+    if not uid:
+        return results
+    async for row in get_db()[C.PARTNERS].find(
+        {"owner_crm_uid": uid, "status": str(PartnerStatus.AWAITING_VERIFICATION)}
+    ):
+        pid = str(row.get("_id") or "")
+        try:
+            results.append(await activate_partner_if_verified(pid, actor))
+        except PartnerOpsError as exc:
+            detail = getattr(exc, "api_detail", None)
+            results.append({"id": pid, "activated": False,
+                            "refusal": detail() if callable(detail) else str(exc)})
+    return results
+
+
+async def _start_role(
+    partner: dict,
+    reason: str,
+    actor: dict,
+    *,
+    expect_status: str,
+    action: str,
+    record_created: bool,
+    warnings: list[str],
+) -> dict:
+    """The role starts: status approved and active, and everything that follows.
+
+    Shared by a first approval with verified contacts and by the activation of
+    a record the Owner approved earlier (Decision 15). One body, so the two
+    can never drift: the same session sweep, replicas, referral code, login
+    mirror, virtual account, second-role grant and notice.
+    """
+    partner_id = str(partner["_id"])
     # Approving states that the documents were checked, so `kycStatus` follows
     # the decision — but only when there were documents to check. With none,
     # `kycStatus` stays where it is and the partner keeps the upload form on
@@ -2584,24 +3570,43 @@ async def approve_partner(
         "status": partner.get("status"),
         "is_active": partner.get("is_active", False),
     }
+    # B17: conditional on the status read above. A concurrent decision that
+    # moved the record first leaves this matching nothing, and it stops here —
+    # before the audit row, the session sweep, the replicas and the notice.
+    starting_awaited = expect_status == str(PartnerStatus.AWAITING_VERIFICATION)
+    stamp: dict = {
+        "status": str(PartnerStatus.APPROVED),
+        "is_active": True,
+        "updated_at": now,
+    }
+    if starting_awaited:
+        # Decision 15: the Owner's approval stays the approval on record; this
+        # is when the role STARTED, and who (or what) started it.
+        stamp.update({
+            "activated_at": now,
+            "activated_by": _who(actor),
+            "activation.state": "started",
+            "activation.started_at": now,
+        })
+    else:
+        stamp.update({
+            "approved_at": now,
+            "approved_by": _who(actor),
+            "approval_reason": reason,
+        })
     updated = await get_db()[C.PARTNERS].find_one_and_update(
-        {"_id": partner_id},
-        {
-            "$set": {
-                "status": str(PartnerStatus.APPROVED),
-                "is_active": True,
-                "approved_at": now,
-                "approved_by": _who(actor),
-                "approval_reason": reason,
-                "updated_at": now,
-            }
-        },
+        {"_id": partner_id, "status": expect_status},
+        {"$set": stamp},
         return_document=ReturnDocument.AFTER,
     )
+    if updated is None:
+        raise PartnerOpsError(
+            "This record changed while it was being approved. Reload it and try again."
+        )
 
     await audit.record(
         actor=actor,
-        action=audit.Action.PARTNER_APPROVED,
+        action=action,
         subject_type="partner",
         subject_id=partner_id,
         reason=reason,
@@ -2634,6 +3639,8 @@ async def approve_partner(
             out_sessions,
         )
 
+    from firebase_admin import firestore as _fb_fs  # local: the stubbed module in tests
+
     synced = _sync_partner_doc(
         updated,
         {
@@ -2643,8 +3650,12 @@ async def approve_partner(
                 True,
                 verified_documents=has_documents,
             ),
-            "approvedAt": now,
-            "approvedBy": actor.get("uid", ""),
+            **(
+                {"activatedAt": now, "activatedBy": actor.get("uid", ""),
+                 "activationPending": _fb_fs.DELETE_FIELD}
+                if starting_awaited else
+                {"approvedAt": now, "approvedBy": actor.get("uid", "")}
+            ),
             "rejectionReason": "",
         },
     )
@@ -2656,9 +3667,7 @@ async def approve_partner(
     # The login itself. Without this the approval never reaches the person:
     # the CRM routes on `crmUsers.status`, not on Mongo and not on the partner
     # document, so an approved partner stayed locked in the waiting room.
-    login_synced = await asyncio.to_thread(
-        _mirror_login_status, updated or partner, str(PartnerStatus.APPROVED)
-    )
+    login_synced = await _mirror_login(updated or partner, str(PartnerStatus.APPROVED))
 
     out = _public(updated)
     out["replica_synced"] = synced
@@ -2729,6 +3738,19 @@ async def approve_partner(
 
     if second_of:
         out["second_role"] = await _grant_second_role(updated or partner, reason, actor)
+
+    # ── Tell the person. LAST, and never a reason for the above to fail. ────
+    out["notified"] = await _notify_owner(
+        updated or partner,
+        lambda uid, kind, pid: notices.partner_approved(
+            uid, kind, pid,
+            next_step=(
+                "Share your referral code with hosts to start onboarding."
+                if str(kind) != str(PartnerKind.SELLER) else
+                "You can now receive recharge requests from buyers."
+            ),
+        ),
+    )
     return out
 
 
@@ -2748,14 +3770,24 @@ async def reject_partner(partner_id: str, reason: str, actor: dict) -> dict:
             "This application was already rejected: "
             f"{partner.get('rejection_reason') or 'no reason on record'}"
         )
+    # UGP-B: reject is the decision on an APPLICATION. On an approved,
+    # suspended or revoked record it was an unguarded revocation — no dependents
+    # check, no one-role rule — that overwrote the record's status.
+    if str(partner.get("status") or str(PartnerStatus.PENDING)) != str(PartnerStatus.PENDING):
+        raise PartnerOpsError(
+            f"Only a pending application can be rejected; this one is "
+            f"{partner.get('status')}. Use Suspend, Revoke or Restore instead."
+        )
 
     now = _now()
     before = {
         "status": partner.get("status"),
         "is_active": partner.get("is_active", False),
     }
+    # B17: conditional on the (pending) status read above; on no match nothing
+    # else happens.
     updated = await get_db()[C.PARTNERS].find_one_and_update(
-        {"_id": partner_id},
+        {"_id": partner_id, "status": partner.get("status")},
         {
             "$set": {
                 "status": str(PartnerStatus.REJECTED),
@@ -2775,6 +3807,20 @@ async def reject_partner(partner_id: str, reason: str, actor: dict) -> dict:
         },
         return_document=ReturnDocument.AFTER,
     )
+    if updated is None:
+        raise PartnerOpsError(
+            "This application changed while it was being rejected. Reload it and try again."
+        )
+
+    # Decision 16 (RC): rejection releases the registration slot. The record
+    # and its decision history stay exactly as they are; a fresh application
+    # (including under the same Agency) is a NEW record that takes the slot.
+    slot_released = False
+    owner_for_slot = await partner_roles.owner_uid_of(updated or partner, db=get_db())
+    if owner_for_slot:
+        slot_released = await partner_roles.release_claim_of(
+            owner_for_slot, str(partner.get("kind") or ""), partner_id
+        )
 
     await audit.record(
         actor=actor,
@@ -2784,7 +3830,7 @@ async def reject_partner(partner_id: str, reason: str, actor: dict) -> dict:
         reason=reason,
         before=before,
         after={"status": str(PartnerStatus.REJECTED), "rejection_reason": reason},
-        meta={"kind": partner.get("kind")},
+        meta={"kind": partner.get("kind"), "slot_released": slot_released},
     )
 
     synced = _sync_partner_doc(
@@ -2798,9 +3844,7 @@ async def reject_partner(partner_id: str, reason: str, actor: dict) -> dict:
     )
     # The login too, or a rejected applicant keeps whatever access their last
     # decision gave them. Status has to move in lockstep with the record.
-    login_synced = await asyncio.to_thread(
-        _mirror_login_status, updated or partner, str(PartnerStatus.REJECTED)
-    )
+    login_synced = await _mirror_login(updated or partner, str(PartnerStatus.REJECTED))
     out = _public(updated)
     out["replica_synced"] = synced
     out["login_synced"] = login_synced
@@ -2814,6 +3858,11 @@ async def reject_partner(partner_id: str, reason: str, actor: dict) -> dict:
     # either side.
     if partner.get("second_role_of"):
         out["second_role"] = await _reject_second_role(updated or partner, reason, actor)
+
+    out["notified"] = await _notify_owner(
+        updated or partner,
+        lambda uid, kind, pid: notices.partner_rejected(uid, kind, pid, reason),
+    )
     return out
 
 
@@ -2826,14 +3875,34 @@ async def deactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         PartnerStatus.SUSPENDED
     ):
         raise PartnerOpsError("This partner is already deactivated.")
+    # UGP review: only a role that is HELD can be suspended. Suspending a
+    # pending, rejected or revoked record turned it into a "suspended" one —
+    # which counts as held (so the one-role rule could be walked round) and
+    # which Restore then made approved without the approval's checks.
+    status_now = str(partner.get("status") or "")
+    if status_now != str(PartnerStatus.APPROVED):
+        raise PartnerOpsError({
+            str(PartnerStatus.PENDING): "This application has not been approved, so there is nothing to suspend. Reject it instead.",
+            str(PartnerStatus.REJECTED): "This application was rejected, so there is nothing to suspend.",
+            str(PartnerStatus.REVOKED): "This role was revoked, so there is nothing to suspend.",
+        }.get(status_now, f"Only an approved partner can be suspended (this one is '{status_now or 'unknown'}')."))
+
+    # RC (confirmed, CRM-FLOW 9.48): a role suspension freezes this record's
+    # pending money for the Owner's review, first. Restoring does not release it.
+    await money_freeze.freeze_partner(
+        partner_id, row=partner, cause="role_suspended", label="a role suspension",
+        reason=reason, actor=actor, db=get_db(),
+    )
 
     now = _now()
     before = {
         "status": partner.get("status"),
         "is_active": partner.get("is_active", False),
     }
+    # Conditional on the status just checked, so a decision racing this one
+    # (a revoke, a reject) is not overwritten by a suspension.
     updated = await get_db()[C.PARTNERS].find_one_and_update(
-        {"_id": partner_id},
+        {"_id": partner_id, "status": str(PartnerStatus.APPROVED)},
         {
             "$set": {
                 "status": str(PartnerStatus.SUSPENDED),
@@ -2846,6 +3915,8 @@ async def deactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         },
         return_document=ReturnDocument.AFTER,
     )
+    if updated is None:
+        raise PartnerOpsError("This record changed while it was being suspended. Reload it and try again.")
 
     await audit.record(
         actor=actor,
@@ -2862,20 +3933,29 @@ async def deactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         updated,
         _fs_status_fields(partner.get("kind", ""), PartnerStatus.SUSPENDED, False),
     )
-    login_synced = await asyncio.to_thread(
-        _mirror_login_status, updated or partner, str(PartnerStatus.SUSPENDED)
-    )
+    login_synced = await _mirror_login(updated or partner, str(PartnerStatus.SUSPENDED))
     out = _public(updated)
     out["replica_synced"] = synced
     out["login_synced"] = login_synced
     # A suspension that leaves the current token working is a suspension that
     # starts in up to seven days. See `_revoke_partner_sessions`.
     out["sessions_revoked"] = await _revoke_partner_sessions(updated or partner)
+    out["notified"] = await _notify_owner(
+        updated or partner,
+        lambda uid, kind, pid: notices.partner_suspended(uid, kind, pid, reason),
+    )
     return out
 
 
 async def reactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
-    """Lift a suspension. Only a partner that was approved once can come back."""
+    """Lift a suspension, or — Owner only — restore a revoked role.
+
+    Only a partner that was approved once can come back, and it comes back as
+    the SAME record. A role-level suspension keeps the permission it always
+    had; a REVOKED record is the Owner's decision (C2), whether it arrives
+    here directly, through Approve (which delegates here), or from a decided
+    reinstatement request.
+    """
     reason = _require_reason(reason)
     partner = await _partner(partner_id)
 
@@ -2887,14 +3967,56 @@ async def reactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         raise PartnerOpsError(
             "This application was rejected, not suspended. Approve it instead."
         )
+    # Decision 15 (RC): an Owner-approved role WAITING for verified contacts was
+    # never started, so there is nothing to restore — and "restoring" it here
+    # would start it around the verification. Restore on it is the activation
+    # check, exactly like Approve: it starts only if both contacts are verified.
+    if str(partner.get("status") or "") == str(PartnerStatus.AWAITING_VERIFICATION):
+        return await activate_partner_if_verified(partner_id, actor, reason=reason)
+    # UGP-B: restoring is for a role that was held. A pending record was never
+    # approved; "reactivating" it approved it without the approval's checks.
+    if str(partner.get("status") or str(PartnerStatus.PENDING)) == str(PartnerStatus.PENDING):
+        raise PartnerOpsError(
+            "This application has not been approved yet, so there is nothing to "
+            "restore. Approve it instead."
+        )
+    if partner.get("status") == str(PartnerStatus.REVOKED) and not _is_owner(actor):
+        raise PartnerOpsForbidden(OWNER_ONLY_RESTORE)
+
+    await _refuse_restricted_owner(partner)
+    await _enforce_role_rules_at_decision(
+        partner, actor,
+        ignore_guest=str(partner.get("status") or "") == str(PartnerStatus.REVOKED),
+    )
+    await _recheck_sub_agency_parent(partner)
+
+    # Decision 15 (RC): restoring a REVOKED role starts it again, so the login
+    # must hold both verified contacts, exactly as at a first approval. (Lifting
+    # a temporary suspension is not a new start and is not gated here — see
+    # the RC report, INV-13.) The Owner cannot restore around it: there is no
+    # "restore pending verification" state for a revoked role.
+    if str(partner.get("status") or "") == str(PartnerStatus.REVOKED):
+        login_uid = await partner_roles.owner_uid_of(partner, db=get_db())
+        verification = await asyncio.to_thread(contact_verification.status, login_uid)
+        if not verification.complete:
+            raise ContactVerificationRequired(
+                verification,
+                "Restoring this role needs BOTH a verified phone number and a verified email "
+                f"address on the login (missing: {', '.join(verification.missing)}). "
+                "Nothing was restored.",
+            )
+    # `kycStatus: approved` only when there are documents behind it — the same
+    # rule approval applies (I-3: restoration used to write it unconditionally).
+    has_documents = await asyncio.to_thread(_has_kyc_documents, partner)
 
     now = _now()
     before = {
         "status": partner.get("status"),
         "is_active": partner.get("is_active", False),
     }
+    # B17: conditional on the status read above (suspended or revoked).
     updated = await get_db()[C.PARTNERS].find_one_and_update(
-        {"_id": partner_id},
+        {"_id": partner_id, "status": partner.get("status")},
         {
             "$set": {
                 "status": str(PartnerStatus.APPROVED),
@@ -2907,6 +4029,10 @@ async def reactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         },
         return_document=ReturnDocument.AFTER,
     )
+    if updated is None:
+        raise PartnerOpsError(
+            "This record changed while it was being restored. Reload it and try again."
+        )
 
     await audit.record(
         actor=actor,
@@ -2916,19 +4042,695 @@ async def reactivate_partner(partner_id: str, reason: str, actor: dict) -> dict:
         reason=reason,
         before=before,
         after={"status": str(PartnerStatus.APPROVED), "is_active": True},
-        meta={"kind": partner.get("kind")},
+        meta={"kind": partner.get("kind"), "restored_from": partner.get("status")},
     )
 
     synced = _sync_partner_doc(
         updated,
-        _fs_status_fields(partner.get("kind", ""), PartnerStatus.APPROVED, True),
+        _fs_status_fields(
+            partner.get("kind", ""), PartnerStatus.APPROVED, True,
+            verified_documents=has_documents,
+        ),
     )
-    login_synced = await asyncio.to_thread(
-        _mirror_login_status, updated or partner, str(PartnerStatus.APPROVED)
-    )
+    login_synced = await _mirror_login(updated or partner, str(PartnerStatus.APPROVED))
     out = _public(updated)
     out["replica_synced"] = synced
     out["login_synced"] = login_synced
+    # B39: the restored capability is not on any session issued while it was
+    # withdrawn — `partner_ids` is stamped at sign-in. Revoking those sessions
+    # sends the CRM back through sign-in, which mints one carrying it, exactly
+    # as approval does.
+    out["sessions_revoked"] = await _revoke_partner_sessions(updated or partner)
+    out["notified"] = await _notify_owner(
+        updated or partner,
+        lambda uid, kind, pid: notices.partner_reactivated(uid, kind, pid),
+    )
+    # FX-13 (RF-20): restoring a REVOKED role closes the person's open
+    # reinstatement request for it (one being decided right now is left to
+    # its own decision). Lifting a suspension is not a reinstatement.
+    out["closed_requests"] = []
+    if partner.get("status") == str(PartnerStatus.REVOKED):
+        from app.services import role_appeals  # local: role_appeals imports this module's peers
+
+        owner = await partner_roles.owner_uid_of(partner, db=get_db())
+        out["closed_requests"] = await role_appeals.close_after_direct_restore(
+            owner, str(partner.get("kind") or ""), actor
+        )
+    return out
+
+
+async def _notify_owner(partner: dict, send) -> bool:
+    """Deliver a lifecycle notice to the human behind a partner record.
+
+    `send(uid, kind, partner_id)` is one of the `notices.partner_*` writers.
+    The uid is `owner_crm_uid` — the authoritative owner — falling back to
+    the Firestore document's `crmUid`/`ownerUid` for records that predate
+    ownership being written at creation. A record with no human attached
+    returns False; there is nobody to tell, and `attach_login` is the repair.
+
+    Never raises: the decision is committed and audited by the time this runs.
+    """
+    try:
+        uid = await asyncio.to_thread(_login_uid_of, partner)
+        if not uid:
+            return False
+        return bool(
+            await send(uid, str(partner.get("kind") or ""), str(partner.get("_id") or ""))
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("lifecycle notice for partner %s was not delivered", partner.get("_id"))
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4a. Revocation — the role taken away, the human left standing
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# "Deactivate" writes `suspended`, keeps the record, and — because `suspended`
+# keeps its place in the one-agency-per-human rule — barred the person from
+# ever applying again. That is the right behaviour for a suspension and the
+# wrong one for the thing staff were actually using it for, which was ending
+# the relationship. There was no other button.
+#
+# Revocation is the ending. It is NOT:
+#
+#   * suspending the person's account — that is `users.suspend_user`, moderation;
+#   * banning them — `users.ban_user`;
+#   * deleting anything — the record, the ledger, the audit trail, the KYC
+#     documents and the commission history all stay exactly as they are.
+#
+# It IS: this one partner record goes to `revoked` and inactive; its sessions
+# are revoked; its role-family slot is KEPT (C1 — a revoked role still counts
+# for the combination rules, and coming back is a reinstatement request the
+# Owner decides, restoring this same record); the login stays active if it
+# holds another live capability (Agency + Coin Seller → revoke the Agency →
+# the Seller portal still opens); and the person is told, with the reason.
+#
+# ── DEPENDENTS ─────────────────────────────────────────────────────────────
+#
+# An agency may have sub-agencies and hosts hanging off it. Revoking it must
+# not leave them attached to a dead parent, and must not silently detach them
+# either. So:
+#
+#   * a MAIN agency with dependents is refused unless `transfer_to` names a
+#     live main agency to receive them. The refusal lists what is attached so
+#     the Owner can create or choose the replacement and try again;
+#   * a SUB-agency's hosts move to its parent main agency by default, or to
+#     `transfer_to` if given;
+#   * each moved dependent is told. Earnings history is untouched: commission
+#     and payout ledger rows carry `meta.agency_id` as it was at the time, so
+#     repointing a host's current agency rewrites nothing historical and
+#     double-counts nothing.
+#
+# There was no transfer mechanism anywhere in the four codebases before this,
+# so this is the one; it moves the two relationships that exist (`parent_id`
+# on a sub-agency, `users.agencyId` + the `agencyHosts` roster row on a host)
+# and nothing else.
+
+
+def _hosts_of(agency_id: str) -> list[dict]:
+    """Blocking — the agency's CURRENT roster, `agencies/{id}/agencyHosts/*`.
+
+    FX-10 (RF-15): a row `revoke_host` or the account purge marked inactive is
+    not a host of this agency, so revoking the agency no longer "moves" a
+    revoked Host onto the receiving agency's roster. A row with no `active`
+    field predates the marker and is current.
+    """
+    from app.services import users as users_svc  # local: users imports partner peers
+
+    out: list[dict] = []
+    try:
+        client = firebase.firestore_client()
+        rows = client.collection("agencies").document(agency_id).collection("agencyHosts").stream()
+        for snap in rows:
+            data = snap.to_dict() or {}
+            if not users_svc.roster_row_is_current(data):
+                continue
+            data["uid"] = str(data.get("uid") or snap.id)
+            out.append(data)
+    except Exception:  # noqa: BLE001
+        log.exception("Could not read the roster of agency %s", agency_id)
+    return out
+
+
+HOST_MOVE_CONTENDED = (
+    "Another change to this host was being saved at the same moment, so the move was "
+    "not made: the host is still under the agency it was moving from. Try again — it "
+    "cannot move the host twice."
+)
+HOST_MOVE_UNKNOWN = (
+    "The database did not confirm whether the host was moved. The host is not under the "
+    "new agency yet, but the move may still complete. Check the host's agency before "
+    "anything else; trying again is safe — it cannot move the host twice."
+)
+
+
+class HostMoveContended(PartnerOpsError):
+    """HT-1 — Firestore aborted a Host move under contention, and it is not there.
+
+    The move is one Firestore transaction. When other writes to the same
+    documents keep winning, the client library aborts it: an aborted COMMIT is
+    retried at once, five attempts in all, and then reported as
+    `ValueError("Failed to commit transaction in 5 attempts.")`; an `Aborted`
+    raised by a READ inside the transaction is not retried at all. `_move_host`
+    then reads the Host once more (HT-2: its own move id first — an error is no
+    proof that nothing committed): moved by this call → True; moved by somebody
+    else → False; still under the agency it was moving from → this (409), so the
+    caller answers "try again" instead of passing a library error on as a 500.
+    """
+
+    status_code = 409
+
+
+class HostMoveOutcomeUnknown(PartnerOpsError):
+    """HT-2 — whether a Host move committed could not be established.
+
+    A Firestore error other than ABORTED (a deadline, an unavailable or
+    internal error, a transport error), or the read after it failing. The move
+    is not visible, but a commit can still land after the client stopped
+    waiting. 503. Retrying is safe: the move is a compare-and-set, so a move
+    that did land makes the retry return False.
+    """
+
+    status_code = 503
+
+
+def _move_host(
+    host: dict, from_agency: str, to_agency: str, now: datetime, *, move_id: str = "",
+) -> bool:
+    """Blocking — repoint one host's current agency. History is untouched.
+
+    B23: the host's verification record names the agency too (the reviewer's
+    queue column), so it moves in the same write — only when it exists: an
+    update on a missing record would fail the whole move, and creating a
+    partial one would invent a verification nobody opened.
+
+    FX-10 (RF-15 / RF-31):
+      * COMPARE-AND-SET on `users/{uid}.agencyId`. It used to be overwritten
+        unconditionally, so two moves of one host that both read it under A —
+        an Owner transfer A→B and a revocation of A with transfer to C — both
+        ran, and the host ended on whichever landed last, with a roster row
+        left under the other. The move now happens only while the host is
+        still under `from_agency`, inside one transaction; otherwise nothing is
+        written and False is returned.
+      * the application the host joined on is STAMPED (`transferredTo`,
+        `transferredFrom`, `transferredAt`). It still says agency A, and the
+        CRM roster counted an activated application of A as one of A's hosts —
+        so a transferred host was counted under both agencies.
+
+    HT-1 / HT-2: the move carries its own id (`transferId` on the destination
+    roster row, which only the server writes), and the transaction recognises
+    it first. A move whose answer was lost — the client re-sends a commit, and
+    the library may run the callback again on the state it committed — is
+    therefore reported as the move it is; it used to come back False ("another
+    move won"), leaving the transfer request pending and the Host untold. After
+    a Firestore error the Host is read again: moved by this call → True; no
+    longer under `from_agency` → False; still under it → `HostMoveContended`
+    (aborted) or `HostMoveOutcomeUnknown`. An error of the transaction's own
+    code is re-raised unchanged.
+
+    Returns True when this call moved the host. False: it did not, because the
+    host was no longer under `from_agency`.
+    """
+    import secrets
+
+    from firebase_admin import firestore as fb_firestore_tx
+
+    client = firebase.firestore_client()
+    uid = str(host.get("uid") or "")
+    if not uid:
+        return False
+    user_ref = client.collection("users").document(uid)
+    to_row = client.collection("agencies").document(to_agency).collection("agencyHosts").document(uid)
+    from_row = client.collection("agencies").document(from_agency).collection("agencyHosts").document(uid)
+    verification = client.collection("hostVerification").document(uid)
+    app_id = str(host.get("applicationId") or "").strip()
+    app_ref = client.collection("hostApplications").document(app_id) if app_id else None
+    expected = str(from_agency or "").strip()
+    destination = str(to_agency or "").strip()
+    # HT-2: a transfer request passes its own id, so approving it again can
+    # recognise a move that landed; a revocation's moves get a fresh one.
+    move_id = str(move_id or "").strip() or secrets.token_urlsafe(12)
+
+    def _agency_of(user) -> str:
+        return str(((user.to_dict() or {}) if getattr(user, "exists", False) else {}).get("agencyId") or "").strip()
+
+    def _ours(row) -> bool:
+        return bool(getattr(row, "exists", False)) and (row.to_dict() or {}).get("transferId") == move_id
+
+    @fb_firestore_tx.transactional
+    def _run(tx) -> bool:
+        current = _agency_of(user_ref.get(transaction=tx))
+        if current != expected:
+            # HT-2: under the destination with THIS move's id — an earlier
+            # attempt committed and its answer was lost.
+            return current == destination and _ours(to_row.get(transaction=tx))
+        ver = verification.get(transaction=tx)
+        app = app_ref.get(transaction=tx) if app_ref is not None else None
+        tx.update(
+            user_ref,
+            {"agencyId": to_agency, "agencyTransferredAt": now, "agencyTransferredFrom": from_agency},
+        )
+        tx.set(
+            to_row,
+            {**{k: v for k, v in host.items() if k != "uid"}, "uid": uid, "agencyId": to_agency,
+             "transferredFrom": from_agency, "transferredAt": now, "transferId": move_id},
+            merge=True,
+        )
+        tx.delete(from_row)
+        if getattr(ver, "exists", False):
+            tx.update(verification, {"agencyId": to_agency, "updatedAt": now})
+        if app is not None and getattr(app, "exists", False):
+            tx.update(
+                app_ref,
+                {"transferredTo": to_agency, "transferredFrom": from_agency, "transferredAt": now},
+            )
+        return True
+
+    try:
+        return bool(_run(client.transaction()))
+    except Exception as exc:
+        kind = firebase.transaction_error_kind(exc)
+        if kind is None:
+            raise
+        # HT-1 / HT-2: which documented result applies? The error does not say.
+        log.warning("Host %s: the move %s→%s failed in Firestore (%s); reading it again",
+                    uid, from_agency, to_agency, exc)
+        try:
+            now_under = _agency_of(user_ref.get())
+            if now_under == destination and _ours(to_row.get()):
+                return True  # this move landed; its answer was lost
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("Host %s: could not re-read the agency after the failed move", uid)
+            raise HostMoveOutcomeUnknown(HOST_MOVE_UNKNOWN) from exc
+        if now_under != expected:
+            return False  # another move won: the compare-and-set result
+        if kind == "contended":
+            raise HostMoveContended(HOST_MOVE_CONTENDED) from exc
+        raise HostMoveOutcomeUnknown(HOST_MOVE_UNKNOWN) from exc
+
+
+async def _move_sub_agency(
+    sub_id: str,
+    from_id: str,
+    from_name: str,
+    to_agency: dict,
+    reason: str,
+    actor: dict,
+    now: datetime,
+    *,
+    expect_parent: str | None = None,
+) -> bool:
+    """Repoint one sub-agency's parent, mirror it and tell its owner.
+
+    The move revocation has always made, as one helper so an Owner-approved
+    transfer (`services/transfer_requests`) makes exactly the same one.
+    `expect_parent` makes the move conditional on the parent still being the
+    one it was read as; False is returned when it no longer is. No balance
+    and no ledger row moves — the relationship is the whole of it.
+    """
+    to_id = str(to_agency["_id"])
+    query: dict = {"_id": sub_id}
+    if expect_parent is not None:
+        query["parent_id"] = expect_parent
+    result = await get_db()[C.PARTNERS].update_one(
+        query,
+        {"$set": {"parent_id": to_id, "parent_name": str(to_agency.get("name") or ""),
+                  "updated_at": now},
+         "$push": {"parent_history": {"from": from_id, "to": to_id, "at": now,
+                                      "reason": reason, "by": _who(actor)}}},
+    )
+    if expect_parent is not None and not int(getattr(result, "modified_count", 0) or 0):
+        return False
+    sub_row = await get_db()[C.PARTNERS].find_one({"_id": sub_id}) or {"_id": sub_id, "kind": "sub_agency"}
+    await asyncio.to_thread(
+        _sync_partner_doc, sub_row,
+        {"parentAgencyId": to_id, "parentTransferredFrom": from_id, "parentTransferredAt": now},
+    )
+    await _notify_owner(
+        sub_row,
+        lambda uid, k, p, _from=from_name, _to=to_agency.get("name"):
+            notices.partner_transferred(uid, k, p, str(_from or ""), str(_to or "")),
+    )
+    return True
+
+
+async def _dependents_of(partner: dict) -> tuple[list[dict], list[dict]]:
+    """`(live sub-agencies, roster hosts)` hanging off this partner. Read-only."""
+    pid = str(partner["_id"])
+    kind = str(partner.get("kind") or "")
+    subs = (
+        await partner_svc.sub_agencies_of(pid) if kind == str(PartnerKind.AGENCY) else []
+    )
+    live_subs = [s for s in subs if str(s.get("status")) not in ("revoked", "rejected")]
+    hosts = await asyncio.to_thread(_hosts_of, pid)
+    return live_subs, hosts
+
+
+async def _transfer_target(
+    partner: dict, to_agency: dict | None, live_subs: list[dict], hosts: list[dict]
+) -> dict | None:
+    """Where the dependents go, or None when there are none. Validates; writes nothing.
+
+    Raises `PartnerOpsError` if there are dependents and nowhere valid to put
+    them — before anything at all has changed.
+    """
+    pid = str(partner["_id"])
+    kind = str(partner.get("kind") or "")
+    if not live_subs and not hosts:
+        return None
+
+    if to_agency is None:
+        if kind == str(PartnerKind.SUB_AGENCY) and partner.get("parent_id"):
+            # A sub-agency's hosts go up to the parent unless told otherwise.
+            to_agency = await get_db()[C.PARTNERS].find_one({"_id": str(partner["parent_id"])})
+        if to_agency is None:
+            raise PartnerOpsError(
+                f"{partner.get('name') or pid} still has "
+                f"{len(live_subs)} sub-agenc{'y' if len(live_subs) == 1 else 'ies'} and "
+                f"{len(hosts)} host{'s' if len(hosts) != 1 else ''} attached. Name a "
+                "replacement main agency (transfer_to) to receive them, or create "
+                "one first. Nothing was revoked and nothing was moved."
+            )
+
+    to_id = str(to_agency["_id"])
+    if to_id == pid:
+        raise PartnerOpsError("A partner cannot receive its own dependents. Nothing was changed.")
+    if (
+        str(to_agency.get("kind") or "") != str(PartnerKind.AGENCY)
+        or str(to_agency.get("status") or "") != str(PartnerStatus.APPROVED)
+        or not to_agency.get("is_active", False)
+    ):
+        raise PartnerOpsError(
+            f"'{to_agency.get('name') or to_id}' is not an approved, active main "
+            "agency, so it cannot receive sub-agencies or hosts. Nothing was changed."
+        )
+    return to_agency
+
+
+async def _transfer_dependents(
+    partner: dict, to_agency: dict | None, reason: str, actor: dict, now: datetime,
+    *, planned: tuple[list[dict], list[dict], dict | None] | None = None,
+) -> dict:
+    """Move a revoked agency's sub-agencies and hosts to `to_agency`.
+
+    Returns what moved. Raises `PartnerOpsError` if there are dependents and
+    nowhere to put them. `planned` is `(live_subs, hosts, target)` as already
+    read and validated by the caller — `revoke_partner` validates BEFORE its
+    conditional status write and moves after it, so a refusal can never come
+    between the two.
+    """
+    pid = str(partner["_id"])
+    kind = str(partner.get("kind") or "")
+    if planned is None:
+        live_subs, hosts = await _dependents_of(partner)
+        to_agency = await _transfer_target(partner, to_agency, live_subs, hosts)
+    else:
+        live_subs, hosts, to_agency = planned
+    if to_agency is None:
+        return {"sub_agencies": [], "hosts": [], "to": None}
+    to_id = str(to_agency["_id"])
+
+    # FX-13 (RF-21): nothing is swallowed and nothing aborts half-way. The
+    # revocation is already committed when this runs, so a failure used to
+    # leave a half-moved agency — a host's failure logged and forgotten, a
+    # sub-agency's failure thrown out of the endpoint AFTER the commit, so the
+    # caller was told "failed" about a revocation that had happened. Every
+    # move is now attempted, every failure is reported by name, the outcome is
+    # recorded on the record (`dependents_transfer`), and running Revoke again
+    # moves whatever is left (`revoke_partner` → resume).
+    moved_subs: list[str] = []
+    failed_subs: list[dict] = []
+    skipped_subs: list[str] = []
+    for sub in live_subs:
+        sub_id = str(sub["id"])
+        try:
+            moved_one = await _move_sub_agency(
+                sub_id, pid, str(partner.get("name") or ""), to_agency, reason, actor, now,
+                expect_parent=pid,
+            )
+        except Exception as exc:  # noqa: BLE001 — reported below, not swallowed
+            log.exception("Sub-agency %s could not be moved from %s to %s", sub_id, pid, to_id)
+            failed_subs.append({"id": sub_id, "error": str(exc) or exc.__class__.__name__})
+            continue
+        if moved_one:
+            moved_subs.append(sub_id)
+        else:
+            # No longer under this agency (moved by somebody else meanwhile).
+            skipped_subs.append(sub_id)
+
+    moved_hosts: list[str] = []
+    failed_hosts: list[dict] = []
+    skipped_hosts: list[str] = []
+    for host in hosts:
+        huid = str(host.get("uid") or "")
+        if not huid:
+            continue
+        try:
+            moved_one = await asyncio.to_thread(_move_host, host, pid, to_id, now)
+        except Exception as exc:  # noqa: BLE001 — reported below, not swallowed
+            log.exception("Host %s could not be moved from %s to %s", huid, pid, to_id)
+            failed_hosts.append({"uid": huid, "error": str(exc) or exc.__class__.__name__})
+            continue
+        if not moved_one:
+            # FX-10: the host is no longer under this agency — the CAS refused.
+            skipped_hosts.append(huid)
+            continue
+        moved_hosts.append(huid)
+        await notices.partner_transferred(
+            huid, "host", pid, str(partner.get("name") or ""), str(to_agency.get("name") or "")
+        )
+
+    complete = not failed_subs and not failed_hosts
+    record = {
+        "to": to_id,
+        "to_name": str(to_agency.get("name") or ""),
+        "complete": complete,
+        "failed_sub_agencies": [f["id"] for f in failed_subs],
+        "failed_hosts": [f["uid"] for f in failed_hosts],
+        "at": now,
+    }
+    try:
+        await get_db()[C.PARTNERS].update_one({"_id": pid}, {"$set": {"dependents_transfer": record}})
+    except Exception:  # noqa: BLE001 — the audit row below still says what happened
+        log.exception("Could not record the dependents transfer on %s", pid)
+
+    await audit.record(
+        actor=actor,
+        action=audit.Action.PARTNER_DEPENDENTS_TRANSFERRED,
+        subject_type="partner",
+        subject_id=pid,
+        reason=reason,
+        before={"sub_agencies": [s["id"] for s in live_subs], "hosts": [h.get("uid") for h in hosts]},
+        after={"to": to_id, "sub_agencies": moved_subs, "hosts": moved_hosts,
+               "failed_sub_agencies": failed_subs, "failed_hosts": failed_hosts,
+               "skipped_sub_agencies": skipped_subs, "skipped_hosts": skipped_hosts,
+               "complete": complete},
+        meta={"kind": kind},
+    )
+    return {"sub_agencies": moved_subs, "hosts": moved_hosts, "to": to_id,
+            "to_name": str(to_agency.get("name") or ""),
+            "failed_sub_agencies": failed_subs, "failed_hosts": failed_hosts,
+            "skipped_sub_agencies": skipped_subs, "skipped_hosts": skipped_hosts,
+            "complete": complete}
+
+
+INCOMPLETE_TRANSFER_NOTE = (
+    "Not every dependent could be moved{what}. The revocation itself is done. "
+    "Run Revoke again with the same destination to move what is left — it "
+    "changes nothing else."
+)
+
+
+def _incomplete_note(moved: dict) -> str:
+    parts = []
+    if moved.get("failed_sub_agencies"):
+        parts.append(f"{len(moved['failed_sub_agencies'])} sub-agenc"
+                     f"{'y' if len(moved['failed_sub_agencies']) == 1 else 'ies'}")
+    if moved.get("failed_hosts"):
+        parts.append(f"{len(moved['failed_hosts'])} host{'s' if len(moved['failed_hosts']) != 1 else ''}")
+    return INCOMPLETE_TRANSFER_NOTE.format(what=f" ({' and '.join(parts)} failed)" if parts else "")
+
+
+async def _resume_dependents_transfer(
+    partner: dict, reason: str, actor: dict, transfer_to: str | None
+) -> dict | None:
+    """FX-13 (RF-21) — finish moving a REVOKED partner's dependents.
+
+    None when there is nothing left to move (the caller then says "already
+    revoked", as before). Owner only, like the first attempt; the destination
+    is the one named now, else the one the first attempt recorded, and it is
+    validated again — it may have been revoked in between.
+    """
+    live_subs, hosts = await _dependents_of(partner)
+    if not live_subs and not hosts:
+        return None
+    if not _is_owner(actor):
+        raise PartnerOpsForbidden(OWNER_ONLY_TRANSFER.format(n=len(live_subs) + len(hosts)))
+    recorded = (partner.get("dependents_transfer") or {}).get("to")
+    wanted = str(transfer_to or recorded or "").strip()
+    target = await get_db()[C.PARTNERS].find_one({"_id": wanted}) if wanted else None
+    if wanted and target is None:
+        raise PartnerOpsError(
+            f"'{wanted}' is not a registered agency, so nothing can be transferred to it. "
+            "Nothing was changed."
+        )
+    destination = await _transfer_target(partner, target, live_subs, hosts)
+    moved = await _transfer_dependents(
+        partner, destination, reason, actor, _now(), planned=(live_subs, hosts, destination)
+    )
+    out = _public(partner)
+    out["resumed"] = True
+    out["dependents_moved"] = moved
+    out["note"] = (
+        "The role was already revoked; its remaining dependents were moved."
+        if moved.get("complete") else _incomplete_note(moved)
+    )
+    return out
+
+
+async def revoke_partner(
+    partner_id: str, reason: str, actor: dict, transfer_to: str | None = None
+) -> dict:
+    """Take the role away. The record, the money and the history all stay.
+
+    See the section comment above for what this is and is not. Three rules
+    added since it was written:
+
+      * C1 / B04 — the role-family slot is KEPT. A revoked role still counts
+        for the combination rules, and the way back is a reinstatement request
+        the Owner decides, which restores this same record;
+      * C3 — a revocation that MOVES dependents (sub-agencies or hosts) is a
+        transfer, and transfers are the Owner's decision. Anyone else is
+        refused before anything is written and pointed at a transfer request.
+        Revoking with no dependents keeps its permission;
+      * B17 — the status write is conditional on the status read, and
+        validation of where dependents go happens before it, so a concurrent
+        decision cannot make both run and a refusal cannot land half-way.
+    """
+    reason = _require_reason(reason)
+    partner = await _partner(partner_id)
+    kind = str(partner.get("kind") or "")
+
+    if partner.get("status") == str(PartnerStatus.REVOKED):
+        # FX-13: resumable. A revocation whose dependents were not all moved
+        # finishes moving them; one with nothing left says so, as before.
+        resumed = await _resume_dependents_transfer(partner, reason, actor, transfer_to)
+        if resumed is not None:
+            return resumed
+        raise PartnerOpsError(
+            "This role was already revoked"
+            + (f": {partner.get('revocation_reason')}" if partner.get("revocation_reason") else ".")
+        )
+    if partner.get("status") == str(PartnerStatus.REJECTED):
+        raise PartnerOpsError(
+            "This application was rejected and never held the role, so there "
+            "is nothing to revoke."
+        )
+    if str(partner.get("status") or str(PartnerStatus.PENDING)) == str(PartnerStatus.PENDING):
+        raise PartnerOpsError(
+            "This application has not been approved, so there is no role to "
+            "revoke. Reject it instead."
+        )
+    await _refuse_single_role_revocation(partner)
+
+    now = _now()
+    target: dict | None = None
+    if transfer_to:
+        target = await get_db()[C.PARTNERS].find_one({"_id": str(transfer_to).strip()})
+        if target is None:
+            raise PartnerOpsError(
+                f"'{transfer_to}' is not a registered agency, so nothing can be "
+                "transferred to it. Nothing was revoked."
+            )
+
+    # Dependents first — read and validated, nothing written. A refusal here
+    # leaves everything exactly as it was.
+    live_subs, hosts = await _dependents_of(partner)
+    if (live_subs or hosts) and not _is_owner(actor):
+        raise PartnerOpsForbidden(OWNER_ONLY_TRANSFER.format(n=len(live_subs) + len(hosts)))
+    destination = await _transfer_target(partner, target, live_subs, hosts)
+
+    # RC (confirmed, CRM-FLOW 9.48): the money behind the revocation is frozen
+    # for the Owner's review — first, so it never moves after the role is gone.
+    await money_freeze.freeze_partner(
+        partner_id, row=partner, cause="role_revoked", label="the role's revocation",
+        reason=reason, actor=actor, db=get_db(),
+    )
+
+    before = {"status": partner.get("status"), "is_active": partner.get("is_active", False)}
+    # B17: conditional on the status read above. On no match, stop — nothing
+    # has been moved, audited or told.
+    updated = await get_db()[C.PARTNERS].find_one_and_update(
+        {"_id": partner_id, "status": partner.get("status")},
+        {
+            "$set": {
+                "status": str(PartnerStatus.REVOKED),
+                "is_active": False,
+                "revoked_at": now,
+                "revoked_by": _who(actor),
+                "revocation_reason": reason,
+                "updated_at": now,
+            },
+            "$push": {"revocation_history": {"at": now, "reason": reason, "by": _who(actor)}},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise PartnerOpsError(
+            "This record changed while it was being revoked. Reload it and try again."
+        )
+
+    moved = await _transfer_dependents(
+        partner, destination, reason, actor, now, planned=(live_subs, hosts, destination)
+    )
+
+    await audit.record(
+        actor=actor,
+        action=audit.Action.PARTNER_REVOKED,
+        subject_type="partner",
+        subject_id=partner_id,
+        reason=reason,
+        before=before,
+        after={"status": str(PartnerStatus.REVOKED), "is_active": False},
+        meta={"kind": kind, "dependents_moved": moved, "role_family_kept": True},
+    )
+
+    # ── The slot is KEPT (C1 / B04) ─────────────────────────────────────────
+    #
+    # This used to release the role-family claim, so the revoked role could
+    # be re-applied for and re-created as a brand-new record — the revocation
+    # treated as though the role had never existed. The claim now stays with
+    # this record; a reinstatement request decided by the Owner restores it.
+
+    synced = _sync_partner_doc(
+        updated,
+        {
+            **_fs_status_fields(kind, PartnerStatus.REVOKED, False),
+            "revokedAt": now,
+            "revokedBy": actor.get("uid", ""),
+            "revocationReason": reason,
+        },
+    )
+    login_synced = await _mirror_login(updated or partner, str(PartnerStatus.REVOKED))
+    out = _public(updated)
+    out["replica_synced"] = synced
+    out["login_synced"] = login_synced
+    out["sessions_revoked"] = await _revoke_partner_sessions(updated or partner)
+    out["dependents_moved"] = moved
+    out["role_family_released"] = False
+    out["notified"] = await _notify_owner(
+        updated or partner,
+        lambda uid, k, pid: notices.partner_revoked(uid, k, pid, reason),
+    )
+    out["note"] = (
+        "The role is revoked. The person's account, their other roles, and "
+        "every historical record are untouched. The role still counts for the "
+        "combination rules; the person may request reinstatement, which the "
+        "Owner decides."
+    )
+    if moved.get("to") and not moved.get("complete", True):
+        out["note"] += " " + _incomplete_note(moved)
     return out
 
 
@@ -4182,6 +5984,13 @@ async def approve_sale(sale_id: str, reason: str, actor: dict) -> dict:
     buyer_uid = sale["buyer_uid"]
     diamonds = int(sale["diamonds"])
 
+    # RC (confirmed, CRM-FLOW 9.48): a frozen Coin Seller's inventory does not
+    # move until the Owner decides.
+    try:
+        await money_freeze.assert_subject_not_frozen("partner", str(seller_id), db=get_db())
+    except money_freeze.MoneyFrozen as exc:
+        raise MoneyFrozenError(str(exc)) from exc
+
     # 1. Seller's inventory comes down first. If it is short, this raises and
     #    the sale stays pending — nothing was credited, so nothing to unwind.
     debit = await _move(
@@ -4685,10 +6494,78 @@ async def commission_preview(
 #   `firebase.debit_host_beans`, and the ledger row explains it.
 
 
+def _read_payout_request(collection: str, request_id: str) -> dict | None:
+    """Blocking — the Firestore payout request a card is raised for, or None."""
+    snap = firebase.firestore_client().collection(collection).document(request_id).get()
+    return (snap.to_dict() or {}) if getattr(snap, "exists", False) else None
+
+
+async def _payout_request_for_card(
+    host_uid: str, request_collection: str, request_id: str,
+    beans: int = 0, host_agency_id: str = "",
+) -> dict:
+    """P0-7 (FIN-5): the payout request a host-withdrawal card will settle.
+
+    Refused unless it exists, is this host's, is still payable, and has no
+    other live card. The executor re-checks all of it inside the transaction
+    that debits the wallet — this is so an impossible card is refused when it
+    is asked for rather than after somebody has signed it.
+    """
+    collection = (request_collection or "").strip()
+    rid = (request_id or "").strip()
+    if collection not in firebase.PAYOUT_REQUEST_COLLECTIONS:
+        raise PartnerOpsError(
+            "A payout card settles a host withdrawal request or an agency salary "
+            "request — name one of those."
+        )
+    if not rid:
+        raise PartnerOpsError("The payout request id is missing.")
+    try:
+        req = await asyncio.to_thread(_read_payout_request, collection, rid)
+    except Exception as exc:  # noqa: BLE001
+        raise PartnerOpsError(
+            "The payout request could not be read from Firestore, so no card was "
+            "raised. Try again once Firestore is reachable."
+        ) from exc
+    if req is None:
+        raise PartnerOpsError("That payout request does not exist.")
+    if firebase.payout_request_holder(req) != host_uid:
+        raise PartnerOpsError("That payout request is for a different host.")
+    status = str(req.get("status") or "")
+    if status not in firebase.PAYOUT_REQUEST_PAYABLE:
+        raise PartnerOpsError(f"That payout request is '{status}', so it cannot be paid.")
+    asked = firebase.payout_request_beans(collection, req)
+    if asked != beans:
+        raise PartnerOpsError(
+            f"That request is for {asked:,} beans; a card that pays it must be for exactly that."
+        )
+    if collection == "salaryRequests" and str(req.get("agencyId") or "") != (host_agency_id or ""):
+        raise PartnerOpsError(
+            "That salary request was filed by an agency this host does not belong to."
+        )
+    live = await get_db()[C.CARDS].find_one({
+        "type": str(CardType.HOST_WITHDRAWAL),
+        "payload.request_collection": collection,
+        "payload.request_id": rid,
+        "stage": {"$nin": [str(Stage.REJECTED), str(Stage.FAILED)]},
+    })
+    if live is not None:
+        raise PartnerOpsError(
+            "A card for this payout request already exists. Work that card — or "
+            "reject it — rather than raising a second one."
+        )
+    return req
+
+
 async def request_host_withdrawal(
-    host_uid: str, beans: int, reason: str, actor: dict
+    host_uid: str, beans: int, reason: str, actor: dict,
+    request_collection: str = "", request_id: str = "",
 ) -> dict:
     """Raise a card to pay a host the beans they have available.
+
+    P0-7 (FIN-5): when the card is FOR a queued request (`request_collection`
+    + `request_id`), the request is checked here and settled — marked `paid` —
+    only by executing this card, in the same transaction as the debit.
 
     Refused if the amount is more than the host's **current** `beansAvailable`.
     That figure is read live from Firestore rather than from the ledger for the
@@ -4736,6 +6613,15 @@ async def request_host_withdrawal(
         )
 
     agency_id = str(wallet["agency_id"])
+
+    settles: dict | None = None
+    if (request_collection or "").strip() or (request_id or "").strip():
+        await _payout_request_for_card(uid, request_collection, request_id, beans, agency_id)
+        settles = {
+            "request_collection": request_collection.strip(),
+            "request_id": request_id.strip(),
+        }
+
     warnings: list[str] = []
     if not agency_id:
         warnings.append(
@@ -4776,6 +6662,8 @@ async def request_host_withdrawal(
                 "agency_id": agency_id,
                 "beans_available_at_request": available,
                 "is_verified_host": wallet["is_verified_host"],
+                # P0-7: the queued request this card settles, if any.
+                **(settles or {}),
             },
         ),
         actor,
@@ -4783,6 +6671,18 @@ async def request_host_withdrawal(
     if warnings:
         card["warnings"] = warnings
     return card
+
+
+class WithdrawalDebitNotConfirmed(PartnerOpsError):
+    """HT-2 — the withdrawal's Firestore debit could not be confirmed, and none is recorded.
+
+    409 when the database aborted it, 503 when its outcome is unknown (it may
+    still land). The card stays approved; executing the same card again is safe.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 async def execute_host_withdrawal(
@@ -4819,9 +6719,64 @@ async def execute_host_withdrawal(
     host_uid = (card.get("subject") or {}).get("id", "")
     beans = int(card.get("amount", 0))
 
-    # ── 1. The authoritative debit, guarded by a transaction ─────────────────
+    # P0-7 (FIN-5): the queued request this card settles is marked `paid` in the
+    # SAME Firestore transaction as the debit — the only way any request
+    # becomes paid — and a request already paid refuses the whole thing.
+    payload = card.get("payload") or {}
+    settle = None
+    if payload.get("request_id"):
+        settle = {
+            "collection": payload.get("request_collection", ""),
+            "id": payload.get("request_id", ""),
+            "card_id": card_id,
+            "payment_ref": ref,
+        }
+
+    # HT-2 — the point of no return, as for a signed balance card: from here on
+    # the card cannot be rejected (`cards.reject` refuses a claimed card), so a
+    # debit that may have landed can only be finished by executing THIS card
+    # again — never abandoned for a fresh card that would debit again.
     try:
-        debited = await asyncio.to_thread(firebase.debit_host_beans, host_uid, beans)
+        await card_svc.claim_execution(card_id, actor)
+    except CardError as exc:
+        raise PartnerOpsError(str(exc)) from exc
+
+    # ── 1. The authoritative debit, guarded by a transaction ─────────────────
+    #
+    # HT-2: keyed on the card (`debit_id`), so the debit happens once per card
+    # whatever is retried — the library re-running an attempt after a lost
+    # answer, this card executed again, two executions at once. A card raised
+    # without a payout request used to carry no key at all, and a re-run could
+    # debit the wallet twice.
+    try:
+        debited = await asyncio.to_thread(
+            firebase.debit_host_beans, host_uid, beans, settle, debit_id=f"card_{card_id}"
+        )
+    except (firebase.TransactionNotApplied, firebase.TransactionOutcomeUnknown) as exc:
+        # HT-2: NOT "nothing was paid — raise a fresh one". The re-read found no
+        # debit for this card, and a fresh card would have its own key: if this
+        # debit still lands, a second card debits the wallet again. The card is
+        # left APPROVED; executing it again is safe (keyed on the card).
+        log.error("Host withdrawal %s: the bean debit was not confirmed (%s)", card_id, exc.outcome)
+        raise WithdrawalDebitNotConfirmed(
+            f"{exc} The card is still approved: execute THIS card again (do not raise a new "
+            "one) — it records the debit if it happened and makes it once if it did not.",
+            status_code=exc.status_code,
+        ) from exc
+    except firebase.PayoutRequestAlreadySettled as exc:
+        # A repeated or raced execution of THIS card: the first one debited and
+        # settled. The card is not marked failed — it did not fail.
+        raise PartnerOpsError(
+            "This card has already paid its request; nothing was debited again. "
+            "Reload the board."
+        ) from exc
+    except firebase.PayoutRequestNotPayable as exc:
+        detail = (
+            f"{exc} Nothing was paid and nothing was debited — the card is "
+            "marked failed."
+        )
+        await _finish(card_id, actor, {"error": detail, "payment_ref": ref}, False)
+        raise PartnerOpsError(detail) from exc
     except firebase.HostBeansUnavailable as exc:
         detail = (
             f"{host_uid} now has {exc.available:,} beans available, not "
@@ -4884,6 +6839,28 @@ async def execute_host_withdrawal(
             )
         )
     except PartnerOpsError as exc:
+        if isinstance(exc.__cause__, DuplicateMovement):
+            # HT-2: the ledger already holds THIS card's withdrawal (keyed on the
+            # card), and the debit is keyed on the card too: another execution of
+            # this card did the work, or one was interrupted after its ledger row.
+            # Nothing moved again. The card is closed as executed — the same as a
+            # signed balance card — instead of being left approved for ever, or
+            # marked failed ("needs manual correction") over a payout that is
+            # complete: an execution that lost the race to write the row used to
+            # do exactly that.
+            try:
+                await _finish(card_id, actor, {
+                    "note": "Already applied — the ledger already holds this card's withdrawal.",
+                    "payment_ref": ref, "host_id": host_uid, "beans": beans,
+                }, True)
+            except PartnerOpsError:
+                pass  # another execution of this card closed it first
+            raise PartnerOpsError(
+                ("This card has already paid its request; nothing was debited again."
+                 if settle else
+                 "This card has already been executed; nothing was debited again.")
+                + " The card has been closed."
+            ) from exc
         detail = (
             f"The host's wallet WAS debited {beans:,} beans in Firestore, but "
             f"the ledger row could not be written ({exc}). The card is failed "
@@ -4933,6 +6910,7 @@ async def execute_host_withdrawal(
             "agency_id": agency_id,
             "beans_available_before": debited["beans_available_before"],
             "beans_available_after": debited["beans_available_before"] - beans,
+            **({"settled_request": f"{settle['collection']}/{settle['id']}"} if settle else {}),
             **movement,
         },
         True,

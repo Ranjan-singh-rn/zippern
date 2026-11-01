@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.ContactRequirementTest" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.136Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="each action appears once" classname="com.zipper.app.util.ContactRequirementTest" time="0.001"/>
+  <testcase name="any other refusal stays a sentence" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="an unverified email is offered first, as confirming it" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="a refusal with no list still means either contact would do" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="the eligibility block says whether verification is required" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="only an explicit true is required" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="one verified contact is enough — the explanation says so" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="a CONTACT_REQUIRED refusal becomes a requirement" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="an older server without the block is not a requirement" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <testcase name="unknown contact names are ignored, never offered" classname="com.zipper.app.util.ContactRequirementTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

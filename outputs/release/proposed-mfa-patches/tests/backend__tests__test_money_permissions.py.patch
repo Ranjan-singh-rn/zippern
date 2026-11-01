@@ -1,0 +1,20 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/tests/test_money_permissions.py
++++ b/backend/tests/test_money_permissions.py
+@@ -246,9 +246,14 @@
+         is_crm_user,
+     ),
+     ("isSuperAdmin", "isCrmUser() && crmRole() == 'superadmin'", is_super_admin),
++    # P1-A3b: a pending Owner (no MFA-bound sign-in) reads as
++    # 'superadmin_mfa_pending' from crmRole() and is refused here before the
++    # permissions array — which lists every capability for an Owner — is read.
++    # This model assumes a BOUND Owner; tests/firestore.p1mfa.rules.test.mjs
++    # covers the pending case in the emulator.
+     (
+         "hasPerm",
+-        "isCrmUser() && (crmRole() == 'superadmin' || p in crmPermissions())",
++        "isCrmUser() && crmRole() != 'superadmin_mfa_pending' && (crmRole() == 'superadmin' || p in crmPermissions())",
+         None,
+     ),
+     (

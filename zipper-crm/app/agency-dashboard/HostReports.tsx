@@ -33,7 +33,14 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   AlertTriangle, CheckCircle2, Flag, Loader2, RefreshCw, Scale, X,
 } from 'lucide-react'
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore'
+import {
+  collection, doc, getDoc, getDocs, query, serverTimestamp, setDoc, where,
+  type FirestoreError,
+} from 'firebase/firestore'
+import {
+  CONTEST_ALREADY_PENDING, CONTEST_EXHAUSTED, CONTEST_NEEDS_NEW, overturnedContestReportIds,
+  pendingContestReportIds, placeContest,
+} from '@/lib/appealIds'
 import { db } from '@/lib/firebase'
 import { ApiError, type UserReport } from '@/lib/api'
 import { statements } from '@/lib/apiPartners'
@@ -88,10 +95,27 @@ export default function HostReports({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [sent, setSent] = useState('')
+  /**
+   * FX-13 (RF-19): reports this agency already has a PENDING contest against.
+   * Their "Contest this" is hidden — it used to stay, and every press filed
+   * another appeal. Read from the agency's own appeals (which it may read);
+   * if that read fails the button shows, and the deterministic id below still
+   * stops a second contest.
+   */
+  const [contested, setContested] = useState<Set<string>>(new Set())
+  /** RC: reports whose contest was decided OVERTURNED — nothing is left to contest. */
+  const [overturned, setOverturned] = useState<Set<string>>(new Set())
 
   const load = useCallback(async () => {
     if (!agencyId) return
     setReports(await attempt(statements.agencyHostReports(agencyId), 'agency host reports'))
+    try {
+      const mine = await getDocs(query(collection(db, 'appeals'), where('agencyId', '==', agencyId)))
+      setContested(pendingContestReportIds(mine.docs.map((d) => d.data())))
+      setOverturned(overturnedContestReportIds(mine.docs.map((d) => d.data())))
+    } catch {
+      // Not knowing is not "none": the write below is still create-only.
+    }
   }, [agencyId])
 
   useEffect(() => { load() }, [load])
@@ -111,7 +135,7 @@ export default function HostReports({
     try {
       // The key set must match `appealFields()` in firestore.rules exactly —
       // the rule uses `hasOnly`, so one extra key refuses the whole write.
-      await addDoc(collection(db, 'appeals'), {
+      const contest = {
         subjectUid: contesting.targetUid ?? '',
         subjectName: contesting.targetName ?? '',
         raisedByUid: actor.uid,
@@ -127,7 +151,43 @@ export default function HostReports({
         // So the server can stop the reviewer who decided this report from
         // also deciding the appeal against it.
         originalDecidedBy: contesting.reviewedBy ?? '',
-      })
+      }
+      // FX-13: at this report's deterministic id, create-only (the rules allow
+      // no update on `appeals`, so a second write to the id is refused).
+      const refused = (e: unknown) => (e as FirestoreError | undefined)?.code === 'permission-denied'
+      const placed = await placeContest(agencyId, contesting.id, {
+        createIfAbsent: async (id) => {
+          const ref = doc(db, 'appeals', id)
+          // Reading an appeal that does not exist is refused by the rules;
+          // here that means "free".
+          const seen = await getDoc(ref).catch((e: unknown) => {
+            if (refused(e)) return null
+            throw e
+          })
+          if (seen && seen.exists()) return { created: false, existing: seen.data() as Record<string, unknown> }
+          try {
+            await setDoc(ref, contest)
+            return { created: true }
+          } catch (e) {
+            if (!refused(e)) throw e
+            const again = await getDoc(ref).catch(() => null)
+            if (again && again.exists()) return { created: false, existing: again.data() as Record<string, unknown> }
+            throw e
+          }
+        },
+      }, text, 0)
+      if (!placed.ok && placed.reason !== 'pending') {
+        // RC (confirmed): a contest after a decided one needs something new;
+        // and there is no automatic-id fallback any more.
+        setError(placed.reason === 'needs_new' ? CONTEST_NEEDS_NEW : CONTEST_EXHAUSTED)
+        return
+      }
+      setContested((prev) => new Set(prev).add(contesting.id))
+      if (!placed.ok) {
+        setError(CONTEST_ALREADY_PENDING)
+        setContesting(null)
+        return
+      }
       setSent(contesting.targetName || contesting.targetUid || 'that host')
       setContesting(null)
       setStatement('')
@@ -212,7 +272,14 @@ export default function HostReports({
                   </span>
                   {/* A pending report has no decision to contest yet, and a
                       dismissed one has nothing to correct. */}
-                  {r.status !== 'pending' && r.actionTaken !== 'dismiss' && (
+                  {r.status !== 'pending' && r.actionTaken !== 'dismiss' && contested.has(r.id) && (
+                    <span className="text-xs text-slate-400">Contest sent — with a reviewer</span>
+                  )}
+                  {/* RC: a decision already overturned on appeal has nothing left to contest. */}
+                  {r.status !== 'pending' && overturned.has(r.id) && !contested.has(r.id) && (
+                    <span className="text-xs text-green-300">Overturned on appeal</span>
+                  )}
+                  {r.status !== 'pending' && r.actionTaken !== 'dismiss' && !contested.has(r.id) && !overturned.has(r.id) && (
                     <button
                       onClick={() => { setContesting(r); setStatement(''); setError('') }}
                       className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"

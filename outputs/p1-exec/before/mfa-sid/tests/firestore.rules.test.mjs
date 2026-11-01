@@ -1,0 +1,699 @@
+/**
+ * firestore.rules — the agency `crmUid` back-link, against the Firestore emulator.
+ *
+ * ── WHAT THIS PINS DOWN ──────────────────────────────────────────────────────
+ *
+ * `crmUid` is the field that says which Firebase login owns a partner record.
+ * Writing it is the moment a business acquires a human, and the agency clause
+ * that permits the applicant to write it carried no guard on the field's
+ * previous value:
+ *
+ *     || (request.auth != null
+ *         && resource.data.get('ownerEmail', '') == request.auth.token.email
+ *         && resource.data.get('status', '') == 'pending'
+ *         && request.resource.data.diff(resource.data)
+ *               .affectedKeys().hasOnly(['crmUid']));
+ *
+ * So an agency that already had an owner could be re-pointed at a different
+ * login — a handover, performed from a browser, with nothing recording it. The
+ * identical clause on `/sellers` has always required `crmUid == ''`; agencies
+ * was the one that did not, and agencies is the collection the duplicate-agency
+ * incident happened in. One condition was added:
+ *
+ *         && resource.data.get('crmUid', '') == ''
+ *
+ * These tests exist because that is only one clause of five, and **Firestore
+ * Security Rules are a permissive union**: `allow update` is satisfied if ANY
+ * arm matches, so tightening one arm proves nothing until the others are asked
+ * the same question. That is exactly how the two storage-rules bugs in the
+ * previous audit got in — see the header of `storage.rules.test.mjs`, and
+ * section 6 below, which asks the other arms directly.
+ *
+ * ── WHAT THIS DELIBERATELY DOES NOT TEST ─────────────────────────────────────
+ *
+ * One human holding one agency. Rules cannot answer "does another document
+ * already name this human" — that needs a collection query, and rules cannot
+ * query. It is enforced in the API against Mongo, by
+ * `backend/app/services/partner_roles.py`, at both doors that attach a human to
+ * a record (`ensure_partner_record` and `attach_login`).
+ *
+ * Section 7 asserts the absence, so that nobody reading a green run here ever
+ * concludes the rules are holding that line.
+ *
+ * ── RUN ──────────────────────────────────────────────────────────────────────
+ *
+ *     cd tests && npm install          # once
+ *     cd .. && firebase emulators:exec --only firestore \
+ *                --project demo-zipper "node tests/firestore.rules.test.mjs"
+ *
+ * Needs Java. Loads ../firestore.rules from disk; nothing touches the real
+ * project and every document lives in the emulator.
+ */
+
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import {
+  initializeTestEnvironment, assertFails, assertSucceeds,
+} from '@firebase/rules-unit-testing'
+import { doc, setDoc, updateDoc, deleteField, deleteDoc, getDoc } from 'firebase/firestore'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const RULES = readFileSync(join(here, '..', 'firestore.rules'), 'utf8')
+
+let checks = 0
+let failures = 0
+const failed = []
+
+async function expect(claim, promise, shouldPass) {
+  checks += 1
+  try {
+    await (shouldPass ? assertSucceeds(promise) : assertFails(promise))
+  } catch (err) {
+    failures += 1
+    failed.push(claim)
+    console.error(`  FAIL  ${claim}\n        ${String(err.message ?? err).split('\n')[0]}`)
+  }
+}
+const ok = (c, p) => expect(c, p, true)
+const no = (c, p) => expect(c, p, false)
+
+const testEnv = await initializeTestEnvironment({
+  projectId: 'demo-zipper',
+  firestore: { rules: RULES, host: '127.0.0.1', port: 8080 },
+})
+await testEnv.clearFirestore()
+
+// ── Seeding ─────────────────────────────────────────────────────────────────
+//
+// Written with the rules switched off, the way the Admin SDK writes in
+// production. Nothing here is the thing under test; it is the world the thing
+// under test runs against.
+async function seed(path, data) {
+  await testEnv.withSecurityRulesDisabled(async (c) => {
+    await setDoc(doc(c.firestore(), path), data)
+  })
+}
+
+// P1-A3b — Owner authority in the rules holds only for a Firebase sign-in the
+// backend bound to an MFA-verified session (ownerMfaSessions/{uid}). The mock
+// token's defaults are auth_time 0 and provider 'custom', so that is the key
+// the Owners in this suite are bound under. Pending/unbound Owners are covered
+// in tests/firestore.p1mfa.rules.test.mjs.
+const OWNER_MFA_BOUND = { active: { '0:custom': new Date(Date.now() + 7 * 864e5) } }
+
+// ── ONE Firestore HANDLE PER CONTEXT, RESOLVED ONCE ─────────────────────────
+//
+// `RulesTestContext.firestore()` is not an accessor. Every call does:
+//
+//     const firestore = this.getApp().firestore();
+//     firestore.useEmulator(host, port, { mockUserToken: this.authToken });
+//
+// and `useEmulator` writes settings. Firestore locks its settings the moment
+// the instance is first used, so the SECOND call on a given context throws
+//
+//     FirebaseError: Firestore has already been started and its settings can
+//     no longer be changed.
+//
+// which is a failed-precondition, not a rules decision — it kills the run
+// rather than failing an assertion. The first draft of this file called
+// `ctx.firestore()` inside `D()`, i.e. once per assertion, and died on the
+// second one.
+//
+// Seeding is unaffected: `withSecurityRulesDisabled` builds a FRESH context
+// per call and cleans it up after, so each gets its own first-and-only call.
+const handles = new Map()
+function fs(ctx) {
+  if (!handles.has(ctx)) handles.set(ctx, ctx.firestore())
+  return handles.get(ctx)
+}
+
+const D = (ctx, path) => doc(fs(ctx), path)
+
+// ── The documents, in the shape the real writers produce ────────────────────
+//
+// Field names are taken from `zipper-crm/lib/agencies.ts` and
+// `zipper-crm/lib/sellers.ts`, and the create payloads from the four
+// registration pages — NOT invented for the test. In particular, the signup
+// forms create the record with NO `crmUid` key at all and write it afterwards,
+// which is the case `get('crmUid','')` has to treat as empty.
+const AGENCY = (over = {}) => ({
+  crmId: 'A1B2C3D4',
+  agencyName: 'Skyline Talents',
+  ownerName: 'Ruhan Mittal',
+  ownerPhone: '+919876500001',
+  ownerEmail: 'ruhan@example.test',
+  type: 'main',
+  parentAgencyId: null,
+  status: 'pending',
+  kycStatus: 'pending',
+  kycDocUrls: [],
+  isActive: false,
+  totalHosts: 0,
+  totalSubAgencies: 0,
+  source: 'self_signup',
+  ...over,
+})
+
+const SELLER = (over = {}) => ({
+  crmId: 'S1S2S3S4',
+  displayName: 'Ruhan Coin Shop',
+  phone: '+919876500001',
+  email: 'ruhan@example.test',
+  registrationProofUrl: '',
+  idDocUrls: [],
+  isApproved: false,
+  isActive: false,
+  status: 'pending',
+  coinBalance: 0,
+  totalCoinsSold: 0,
+  qrCodeUrl: '',
+  source: 'self_signup',
+  ...over,
+})
+
+// ── The cast ────────────────────────────────────────────────────────────────
+//
+// `isCrmUser()` is `exists(crmUsers/$(uid)) && isActive != false`, and
+// `crmRole()` reads that document — so a staff principal is only staff once
+// the document exists. Seeding it IS what makes them staff, exactly as in
+// production.
+const ctx = (uid, token = {}) => testEnv.authenticatedContext(uid, token)
+
+const RUHAN = 'ruhan@example.test'
+const TAN = 'tan@example.test'
+
+await seed('crmUsers/uidOps', {
+  uid: 'uidOps', email: 'priya@zipper.test', name: 'Priya Menon',
+  role: 'ops_admin', isActive: true, status: 'approved',
+})
+await seed('crmUsers/uidSuper', {
+  uid: 'uidSuper', email: 'owner@zipper.test', name: 'Owner',
+  role: 'superadmin', isActive: true, status: 'approved',
+})
+await seed('ownerMfaSessions/uidSuper', OWNER_MFA_BOUND)  // P1-A3b
+await seed('crmUsers/uidSupportMember', {
+  uid: 'uidSupportMember', email: 'sm@zipper.test', name: 'Support',
+  role: 'support_member', isActive: true, status: 'approved',
+})
+
+const applicant = ctx('uidA', { email: RUHAN, email_verified: true })
+const otherPerson = ctx('uidB', { email: TAN, email_verified: true })
+const stranger = ctx('uidZ', { email: 'nobody@example.test', email_verified: true })
+const unauth = testEnv.unauthenticatedContext()
+
+const opsAdmin = ctx('uidOps', { email: 'priya@zipper.test', email_verified: true })
+const superAdmin = ctx('uidSuper', { email: 'owner@zipper.test', email_verified: true })
+const supportMember = ctx('uidSupportMember', {
+  email: 'sm@zipper.test', email_verified: true,
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('\n1. An unlinked agency can be linked ONCE')
+// ════════════════════════════════════════════════════════════════════════════
+
+// The record is created before the Firebase account exists, so it carries no
+// uid to match on. The verified email is the binding.
+await seed('agencies/AG_FIRST', AGENCY())
+await ok('the applicant writes the crmUid back-link on their own pending agency',
+  updateDoc(D(applicant, 'agencies/AG_FIRST'), { crmUid: 'uidA' }))
+
+// An explicitly empty string must behave the same as an absent key, because
+// `get('crmUid','')` cannot tell them apart and different writers produce
+// different ones.
+await seed('agencies/AG_EMPTY_STRING', AGENCY({ crmUid: '' }))
+await ok('an explicit empty crmUid is equally unlinked',
+  updateDoc(D(applicant, 'agencies/AG_EMPTY_STRING'), { crmUid: 'uidA' }))
+
+// The clause is pinned to that one field, so it cannot become an edit of
+// anything else. Checked because `hasOnly` is easy to get wrong.
+await seed('agencies/AG_SMUGGLE', AGENCY())
+await no('the link write cannot smuggle a second field alongside it',
+  updateDoc(D(applicant, 'agencies/AG_SMUGGLE'),
+    { crmUid: 'uidA', status: 'approved' }))
+await no('nor a harmless-looking one',
+  updateDoc(D(applicant, 'agencies/AG_SMUGGLE'),
+    { crmUid: 'uidA', agencyName: 'Renamed Ltd' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('2. WRITE-ONCE — an agency that already has an owner cannot be re-pointed')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// This is the one-line change. Before it, every assertion in this section
+// passed the rule and was allowed.
+
+await seed('agencies/AG_LINKED', AGENCY({ crmUid: 'uidA' }))
+
+await no('the holder cannot move the link to somebody else',
+  updateDoc(D(applicant, 'agencies/AG_LINKED'), { crmUid: 'uidB' }))
+await no('and cannot rewrite it to their own uid again',
+  updateDoc(D(applicant, 'agencies/AG_LINKED'), { crmUid: 'uidA' }))
+await no('and cannot blank it to free the slot for a fresh link',
+  updateDoc(D(applicant, 'agencies/AG_LINKED'), { crmUid: '' }))
+await no('and cannot delete the field to the same end',
+  updateDoc(D(applicant, 'agencies/AG_LINKED'), { crmUid: deleteField() }))
+
+// The person the link would be moved TO cannot pull it across either — their
+// email does not match the record, so no clause admits them.
+await no('the intended new owner cannot claim it',
+  updateDoc(D(otherPerson, 'agencies/AG_LINKED'), { crmUid: 'uidB' }))
+
+// A linked agency that has since been approved is not a second chance.
+await seed('agencies/AG_LINKED_APPROVED',
+  AGENCY({ crmUid: 'uidA', status: 'approved', isActive: true }))
+await no('an approved linked agency cannot be re-pointed by its owner',
+  updateDoc(D(applicant, 'agencies/AG_LINKED_APPROVED'), { crmUid: 'uidB' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('3. Staff can still create and manage an UNLINKED agency')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `/agencies/register` deliberately creates the agency first and attaches the
+// login after, so a half-finished onboarding is visible on /agencies rather
+// than invisible. The cheapest way to make a write-once rule hold is to
+// require an owner on every record, and that would break this.
+
+await ok('an ops admin creates an agency with no crmUid',
+  setDoc(D(opsAdmin, 'agencies/AG_STAFF_NEW'), AGENCY({ ownerEmail: TAN })))
+await ok('and edits it while it is still unlinked',
+  updateDoc(D(opsAdmin, 'agencies/AG_STAFF_NEW'), { ownerPhone: '+919000000000' }))
+// Phase 1A (SECURITY-003/005): CHANGED EXPECTATION. Approval is a server
+// decision (partner_ops: eligibility matrix, owner link, claims, audit). A
+// browser write of `status`/`isActive` skipped all of it, so it is refused now
+// even for an admin. This is a tightening, not a relaxed assertion.
+await no('Phase 1A — staff can no longer approve from the browser',
+  updateDoc(D(opsAdmin, 'agencies/AG_STAFF_NEW'),
+    { status: 'approved', isActive: true }))
+await ok('a superadmin can do the same',
+  setDoc(D(superAdmin, 'agencies/AG_SUPER_NEW'), AGENCY({ ownerEmail: TAN })))
+
+// Staff attaching the login. `isAdmin()` is the first arm of `allow update`
+// and is unconditional, so this is permitted at any status and on an
+// already-linked record — a deliberate staff override, asserted here so the
+// override is a decision on the record rather than a surprise.
+await seed('agencies/AG_STAFF_LINK', AGENCY())
+await ok('staff attach a login to an unlinked agency',
+  updateDoc(D(opsAdmin, 'agencies/AG_STAFF_LINK'), { crmUid: 'uidA' }))
+// Phase 1A (SECURITY-005, protected owner links): CHANGED EXPECTATION. The
+// staff override that re-pointed a linked agency at another human from a
+// browser is closed; a handover is a server operation with an audit entry.
+await no('Phase 1A — staff can no longer re-point an already-linked agency',
+  updateDoc(D(opsAdmin, 'agencies/AG_STAFF_LINK'), { crmUid: 'uidB' }))
+await no('Phase 1A — nor change its ownerUid',
+  updateDoc(D(opsAdmin, 'agencies/AG_STAFF_LINK'), { ownerUid: 'uidB' }))
+
+// Non-admin staff are not admins. `support_member` does not match
+// `.*_admin`, so `isAdmin()` is false and no other arm admits them.
+await seed('agencies/AG_SUPPORT', AGENCY())
+await no('a support MEMBER is not an admin and cannot attach a login',
+  updateDoc(D(supportMember, 'agencies/AG_SUPPORT'), { crmUid: 'uidA' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('4. An unrelated account cannot assign or change crmUid')
+// ════════════════════════════════════════════════════════════════════════════
+
+await seed('agencies/AG_STRANGER', AGENCY())
+await no('a signed-in stranger cannot link an agency that is not theirs',
+  updateDoc(D(stranger, 'agencies/AG_STRANGER'), { crmUid: 'uidZ' }))
+await no('nor link it to its rightful applicant',
+  updateDoc(D(stranger, 'agencies/AG_STRANGER'), { crmUid: 'uidA' }))
+await no('an unauthenticated caller cannot link anything',
+  updateDoc(D(unauth, 'agencies/AG_STRANGER'), { crmUid: 'uidA' }))
+await no('a stranger cannot delete the agency either',
+  updateDoc(D(stranger, 'agencies/AG_STRANGER'), { status: 'approved' }))
+
+// Email is the binding, and it is the VERIFIED token email — a record bearing
+// somebody else's address is not reachable however the caller is signed in.
+await seed('agencies/AG_TAN', AGENCY({ ownerEmail: TAN }))
+await no("the applicant cannot link an agency carrying another person's email",
+  updateDoc(D(applicant, 'agencies/AG_TAN'), { crmUid: 'uidA' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('5. Seller regression — unchanged by this edit')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `/sellers` has always carried `crmUid == ''` on its back-link clause. These
+// assertions are the control: if the agency edit had been made by changing a
+// shared helper rather than one clause, this section is what would move.
+
+await seed('sellers/SL_FIRST', SELLER())
+await ok('the applicant writes the crmUid back-link on their own seller record',
+  updateDoc(D(applicant, 'sellers/SL_FIRST'), { crmUid: 'uidA' }))
+
+await seed('sellers/SL_LINKED', SELLER({ crmUid: 'uidA' }))
+await no('a linked seller cannot be re-pointed',
+  updateDoc(D(applicant, 'sellers/SL_LINKED'), { crmUid: 'uidB' }))
+await no('nor blanked',
+  updateDoc(D(applicant, 'sellers/SL_LINKED'), { crmUid: '' }))
+await no('and the intended new owner cannot claim it',
+  updateDoc(D(otherPerson, 'sellers/SL_LINKED'), { crmUid: 'uidB' }))
+await no('a stranger cannot link a seller record',
+  updateDoc(D(stranger, 'sellers/SL_FIRST'), { crmUid: 'uidZ' }))
+
+// The seller "pending record edits itself" clause EXCLUDES crmUid by name —
+// `hasAny([... 'ownerUid', 'crmUid', ...])`. That exclusion is what stops the
+// union re-granting the overwrite on this collection, and it is the thing
+// section 6 finds missing on agencies. Asserted from the far side.
+await seed('crmUsers/uidSellerCrm', {
+  uid: 'uidSellerCrm', email: RUHAN, name: 'Ruhan', role: 'seller',
+  sellerId: 'SL_SELF', isActive: true, status: 'approved',
+})
+const sellerCrm = ctx('uidSellerCrm', { email: RUHAN, email_verified: true })
+await seed('sellers/SL_SELF', SELLER({ crmUid: 'uidSellerCrm' }))
+await ok('a pending seller may still edit its own ordinary fields',
+  updateDoc(D(sellerCrm, 'sellers/SL_SELF'), { description: 'Open 9 to 6' }))
+await no('but that clause does not let it rewrite its own crmUid',
+  updateDoc(D(sellerCrm, 'sellers/SL_SELF'), { crmUid: 'uidB' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('6. THE UNION — the other arms of `allow update`, asked the same question')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Rules are a permissive union: one `allow` anywhere wins, and a more specific
+// clause does NOT override a general one. The write-once condition was added
+// to the fifth arm of `allow update` on /agencies. There are four others, and
+// two of them touch `crmUid` without mentioning it:
+//
+//   ARM 2  isAgencyCrmUser() && crmUserAgencyId() == agencyId
+//            && !affectedKeys.hasAny(['status','approvedBy','approvedAt','isActive'])
+//            && (touchesNoSensitiveField() || status == 'pending')
+//
+//          `crmUid` is in neither `payoutFields()` nor `identityFields()`, so
+//          `touchesNoSensitiveField()` is TRUE for a crmUid-only write — at
+//          any status, approved included.
+//
+//   ARM 4  isAppUser() && ownerUid == request.auth.uid && status == 'pending'
+//            && !affectedKeys.hasAny(['status','approvedBy','approvedAt'])
+//
+//          `crmUid` is not in that exclusion list either.
+//
+// The equivalent seller clause lists `'crmUid'` in its exclusions by name
+// (section 5 proves it), which is why /sellers is closed and /agencies may not
+// be. These assert the INTENDED behaviour — write-once means write-once,
+// whichever arm the caller comes through. They are not written to pass.
+
+await seed('crmUsers/uidAgencyCrm', {
+  uid: 'uidAgencyCrm', email: RUHAN, name: 'Ruhan', role: 'agency',
+  agencyId: 'AG_UNION_2', isActive: true, status: 'approved',
+})
+const agencyCrm = ctx('uidAgencyCrm', { email: RUHAN, email_verified: true })
+
+await seed('agencies/AG_UNION_2', AGENCY({ crmUid: 'uidAgencyCrm' }))
+await ok('ARM 2 — an agency CRM user may still edit its own ordinary fields',
+  updateDoc(D(agencyCrm, 'agencies/AG_UNION_2'), { city: 'Pune' }))
+await no('ARM 2 — but must not rewrite its own crmUid while pending',
+  updateDoc(D(agencyCrm, 'agencies/AG_UNION_2'), { crmUid: 'uidB' }))
+
+await seed('agencies/AG_UNION_2_APPROVED',
+  AGENCY({ crmUid: 'uidAgencyCrm', status: 'approved', isActive: true }))
+await seed('crmUsers/uidAgencyCrm2', {
+  uid: 'uidAgencyCrm2', email: RUHAN, name: 'Ruhan', role: 'agency',
+  agencyId: 'AG_UNION_2_APPROVED', isActive: true, status: 'approved',
+})
+const agencyCrmApproved = ctx('uidAgencyCrm2', { email: RUHAN, email_verified: true })
+await no('ARM 2 — nor once the agency is approved',
+  updateDoc(D(agencyCrmApproved, 'agencies/AG_UNION_2_APPROVED'), { crmUid: 'uidB' }))
+
+await seed('agencies/AG_UNION_4', AGENCY({ ownerUid: 'uidA', crmUid: 'uidA' }))
+await ok('ARM 4 — an app-user owner may still edit their pending application',
+  updateDoc(D(applicant, 'agencies/AG_UNION_4'), { ownerPhone: '+919111111111' }))
+await no('ARM 4 — but must not rewrite crmUid through the owner clause',
+  updateDoc(D(applicant, 'agencies/AG_UNION_4'), { crmUid: 'uidB' }))
+
+// The FIRST link still works — but it is the back-link arm that grants it,
+// not this one. Both arms used to admit it, which is what made the hole easy
+// to miss: removing `crmUid` from ARM 4 changes nothing a user can see.
+await seed('agencies/AG_UNION_4_UNLINKED', AGENCY({ ownerUid: 'uidA' }))
+await ok('ARM 4 — a FIRST link is still granted (by the back-link arm)',
+  updateDoc(D(applicant, 'agencies/AG_UNION_4_UNLINKED'), { crmUid: 'uidA' }))
+await no('ARM 4 — a second one is not',
+  updateDoc(D(applicant, 'agencies/AG_UNION_4_UNLINKED'), { crmUid: 'uidB' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('7. What these rules do NOT enforce, asserted on purpose')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// One human, one agency. Answering it needs "does another document already
+// name this uid", which is a collection query, and rules cannot query. This
+// section exists so that a green run here is never mistaken for that
+// guarantee: it shows the rules cheerfully allowing the exact production
+// shape — one person, two agencies — because stopping it is not their job.
+//
+// It is stopped in the API, against Mongo, by `services/partner_roles`, at
+// both `ensure_partner_record` and `attach_login`. The backend tests for that
+// are `backend/tests/test_partner_roles.py` and `test_attach_login.py`.
+
+await seed('agencies/AG_RUHAN', AGENCY({ agencyName: 'Ruhan Agency' }))
+await seed('agencies/AG_TAN_SAME_HUMAN', AGENCY({ agencyName: 'Tan Agency' }))
+
+await ok('one human links their first agency',
+  updateDoc(D(applicant, 'agencies/AG_RUHAN'), { crmUid: 'uidA' }))
+await ok('AND THEIR SECOND — the rules cannot see the first one, and this is '
+  + 'exactly the production duplicate. partner_roles is what refuses it.',
+  updateDoc(D(applicant, 'agencies/AG_TAN_SAME_HUMAN'), { crmUid: 'uidA' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('8. ADJACENT — `ownerUid`, the other identity-linking field')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// NEW IN THIS RUN. Not part of the crmUid finding; a question raised BY it.
+//
+// `ownerUid` is the other field that says which human a record belongs to —
+// ARM 4 binds on it, and the app-side read clause on /agencies authorises on
+// it (`resource.data.ownerUid == request.auth.uid`). It sits in exactly the
+// same position as `crmUid` and was left out of exactly the same two
+// exclusion lists.
+//
+// The seller clause excludes BOTH by name: hasAny([… 'ownerUid', 'crmUid' …]).
+// Agencies excluded neither until this round, and now excludes only `crmUid`,
+// because `crmUid` is what the tests had actually demonstrated.
+//
+// These assertions are the demonstration for `ownerUid`. They state the
+// intended behaviour — an owner may edit their application, not hand it to
+// somebody else — and they are not written to pass. If they fail, the remedy
+// is one more name in each of the two lists, the same edit as above.
+
+await seed('agencies/AG_OWNERUID', AGENCY({ ownerUid: 'uidA', crmUid: 'uidA' }))
+await ok('an app-user owner may edit their own pending application',
+  updateDoc(D(applicant, 'agencies/AG_OWNERUID'), { ownerName: 'Ruhan M' }))
+await no('but must not hand the record to another uid via ownerUid',
+  updateDoc(D(applicant, 'agencies/AG_OWNERUID'), { ownerUid: 'uidB' }))
+
+await seed('crmUsers/uidAgencyCrm3', {
+  uid: 'uidAgencyCrm3', email: RUHAN, name: 'Ruhan', role: 'agency',
+  agencyId: 'AG_OWNERUID_CRM', isActive: true, status: 'approved',
+})
+const agencyCrmOwner = ctx('uidAgencyCrm3', { email: RUHAN, email_verified: true })
+await seed('agencies/AG_OWNERUID_CRM',
+  AGENCY({ ownerUid: 'uidA', crmUid: 'uidAgencyCrm3' }))
+await no('nor may an agency CRM user rewrite ownerUid on its own record',
+  updateDoc(D(agencyCrmOwner, 'agencies/AG_OWNERUID_CRM'), { ownerUid: 'uidB' }))
+
+// The seller control, again — this is what the agency clauses are measured
+// against, and it already passes.
+await seed('sellers/SL_OWNERUID', SELLER({ crmUid: 'uidSellerCrm', ownerUid: 'uidA' }))
+await no('a seller cannot rewrite its own ownerUid — excluded by name',
+  updateDoc(D(sellerCrm, 'sellers/SL_OWNERUID'), { ownerUid: 'uidB' }))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('9. CREATE — an app user may not write somebody else\'s ownerUid')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// The registration trigger reads `ownerUid` off a new agency document as the
+// record's human, and the API enforces one agency-family record per human on
+// it. So a signed-in app user who could create an agency carrying another
+// uid could claim that person's slot or hang a record on them. The app-user
+// create arm binds the field to the caller — the binding `sellers` has
+// always had. An omitted field is still allowed (the legacy forms wrote none
+// and the API treats it as unowned); a WRONG one is not.
+
+// FX-06 / approved contact rule — CHANGED EXPECTATION: a client create may
+// carry only the public signup's `self_signup` source, which the registration
+// path holds to the full application eligibility. `self_app` (the API's own
+// app applications, skipped by the registration trigger) is the Admin SDK's
+// alone; a client writing it created a record no server check ever saw.
+await ok('an app user creates an agency naming themselves as owner (self_signup)',
+  setDoc(D(applicant, 'agencies/AG_SELF_OWNED'),
+    AGENCY({ ownerUid: 'uidA', source: 'self_signup' })))
+await no('FX-06: …but not with the API\'s own `self_app` source',
+  setDoc(D(applicant, 'agencies/AG_SELF_OWNED_SELFAPP'),
+    AGENCY({ ownerUid: 'uidA', source: 'self_app' })))
+await no('…and not one naming somebody else',
+  setDoc(D(applicant, 'agencies/AG_SPOOFED_OWNER'),
+    AGENCY({ ownerUid: 'uidZ', source: 'self_signup' })))
+await ok('an agency with no ownerUid at all is still creatable (legacy form shape)',
+  setDoc(D(applicant, 'agencies/AG_NO_OWNER'), AGENCY()))
+await no('an app user still cannot create one pre-approved',
+  setDoc(D(applicant, 'agencies/AG_PRE_APPROVED'),
+    AGENCY({ ownerUid: 'uidA', isActive: true, status: 'approved' })))
+
+// ════════════════════════════════════════════════════════════════════════════
+console.log('10. RECHARGE REQUESTS — read-only to every client; the API alone writes')
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Every field on a recharge request is server-authoritative: the status and
+// its transitions, the reviewer and review time, the credited and refunded
+// amounts, the ledger marker. The API writes them through the Admin SDK.
+// These cases put each kind of client in front of each kind of write and
+// expect a refusal every time — including the two that used to succeed: the
+// seller approving their own sale, and finance approving from the browser.
+
+await seed('crmUsers/uidFinance', {
+  uid: 'uidFinance', email: 'fin@zipper.test', name: 'Finance',
+  role: 'finance_admin', isActive: true, status: 'approved',
+})
+const finance = ctx('uidFinance', { email: 'fin@zipper.test', email_verified: true })
+const buyer = ctx('uidBuyer', { email: 'buyer@example.test', email_verified: true })
+const sellerApp = ctx('uidSellerApp', { email: 'seller@example.test', email_verified: true })
+await seed('sellers/uidSellerApp', SELLER({ crmUid: 'uidSellerCrm', ownerUid: 'uidSellerApp', status: 'approved', isApproved: true, isActive: true }))
+
+const RECHARGE = (over = {}) => ({
+  buyerUid: 'uidBuyer',
+  sellerUid: 'uidSellerApp',
+  sellerPartnerId: 'uidSellerApp',
+  sellerName: 'Ruhan Coin Shop',
+  diamondPackage: 500,
+  amountPaid: 499,
+  currency: 'INR',
+  paymentMethod: 'upi',
+  transactionRef: 'UTR-1',
+  status: 'pending',
+  verifiedByStaff: false,
+  ...over,
+})
+await seed('rechargeRequests/RQ_PENDING', RECHARGE())
+await seed('rechargeRequests/RQ_APPROVED', RECHARGE({
+  status: 'approved', verifiedByStaff: true, creditedByLedger: true, creditedDiamonds: 500,
+  approvedBy: 'uidSuper',
+}))
+
+// Reads stay as they were.
+await ok('the buyer reads their own request', getDoc(D(buyer, 'rechargeRequests/RQ_PENDING')))
+await ok('the seller (app uid) reads a request against them', getDoc(D(sellerApp, 'rechargeRequests/RQ_PENDING')))
+await ok('the seller (CRM login) reads it too', getDoc(D(sellerCrm, 'rechargeRequests/RQ_PENDING')))
+await ok('finance reads it', getDoc(D(finance, 'rechargeRequests/RQ_PENDING')))
+await no('a stranger cannot read it', getDoc(D(stranger, 'rechargeRequests/RQ_PENDING')))
+
+// Create — the API creates these; no client may.
+await no('a buyer cannot create a request directly (the callable files it)',
+  setDoc(D(buyer, 'rechargeRequests/RQ_NEW_BUYER'), RECHARGE()))
+await no('a CRM seller cannot create one',
+  setDoc(D(sellerCrm, 'rechargeRequests/RQ_NEW_SELLER'), RECHARGE()))
+await no('nor finance', setDoc(D(finance, 'rechargeRequests/RQ_NEW_FIN'), RECHARGE()))
+await no('nor the owner', setDoc(D(superAdmin, 'rechargeRequests/RQ_NEW_OWNER'), RECHARGE()))
+await no('nor a client creating one already approved',
+  setDoc(D(buyer, 'rechargeRequests/RQ_NEW_APPROVED'), RECHARGE({ status: 'approved', creditedByLedger: true })))
+
+// Status transitions — the old money path.
+await no('the seller (app uid) cannot approve their own sale',
+  updateDoc(D(sellerApp, 'rechargeRequests/RQ_PENDING'), { status: 'approved' }))
+await no('the seller (CRM login) cannot approve it',
+  updateDoc(D(sellerCrm, 'rechargeRequests/RQ_PENDING'), { status: 'approved' }))
+await no('the seller cannot reject it either',
+  updateDoc(D(sellerApp, 'rechargeRequests/RQ_PENDING'), { status: 'rejected', rejectedReason: 'no' }))
+await no('the buyer cannot approve their own request',
+  updateDoc(D(buyer, 'rechargeRequests/RQ_PENDING'), { status: 'approved' }))
+await no('finance cannot approve from the browser',
+  updateDoc(D(finance, 'rechargeRequests/RQ_PENDING'), { status: 'approved' }))
+await no('the owner cannot approve from the browser',
+  updateDoc(D(superAdmin, 'rechargeRequests/RQ_PENDING'), { status: 'approved' }))
+await no('an approved request cannot be sent back to pending (the re-credit loop)',
+  updateDoc(D(sellerApp, 'rechargeRequests/RQ_APPROVED'), { status: 'pending' }))
+
+// Every server-authoritative field, one at a time, by the party most tempted.
+const FORBIDDEN = [
+  ['verifiedByStaff', true],
+  ['creditedByLedger', true],
+  ['creditedDiamonds', 99999],
+  ['diamondPackage', 99999],
+  ['amountPaid', 1],
+  ['approvedBy', 'uidSellerApp'],
+  ['approvedAt', new Date()],
+  ['reviewedBy', 'uidSellerApp'],
+  ['reviewedAt', new Date()],
+  ['refundedDiamonds', 0],
+  ['unrecoverableDiamonds', 0],
+  ['refundReason', 'x'],
+  ['refundDecidedAt', new Date()],
+  ['transferErrorReason', ''],
+  ['buyerUid', 'uidSellerApp'],
+  ['sellerUid', 'uidBuyer'],
+]
+for (const [field, value] of FORBIDDEN) {
+  await no(`the seller cannot write ${field}`,
+    updateDoc(D(sellerApp, 'rechargeRequests/RQ_APPROVED'), { [field]: value }))
+  await no(`the buyer cannot write ${field}`,
+    updateDoc(D(buyer, 'rechargeRequests/RQ_APPROVED'), { [field]: value }))
+}
+await no('a refund cannot be opened from a client',
+  updateDoc(D(buyer, 'rechargeRequests/RQ_APPROVED'), { status: 'refund_pending' }))
+await no('nor decided from a client',
+  updateDoc(D(finance, 'rechargeRequests/RQ_APPROVED'), { status: 'refunded', refundedDiamonds: 500 }))
+await no('a reversal cannot be written from a client',
+  updateDoc(D(superAdmin, 'rechargeRequests/RQ_APPROVED'), { status: 'reversed', unrecoverableDiamonds: 0 }))
+
+// Delete — a record of a payment is never deleted from a client.
+await no('the seller cannot delete a request', deleteDoc(D(sellerApp, 'rechargeRequests/RQ_PENDING')))
+await no('the buyer cannot delete it', deleteDoc(D(buyer, 'rechargeRequests/RQ_PENDING')))
+await no('not even the owner', deleteDoc(D(superAdmin, 'rechargeRequests/RQ_APPROVED')))
+
+console.log('11. HOST APPLICATIONS — invitations from the CRM only; no self-filed bypass')
+// ════════════════════════════════════════════════════════════════════════════
+const INVITE = (over = {}) => ({
+  referralCode: 'ABC123', agencyId: 'AG_UNION_2', agencyName: 'Union Two',
+  hostName: 'Invitee', applicantPhone: '+919999999999', applicantEmail: 'inv@example.test',
+  kycStatus: 'submitted', isActivated: false, status: 'pending', ...over,
+})
+// Phase 1A: an invitation must carry its agency's real referral code, so the
+// agencies used below carry one — as every approved agency does in production.
+await seed('agencies/AG_UNION_2', AGENCY({ crmUid: 'uidAgencyCrm', referralCode: 'ABC123' }))
+await seed('agencies/AG_ANY', AGENCY({ referralCode: 'ABC123' }))
+await no('Phase 1A — an invitation with a FORGED referral code is refused',
+  setDoc(D(agencyCrm, 'hostApplications/HA_FORGED'), INVITE({ referralCode: 'ZZZ999' })))
+await no('Phase 1A — staff cannot invent a code either',
+  setDoc(D(opsAdmin, 'hostApplications/HA_FORGED2'), INVITE({ agencyId: 'AG_ANY', referralCode: 'ZZZ999' })))
+await no('Phase 1A — an invitation cannot be born with a decision stamp',
+  setDoc(D(agencyCrm, 'hostApplications/HA_DECIDED'), INVITE({ decidedByUid: 'uidSuper' })))
+await no('an app user cannot create a host application naming themselves',
+  setDoc(D(stranger, 'hostApplications/HA_SELF'), INVITE({ applicantUid: 'uidZ', agencyId: 'AG_X' })))
+await no('an app user cannot create even a plain invitation',
+  setDoc(D(stranger, 'hostApplications/HA_STRANGER'), INVITE()))
+await ok('an agency CRM login may invite a host to its OWN agency',
+  setDoc(D(agencyCrm, 'hostApplications/HA_INVITE'), INVITE()))
+await no('…but not to another agency',
+  setDoc(D(agencyCrm, 'hostApplications/HA_OTHER'), INVITE({ agencyId: 'AG_SOMEONE_ELSE' })))
+await no('…nor pre-activated',
+  setDoc(D(agencyCrm, 'hostApplications/HA_ACT'), INVITE({ isActivated: true, activatedByUid: 'uidZ' })))
+await no('…nor pre-approved',
+  setDoc(D(agencyCrm, 'hostApplications/HA_APPR'), INVITE({ status: 'approved' })))
+await no('…nor naming an applicant uid',
+  setDoc(D(agencyCrm, 'hostApplications/HA_UID'), INVITE({ applicantUid: 'uidA' })))
+await ok('staff may create an invitation', setDoc(D(opsAdmin, 'hostApplications/HA_STAFF'), INVITE({ agencyId: 'AG_ANY' })))
+
+// ── Result ──────────────────────────────────────────────────────────────────
+await testEnv.cleanup()
+
+if (failures > 0) {
+  console.error(`\n${failures} of ${checks} firestore-rule checks FAILED:`)
+  for (const f of failed) console.error(`  · ${f}`)
+  console.error(
+    '\nSection 6 failing means the permissive union is back: a guard on one\n'
+    + 'arm of `allow update` does nothing while another arm permits the same\n'
+    + 'write. Section 8 failing means `ownerUid` has the hole `crmUid` had.\n'
+    + "Both are fixed the same way — name the field in the two exclusion\n"
+    + 'lists, as the seller clause already does for both.\n',
+  )
+  process.exit(1)
+}
+
+console.log(`\nAll ${checks} firestore-rule checks passed.`)
+console.log('  · an unlinked agency links once, by the verified email, one field only')
+console.log('  · a linked agency cannot be re-pointed, blanked or deleted into reuse')
+console.log('  · staff still create, edit and link UNLINKED agencies; since Phase 1A they')
+console.log('    can no longer approve or re-point an owner from the browser (API only)')
+console.log('  · a stranger reaches none of it, signed in or not')
+console.log('  · seller write-once behaviour is unchanged')
+console.log('  · no other arm of `allow update` re-grants the crmUid overwrite')
+console.log('  · ownerUid, the other identity-linking field, is equally pinned')
+console.log('  · one human holding two agencies is NOT refused here, by design —')
+console.log('    that is partner_roles, in the API, against Mongo\n')

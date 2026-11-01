@@ -44,6 +44,7 @@ from app.core.roles import Role
 from app.db import firebase
 from app.db.mongo import C, get_db
 from app.services import crm_directory as crm
+from app.services import storage_claims
 
 log = logging.getLogger(__name__)
 
@@ -98,8 +99,23 @@ def manages(actor: dict, person: Mapping) -> bool:
     is what keeps a department from being taken over from inside it.
     """
     actor_role: Role = actor["role"]
-    if R.can_read_all(actor_role) or R.is_owner(actor_role):
+
+    # ── Phase 1A (STAFF-001/002) — the top of the hierarchy is not managed ──
+    #
+    # The observer is managed by nobody. An Owner is managed only by the
+    # observer: Owners manage the departments, not each other. This used to
+    # return True for any owner against any record, which let one Owner
+    # deactivate or re-role another — or the last one.
+    target_raw = str(person.get("role", ""))
+    if target_raw == str(Role.OBSERVER):
+        return False
+    if target_raw == str(Role.OWNER):
+        return R.is_observer(actor_role)
+    if R.is_owner(actor_role):
         return True
+    if R.is_observer(actor_role):
+        # Reads everything (list_staff uses can_read_all); manages only Owners.
+        return False
     if not R.is_team_admin(actor_role):
         return False
 
@@ -164,7 +180,10 @@ def assignable_roles(actor_role: Role) -> list[Role]:
         # mailbox regardless of who the account belongs to, and
         # `security.py` refuses any Firebase-token observer session. Offering it
         # was offering an account that cannot sign in.
-        return [Role.OWNER, *sorted(R.STAFF_ROLES, key=str)]
+        # Phase 1A (STAFF-001): `Role.OWNER` is no longer here. Only the
+        # observer provisions Owners (`POST /staff/owners`); an Owner minting
+        # another Owner was a privilege escalation with no second party.
+        return sorted(R.STAFF_ROLES, key=str)
 
     if R.is_team_admin(actor_role):
         team = R.team_of(actor_role)
@@ -261,6 +280,84 @@ async def _carry_to_crm(
         ) from exc
 
 
+# ── P1-B3: the staff state model ──────────────────────────────────────────────
+#
+# `status` ∈ {active, suspended, deactivated}, ALWAYS written together with
+# `is_active = (status == "active")` by `status_patch`. Access is decided by
+# `is_active` alone — every existing guard and every legacy writer uses it — and
+# `status` names which kind of inactive (see `status_of`). Legacy rows with no
+# `status` read correctly as they are; no migration is needed to read them.
+STATUS_ACTIVE = "active"
+STATUS_SUSPENDED = "suspended"
+STATUS_DEACTIVATED = "deactivated"
+STAFF_STATUSES = (STATUS_ACTIVE, STATUS_SUSPENDED, STATUS_DEACTIVATED)
+
+#: Allowed transitions. Anything else is refused with a sentence.
+TRANSITIONS: dict[str, frozenset[str]] = {
+    STATUS_ACTIVE: frozenset({STATUS_SUSPENDED, STATUS_DEACTIVATED}),
+    STATUS_SUSPENDED: frozenset({STATUS_ACTIVE, STATUS_DEACTIVATED}),
+    STATUS_DEACTIVATED: frozenset({STATUS_ACTIVE}),
+}
+
+
+def status_of(row: Mapping) -> str:
+    """The row's state.
+
+    `is_active` decides active vs not — it is what every guard and every legacy
+    writer (scripts, repairs) reads and writes — and `status` only says WHICH
+    kind of inactive. So the two can never disagree about access: a row with
+    `is_active: true` is active whatever an old `status` says, and a legacy row
+    with no `status` and `is_active: false` is deactivated.
+    """
+    if row.get("is_active", True):
+        return STATUS_ACTIVE
+    raw = str(row.get("status") or "")
+    return raw if raw in (STATUS_SUSPENDED, STATUS_DEACTIVATED) else STATUS_DEACTIVATED
+
+
+def status_patch(status: str) -> dict:
+    """The two fields, always written together."""
+    if status not in STAFF_STATUSES:
+        raise StaffError(f"'{status}' is not a staff status.")
+    return {"status": status, "is_active": status == STATUS_ACTIVE}
+
+
+#: P1-B4 — partner statuses that count as HOLDING a role, taken from the one
+#: canonical definition (`partner_applications.HELD_STATUSES`: pending,
+#: awaiting_verification, approved, suspended, revoked). This was a local copy
+#: that had drifted — it left out `awaiting_verification` and `revoked`, so a
+#: person with an Owner-approved role waiting on contact verification, or a
+#: revoked role that can still be restored, could be hired as staff.
+def _partner_held_statuses() -> frozenset[str]:
+    from app.services import partner_applications as apps  # local: avoids an import cycle
+
+    return frozenset(apps.HELD_STATUSES)
+
+
+async def _partner_roles_held(uid: str) -> list[str]:
+    """Partner records this uid owns in Mongo `partners` that still HOLD a role,
+    as `kind (status)` — the authoritative store, the canonical held statuses."""
+    held_statuses = _partner_held_statuses()
+    kinds: set[str] = set()
+    async for row in get_db()[C.PARTNERS].find({"owner_crm_uid": uid}):
+        status = str(row.get("status") or "")
+        if status in held_statuses:
+            kinds.add(f"{row.get('kind') or 'partner'} ({status})")
+    return sorted(kinds)
+
+
+def _is_app_host(uid: str) -> bool:
+    """`users/{uid}.isHost`. Best effort: an unreadable document is reported as
+    not-a-host here, and `partner_applications.eligible_kinds` independently
+    refuses Host to any internal account, so the pair cannot be created later."""
+    try:
+        snap = firebase.firestore_client().collection("users").document(uid).get()
+        return bool(snap.exists and (snap.to_dict() or {}).get("isHost"))
+    except Exception:  # noqa: BLE001
+        log.warning("Could not read users/%s to check host status at invite", uid)
+        return False
+
+
 async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
     """Create a staff account — both records — and email a set-password link.
 
@@ -346,6 +443,28 @@ async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
     reused_account = existing is not None
     if existing:
         uid = existing.uid
+        # ── Phase 1A (SECURITY-004 / ROLE-001): staff never hold partner roles ─
+        #
+        # Reusing an existing account is how one human keeps one uid — but if
+        # that uid already holds an agency, sub-agency or coin-seller role, or is
+        # a host, making it staff would give one person both sides of a money
+        # flow. Refused, and named. Unwinding the partner role first is an
+        # explicit operator decision, not a side effect of an invitation.
+        held_partner = await _partner_roles_held(uid)
+        is_host = await asyncio.to_thread(_is_app_host, uid)
+        if held_partner or is_host:
+            what = ", ".join(held_partner) or "host"
+            # P1-B4: refused, never resolved here. Ending a partner role (reject a
+            # pending application, revoke an approved one) is its own authorised,
+            # audited decision on the partner record; hiring never does it as a
+            # side effect.
+            raise StaffError(
+                f"{email} has a partner record that conflicts with a staff role "
+                f"({what}). Staff accounts cannot hold partner roles. Resolve the "
+                "partner record first through its own decision (reject the "
+                "application or revoke the role, with a reason) and then invite "
+                "again. Nothing was created."
+            )
         # Any provider at all means somebody can already sign in as this
         # account: a password they chose, a Google identity, a phone number.
         # `provider_data` excludes the synthetic `firebase` entry, so an empty
@@ -397,7 +516,7 @@ async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
         # A member reports to whoever invited them; an owner-invited admin
         # reports to that owner.
         "reports_to": actor["uid"],
-        "is_active": True,
+        **status_patch(STATUS_ACTIVE),
         "created_at": now,
         "created_by": {"uid": actor["uid"], "name": actor.get("name", "")},
         "updated_at": now,
@@ -498,6 +617,25 @@ async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
     doc["notification"] = notified
     doc["reused_existing_account"] = reused_account
     doc["email_already_verified"] = email_already_proven
+
+    # ── The third record: the Storage role claim ─────────────────────────────
+    #
+    # A staff account is two records — this Mongo row and the `crmUsers`
+    # document above — and neither is visible to `storage.rules`, which cannot
+    # read Firestore. Without the claim a newly invited reviewer signs into the
+    # CRM, sees the KYC queue, and is refused every document in it.
+    #
+    # Set here rather than by the Firestore trigger on purpose: the trigger can
+    # only ever emit 'agency' or 'seller', because partner `crmUsers`
+    # documents are client-written and a trigger that could emit an internal
+    # role would be an escalation path. See `app/services/storage_claims.py`.
+    claim_problem = await asyncio.to_thread(
+        storage_claims.apply_for_role, uid, inv.role
+    )
+    doc["storage_role_claim"] = claim_problem or "granted"
+    if claim_problem:
+        log.warning("storage claim not granted for %s: %s", uid, claim_problem)
+
     return doc
 
 
@@ -724,16 +862,34 @@ async def set_employment(
 
 
 async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dict:
-    """Change someone's role. Owners only — this is an authority change."""
+    """Change someone's role. Owners only — this is an authority change.
+
+    Phase 1A (STAFF-002/003): an Owner moves people between DEPARTMENT roles
+    (admin/member) and nothing else. Never to or from Owner or Observer, never a
+    partner role, never their own role.
+    """
     if not R.is_owner(actor["role"]):
         raise StaffError("Only an owner can change a role.")
     if not reason.strip():
         raise StaffError("A reason is required.")
+    if uid == actor.get("uid"):
+        raise StaffError("You cannot change your own role.")
+    if new_role not in R.STAFF_ROLES:
+        raise StaffError(
+            f"'{new_role}' is not a department role. Owners are provisioned and "
+            "removed by the observer; agency and seller are partner roles and are "
+            "never given to staff."
+        )
 
     db = get_db()
     person = await db[C.STAFF].find_one({"uid": uid})
     if person is None:
         raise StaffError("Account not found.")
+    if str(person.get("role", "")) in (str(Role.OWNER), str(Role.OBSERVER)):
+        raise StaffError(
+            "An owner's or the observer's role cannot be changed here. Owners are "
+            "managed by the observer."
+        )
 
     old_role = person["role"]
     if old_role == str(new_role):
@@ -761,7 +917,7 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
     # the historical record of who brought them in, which is all it ever was.
     await db[C.STAFF].update_one({"uid": uid}, {"$set": patch})
 
-    await audit.record(
+    role_audit_id = await audit.record(
         actor=actor,
         action=audit.Action.STAFF_ROLE_CHANGED,
         subject_type="staff",
@@ -773,6 +929,11 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
 
     # Existing sessions carry the old role in their token, so they are revoked.
     await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
+    if str(old_role) == str(Role.OWNER):
+        # P1-A3b: an Owner MFA binding must not outlive the Owner role.
+        from app.services import owner_mfa
+
+        await owner_mfa.clear_all_bindings(uid, "Role changed away from Owner", actor=actor)
 
     # And the CRM directory, or the shell shows one role while the API enforces
     # another — a `finance_admin` demoted to `finance_member` would keep the
@@ -806,11 +967,97 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
     person.pop("_id", None)
     person["crm_user_document"] = mirrored.action
     person["crm_role"] = mirrored.crm_role
+
+    # The Storage role claim follows the Mongo row, which is the authority for
+    # an internal role. Without this a promotion to finance_admin would reach
+    # the CRM and the API but not `storage.rules`, so the person would be
+    # refused the evidence files their new role exists to review.
+    #
+    # Reported, not raised: the role change has already been written and
+    # audited, and failing the request now would leave the caller believing it
+    # did not happen. `storage_role_claim` carries the problem forward the same
+    # way `crm_user_document` carries a mirroring failure.
+    claim_problem = await asyncio.to_thread(
+        storage_claims.apply_for_role, uid, new_role
+    )
+    person["storage_role_claim"] = claim_problem or "updated"
+    if claim_problem:
+        log.warning("storage claim not updated for %s: %s", uid, claim_problem)
+
+    # P1-F: told after the change has landed. Keyed on the audit entry.
+    person["notified"] = await notify_access_change(
+        person=person, change="role_changed", actor=actor,
+        audit_id=str(role_audit_id or ""), new_role=str(new_role),
+    )
     return person
 
 
 async def deactivate(uid: str, actor: dict, reason: str) -> dict:
-    """Revoke access. The record is kept — history must remain attributable."""
+    """Revoke staff access permanently-until-reactivated. P1-B1.
+
+    The record is kept — history must remain attributable.
+
+    ── WHAT CHANGED (approved decision 1) ─────────────────────────────────────
+    This used to DISABLE THE FIREBASE ACCOUNT. `invite` deliberately reuses an
+    existing account with the same email ("one person, one uid"), and most staff
+    are app users, so disabling it locked the person out of their personal
+    Zipper app account — wallet, diamonds, beans and host earnings — along with
+    the CRM. The Firebase account is no longer touched. Staff access is revoked
+    by everything that actually carries it:
+
+      * API sessions revoked, and `staff.status` → deactivated (every session
+        guard reads the Mongo row: `account_state.assert_may_act`, sign-in and
+        renewal in `security.py`, and `require_permission` in `deps.py`, so an
+        enabled personal login cannot mint or keep a staff session);
+      * `crmUsers.isActive` → false, which turns off every Firestore staff grant
+        (`isCrmUser()` reads it), and the CRM shell refuses the login;
+      * the Storage role claim cleared. An ID token minted earlier keeps the
+        claim until it expires (at most an hour) — the residual window is
+        documented in the Phase 1 report; revoking the refresh token would sign
+        the person out of the app, which decision 1 rules out.
+    """
+    return await _change_status(uid, actor, reason, STATUS_DEACTIVATED)
+
+
+async def suspend(uid: str, actor: dict, reason: str) -> dict:
+    """Pause staff access, reversibly. P1-B3. Same authority as deactivation."""
+    return await _change_status(uid, actor, reason, STATUS_SUSPENDED)
+
+
+async def reactivate(uid: str, actor: dict, reason: str) -> dict:
+    """Restore a suspended or deactivated staff member's access. P1-B2.
+
+    Authority is `manages()` — a department admin for their own team's members,
+    an owner for department staff, the observer for owners — never self and
+    never the observer. Old sessions stay revoked: the person signs in again and
+    gets a fresh session; nothing silently comes back. The personal Firebase
+    account is not touched. A login disabled by a deactivation made BEFORE
+    decision 1 is reported (`personal_login_disabled`) and left for an explicit
+    operator decision, because a disabled account may also be a moderation
+    outcome that a staff reactivation must not undo.
+    """
+    return await _change_status(uid, actor, reason, STATUS_ACTIVE)
+
+
+_VERB = {
+    STATUS_DEACTIVATED: "deactivate",
+    STATUS_SUSPENDED: "suspend",
+    STATUS_ACTIVE: "reactivate",
+}
+_DONE = {
+    STATUS_DEACTIVATED: "deactivated",
+    STATUS_SUSPENDED: "suspended",
+    STATUS_ACTIVE: "reactivated",
+}
+_ACTION = {
+    STATUS_DEACTIVATED: audit.Action.STAFF_DEACTIVATED,
+    STATUS_SUSPENDED: audit.Action.STAFF_SUSPENDED,
+    STATUS_ACTIVE: audit.Action.STAFF_REACTIVATED,
+}
+
+
+async def _change_status(uid: str, actor: dict, reason: str, to_status: str) -> dict:
+    verb = _VERB[to_status]
     if not reason.strip():
         raise StaffError("A reason is required.")
 
@@ -818,97 +1065,216 @@ async def deactivate(uid: str, actor: dict, reason: str) -> dict:
     person = await db[C.STAFF].find_one({"uid": uid})
     if person is None:
         raise StaffError("Account not found.")
-
     if uid == actor["uid"]:
-        raise StaffError("You cannot deactivate your own account.")
+        raise StaffError(f"You cannot {verb} your own account.")
 
-    target_role = Role(person["role"])
-    if R.is_owner(target_role) and not R.is_owner(actor["role"]):
-        raise StaffError("Only an owner can deactivate an owner.")
+    try:
+        target_role = Role(person["role"])
+    except ValueError as exc:
+        raise StaffError("This record carries a role this build does not know; it cannot be changed here.") from exc
+    if target_role == Role.OBSERVER:
+        raise StaffError(f"The observer cannot be {_DONE[to_status]}.")
+
+    current = status_of(person)
+    if to_status not in TRANSITIONS[current]:
+        if current == to_status:
+            raise StaffError(f"This account is already {current}.")
+        raise StaffError(f"A {current} account cannot be {_DONE[to_status]}.")
+
+    if R.is_owner(target_role):
+        # Owners are managed by the observer only (Phase 1A STAFF-001/003).
+        if not R.is_observer(actor["role"]):
+            raise StaffError(f"Only the observer can {verb} an owner.")
+        if to_status != STATUS_ACTIVE:
+            active_owners = await db[C.STAFF].count_documents(
+                {"role": str(Role.OWNER), "is_active": True}
+            )
+            if active_owners <= 1:
+                raise StaffError(
+                    "This is the last active owner. Provision another owner before "
+                    f"you {verb} this one."
+                )
     if not manages(actor, person):
-        # One predicate for the three staff-management sites, so revoking,
-        # editing and listing can never disagree about who a department admin
-        # is responsible for. The old test — "did I invite you" — left the
-        # admin of a department somebody had LEFT still able to revoke them.
-        raise StaffError("You can only deactivate members of your own department.")
+        raise StaffError(f"You can only {verb} members of your own department.")
 
-    # Sessions first. Whatever else fails below, the live token stops working —
-    # a revocation that gets halfway should get the most valuable half done.
-    await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
-    await db[C.STAFF].update_one(
-        {"uid": uid},
-        {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}},
+    now = datetime.now(timezone.utc)
+    if to_status != STATUS_ACTIVE:
+        # Sessions first: whatever fails below, the live token stops working.
+        await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
+        if str(person.get("role")) == str(Role.OWNER):
+            # P1-A3b: and every Firestore/Storage MFA binding of the Owner.
+            from app.services import owner_mfa
+
+            await owner_mfa.clear_all_bindings(uid, f"Owner {to_status}", actor=actor)
+
+    # Compare-and-set on the state we read, so two operators cannot race a
+    # transition into a combination nobody chose.
+    res = await db[C.STAFF].update_one(
+        {"uid": uid, "is_active": bool(person.get("is_active", True))},
+        {"$set": {**status_patch(to_status), "updated_at": now,
+                  "status_changed_at": now,
+                  "status_changed_by": {"uid": actor["uid"], "name": actor.get("name", "")},
+                  "status_reason": reason.strip()}},
     )
+    if getattr(res, "matched_count", 1) == 0:
+        raise StaffError("This account changed while you were deciding. Reload it and try again.")
 
-    # ── The credential itself ────────────────────────────────────────────────
-    #
-    # Everything above this line is a flag in a database WE check. None of it
-    # touches the Firebase account, so before this existed a revoked person kept
-    # a working login indefinitely: they could still authenticate, still mint
-    # fresh ID tokens, still receive a password reset, and were held out only by
-    # two application-level reads. If either of those writes failed — and the CRM
-    # mirror below is best-effort, with a repair script named in its error — the
-    # shell opened for them until somebody ran it.
-    #
-    # Resolved by `uid`, never by the email address on the row. Two accounts can
-    # share an address across systems, and disabling the wrong one locks out
-    # somebody nobody revoked while leaving the revoked person signing in.
-    #
-    # Deliberately NOT a deletion: the Firebase account, the staff row and the
-    # CRM document all survive, so history stays attributable and a reinstatement
-    # is a re-enable rather than a rebuild.
-    firebase_problem = await asyncio.to_thread(firebase.set_user_disabled, uid, True)
-
-    await audit.record(
+    audit_id = await audit.record(
         actor=actor,
-        action=audit.Action.STAFF_DEACTIVATED,
+        action=_ACTION[to_status],
         subject_type="staff",
         subject_id=uid,
-        reason=reason,
-        before={"is_active": True},
-        after={"is_active": False, "firebase_login": "disabled" if not firebase_problem else "STILL ENABLED"},
+        reason=reason.strip(),
+        before={"status": current, "is_active": current == STATUS_ACTIVE},
+        after={"status": to_status, "is_active": to_status == STATUS_ACTIVE},
+        meta={"role": str(target_role), "personal_app_account": "unchanged"},
     )
 
-    if firebase_problem:
-        # Its own entry, so an operator can list every revocation still
-        # outstanding instead of relying on an error that was shown once.
-        await audit.record(
-            actor=actor,
-            action=audit.Action.STAFF_FIREBASE_REVOKE_FAILED,
-            subject_type="staff",
-            subject_id=uid,
-            reason=firebase_problem,
-            before={"firebase_disabled": False},
-            after={"firebase_disabled": False},
-        )
+    # The Storage claim and the CRM directory follow the record. On the way OUT
+    # the claim is cleared BEFORE the directory write, so a directory failure
+    # (which raises, loudly, with the repair command) cannot leave the claim
+    # behind. On the way back IN the whole document is re-mirrored (role,
+    # permissions, isActive) so a document that drifted while the account was
+    # out is put right, and the claim is re-granted after it.
+    mirror_error: StaffError | None = None
+    if to_status == STATUS_ACTIVE:
+        try:
+            mirrored = await _carry_to_crm(
+                actor=actor,
+                what=f"The reactivation of {person.get('email', uid)}",
+                reason=reason,
+                uid=uid,
+                email=str(person.get("email", "")),
+                call=lambda: crm.amirror(
+                    uid=uid,
+                    email=str(person.get("email", "")),
+                    name=str(person.get("name", "")),
+                    role=target_role,
+                    created_by=actor["uid"],
+                    phone=str(person.get("phone", "") or ""),
+                    field_charge=person.get("field_charge"),
+                    reports_to=person.get("reports_to"),
+                    is_active=True,
+                ),
+            )
+        except StaffError as exc:
+            mirror_error = exc
+        claim_problem = await asyncio.to_thread(storage_claims.apply_for_role, uid, target_role)
+    else:
+        claim_problem = await asyncio.to_thread(storage_claims.clear, uid)
+        try:
+            mirrored = await _carry_to_crm(
+                actor=actor,
+                what=f"The {verb} of {person.get('email', uid)}'s access",
+                reason=reason,
+                uid=uid,
+                email=str(person.get("email", "")),
+                call=lambda: crm.aset_active(
+                    uid=uid,
+                    email=str(person.get("email", "")),
+                    role=target_role,
+                    is_active=False,
+                ),
+            )
+        except StaffError as exc:
+            mirror_error = exc
+    if claim_problem:
+        log.warning("storage claim not updated for %s: %s", uid, claim_problem)
 
-    # Revoking the API session is not revoking access. `crmSignIn` reads
-    # `crmUsers.isActive`, and while that still says true the person can open
-    # the shell and use every Firestore-backed screen on it. Both halves, or the
-    # account is only partly gone.
-    mirrored = await _carry_to_crm(
-        actor=actor,
-        what=f"The revocation of {person.get('email', uid)}'s access",
-        reason=reason,
-        uid=uid,
-        email=str(person.get("email", "")),
-        call=lambda: crm.aset_active(
-            uid=uid,
-            email=str(person.get("email", "")),
-            role=target_role,
-            is_active=False,
-        ),
+    # Told after the authoritative change, whatever a mirror did: the person's
+    # access HAS changed at the API either way.
+    notified = await notify_access_change(
+        person=person, change=to_status, actor=actor, audit_id=str(audit_id or ""),
     )
+    if mirror_error is not None:
+        raise mirror_error
 
-    person["is_active"] = False
+    person.update(status_patch(to_status))
     person.pop("_id", None)
     person["crm_user_document"] = mirrored.action
-    # Reported, not hidden. A revocation with the login still enabled is not a
-    # completed revocation, and the one thing that must never happen is the
-    # caller being told it is done while the person can still sign in.
-    person["firebase_login"] = "disabled" if not firebase_problem else firebase_problem
-    person["fully_revoked"] = not firebase_problem
+    person["storage_role_claim"] = claim_problem or ("granted" if to_status == STATUS_ACTIVE else "cleared")
+    person["personal_app_account"] = "unchanged"
+    person["fully_applied"] = not claim_problem
+    person["notified"] = notified
+    if to_status == STATUS_ACTIVE:
+        person["personal_login_disabled"] = await asyncio.to_thread(_login_disabled, uid)
     return person
+
+
+def _login_disabled(uid: str) -> bool:
+    """Is the person's Firebase login disabled (e.g. by a pre-decision-1 deactivation)?"""
+    try:
+        user = firebase.get_user(uid)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(getattr(user, "disabled", False))
+
+
+# ── P1-F: telling the person ──────────────────────────────────────────────────
+
+_CHANGE_TEXT = {
+    STATUS_SUSPENDED: ("Your Zipper staff access is paused",
+                       "Your staff access has been suspended. Your personal Zipper app account is not affected."),
+    STATUS_DEACTIVATED: ("Your Zipper staff access has ended",
+                         "Your staff access has been removed. Your personal Zipper app account is not affected."),
+    STATUS_ACTIVE: ("Your Zipper staff access is restored",
+                    "Your staff access has been restored. Sign in to the CRM again to continue."),
+    "role_changed": ("Your Zipper staff role has changed",
+                     "Your staff role is now {role}. Sign in again to see your new screens."),
+}
+
+
+async def notify_access_change(*, person: Mapping, change: str, actor: dict, audit_id: str,
+                               new_role: str | None = None) -> dict:
+    """Email + in-app notice, AFTER the authoritative change. Never raises.
+
+    Idempotent on the audit id: the in-app notice's document id and the email's
+    `dedupe_key` both name the event, so a retry delivers once. Carries no
+    reason text, no credential, no employment detail — only what changed.
+    A failure is recorded as `staff.notice_failed`, never swallowed silently.
+    """
+    from app.services import email as email_service
+    from app.services import notices
+
+    uid = str(person.get("uid", ""))
+    title, body = _CHANGE_TEXT[change]
+    role_label = (new_role or str(person.get("role", ""))).replace("_", " ").title()
+    body = body.format(role=role_label)
+    key = f"staff_{change}_{audit_id or uid}"
+
+    in_app = await notices.deliver(uid, key, type="staff_access", title=title, body=body,
+                                   meta={"change": change, "role": new_role or str(person.get("role", ""))})
+    mailed = False
+    try:
+        row = await email_service.deliver(
+            kind=f"staff.{change}",
+            spec="P1-F",
+            recipient=email_service.Recipient(
+                email=str(person.get("email", "")), name=str(person.get("name", "")),
+                role=new_role or str(person.get("role", "")), uid=uid,
+            ),
+            subject=title,
+            html=email_service.page(title=title, preheader=body,
+                                    body=f'<p style="line-height:1.6">{email_service.esc(body)}</p>'),
+            sensitivity=email_service.Sensitivity.OPERATIONAL,
+            dedupe_key=f"staff.{change}:{audit_id or uid}",
+            meta={"change": change},
+        )
+        mailed = str((row or {}).get("outcome", "")) in ("sent", "delivered", "queued", "duplicate")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("staff notice email failed for %s", uid)
+        mailed = False
+        row = {"error": str(exc)}
+    if not in_app or not mailed:
+        try:
+            await audit.record(
+                actor=actor, action=audit.Action.STAFF_NOTICE_FAILED, subject_type="staff",
+                subject_id=uid, reason=f"Notice of '{change}' not fully delivered",
+                meta={"in_app": in_app, "email": mailed, "event_audit_id": audit_id},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("could not audit a failed staff notice for %s", uid)
+    return {"in_app": in_app, "email": mailed}
 
 
 async def team_overview(actor: dict) -> list[dict]:

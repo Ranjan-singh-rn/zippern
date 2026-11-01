@@ -46,9 +46,19 @@ Set the interval to 0 to check on every request. The default is 60 seconds.
 that revokes takes effect on the very next request through the `revoked` flag,
 with no window at all. This module exists for the changes that do not.
 
+── And the app account behind the session (C4) ──────────────────────────────
+
+After the record above has answered, every session is also asked whether the
+APP account of the same uid is suspended or banned — `users/{uid}` in
+Firestore, the one record that says so. Suspending or banning an account used
+to stop the app and leave the same person's agency or coin-seller portal fully
+working. The read is best effort: an unreadable document refuses nobody,
+because moderation also revokes the sessions outright (`services/users`) and
+this is the backstop for the ones that predate it.
+
 ── What it deliberately does NOT do ─────────────────────────────────────────
 
-It does not read Firestore. `crmUsers.isActive` is read by `firestore.rules`,
+It does not read `crmUsers`. `crmUsers.isActive` is read by `firestore.rules`,
 which runs in Google's infrastructure and not in this process; a stale mirror is
 a separate failure with its own repair script and its own audit entry.
 
@@ -102,7 +112,13 @@ def staff_refusal(row: Mapping[str, Any] | None) -> AccountRefused | None:
             "Your staff record could not be found. Sign in again.",
             reason="staff_record_missing",
         )
+    # P1-B3: `is_active` decides; `status` only names which kind of inactive.
     if not row.get("is_active", True):
+        if str(row.get("status") or "") == "suspended":
+            return AccountRefused(
+                "This staff account is suspended. Your personal app account is not affected.",
+                reason="staff_suspended",
+            )
         return AccountRefused(
             "This account has been deactivated.",
             reason="staff_deactivated",
@@ -126,13 +142,22 @@ def partner_refusal(record: Mapping[str, Any] | None) -> AccountRefused | None:
             reason="partner_record_missing",
         )
 
+    status = str(record.get("status", "") or "").strip().lower()
+    # Decision 15 (RC): approved, not started. Said before the inactive check,
+    # because the record IS inactive and "deactivated" would be untrue.
+    if status == "awaiting_verification":
+        return AccountRefused(
+            "Your role has been approved. It starts once both your phone number and "
+            "your email address are verified on this account.",
+            reason="partner_awaiting_verification",
+        )
+
     if record.get("is_active") is False:
         return AccountRefused(
             "This account has been deactivated.",
             reason="partner_deactivated",
         )
 
-    status = str(record.get("status", "") or "").strip().lower()
     if status == "approved":
         return None
     if status == "pending":
@@ -156,6 +181,60 @@ def partner_refusal(record: Mapping[str, Any] | None) -> AccountRefused | None:
         "This account cannot be used at the moment.",
         reason="partner_status_unknown",
     )
+
+
+#: C4 — the refusal for a session whose APP account is suspended or banned.
+ACCOUNT_RESTRICTED_MESSAGE = (
+    "This account is suspended or banned. Partner access is closed until it is lifted."
+)
+
+#: `users/{uid}.accountState` values that restrict an account. The same two
+#: `services/users.restriction_of` reads; the deletion states are a different
+#: question with a different answer and are not restrictions here.
+_RESTRICTED_STATES = frozenset({"suspended", "banned"})
+
+
+def app_account_refusal(user_doc: Mapping[str, Any] | None) -> AccountRefused | None:
+    """Why the APP account behind a session refuses it, or None. Pure.
+
+    `user_doc` is `users/{uid}`, or None when there is none — an account with
+    no app document has no app restriction to honour.
+    """
+    if not user_doc:
+        return None
+    state = str(user_doc.get("accountState") or "").strip().lower()
+    if (
+        state in _RESTRICTED_STATES
+        or user_doc.get("isBanned") is True
+        or user_doc.get("isSuspended") is True
+    ):
+        return AccountRefused(ACCOUNT_RESTRICTED_MESSAGE, reason="account_restricted")
+    return None
+
+
+def _read_app_account(uid: str) -> dict | None:
+    """Blocking — `users/{uid}`, or None when absent or unreadable."""
+    from app.db import firebase
+
+    try:
+        snap = firebase.firestore_client().collection("users").document(uid).get()
+    except Exception as exc:  # noqa: BLE001 — unreadable refuses nobody; see the module note
+        log.warning("users/%s could not be read for the account check: %s", uid, exc)
+        return None
+    if not getattr(snap, "exists", False):
+        return None
+    return snap.to_dict() or {}
+
+
+async def app_account_refusal_for(uid: str) -> AccountRefused | None:
+    """C4 — the app-account refusal for a uid, read now. Used at sign-in,
+    renewal and on every session re-check."""
+    import asyncio
+
+    uid = str(uid or "").strip()
+    if not uid:
+        return None
+    return app_account_refusal(await asyncio.to_thread(_read_app_account, uid))
 
 
 def is_due(checked_at: Any, *, now: datetime | None = None, interval: int | None = None) -> bool:
@@ -236,19 +315,19 @@ async def assert_may_act(user: Mapping[str, Any]) -> None:
 async def _read_authoritative_refusal(
     db: Any, user: Mapping[str, Any], uid: str, role: Any
 ) -> AccountRefused | None:
-    """Read the record entitled to answer, and ask it."""
+    """Read the record entitled to answer, and ask it — then the app account."""
     from app.db.mongo import C
 
     if role is not None and R.is_external(role):
         # A partner session carries a capability → partner id map. EVERY record
         # it names must still be good: holding one approved capability does not
         # entitle the session to keep carrying a suspended one.
+        #
+        # An applicant under review has no ids: `own_partner_id_or_403`
+        # already refuses every scoped route for that session, so there is no
+        # record to re-check, and refusing here would stop them reading their
+        # own waiting room. Their app account is still checked below.
         partner_ids = dict(user.get("partner_ids") or {})
-        if not partner_ids:
-            # An applicant under review. `own_partner_id_or_403` already refuses
-            # every scoped route for this session; there is nothing to re-check,
-            # and refusing here would stop them reading their own waiting room.
-            return None
         for capability, partner_id in partner_ids.items():
             record = await db[C.PARTNERS].find_one({"_id": str(partner_id)})
             refusal = partner_refusal(record)
@@ -260,7 +339,13 @@ async def _read_authoritative_refusal(
                     refusal.reason,
                 )
                 return refusal
-        return None
+    else:
+        row = await db[C.STAFF].find_one({"uid": uid})
+        refusal = staff_refusal(row)
+        if refusal is not None:
+            return refusal
 
-    row = await db[C.STAFF].find_one({"uid": uid})
-    return staff_refusal(row)
+    # C4 — after the partner/staff answer, for EVERY session: a suspended or
+    # banned app account closes the same uid's CRM access. Staff protected from
+    # moderation cannot be restricted, so this changes nothing for them.
+    return await app_account_refusal_for(uid)

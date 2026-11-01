@@ -156,10 +156,10 @@ class QuickLoginStore @Inject constructor(
     /**
      * Forget the secret on this device.
      *
-     * Called when the person deletes their account, when the server refuses a
-     * token, and on an explicit "sign out of this device completely" — NOT on an
-     * ordinary sign-out, because remembering across an ordinary sign-out is the
-     * entire feature.
+     * Called when the person deletes their account and when the server refuses
+     * a token — NOT on an ordinary sign-out, because remembering across an
+     * ordinary sign-out is the entire feature. (The explicit "sign out and
+     * forget this device" row that also called it was removed, UGP-E2.)
      */
     suspend fun clear() {
         try {

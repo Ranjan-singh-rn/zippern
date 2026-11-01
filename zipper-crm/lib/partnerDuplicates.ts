@@ -74,6 +74,10 @@ export type ExistingStatus =
   | 'approved'
   | 'rejected'
   | 'suspended'
+  // UGP-G (I-11): a revoked record is history and frees its slot, exactly as
+  // the API's `_RELEASABLE_STATUSES` says. It used to fall through to the flag
+  // fallback and read as "pending — in the queue".
+  | 'revoked'
   | 'unknown'
 
 /** What the record can be signed into with. */
@@ -144,7 +148,8 @@ function statusOf(kind: DuplicateKind, data: Record<string, unknown>): ExistingS
     raw === 'pending' ||
     raw === 'approved' ||
     raw === 'rejected' ||
-    raw === 'suspended'
+    raw === 'suspended' ||
+    raw === 'revoked'
   ) {
     return raw
   }

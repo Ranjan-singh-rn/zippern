@@ -274,3 +274,79 @@ async def deactivate(uid: str, body: Reason, user: dict = Depends(require_write)
         return await svc.deactivate(uid, user, body.reason)
     except StaffError as exc:
         raise _fail(exc) from exc
+
+
+@router.post("/owners/{uid}/deactivate")
+async def deactivate_owner(
+    uid: str,
+    body: Reason,
+    user: dict = Depends(require_owner_provisioner),
+):
+    """Phase 1A (STAFF-001): the observer removes an Owner. Nobody else can.
+
+    The counterpart of `POST /staff/owners`, behind the same observer-only
+    guard. The service refuses the last active Owner (counted, not hardcoded)
+    and revokes the login, the CRM directory entry and the storage claim
+    exactly as for any other deactivation."""
+    try:
+        target = await svc.get_db()[svc.C.STAFF].find_one({"uid": uid})
+        if target is None or str(target.get("role", "")) != str(Role.OWNER):
+            raise StaffError("That account is not an owner.")
+        return await svc.deactivate(uid, user, body.reason)
+    except StaffError as exc:
+        raise _fail(exc) from exc
+
+
+# ── P1-B2 / B3: suspension and reactivation ───────────────────────────────────
+#
+# Same guards as deactivation: `can_manage_team` (which includes `require_write`,
+# so the observer and partners are refused here) plus the service's `manages()`
+# — a department admin reaches only their own department's members, an owner
+# reaches department staff, nobody reaches themselves or the observer. Owners
+# are suspended and reactivated by the observer, on the `/owners/...` routes.
+
+
+@router.post("/{uid}/suspend", dependencies=[_MANAGE_TEAM])
+async def suspend(uid: str, body: Reason, user: dict = Depends(require_write)):
+    """Pause a staff member's access (reversible). Sessions end; the personal app
+    account is untouched."""
+    try:
+        return await svc.suspend(uid, user, body.reason)
+    except StaffError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/{uid}/reactivate", dependencies=[_MANAGE_TEAM])
+async def reactivate(uid: str, body: Reason, user: dict = Depends(require_write)):
+    """Restore a suspended or deactivated staff member. A reason is required and
+    audited; old sessions stay revoked."""
+    try:
+        return await svc.reactivate(uid, user, body.reason)
+    except StaffError as exc:
+        raise _fail(exc) from exc
+
+
+async def _owner_target(uid: str) -> None:
+    target = await svc.get_db()[svc.C.STAFF].find_one({"uid": uid})
+    if target is None or str(target.get("role", "")) != str(Role.OWNER):
+        raise StaffError("That account is not an owner.")
+
+
+@router.post("/owners/{uid}/suspend")
+async def suspend_owner(uid: str, body: Reason, user: dict = Depends(require_owner_provisioner)):
+    """The observer pauses an Owner. Never the last active one."""
+    try:
+        await _owner_target(uid)
+        return await svc.suspend(uid, user, body.reason)
+    except StaffError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/owners/{uid}/reactivate")
+async def reactivate_owner(uid: str, body: Reason, user: dict = Depends(require_owner_provisioner)):
+    """The observer restores a suspended or deactivated Owner."""
+    try:
+        await _owner_target(uid)
+        return await svc.reactivate(uid, user, body.reason)
+    except StaffError as exc:
+        raise _fail(exc) from exc

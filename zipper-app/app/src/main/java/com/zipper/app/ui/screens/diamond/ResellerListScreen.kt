@@ -43,6 +43,14 @@ data class SellerFirestoreItem(
     val qrCodeUrl: String = "",
     val description: String = "",
     val photoUrl: String = "",
+    // Payment DESTINATIONS the seller publishes — where a buyer sends money.
+    // Projected by `syncPublicSeller` from the private settlement block; the
+    // bank account itself never reaches this document.
+    val upiId: String = "",
+    val upiQrUrl: String = "",
+    val binanceUid: String = "",
+    /** `upi | qr | binance | bank | international` — what the seller accepts. */
+    val paymentMethods: List<String> = emptyList(),
 )
 
 /*
@@ -58,6 +66,8 @@ fun ResellerListScreen(
     onBack: () -> Unit = {},
     onMessage: (String) -> Unit = {},
     onViewProfile: (String) -> Unit = {},
+    /** "I have paid" — files a recharge request for staff to verify. (sellerId, sellerName) */
+    onPaid: (String, String) -> Unit = { _, _ -> },
 ) {
     var sellers by remember { mutableStateOf<List<SellerFirestoreItem>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
@@ -104,6 +114,10 @@ fun ResellerListScreen(
                     qrCodeUrl = qrCodeUrl,
                     description = description,
                     photoUrl = photoUrl,
+                    upiId = doc.getString("upiId") ?: "",
+                    upiQrUrl = doc.getString("upiQrUrl") ?: qrCodeUrl,
+                    binanceUid = doc.getString("binanceUid") ?: "",
+                    paymentMethods = (doc.get("paymentMethods") as? List<*>).orEmpty().map { it.toString() },
                 )
             }
         } catch (e: Exception) {
@@ -142,12 +156,27 @@ fun ResellerListScreen(
                 Box(Modifier.size(36.dp, 4.dp).background(c.borderDefault, CircleShape))
                 Text(seller.displayName, style = ZipperTheme.type.headingS, color = c.textPrimary)
                 if (seller.phone.isNotBlank()) Text(maskPhone(seller.phone), style = ZipperTheme.type.bodyS, color = c.textMuted)
-                AsyncImage(
-                    model = seller.qrCodeUrl, contentDescription = "Payment QR code", contentScale = ContentScale.Fit,
-                    modifier = Modifier.size(240.dp).background(Color.White, RoundedCornerShape(Radius.lg)).clip(RoundedCornerShape(Radius.lg)).padding(Space.sm),
+                val qr = seller.upiQrUrl.ifBlank { seller.qrCodeUrl }
+                if (qr.isNotBlank()) {
+                    AsyncImage(
+                        model = qr, contentDescription = "Payment QR code", contentScale = ContentScale.Fit,
+                        modifier = Modifier.size(240.dp).background(Color.White, RoundedCornerShape(Radius.lg)).clip(RoundedCornerShape(Radius.lg)).padding(Space.sm),
+                    )
+                }
+                // The other ways to pay this seller. Receiving addresses only —
+                // never a bank account number, which the seller shares in chat.
+                if (seller.upiId.isNotBlank()) Text("UPI: ${seller.upiId}", style = ZipperTheme.type.labelM, color = c.textPrimary)
+                if (seller.binanceUid.isNotBlank()) Text("Binance UID: ${seller.binanceUid}", style = ZipperTheme.type.labelM, color = c.textPrimary)
+                if ("bank" in seller.paymentMethods || "international" in seller.paymentMethods) {
+                    Text("Also accepts bank transfer — message them for the details.", style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center)
+                }
+                Text(
+                    "Pay, then tap \"I have paid\" with the reference or a screenshot. Zipper verifies the " +
+                    "payment and credits your diamonds — the reseller cannot credit you directly.",
+                    style = ZipperTheme.type.bodyS, color = c.textSecondary, textAlign = TextAlign.Center,
                 )
-                Text("Scan to pay, then message the reseller with your Zipper ID.", style = ZipperTheme.type.bodyS, color = c.textSecondary, textAlign = TextAlign.Center)
-                ZipperButton("Message ${seller.displayName}", { qrSeller = null; onMessage(seller.uid) }, size = ButtonSize.Medium, gradient = true, fullWidth = true)
+                ZipperButton("I have paid", { qrSeller = null; onPaid(seller.uid, seller.displayName) }, size = ButtonSize.Medium, gradient = true, fullWidth = true)
+                ZipperButton("Message ${seller.displayName}", { qrSeller = null; onMessage(seller.uid) }, size = ButtonSize.Medium, style = ButtonStyle.Secondary, fullWidth = true)
                 Spacer(Modifier.navigationBarsPadding())
             }
         }

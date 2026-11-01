@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.AppealStatusTest" tests="12" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.795Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="pending shows no verdict card" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="an unknown status is never reported as a refusal" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="overturned is reported as accepted" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="only pending is pending" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="resolved - the proposed new state - is neutral today" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.001"/>
+  <testcase name="an unknown status counts as concluded" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="null blank and whitespace show nothing" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="pending and absent are not concluded" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="upheld is reported as not accepted" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="isPending and outcomeOf never contradict each other" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="case and surrounding space do not change a known verdict" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <testcase name="every concluded status produces a showable outcome" classname="com.zipper.app.data.repository.AppealStatusTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

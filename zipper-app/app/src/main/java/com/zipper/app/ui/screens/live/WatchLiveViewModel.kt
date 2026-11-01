@@ -443,13 +443,15 @@ class WatchLiveViewModel @Inject constructor(
 
     fun setStreamQuality(quality: String) {
         _state.update { it.copy(streamQuality = quality) }
-        // TODO: apply via Agora downlink quality config
+        // Mobile parity: applied to the engine, not just highlighted in the sheet.
+        AgoraManager.setRemoteQuality(_state.value.remoteUid, quality)
     }
 
     fun onRemoteUserJoined(uid: Int) {
         val s = _state.value
         if (s.remoteUid == 0) {
             _state.update { it.copy(remoteUid = uid) }
+            if (s.streamQuality != "Auto") AgoraManager.setRemoteQuality(uid, s.streamQuality)
         } else if (s.pkActive && s.pkPartnerRemoteUid == 0) {
             _state.update { it.copy(pkPartnerRemoteUid = uid) }
         }

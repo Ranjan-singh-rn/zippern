@@ -39,17 +39,61 @@
  * the rule below rather than a change of mind about it. Every other action is
  * always offered: if the API will not allow it, it says why and that answer is
  * shown, because a greyed-out control teaches nobody anything either.
+ *
+ * ── ROLE ACTIONS COME FROM THE ROLE RECORDS (UGP-B) ─────────────────────────
+ *
+ * "Revoke host" and "Remove seller" used to be fixed buttons with no state
+ * gate, so every ordinary account — a guest with no role at all included —
+ * was offered both. They are gone. Role actions are rendered only from
+ * `GET /users/{uid}/roles`, which reads the authoritative records and says,
+ * per role, what may be done: nothing for no role; nothing for ONE role (the
+ * account is suspended instead); "Revoke <role>" on each of two or more; and
+ * "Restore <role>" for a suspended or revoked role, re-activating the existing
+ * record. "Remove seller" was a display flag, not the Coin Seller role, and is
+ * replaced by revoking the role itself. See `lib/userRoleActions.ts`.
  */
 
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
+import { useAuth } from '@/components/AuthProvider'
+import { hasPermission } from '@/lib/auth'
+import { partnerOps } from '@/lib/apiPartners'
+import {
+  deductionProblem, deductionSummary, heldSummary, roleButtons,
+  type RoleButton, type UserRoles,
+} from '@/lib/userRoleActions'
+import {
+  INTERNAL_CRM_ROLES, isOrdinaryTarget, userRowActionKeys,
+  type UserRowActionKey,
+} from '@/lib/crmRoles'
+import { REVOKED_RESTORE_HINT } from '@/lib/governanceRequests'
+import { TransferRecommendation } from '@/components/TransferRecommendation'
+
+/**
+ * The four actions whose visibility is decided by the shared policy rather
+ * than by this file's own `states` gate. Everything else on this page —
+ * warn, revoke host, remove seller flag, balance — has no counterpart on the
+ * /users list, so there is nothing for it to drift against and it keeps the
+ * local gate.
+ *
+ * `grant_host` and `seller_on` are gone from this page altogether. A Host, an
+ * Agency, a Sub-agency and a Coin Seller are obtained through an application
+ * that a reviewer decides on /kyc — never by a button here — and the backend
+ * routes behind those two buttons refuse (`/grant-host` is removed;
+ * `/seller-flag` with `is_seller: true` is 400). Pending applications for
+ * this user are listed on the page with Review / Approve / Reject instead
+ * (`PartnerApplications.tsx`).
+ */
+const POLICY_KEYS = new Set<string>([
+  'ban', 'unban', 'suspend', 'resume',
+])
 import {
   AlertTriangle, ArrowRight, BadgeCheck, Check, Coins, Loader2, PlayCircle,
-  ShieldOff, ShoppingBag, Smartphone, Star, StarOff, Shield, AlertOctagon, X,
+  RotateCcw, ShieldOff, Smartphone, StarOff, Shield, AlertOctagon, X,
   type LucideIcon,
 } from 'lucide-react'
 import api, {
-  ApiError, type Card, type ModerationResult, type UserCurrency,
+  ApiError, type Card, type ModerationResult, type UserCurrency, type WarnResult,
 } from '@/lib/api'
 import {
   DEFAULT_SUSPENSION, SuspendDuration, suspensionDays, suspensionProblem,
@@ -62,9 +106,9 @@ type Tone = 'red' | 'green' | 'yellow' | 'blue' | 'purple' | 'slate'
 
 type ActionKey =
   | 'ban' | 'unban' | 'suspend' | 'resume' | 'warn'
-  | 'grant_host' | 'revoke_host'
-  | 'seller_on' | 'seller_off'
   | 'balance'
+  /** A per-role revoke or restore, built from the role inventory (UGP-B). */
+  | 'role'
 
 // ── What the account currently is ─────────────────────────────────────────────
 
@@ -299,63 +343,19 @@ const ACTIONS: ActionSpec[] = [
     title: 'Issue a formal warning',
     effect: (
       <>
-        Adds a warning to the account, attributed to you by name, and increments the warning count.
-        The account is not restricted and no device is touched.
+        Adds a warning to the account and increments the warning count. The reason below is sent
+        to the user as an Official message, without your name. The account is not restricted and
+        no device is touched. You may add a deduction: it is checked against the person&rsquo;s
+        roles and live balance, and raised as a card an owner signs — nothing is taken here.
       </>
     ),
     confirmLabel: 'Issue the warning',
-    reasonHint: 'What is being warned about. The user may be shown this.',
-  },
-  {
-    key: 'grant_host',
-    label: 'Grant host',
-    icon: Star,
-    tone: 'yellow',
-    title: 'Make this user a host',
-    effect: (
-      <>
-        The user can go live. Optionally attach them to an agency — leave the agency blank to keep
-        whatever link they already have.
-      </>
-    ),
-    confirmLabel: 'Grant host',
-    reasonHint: 'Why they are being made a host.',
-  },
-  {
-    key: 'revoke_host',
-    label: 'Revoke host',
-    icon: StarOff,
-    tone: 'slate',
-    title: 'Remove host status',
-    effect: (
-      <>
-        The user can no longer go live. The agency link is deliberately kept, so commission already
-        paid stays readable. If they are not a host the API will refuse.
-      </>
-    ),
-    confirmLabel: 'Revoke host',
-    reasonHint: 'Why host status is being removed.',
-  },
-  {
-    key: 'seller_on',
-    label: 'Make seller',
-    icon: ShoppingBag,
-    tone: 'purple',
-    title: 'Grant seller status',
-    effect: 'The account appears in the Diamond Shop as a coin seller.',
-    confirmLabel: 'Grant seller',
-    reasonHint: 'Why they are being made a seller.',
-  },
-  {
-    key: 'seller_off',
-    label: 'Remove seller',
-    icon: ShoppingBag,
-    tone: 'slate',
-    title: 'Remove seller status',
-    effect:
-      'The account stops appearing in the Diamond Shop. If it is not a seller the API will refuse.',
-    confirmLabel: 'Remove seller',
-    reasonHint: 'Why seller status is being removed.',
+    // Was "The user may be shown this", and they were not: the warning was
+    // written to a subcollection, a counter and the audit log, and the app had
+    // no reader for any of them. It is delivered now, every time, so the hint
+    // says so — a reviewer who knows the person will read it writes a
+    // different sentence from one who thinks they might.
+    reasonHint: 'What is being warned about. This is sent to the user, in these words.',
   },
   {
     key: 'balance',
@@ -396,7 +396,19 @@ interface Props {
   isBanned: boolean
   isSuspended: boolean
   isHost: boolean
+  /** The signed-in reviewer. Nobody moderates their own account. */
+  actorUid?: string | null
+  /**
+   * `users/{uid}.crmRole`, denormalised from `crmUsers` — or '' for an
+   * ordinary account. Used ONLY to hide the controls on an internal
+   * identity; the enforcing check is server-side against the Mongo staff
+   * collection. See the note beside `INTERNAL_CRM_ROLES`.
+   */
+  crmRole?: string
   isSeller: boolean
+  /** Live balances from `users/{uid}`, for the deduction check and summary (UGP-D). */
+  diamonds?: number
+  beansAvailable?: number
   /** Called after any action succeeds, so the record and history are re-read. */
   onDone: () => void
 }
@@ -411,6 +423,8 @@ interface Success {
   text: string
   /** Set when a balance card was raised, so we can point at the board. */
   card?: Card
+  /** Set when a warning raised a deduction card (UGP-D). */
+  deductionCard?: { id: string; stage: string; amount: number; currency: string }
   /** The server's own sentence about what happened. Shown word for word. */
   note?: string
   /** Set by a ban: the handsets barred with the account. */
@@ -427,13 +441,28 @@ function plural(n: number, noun: string): string {
 }
 
 export function UserActions({
-  uid, name, accountState, isBanned, isSuspended, isHost, isSeller, onDone,
+  uid, name, accountState, isBanned, isSuspended, isHost, isSeller, crmRole,
+  actorUid, diamonds = 0, beansAvailable = 0, onDone,
 }: Props) {
+  const { crmUser, apiUser } = useAuth()
+  const canAdjustBalance = hasPermission(crmUser, 'can_adjust_balance')
+  // GOV C2: restoring a REVOKED role is the Owner's decision (403 otherwise).
+  const isOwner = apiUser?.role === 'owner'
   const [pending, setPending] = useState<ActionSpec | null>(null)
   const [reason, setReason] = useState('')
-  const [agencyId, setAgencyId] = useState('')
   const [currency, setCurrency] = useState<UserCurrency>('diamonds')
   const [amount, setAmount] = useState('')
+  // ── UGP-B: the role inventory, and the role action being confirmed ───────
+  const [roles, setRoles] = useState<UserRoles | null>(null)
+  const [rolesError, setRolesError] = useState<string | null>(null)
+  const [roleAction, setRoleAction] = useState<RoleButton | null>(null)
+  // ── UGP-D: the optional deduction on a warning ───────────────────────────
+  const [deduct, setDeduct] = useState(false)
+  const [dedCurrency, setDedCurrency] = useState<UserCurrency>('diamonds')
+  const [dedAmount, setDedAmount] = useState('')
+  // One id per opened Warn dialog, REUSED on a retry, so a request that timed
+  // out and is pressed again is the same warning on the server.
+  const requestId = useRef<string>('')
   // The shape, the default and the bounds are in components/SuspendDuration,
   // because the row action on /users asks the same question.
   const [term, setTerm] = useState<SuspensionTerm>(DEFAULT_SUSPENSION)
@@ -453,20 +482,108 @@ export function UserActions({
   const deleting =
     badgeKey === 'recovery_pending' || badgeKey === 'permanently_deactivated'
 
-  const visible = ACTIONS.filter((spec) => !spec.states || spec.states.includes(restriction))
+  // ── UGP-B: what this person holds, read before any role button renders ──
+  const loadRoles = useCallback(async () => {
+    try {
+      setRolesError(null)
+      setRoles(await api.users.roles(uid))
+    } catch (err) {
+      setRoles(null)
+      setRolesError(err instanceof Error ? err.message : 'The roles could not be read.')
+    }
+  }, [uid])
+  useEffect(() => { void loadRoles() }, [loadRoles])
+  const roleButtonsList = roleButtons(roles)
+  const allowedDeduction = (roles?.deduction_currencies ?? []).filter(
+    (c): c is UserCurrency => c === 'diamonds' || c === 'beans',
+  )
+  const balances = { diamonds, beansAvailable }
+  // UGP review: the Warn dialog can be opened before the roles arrive. Keep the
+  // chosen currency one the roles allow — a Host-only account otherwise kept
+  // "diamonds" while the select showed Beans, and the check refused it.
+  const allowedKey = allowedDeduction.join(',')
+  useEffect(() => {
+    const allowedNow = allowedKey ? (allowedKey.split(',') as UserCurrency[]) : []
+    if (allowedNow.length > 0 && !allowedNow.includes(dedCurrency)) setDedCurrency(allowedNow[0])
+  }, [allowedKey, dedCurrency])
+
+  // ── An internal identity is not moderated from here ─────────────────────
+  //
+  // An Owner, the Observer or any department role who has also signed into
+  // the Android app has a `users/{uid}` document like anybody else, so they
+  // appear in /users — all three production Owners do. Offering Ban, Suspend,
+  // Grant host and Make seller beside their names was wrong twice over: the
+  // actions were available, and until `users.ensure_ordinary_target` landed
+  // the backend performed them.
+  //
+  // This is DEFENCE IN DEPTH, not the control. `crmRole` is denormalised onto
+  // the app document, which the app can write — so a screen that trusted it
+  // would be trusting client-reachable state. The authority is the Mongo
+  // `staff` row, read server-side on every one of these endpoints; hiding the
+  // buttons only stops a reviewer pressing something that was always going to
+  // come back 403.
+  const subject = { uid, crmRole, accountState, isBanned, isSuspended, isHost }
+  const internal = INTERNAL_CRM_ROLES.has((crmRole ?? '').trim())
+
+  // ── ONE POLICY, BOTH SCREENS ────────────────────────────────────────────
+  //
+  // `userRowActionKeys` is the single source of truth for which of the five
+  // state-gated moderation actions may be offered, and `/users` renders the
+  // same function. They used to decide separately and drifted: a suspended
+  // account was offered Resume + Ban here and Resume + Make host on the list.
+  //
+  // The other actions on this page — warn, revoke host, seller on/off,
+  // balance — have no equivalent on the list, so they keep their own
+  // `states` gate. What they do NOT keep is the right to appear beside an
+  // internal identity or the reviewer's own account: `isOrdinaryTarget`
+  // governs the whole set, which is what the old `internal ? []` did and
+  // what the list now does for self as well.
+  const allowed = userRowActionKeys(subject, actorUid)
+  const visible = !isOrdinaryTarget(subject, actorUid)
+    ? []
+    : ACTIONS.filter((spec) => (
+      POLICY_KEYS.has(spec.key)
+        ? allowed.includes(spec.key as UserRowActionKey)
+        : !spec.states || spec.states.includes(restriction)
+    ))
 
   function open(spec: ActionSpec) {
     setPending(spec)
+    setRoleAction(null)
     setReason('')
-    setAgencyId('')
     setAmount('')
     setTerm(DEFAULT_SUSPENSION)
+    setDeduct(false)
+    setDedAmount('')
+    setDedCurrency(allowedDeduction[0] ?? 'diamonds')
+    requestId.current =
+      (globalThis.crypto && 'randomUUID' in globalThis.crypto)
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`
     setFailure(null)
     setSuccess(null)
   }
 
+  /** A per-role revoke or restore, confirmed in the same dialog (UGP-B). */
+  function openRole(button: RoleButton) {
+    open({
+      key: 'role',
+      label: button.label,
+      icon: button.kind === 'revoke' ? StarOff : RotateCcw,
+      tone: button.kind === 'revoke' ? 'slate' : 'green',
+      title: button.title,
+      effect: button.effect,
+      confirmLabel: button.confirmLabel,
+      reasonHint: button.kind === 'revoke'
+        ? 'Why this role is being taken away. The person is told, with these words.'
+        : 'Why this role is being restored.',
+    })
+    setRoleAction(button)
+  }
+
   function close() {
     setPending(null)
+    setRoleAction(null)
     setBusy(false)
     setFailure(null)
   }
@@ -511,21 +628,39 @@ export function UserActions({
           note: res.note,
         }
       }
-      case 'warn':
-        await api.users.warn(uid, why)
-        return { text: 'Warning recorded against the account, issued in your name.' }
-      case 'grant_host':
-        await api.users.grantHost(uid, why, agencyId.trim())
-        return { text: 'Host granted. The user can go live.' }
-      case 'revoke_host':
-        await api.users.revokeHost(uid, why)
-        return { text: 'Host status removed. The agency link was kept.' }
-      case 'seller_on':
-        await api.users.setSellerFlag(uid, true, why)
-        return { text: 'Seller status granted.' }
-      case 'seller_off':
-        await api.users.setSellerFlag(uid, false, why)
-        return { text: 'Seller status removed.' }
+      case 'warn': {
+        const res: WarnResult = await api.users.warn(uid, why, {
+          requestId: requestId.current,
+          ...(deduct ? { deduction: { currency: dedCurrency, amount: Number(dedAmount) } } : {}),
+        })
+        const d = res.deduction
+        return {
+          text: res.replayed
+            ? 'This warning had already been recorded — nothing was issued twice.'
+            : 'Warning recorded against the account, issued in your name.',
+          ...(d ? {
+            deductionCard: { id: d.card_id, stage: d.card_stage, amount: d.amount, currency: d.currency },
+          } : {}),
+        }
+      }
+      case 'role': {
+        const b = roleAction
+        if (!b) throw new Error('No role action selected.')
+        if (b.kind === 'revoke' && b.role === 'host') {
+          await api.users.revokeHost(uid, why)
+          return { text: 'Host role revoked. The account and its other roles are untouched.' }
+        }
+        if (b.kind === 'restore' && b.role === 'host') {
+          await api.users.restoreHost(uid, why)
+          return { text: 'Host role restored from the existing application and agency.' }
+        }
+        if (b.kind === 'revoke') {
+          await partnerOps.revoke(b.targetId, why)
+          return { text: `${b.label.replace('Revoke ', '')} role revoked. The other roles are untouched.` }
+        }
+        await partnerOps.reactivate(b.targetId, why)
+        return { text: `${b.label.replace('Restore ', '')} role restored — the same record, re-activated.` }
+      }
       case 'balance': {
         const n = Number(amount)
         const card = await api.users.requestBalanceChange(uid, currency, n, why)
@@ -560,6 +695,14 @@ export function UserActions({
       }
     }
 
+    if (pending.key === 'warn' && deduct) {
+      const problem = deductionProblem(dedAmount, dedCurrency, allowedDeduction, balances)
+      if (problem) {
+        setFailure({ message: problem, isRule: true })
+        return
+      }
+    }
+
     if (pending.key === 'balance') {
       const n = Number(amount)
       if (!Number.isInteger(n) || n === 0) {
@@ -577,7 +720,9 @@ export function UserActions({
       const result = await perform(pending, why)
       setSuccess(result)
       setPending(null)
+      setRoleAction(null)
       onDone()
+      void loadRoles()
     } catch (err) {
       if (err instanceof ApiError) {
         // Shown verbatim. When the server refuses Resume on a banned account,
@@ -611,7 +756,36 @@ export function UserActions({
       {/* A raised card is deliberately not dressed up as a success: nothing has
           happened to the balance yet, and saying otherwise is the failure mode
           this whole flow exists to prevent. */}
-      {success?.card ? (
+      {success?.deductionCard ? (
+        <div className="flex items-start justify-between gap-3 bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-3">
+          <div className="flex items-start gap-2">
+            <Coins size={15} className="text-blue-300 mt-0.5 shrink-0" />
+            <div className="text-blue-50 text-sm">
+              <p className="font-semibold">{success.text}</p>
+              <p className="mt-1 text-blue-100/90">
+                A deduction of{' '}
+                <strong>
+                  {success.deductionCard.amount.toLocaleString('en-IN')} {success.deductionCard.currency}
+                </strong>{' '}
+                was requested. <strong>No money has moved.</strong> The card waits on the money board
+                for an owner to sign it, and is then taken from the live balance — whole, or not at all.
+              </p>
+              <p className="mt-1 text-blue-100/70 text-xs">
+                Card {success.deductionCard.id} · {success.deductionCard.stage.replace(/_/g, ' ')}
+              </p>
+              <Link
+                href="/board"
+                className="inline-flex items-center gap-1.5 mt-2 text-blue-200 hover:text-white underline underline-offset-2 font-medium"
+              >
+                Open the money board <ArrowRight size={13} />
+              </Link>
+            </div>
+          </div>
+          <button onClick={() => setSuccess(null)} className="text-blue-300/70 hover:text-blue-100">
+            <X size={14} />
+          </button>
+        </div>
+      ) : success?.card ? (
         <div className="flex items-start justify-between gap-3 bg-blue-500/10 border border-blue-500/30 rounded-lg px-4 py-3">
           <div className="flex items-start gap-2">
             <Coins size={15} className="text-blue-300 mt-0.5 shrink-0" />
@@ -701,6 +875,21 @@ export function UserActions({
         </p>
       </div>
 
+      {internal && (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 mb-3">
+          <p className="text-slate-300 text-sm">
+            <strong className="text-white">This is an internal {crmRole} account.</strong>{' '}
+            It appears here because the person has also signed into the app, but
+            moderation and role changes for internal accounts go through the team
+            pages, not through user management.
+          </p>
+          <p className="text-slate-500 text-xs mt-1.5">
+            The server refuses these actions against an internal account whatever
+            this screen shows, so nothing is lost by them being hidden.
+          </p>
+        </div>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {visible.map((spec) => (
           <button
@@ -712,6 +901,73 @@ export function UserActions({
           </button>
         ))}
       </div>
+
+      {/* UGP-B: role actions, ONLY from the authoritative role inventory. No
+          role → no button; one role → no revoke (suspend the account instead). */}
+      {isOrdinaryTarget(subject, actorUid) && (
+        <div className="border-t border-slate-800 pt-4">
+          <p className="text-slate-400 text-xs font-medium uppercase tracking-wide mb-2">Roles</p>
+          {rolesError ? (
+            <p className="text-amber-200 text-sm">
+              The roles could not be read, so no role action is offered: {rolesError}
+            </p>
+          ) : roles === null ? (
+            <p className="text-slate-500 text-sm flex items-center gap-2">
+              <Loader2 size={13} className="animate-spin" /> Reading roles…
+            </p>
+          ) : (
+            <>
+              <p className="text-slate-300 text-sm">{heldSummary(roles)}</p>
+              {roleButtonsList.length > 0 && (
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {roleButtonsList.map((b) => {
+                    // GOV C2: a REVOKED role comes back by the Owner's decision
+                    // only — disabled for everybody else, with the way forward.
+                    const ownerGate = b.ownerOnly && !isOwner
+                    return (
+                      <button
+                        key={b.key}
+                        onClick={() => { if (!ownerGate) openRole(b) }}
+                        disabled={ownerGate}
+                        title={ownerGate ? REVOKED_RESTORE_HINT : undefined}
+                        className={`flex items-center gap-2 border rounded-lg px-3 py-2 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                          TONES[b.kind === 'revoke' ? 'slate' : 'green']}`}
+                      >
+                        {b.kind === 'revoke' ? <StarOff size={14} /> : <RotateCcw size={14} />} {b.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+              {!isOwner && roleButtonsList.some((b) => b.ownerOnly) && (
+                <p className="text-slate-500 text-xs mt-2">
+                  {REVOKED_RESTORE_HINT}:{' '}
+                  <Link href="/role-appeals" className="text-pink-400 hover:text-pink-300 underline underline-offset-2">
+                    Reinstatement requests
+                  </Link>
+                  .
+                </p>
+              )}
+              {/* GOV C3: moving a current Host to another agency is a request
+                  the Owner decides — filed here, decided on /transfers. */}
+              {(() => {
+                const host = roles.roles.find((r) => r.role === 'host' && r.status === 'active')
+                if (!host) return null
+                return (
+                  <div className="mt-3">
+                    <TransferRecommendation
+                      kind="host"
+                      subjectId={uid}
+                      currentAgencyId={host.agency_id ?? ''}
+                      subjectLabel={who}
+                    />
+                  </div>
+                )
+              })()}
+            </>
+          )}
+        </div>
+      )}
 
       {pending && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -762,17 +1018,62 @@ export function UserActions({
                 </div>
               )}
 
-              {pending.key === 'grant_host' && (
-                <div>
-                  <label className="block text-slate-400 text-xs font-medium mb-1.5">
-                    Agency id (optional)
-                  </label>
-                  <input
-                    value={agencyId}
-                    onChange={(e) => setAgencyId(e.target.value)}
-                    placeholder="Leave blank to keep the existing link"
-                    className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500"
-                  />
+              {pending.key === 'warn' && (
+                <div className="space-y-3 bg-slate-950/50 border border-slate-800 rounded-lg px-4 py-3">
+                  {canAdjustBalance ? (
+                    <label className="flex items-center gap-2 text-slate-300 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={deduct}
+                        onChange={(e) => setDeduct(e.target.checked)}
+                        disabled={allowedDeduction.length === 0}
+                      />
+                      Also deduct from the balance
+                    </label>
+                  ) : (
+                    <p className="text-slate-500 text-xs">
+                      A deduction needs the balance-adjustment permission. The warning itself does not.
+                    </p>
+                  )}
+                  {deduct && canAdjustBalance && (
+                    <>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-slate-400 text-xs font-medium mb-1.5">Currency</label>
+                          <select
+                            value={dedCurrency}
+                            onChange={(e) => setDedCurrency(e.target.value as UserCurrency)}
+                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-pink-500"
+                          >
+                            {allowedDeduction.map((c) => (
+                              <option key={c} value={c}>{c === 'beans' ? 'Beans (released)' : 'Diamonds'}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-slate-400 text-xs font-medium mb-1.5">Amount</label>
+                          <input
+                            type="number"
+                            min={1}
+                            value={dedAmount}
+                            onChange={(e) => setDedAmount(e.target.value)}
+                            placeholder="e.g. 50"
+                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500"
+                          />
+                        </div>
+                      </div>
+                      {/* The amount and currency are stated BEFORE confirmation. */}
+                      {dedAmount && !deductionProblem(dedAmount, dedCurrency, allowedDeduction, balances) ? (
+                        <p className="text-blue-100 text-sm bg-blue-500/10 border border-blue-500/30 rounded-lg px-3 py-2">
+                          {deductionSummary(who, dedAmount, dedCurrency, balances)}
+                        </p>
+                      ) : dedAmount ? (
+                        <p className="text-amber-200 text-sm">
+                          {deductionProblem(dedAmount, dedCurrency, allowedDeduction, balances)}
+                        </p>
+                      ) : null}
+                    </>
+                  )}
                 </div>
               )}
 

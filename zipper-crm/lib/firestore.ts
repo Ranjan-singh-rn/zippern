@@ -20,6 +20,7 @@ import {
 } from 'firebase/firestore'
 import type { DocumentData, Query, QueryDocumentSnapshot } from 'firebase/firestore'
 import type { Dept } from './auth'
+import { tickets as apiTickets } from './api'
 import { getPlatformRevenueDays, getPlatformStats } from './finance'
 import { getRates } from './rates'
 import { fromSettled, isOk, ok, toFailure, type ReadResult } from './readState'
@@ -28,6 +29,24 @@ import { fromSettled, isOk, ok, toFailure, type ReadResult } from './readState'
 
 export interface UserRecord {
   uid: string
+  /**
+   * The CRM role denormalised onto the app document by `syncMyRoles`, or ''.
+   *
+   * ── FOR HIDING CONTROLS, NOT FOR DECIDING ACCESS ─────────────────────────
+   *
+   * An internal identity that has also signed into the Android app has a
+   * `users/{uid}` document like anybody else, so all three Owners appear in
+   * this list. This field lets the UI stop offering Ban and Suspend beside
+   * their names.
+   *
+   * It is NOT the authority and must never be treated as one: it lives on a
+   * document the app writes to, so a screen that trusted it would be
+   * trusting client-reachable state. The real guard is
+   * `users.ensure_ordinary_target` in the backend, which reads the Mongo
+   * `staff` collection. This is the courtesy that stops a reviewer pressing
+   * a button that was always going to 403.
+   */
+  crmRole: string
   name: string
   email: string
   phoneNumber: string
@@ -171,6 +190,7 @@ function mapUser(d: QueryDocumentSnapshot<DocumentData>): UserRecord {
     email: data.email ?? '',
     phoneNumber: data.phoneNumber ?? '',
     photoUrl: data.photoUrl ?? '',
+    crmRole: typeof data.crmRole === 'string' ? data.crmRole : '',
     diamonds: data.diamonds ?? 0,
     beans: data.beans ?? 0,
     isHost: data.isHost ?? false,
@@ -335,6 +355,7 @@ export async function getUser(uid: string): Promise<UserRecord | null> {
     email: d.email ?? '',
     phoneNumber: d.phoneNumber ?? '',
     photoUrl: d.photoUrl ?? '',
+    crmRole: typeof d.crmRole === 'string' ? d.crmRole : '',
     diamonds: d.diamonds ?? 0,
     beans: d.beans ?? 0,
     isHost: d.isHost ?? false,
@@ -479,13 +500,14 @@ export async function getUserBeanTransactions(uid: string): Promise<Transaction[
  * DO NOT REINTRODUCE.
  * ───────────────────────────────────────────────────────────────────────────── */
 
-export async function makeHost(uid: string): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), { isHost: true, hostAddedAt: serverTimestamp() })
-}
-
-export async function removeHost(uid: string): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), { isHost: false })
-}
+/*
+ * makeHost / removeHost — REMOVED (Phase 1A, SECURITY-004 / ROLE-001).
+ *
+ * They wrote `users.isHost` directly from the browser, skipping the role
+ * eligibility matrix, the agency roster and the audit log. Host status now
+ * changes only through the API: `api.users.grantHost` / `api.users.revokeHost`.
+ * The Firestore rules refuse the direct write for every staff role.
+ */
 
 /**
  * Set a user's XP level by hand.
@@ -503,9 +525,7 @@ export async function removeHost(uid: string): Promise<void> {
  * If a user level is ever wanted in the CRM, mirror that: a writer driven by
  * `totalXp`, not a text box.
  */
-export async function setUserLevel(uid: string, level: number): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), { level })
-}
+// setUserLevel — REMOVED (Phase 1A): `level` is server-derived and staff-protected in the rules.
 
 export async function warnUser(uid: string, reason: string): Promise<void> {
   const userRef = doc(db, 'users', uid)
@@ -530,6 +550,8 @@ export interface WithdrawalRequest {
   beans: number
   inrAmount: number
   status: 'pending' | 'approved' | 'rejected' | 'paid'
+  /** The host. Rules and the server read `hostUid`; older rows carry only `uid`. */
+  hostUid?: string
   paymentType?: 'india' | 'foreign'
   bankName?: string
   accountNumber?: string
@@ -547,6 +569,12 @@ export interface WithdrawalRequest {
   transactionProofUrl?: string
   transactionDate?: string
   paymentMode?: string   // NEFT | IMPS | UPI | Binance | USDT
+  // P0-7: written by the server when the card that pays this request executes.
+  paidAt?: Timestamp | null
+  paidVia?: 'card'
+  cardId?: string
+  paymentRef?: string
+  beansDebited?: number
 }
 
 export async function getWithdrawalRequests(status?: string): Promise<WithdrawalRequest[]> {
@@ -575,14 +603,9 @@ export interface PaymentProof {
   notes?: string
 }
 
-export async function markWithdrawalPaid(id: string, proof: PaymentProof): Promise<void> {
-  await updateDoc(doc(db, 'withdrawalRequests', id), {
-    status: 'paid',
-    processedAt: Timestamp.now(),
-    processedBy: 'Admin',
-    ...proof,
-  })
-}
+// P0-7 (FIN-5): `markWithdrawalPaid` is gone. It wrote `status: 'paid'` with
+// no bean debit and no ledger row. A request is paid only by executing the
+// host-withdrawal card raised for it — see `api.partnerOps.executeHostWithdrawal`.
 
 export async function rejectWithdrawal(id: string, reason: string): Promise<void> {
   await updateDoc(doc(db, 'withdrawalRequests', id), {
@@ -731,24 +754,13 @@ export async function getLegacySellers(): Promise<SellerRecord[]> {
   })).sort((a, b) => (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0))
 }
 
-export async function setSeller(uid: string, online: boolean): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), {
-    isSeller: true,
-    isOnline: online,
-    sellerAddedAt: serverTimestamp(),
-  })
-}
+// setSeller — REMOVED (Phase 1A): `users.isSeller` is a partner role; it is granted by the API, never from a browser.
 
 export async function setSellerOnlineStatus(uid: string, online: boolean): Promise<void> {
   await updateDoc(doc(db, 'users', uid), { isOnline: online })
 }
 
-export async function removeSeller(uid: string): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), {
-    isSeller: deleteField(),
-    sellerAddedAt: deleteField(),
-  })
-}
+// removeSeller — REMOVED (Phase 1A): seller revocation goes through the partner API.
 
 // ── Support Tickets ────────────────────────────────────────────────────────
 
@@ -848,107 +860,69 @@ export async function getSupportTicketsByAssignee(uid: string): Promise<SupportT
  * written because removing it would lose the record, not because anything sees
  * it.
  */
+//
+// P1-D — every write below goes through the API (`/api/tickets/support/...`).
+// Firestore rules refuse client writes to `supportTickets` and `techTickets`.
+// The server records the actor from the session, writes the audit entry
+// before the ticket, stamps `updatedAt`, and sends the app user an in-app
+// notice on a reply (to the top-level `notifications` collection the app
+// reads — which replaces the `users/{uid}/notifications` row this used to
+// write and nothing ever read).
+//
+// `userId` and `routedBy` are kept in the signatures so callers compile
+// unchanged; the server ignores who the client says it is.
+
 export async function respondToTicket(
   ticketId: string,
-  userId: string,
+  _userId: string,
   reply: string
 ): Promise<void> {
-  await updateDoc(doc(db, 'supportTickets', ticketId), {
-    adminReply: reply,
-    status: 'replied',
-    repliedAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  })
-  await addDoc(collection(db, 'users', userId, 'notifications'), {
-    type: 'support_reply',
-    message: reply,
-    timestamp: serverTimestamp(),
-    read: false,
-  })
+  await apiTickets.update('support', ticketId, { adminReply: reply })
 }
 
+/** Closing and reopening need a `reason`; the API refuses them without one. */
 export async function setSupportTicketStatus(
   ticketId: string,
-  status: SupportTicketStatus
+  status: SupportTicketStatus,
+  reason = ''
 ): Promise<void> {
-  // `updatedAt` for the same reason as in `respondToTicket`: the app orders its
-  // ticket list on it, so a document without one is invisible to the person who
-  // filed it.
-  await updateDoc(doc(db, 'supportTickets', ticketId), {
-    status,
-    updatedAt: serverTimestamp(),
-  })
+  await apiTickets.update('support', ticketId, { status }, reason)
 }
 
 export async function setSupportTicketPriority(
   ticketId: string,
   priority: SupportTicketPriority
 ): Promise<void> {
-  await updateDoc(doc(db, 'supportTickets', ticketId), { priority })
+  await apiTickets.update('support', ticketId, { priority })
 }
 
 export async function assignSupportTicket(
   ticketId: string,
   assignedTo: string,
-  assignedToName: string
+  _assignedToName?: string
 ): Promise<void> {
-  await updateDoc(doc(db, 'supportTickets', ticketId), {
-    assignedTo,
-    assignedToName,
-    status: 'in_progress',
-    // The status the person who filed it sees changes here, so the same
-    // `updatedAt` rule applies — see `respondToTicket`.
-    updatedAt: serverTimestamp(),
-  })
+  // The server sets the name from the assignee's staff record.
+  await apiTickets.update('support', ticketId, { assignedTo })
 }
 
 /**
  * Route a support ticket to a CRM department (and optionally a specific
- * person) — creates a linked entry in Team Tickets (`techTickets`) tagged
- * `source: 'app'` so it's visibly distinct from CRM-filed tickets, and marks
- * the support ticket as escalated. Replaces the old tech-only escalation flow.
+ * person) — the server creates a linked Team Ticket tagged `source: 'app'`,
+ * marks the support ticket escalated and links the two. A ticket routes once.
+ * A note of at least 3 characters is required (it is the audit reason).
  */
 export async function routeSupportTicketToTeam(
   ticket: SupportTicketRecord,
   team: Dept,
   note: string,
-  routedBy: { name: string },
+  _routedBy?: { name: string },
   assignTo?: { uid: string; name: string }
 ): Promise<void> {
-  await updateDoc(doc(db, 'supportTickets', ticket.id), {
-    escalatedToTech: team === 'tech',
-    escalatedTeam: team,
-    escalatedAt: serverTimestamp(),
-    escalationNote: note,
-  })
-  const teamTicketRef = await addDoc(collection(db, 'techTickets'), {
-    title: ticket.subject || ticket.message.slice(0, 60),
-    description: note ? `${ticket.message}\n\n— Routed by Support: ${note}` : ticket.message,
-    category: 'support',
-    priority: ticket.priority,
-    status: 'open',
-    source: 'app',
-    assignedTeam: team,
-    assignedTo: assignTo?.uid ?? '',
-    assignedToName: assignTo?.name ?? '',
-    reportedBy: routedBy.name,
-    reportedByDept: 'support',
-    linkedSupportTicketId: ticket.id,
-    labels: [],
-    attachmentUrls: [],
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  })
-  await updateDoc(doc(db, 'supportTickets', ticket.id), {
-    linkedTeamTicketId: teamTicketRef.id,
-  })
+  await apiTickets.routeSupport(ticket.id, team, note, assignTo?.uid ?? '')
 }
 
-export async function closeTicket(ticketId: string): Promise<void> {
-  await updateDoc(doc(db, 'supportTickets', ticketId), {
-    status: 'closed',
-    updatedAt: serverTimestamp(),
-  })
+export async function closeTicket(ticketId: string, reason: string): Promise<void> {
+  await apiTickets.update('support', ticketId, { status: 'closed' }, reason)
 }
 
 // ── Broadcasts ─────────────────────────────────────────────────────────────

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.AgencyIdentityTest" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.065Z" hostname="CW253.local" time="0.002">
+  <properties/>
+  <testcase name="refund statuses are shown as what they are" classname="com.zipper.app.util.AgencyIdentityTest" time="0.001"/>
+  <testcase name="id labels are distinct" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="a host with no name says so, and the avatar letter never comes from a uid" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="buyer name - public name, else recorded name, else the honest sentence" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="the referral code is the agency record's, blank when not issued" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="the agency is named by agencyName, then a legacy name, never by its id" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="buyer lookups are batched by 30, de-duplicated, blanks dropped" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="my agency reads the agency record, not the user doc, and invents no counts" classname="com.zipper.app.util.AgencyIdentityTest" time="0.001"/>
+  <testcase name="roster rows carry the host name and a uid, current rows only" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <testcase name="seller dashboard names buyers from the public profile only, and decides nothing" classname="com.zipper.app.util.AgencyIdentityTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

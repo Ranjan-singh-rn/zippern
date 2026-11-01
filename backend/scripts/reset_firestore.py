@@ -209,6 +209,14 @@ def main() -> int:
     if latest:
         print(f"\n  Most recent backup: {latest.name}")
 
+    # P0-10 (OPS-C): the target, named and confirmed, before anything connects.
+    from app.core.destructive import DestructiveRefused, require_data_canary, require_destructive_target
+    try:
+        print(require_destructive_target("reset_firestore", writes=confirm))
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        return 2
+
     firebase.init()
 
     # The owners and the observer. Resolved before anything is counted, so the
@@ -226,6 +234,9 @@ def main() -> int:
         protected = _protected_emails([])
         await mongo.connect()
         try:
+            if confirm:
+                # P0-10: this database must name this project before anything is deleted.
+                await require_data_canary(mongo.get_db(), "reset_firestore")
             return await _kept_uids(protected, mongo.get_db())
         finally:
             await mongo.disconnect()
@@ -236,6 +247,9 @@ def main() -> int:
         # `_protected_emails` exits 2 when the owner list cannot be read. That is
         # the one failure that must not be downgraded into "spare nobody".
         raise
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        return 2
     except Exception as exc:  # noqa: BLE001
         print(
             f"\n  ✗ The owner and observer accounts could not be resolved ({exc}).\n"

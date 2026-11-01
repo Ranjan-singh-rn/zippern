@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.ActivationRequirementTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.064Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="an older server sends no block" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <testcase name="actions offer exactly what is missing" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <testcase name="a CONTACT_VERIFICATION_REQUIRED refusal is recognised, nothing else is" classname="com.zipper.app.util.ActivationRequirementTest" time="0.001"/>
+  <testcase name="complete means nothing to say before applying" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <testcase name="the verification block from the check is read, with the unproved email" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <testcase name="the waiting line names what is still needed" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <testcase name="the eligibility activation block is read" classname="com.zipper.app.util.ActivationRequirementTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

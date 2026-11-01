@@ -32,8 +32,8 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * Somebody tapped "Check for updates" in Settings.
  *
- * Same shape as [com.zipper.app.ui.screens.auth.EmailLinkReturn], for the same
- * reason: the screen that raises the event and the composable that owns the
+ * Same shape as the old email-link hand-off (removed in UGP-C) and
+ * `ForcedSignOut`, for the same reason: the screen that raises the event and the composable that owns the
  * dialog are in different parts of the tree, and neither should have to know
  * about the other.
  *

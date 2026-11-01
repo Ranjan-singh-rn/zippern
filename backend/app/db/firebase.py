@@ -15,6 +15,7 @@ from firebase_admin import auth as fb_auth
 from firebase_admin import credentials, firestore
 
 from app.config import settings
+from app.core import isolation
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,14 @@ _fs = None
 def init() -> None:
     global _app, _fs
     if _app is not None:
+        return
+
+    # Before any credential is read: outside production only the local
+    # emulators under a demo- project are allowed, and a production run off
+    # Cloud Run must be confirmed. See app/core/isolation.py.
+    isolation.assert_firebase_allowed(settings)
+    if not settings.is_production:
+        _init_local_emulators()
         return
 
     path = settings.firebase_credentials_path
@@ -43,6 +52,32 @@ def init() -> None:
     _app = firebase_admin.initialize_app(cred, options or None)
     _fs = firestore.client()
     log.info("Firebase Admin initialised")
+
+
+def _init_local_emulators() -> None:
+    """Outside production: the emulators, a demo project, and no credential.
+
+    Anonymous credentials, never the service-account key or Application Default
+    Credentials: the emulators accept them and a real Google endpoint does not,
+    so even a request that somehow missed its emulator could not authenticate as
+    anybody. Firebase Auth switches to its own emulator credential by itself
+    once FIREBASE_AUTH_EMULATOR_HOST is set. `isolation.firebase_problems()` has
+    already required all three emulator hosts on this machine.
+    """
+    global _app, _fs
+    from google.auth.credentials import AnonymousCredentials
+
+    isolation.export_emulator_environment(settings)
+    options = {"projectId": settings.firebase_project_id.strip()}
+    if settings.firebase_storage_bucket:
+        options["storageBucket"] = settings.firebase_storage_bucket
+    _app = firebase_admin.initialize_app(AnonymousCredentials(), options)
+    _fs = firestore.client()
+    log.warning(
+        "Firebase Admin initialised against the LOCAL EMULATORS (project %s); "
+        "no credentials loaded",
+        options["projectId"],
+    )
 
 
 def firestore_client():
@@ -76,6 +111,16 @@ def get_user_by_email(email: str):
     try:
         return fb_auth.get_user_by_email(email)
     except fb_auth.UserNotFoundError:
+        return None
+
+
+def get_user_by_phone(phone_e164: str):
+    """RC (Decision 15): the Firebase Auth account holding this phone, or None."""
+    try:
+        return fb_auth.get_user_by_phone_number(phone_e164)
+    except fb_auth.UserNotFoundError:
+        return None
+    except ValueError:
         return None
 
 
@@ -173,6 +218,30 @@ def set_user_disabled(uid: str, disabled: bool) -> str:
         return f"The Firebase login could not be {'disabled' if disabled else 're-enabled'}: {exc}"
 
 
+def revoke_sessions(uid: str) -> str:
+    """Phase 1A (SESSION-003): end every live session WITHOUT disabling the login.
+
+    A suspension must still let the person sign in to be told they are
+    suspended (and to appeal), so the account is not disabled — but the tokens
+    already issued must stop working now, not in an hour. Revoking refresh
+    tokens stops new ID tokens; the caller also moves `credentialsValidAfter`
+    past now so the rules refuse the ones already out there.
+
+    @return '' on success, or a sentence describing what could not be done.
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return "No account id was given."
+    try:
+        fb_auth.revoke_refresh_tokens(uid)
+        return ""
+    except fb_auth.UserNotFoundError:
+        return ""
+    except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
+        log.exception("could not revoke refresh tokens for %s", uid)
+        return f"The live sessions could not be revoked: {exc}"
+
+
 def clear_user_phone(uid: str) -> None:
     """Detach whatever phone number is on this account.
 
@@ -263,6 +332,48 @@ class HostBeansUnavailable(Exception):
         )
 
 
+#: P0-7 (FIN-5): the two Firestore queues a host payout can settle. Both are a
+#: host's beans paid out in cash — `salaryRequests` is the same thing filed by
+#: the host's agency — so both are paid ONLY by an executed host-withdrawal card.
+PAYOUT_REQUEST_COLLECTIONS = ("withdrawalRequests", "salaryRequests")
+#: A request in one of these may still be paid. `paid`, `distributed` and
+#: `rejected` are final.
+PAYOUT_REQUEST_PAYABLE = ("pending", "approved")
+
+#: HT-2 — `users/{uid}/cardDebits/{debit_id}`: the server-only record that a
+#: card's bean debit committed. No rule matches it, so no client can read or
+#: write it (`firestore.rules` denies everything unmatched).
+CARD_DEBITS = "cardDebits"
+DEBIT_NOT_APPLIED = (
+    "The database was busy and did not apply the debit: no debit is recorded for it. "
+    "Running it again is safe — it cannot debit twice."
+)
+DEBIT_UNKNOWN = (
+    "The database did not confirm the debit, and none is recorded for it yet — but it may "
+    "still complete. Running it again is safe: it records the debit if it happened and "
+    "makes it once if it did not."
+)
+
+
+class PayoutRequestNotPayable(Exception):
+    """The request a host-withdrawal card settles cannot be paid (again)."""
+
+
+class PayoutRequestAlreadySettled(PayoutRequestNotPayable):
+    """The request is already paid BY THIS VERY CARD — a repeated or raced execution."""
+
+
+def payout_request_beans(collection: str, data: dict) -> int:
+    """The beans a payout request asks for: `beans`, or `beansEarned` on a salary request."""
+    value = data.get("beansEarned" if collection == "salaryRequests" else "beans")
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def payout_request_holder(data: dict) -> str:
+    """The host a payout request is for. `hostUid`; older rows carry `uid`."""
+    return str(data.get("hostUid") or data.get("uid") or "").strip()
+
+
 def read_host_wallet(uid: str) -> dict | None:
     """The `users/{uid}` fields a host payout decision turns on, or None.
 
@@ -303,8 +414,17 @@ def read_host_wallet(uid: str) -> dict | None:
     }
 
 
-def debit_host_beans(uid: str, amount: int) -> dict:
+def debit_host_beans(
+    uid: str, amount: int, settle: dict | None = None, history: dict | None = None,
+    *, debit_id: str = "",
+) -> dict:
     """Take `amount` beans out of a host's live wallet, or refuse. Blocking.
+
+    P0-7 (FIN-5): with `settle` — `{"collection", "id", "card_id",
+    "payment_ref"}` — the payout request the card was raised for is marked
+    `paid` IN THE SAME TRANSACTION, and the debit is refused if that request is
+    not the host's, is already paid, or is final. One request is paid once, and
+    a request can only become `paid` together with the debit that pays it.
 
     THIS IS THE AUTHORITATIVE WRITE FOR A HOST WITHDRAWAL, not a replica of one.
 
@@ -329,6 +449,18 @@ def debit_host_beans(uid: str, amount: int) -> dict:
     Returns what the document held *before* the debit, including the host's
     `agencyId`, read inside the same transaction so the commission row cannot be
     attributed to an agency the host had already left.
+
+    HT-2 — IDEMPOTENT ON `debit_id` (a withdrawal card passes its card id). A
+    server-only marker, `users/{uid}/cardDebits/{debit_id}`, is written in the
+    same transaction as the debit and read before anything else. Without it a
+    card raised without a payout request carried no idempotency key at all:
+    when a commit was applied but its answer lost, the library ran this
+    callback again on the debited wallet and debited it AGAIN. With it, a
+    replay returns the recorded figures (`replayed`) and moves nothing. After a
+    Firestore error the marker (or the `history` row) is read again: there →
+    the recorded figures (`verified_after_error`); not there →
+    `TransactionNotApplied` / `TransactionOutcomeUnknown`, never "nothing was
+    debited". Refusals are raised exactly as before.
     """
     if amount <= 0:
         raise ValueError("A withdrawal must be for a positive number of beans")
@@ -336,16 +468,78 @@ def debit_host_beans(uid: str, amount: int) -> dict:
     amount = int(amount)
     client = firestore_client()
     ref = client.collection("users").document(uid)
+    request_ref = None
+    if settle:
+        collection = str(settle.get("collection") or "")
+        request_id = str(settle.get("id") or "").strip()
+        if collection not in PAYOUT_REQUEST_COLLECTIONS or not request_id:
+            raise PayoutRequestNotPayable("The card names no payout request this can settle.")
+        request_ref = client.collection(collection).document(request_id)
+
+    # UGP-D: with `history = {"id", "reason"}` the debit is IDEMPOTENT on that
+    # id and leaves an app-visible `beanTransactions` row, written in the same
+    # transaction — the same guarantee `clawback_user_diamonds` gives. Used for
+    # a signed balance card; a withdrawal keeps using `settle`.
+    history_ref = (
+        ref.collection("beanTransactions").document(str(history["id"]))
+        if history and history.get("id") else None
+    )
+    marker_ref = ref.collection(CARD_DEBITS).document(str(debit_id)) if debit_id else None
+
+    def _replay(record) -> dict:
+        p = record.to_dict() or {}
+        return {
+            "beans_available_before": int(p.get("availableBefore") or 0),
+            "beans_before": int(p.get("beansBefore") or 0),
+            "agency_id": str(p.get("agencyId") or ""),
+            "replayed": True,
+        }
 
     @firestore.transactional
     def _debit(transaction) -> dict:
+        prior = history_ref.get(transaction=transaction) if history_ref is not None else None
+        marker = marker_ref.get(transaction=transaction) if marker_ref is not None else None
         snap = ref.get(transaction=transaction)
+        if prior is not None and getattr(prior, "exists", False):
+            return _replay(prior)
+        if marker is not None and getattr(marker, "exists", False):
+            return _replay(marker)  # HT-2: this card's debit already committed
         if not getattr(snap, "exists", False):
             # No document is not "zero available" — it is an account that does
             # not exist, and nothing should be paid against it.
             raise HostBeansUnavailable(uid, 0, amount)
 
+        # Every read before any write — a Firestore transaction requires it.
+        request_snap = request_ref.get(transaction=transaction) if request_ref is not None else None
+        if request_ref is not None:
+            if not getattr(request_snap, "exists", False):
+                raise PayoutRequestNotPayable("The payout request this card was raised for no longer exists.")
+            req = request_snap.to_dict() or {}
+            if payout_request_holder(req) != uid:
+                raise PayoutRequestNotPayable("The payout request is for a different host than this card.")
+            status = str(req.get("status") or "")
+            if status == "paid" and str(req.get("cardId") or "") == str(settle.get("card_id") or "x"):
+                raise PayoutRequestAlreadySettled("The payout request is already paid by this card.")
+            if status not in PAYOUT_REQUEST_PAYABLE:
+                raise PayoutRequestNotPayable(
+                    f"The payout request is already '{status}', so it cannot be paid again."
+                )
+            # The card pays exactly what was requested — a smaller card must
+            # not close a larger request as `paid`.
+            asked = payout_request_beans(str(settle.get("collection") or ""), req)
+            if asked != amount:
+                raise PayoutRequestNotPayable(
+                    f"The card is for {amount:,} beans but the request is for {asked:,}."
+                )
+
         data = snap.to_dict() or {}
+        if request_ref is not None and str(settle.get("collection")) == "salaryRequests":
+            # A salary request is filed by an agency for ITS host. The host's
+            # beans are paid out to that agency, so they must still be one.
+            if str((request_snap.to_dict() or {}).get("agencyId") or "") != str(data.get("agencyId") or ""):
+                raise PayoutRequestNotPayable(
+                    "The salary request was filed by an agency this host does not belong to."
+                )
         available = data.get("beansAvailable")
         available = int(available) if isinstance(available, (int, float)) else 0
         held = data.get("beans")
@@ -353,6 +547,12 @@ def debit_host_beans(uid: str, amount: int) -> dict:
 
         if available < amount:
             raise HostBeansUnavailable(uid, available, amount)
+        # UGP review: a signed balance card (`history`) moves both fields, so it
+        # must not push `beans` below zero either. Older CRM debits reduced
+        # `beans` alone, so wallets with `beansAvailable > beans` exist. The
+        # withdrawal path (`settle`) is left exactly as it was.
+        if history_ref is not None and held < amount:
+            raise HostBeansUnavailable(uid, min(available, held), amount)
 
         transaction.update(
             ref,
@@ -361,13 +561,699 @@ def debit_host_beans(uid: str, amount: int) -> dict:
                 "beans": firestore.Increment(-amount),
             },
         )
+        if history_ref is not None:
+            transaction.set(
+                history_ref,
+                {
+                    "type": "debit",
+                    "amount": amount,
+                    "availableBefore": available,
+                    "beansBefore": held,
+                    "agencyId": str(data.get("agencyId") or "").strip(),
+                    "reason": str(history.get("reason") or ""),
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+        if request_ref is not None:
+            transaction.update(
+                request_ref,
+                {
+                    "status": "paid",
+                    "paidAt": firestore.SERVER_TIMESTAMP,
+                    "paidVia": "card",
+                    "cardId": str(settle.get("card_id") or ""),
+                    "paymentRef": str(settle.get("payment_ref") or ""),
+                    "beansDebited": amount,
+                },
+            )
+        if marker_ref is not None:
+            transaction.set(
+                marker_ref,
+                {
+                    "debitId": str(debit_id),
+                    "amount": amount,
+                    "availableBefore": available,
+                    "beansBefore": held,
+                    "agencyId": str(data.get("agencyId") or "").strip(),
+                    "settles": f"{settle.get('collection')}/{settle.get('id')}" if request_ref is not None else "",
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
         return {
             "beans_available_before": available,
             "beans_before": held,
             "agency_id": str(data.get("agencyId") or "").strip(),
         }
 
-    return _debit(client.transaction())
+    try:
+        return _debit(client.transaction())
+    except Exception as exc:
+        kind = transaction_error_kind(exc)
+        token_ref = marker_ref or history_ref
+        if kind is None or token_ref is None:
+            raise
+        log.warning("bean debit of %s for %s failed in Firestore (%s); reading it again", amount, uid, exc)
+        try:
+            record = token_ref.get()
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("bean debit of %s for %s: its record could not be read again", amount, uid)
+            raise TransactionOutcomeUnknown(DEBIT_UNKNOWN) from exc
+        if getattr(record, "exists", False):
+            return {**_replay(record), "verified_after_error": True}
+        raise unresolved(kind, DEBIT_NOT_APPLIED, DEBIT_UNKNOWN) from exc
+
+
+WARNING_NOT_APPLIED = (
+    "The database was busy and did not record the warning. Send the same request again — "
+    "it cannot warn twice."
+)
+WARNING_UNKNOWN = (
+    "The database did not confirm the warning, and it is not recorded yet — but it may "
+    "still complete. Send the same request again: it cannot warn twice."
+)
+
+
+def create_warning_once(uid: str, warning_id: str, entry: dict) -> bool:
+    """Create `users/{uid}/warnings/{warning_id}` and count it — ONCE. Blocking.
+
+    UGP-D: the warning id is derived from the CRM's request id, so a retried
+    request lands here with the same id. The existence check and both writes
+    are one transaction: a second call finds the warning and writes nothing,
+    so a timeout-and-retry is one warning, one count, not two.
+
+    Returns True when this call created it, False when it already existed —
+    including when this call's own commit landed but its answer was lost (the
+    replay that False leads to finishes everything, keyed on the warning).
+    """
+    client = firestore_client()
+    user_ref = client.collection("users").document(uid)
+    ref = user_ref.collection("warnings").document(warning_id)
+
+    @firestore.transactional
+    def _create(transaction) -> bool:
+        snap = ref.get(transaction=transaction)
+        if getattr(snap, "exists", False):
+            return False
+        transaction.set(ref, entry)
+        transaction.update(
+            user_ref,
+            {"warnings": firestore.Increment(1), "lastWarnedAt": entry.get("issuedAt")},
+        )
+        return True
+
+    # HT-2: after a Firestore error the warning is read again. There → False,
+    # exactly as when an earlier attempt or request created it: the caller's
+    # replay finishes the card, the audit and the notice, each keyed on the
+    # warning. Not there → `TransactionNotApplied` / `TransactionOutcomeUnknown`.
+    try:
+        return _create(client.transaction())
+    except Exception as exc:
+        kind = transaction_error_kind(exc)
+        if kind is None:
+            raise
+        log.warning("warning %s for %s failed in Firestore (%s); reading it again", warning_id, uid, exc)
+        try:
+            snap = ref.get()
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("warning %s for %s could not be read again", warning_id, uid)
+            raise TransactionOutcomeUnknown(WARNING_UNKNOWN) from exc
+        if getattr(snap, "exists", False):
+            return False
+        raise unresolved(kind, WARNING_NOT_APPLIED, WARNING_UNKNOWN) from exc
+
+
+# ── What a failed Firestore transaction call does, and does not, tell you ──────
+#
+# HT-2. A transaction call that raises is in one of three states, and the error
+# alone cannot tell them apart:
+#
+#   * COMMITTED — an attempt's commit was applied but its answer was lost. The
+#     client re-sends a commit on UNAVAILABLE / RESOURCE_EXHAUSTED
+#     (google-cloud-firestore 2.28.1, `transports/base.py`, `commit`
+#     default_retry), and a re-sent commit of an applied transaction can come
+#     back as an error. If that error is ABORTED the library even runs the
+#     callback AGAIN, on the state it has just committed.
+#   * NOT APPLIED — Firestore aborted every attempt (ABORTED, or the library's
+#     retry-exhaustion `ValueError` built on it) and nothing of it is visible.
+#   * UNKNOWN — a deadline, an unavailable or internal error, a transport
+#     error: a commit can still be applied after the client stopped waiting.
+#
+# So no error is taken as proof that nothing committed. Each transaction in this
+# backend writes an OPERATION TOKEN in the same commit as its effect, its
+# callback recognises that token FIRST (so a re-run attempt, or a retried call,
+# returns what was committed instead of acting twice), and after a Firestore
+# error the caller re-reads the token outside the transaction. What the re-read
+# cannot find is reported as `TransactionNotApplied` (Firestore aborted it; try
+# again) or `TransactionOutcomeUnknown` (it may still land; try again — the
+# retry recognises it if it did), never as "nothing happened". Exceptions raised
+# by the transaction's own code — a refusal, a bug — are definite and pass
+# through unchanged.
+
+
+class TransactionNotApplied(Exception):
+    """HT-2 — Firestore aborted the transaction, and its effect is not there.
+
+    Re-read after the failure: no trace of this operation. Trying again is
+    safe: every transaction here recognises its own committed effect, so a
+    retry can neither act twice nor miss an effect that did land.
+    """
+
+    status_code = 409
+    outcome = "not_applied"
+
+
+class TransactionOutcomeUnknown(Exception):
+    """HT-2 — whether the transaction committed could not be established.
+
+    The effect was not visible when re-read (or the re-read failed), but a
+    commit can still be applied after the client stopped waiting. Never report
+    this as "nothing happened". Trying again is safe for the same reason as
+    above: the retry recognises the effect if it lands.
+    """
+
+    status_code = 503
+    outcome = "unknown"
+
+
+def _single_error_kind(exc: BaseException) -> str | None:
+    if is_transaction_contention(exc):
+        return "contended"
+    try:
+        from google.api_core import exceptions as api_exceptions
+    except ImportError:  # pragma: no cover — the Admin SDK depends on it
+        api_exceptions = None
+    api_error = getattr(api_exceptions, "GoogleAPIError", None)
+    if isinstance(api_error, type) and isinstance(exc, api_error):
+        return "uncertain"
+    try:
+        from google.auth import exceptions as auth_exceptions
+    except ImportError:  # pragma: no cover
+        auth_exceptions = None
+    auth_error = getattr(auth_exceptions, "GoogleAuthError", None)
+    if isinstance(auth_error, type) and isinstance(exc, auth_error):
+        return "uncertain"
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return "uncertain"
+    return None
+
+
+def transaction_error_kind(exc: BaseException) -> str | None:
+    """HT-2 — `"contended"`, `"uncertain"`, or None for an error of our own code.
+
+      * "contended": Firestore aborted it (`is_transaction_contention`);
+      * "uncertain": any other Firestore / Google API error, an auth refresh or
+        a transport error — the commit may or may not have been applied;
+      * None: raised by the transaction's own code (a refusal, a bug). Such an
+        error is definite: the callback raised, so that attempt wrote nothing,
+        and an earlier attempt that committed would have been recognised by the
+        token check every callback here makes first.
+
+    The library can HIDE the real error: after any failure it calls
+    `_rollback()`, and when the failure was a `begin` (no transaction id yet)
+    `_rollback()` raises its own `ValueError("The transaction has no
+    transaction ID, so it cannot be rolled back.")`, with the real error only in
+    `__context__`. So an error whose cause / context chain holds a Firestore or
+    transport error is "uncertain" too — a failed `begin` on a LATER attempt
+    can follow an attempt whose commit was applied.
+
+    Either non-None answer means "re-read the operation's token before saying
+    anything".
+    """
+    kind = _single_error_kind(exc)
+    if kind is not None:
+        return kind
+    seen: set[int] = set()
+    inner = exc.__cause__ or exc.__context__
+    while inner is not None and id(inner) not in seen and len(seen) < 10:
+        seen.add(id(inner))
+        if _single_error_kind(inner) is not None:
+            return "uncertain"
+        inner = inner.__cause__ or inner.__context__
+    return None
+
+
+def unresolved(kind: str | None, not_applied: str, unknown: str) -> Exception:
+    """HT-2 — the typed error for a failure whose effect the re-read did not find."""
+    if kind == "contended":
+        return TransactionNotApplied(not_applied)
+    return TransactionOutcomeUnknown(unknown)
+
+
+def is_transaction_contention(exc: BaseException) -> bool:
+    """HT-1: True only when Firestore aborted a transaction for contention.
+
+    Under contention the client library aborts a transaction: an aborted
+    COMMIT is retried at once, five attempts in all, then reported as
+    `ValueError("Failed to commit transaction in 5 attempts.")` raised from the
+    last `Aborted`; an `Aborted` raised by a READ inside the transaction is not
+    retried at all. Exactly those two shapes are recognised:
+      * `google.api_core.exceptions.Aborted` (gRPC ABORTED);
+      * the library's retry-exhaustion `ValueError`, caused by an `Aborted`.
+    HT-2: ABORTED says the LAST attempt did not commit. It does not prove that
+    no earlier attempt did (see the section note above), so a caller re-reads
+    its operation token before giving any "lost" or "not applied" result. Every
+    other failure is not recognised here (`transaction_error_kind` sorts them).
+    """
+    try:
+        from google.api_core import exceptions as api_exceptions
+    except ImportError:  # pragma: no cover — the Admin SDK depends on it
+        return False
+    aborted = getattr(api_exceptions, "Aborted", None)
+    if not isinstance(aborted, type):
+        return False
+    if isinstance(exc, aborted):
+        return True
+    if type(exc) is not ValueError or not isinstance(exc.__cause__, aborted):
+        return False
+    # google-cloud-firestore 2.28.1 (pinned in requirements.txt):
+    # `_EXCEED_ATTEMPTS_TEMPLATE = "Failed to commit transaction in {:d} attempts."`
+    text, head, tail = str(exc), "Failed to commit transaction in ", " attempts."
+    count = text[len(head):-len(tail)] if text.startswith(head) and text.endswith(tail) else ""
+    return count != "" and all(c in "0123456789" for c in count)
+
+
+# ── A short lease on a document awaiting ONE decision (B17 / B40) ─────────────
+#
+# A host application and an account appeal are each decided once, and the
+# decision does something BEFORE it is stamped on the document — grants or
+# revokes a Host, lifts a ban. Checking the status and writing it at the end is
+# check-then-write: two reviewers could both pass the check and both act, and
+# an approve racing a refuse could leave the account granted and the document
+# refused. The lease is the compare-and-set that comes first: it is taken in a
+# transaction against the status that was read, the decision's side effects run
+# only while it is held, and the final stamp is conditional on still holding
+# it. A crash leaves at most a lease that lapses after `DECISION_LEASE_SECONDS`.
+#
+# A field rather than a status value, so no reader of `status` ever sees an
+# intermediate state it does not know.
+
+DECISION_LEASE_FIELD = "decisionInFlight"
+#: HT-2 — the lease token under which the document's current decision was
+#: recorded, written in the same commit as the decision. It is what tells a
+#: completion whose answer was lost from one that never landed; the lease field
+#: itself is deleted by the completion, as before.
+DECISION_TOKEN_FIELD = "decisionToken"
+DECISION_LEASE_SECONDS = 120
+
+
+class DecisionConflict(Exception):
+    """The document moved, or another decision holds it. `reason` says which.
+
+    HT-2 adds two reasons, for a claim whose transaction failed and whose lease
+    the re-read did not find: "contended" (Firestore aborted it) and "unknown"
+    (its outcome could not be established — a lease that did land lapses after
+    `DECISION_LEASE_SECONDS`). Nothing was decided in either case.
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class DecisionNotRecorded(Exception):
+    """HT-2 — the lease is still ours, but the decision stamp could not be confirmed.
+
+    `outcome` is "not_applied" (Firestore aborted it and nothing of it is
+    visible) or "unknown" (it may still land). Completing again under the same
+    lease is safe: `complete_decision` recognises a stamp it already wrote.
+    """
+
+    def __init__(self, message: str, *, outcome: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+
+
+CLAIM_CONTENDED = (
+    "Another change to this was being saved at the same moment, so the decision did "
+    "not start. Nothing was decided — try again."
+)
+CLAIM_UNKNOWN = (
+    "The database did not confirm that the decision started. Nothing was decided "
+    "yet — try again in a moment."
+)
+
+
+def _lease_fresh(lease, now) -> bool:
+    at = lease.get("at") if isinstance(lease, dict) else None
+    if not hasattr(at, "timestamp"):
+        return False
+    try:
+        return (now.timestamp() - float(at.timestamp())) < DECISION_LEASE_SECONDS
+    except Exception:  # noqa: BLE001 — an unreadable stamp is not a live lease
+        return False
+
+
+def _lease_token(data: dict | None) -> str:
+    lease = (data or {}).get(DECISION_LEASE_FIELD)
+    return str(lease.get("token") or "") if isinstance(lease, dict) else ""
+
+
+def claim_decision(
+    ref, *, expected_status: str, actor_uid: str,
+    status_field: str = "status", default_status: str = "",
+) -> str:
+    """Take the decision lease on `ref`, or raise `DecisionConflict`. Blocking.
+
+    Refused when the document is gone, when its status is no longer the one
+    the caller read (`expected_status`; a missing field reads as
+    `default_status`), or when another decision holds a lease that has not
+    lapsed. Returns the lease token the two calls below need.
+
+    HT-2: an attempt that finds THIS call's lease already there (an earlier
+    attempt committed it and its answer was lost) has the lease — it used to be
+    refused as "somebody else is deciding" by its own lease. After a Firestore
+    error the document is read again: our lease there → claimed; otherwise the
+    usual refusal, or `DecisionConflict` with reason "contended" / "unknown".
+    """
+    import secrets
+    from datetime import datetime, timezone
+
+    client = firestore_client()
+    token = secrets.token_urlsafe(12)
+    now = datetime.now(timezone.utc)
+
+    def _verdict(data: dict | None) -> str:
+        if data is None:
+            return "missing"
+        if _lease_token(data) == token:
+            return ""
+        if str(data.get(status_field) or default_status) != str(expected_status):
+            return "changed"
+        if _lease_fresh(data.get(DECISION_LEASE_FIELD), now):
+            return "in_flight"
+        return "free"
+
+    @firestore.transactional
+    def _claim(transaction) -> str:
+        snap = ref.get(transaction=transaction)
+        verdict = _verdict(snap.to_dict() or {} if getattr(snap, "exists", False) else None)
+        if verdict != "free":
+            return verdict
+        transaction.update(
+            ref, {DECISION_LEASE_FIELD: {"token": token, "by": actor_uid, "at": now}}
+        )
+        return ""
+
+    try:
+        outcome = _claim(client.transaction())
+    except Exception as exc:
+        kind = transaction_error_kind(exc)
+        if kind is None:
+            raise
+        log.warning("decision claim on %s failed (%s); reading it again", getattr(ref, "path", ref), exc)
+        try:
+            snap = ref.get()
+            outcome = _verdict(snap.to_dict() or {} if getattr(snap, "exists", False) else None)
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("decision claim on %s: the document could not be read again", getattr(ref, "path", ref))
+            raise DecisionConflict(CLAIM_UNKNOWN, reason="unknown") from exc
+        if outcome == "free":
+            raise DecisionConflict(
+                CLAIM_CONTENDED if kind == "contended" else CLAIM_UNKNOWN,
+                reason="contended" if kind == "contended" else "unknown",
+            ) from exc
+    if outcome == "in_flight":
+        raise DecisionConflict(
+            "Somebody else is deciding this right now. Reload it in a moment.",
+            reason=outcome,
+        )
+    if outcome:
+        raise DecisionConflict(
+            "This was decided or changed while you were looking at it. Reload it.",
+            reason=outcome,
+        )
+    return token
+
+
+def complete_decision(
+    ref, token: str, patch: dict, *, expected_status: str,
+    status_field: str = "status", default_status: str = "",
+) -> bool:
+    """Stamp the decision — only while this call's lease still holds. Blocking.
+
+    Returns False, writing nothing, when the lease has been taken over or the
+    status has moved; the caller reports that rather than overwriting.
+
+    HT-2: the stamp carries the lease token (`decisionToken`), so True also
+    means "this lease's decision is already recorded" — by an earlier attempt
+    whose answer was lost, or by an earlier call under the same lease. It used
+    to come back False ("changed while being decided") for a decision that HAD
+    been recorded, and the caller then skipped the audit, the lock release and
+    the notice. Recognition needs the token AND the status the stamp writes: a
+    status nobody but the server can set. After a Firestore error the document
+    is read again: recorded → True; lease gone or status moved → False; lease
+    still ours → `DecisionNotRecorded` ("not_applied" or "unknown").
+    """
+    client = firestore_client()
+    decided = str(patch.get(status_field) or "")
+
+    def _recorded(data: dict) -> bool:
+        return data.get(DECISION_TOKEN_FIELD) == token and (
+            not decided or str(data.get(status_field) or default_status) == decided
+        )
+
+    def _still_ours(data: dict) -> bool:
+        return _lease_token(data) == token and (
+            str(data.get(status_field) or default_status) == str(expected_status)
+        )
+
+    @firestore.transactional
+    def _finish(transaction) -> bool:
+        snap = ref.get(transaction=transaction)
+        if not getattr(snap, "exists", False):
+            return False
+        data = snap.to_dict() or {}
+        if _recorded(data):
+            return True
+        if not _still_ours(data):
+            return False
+        transaction.update(
+            ref, {**patch, DECISION_TOKEN_FIELD: token, DECISION_LEASE_FIELD: firestore.DELETE_FIELD}
+        )
+        return True
+
+    try:
+        return bool(_finish(client.transaction()))
+    except Exception as exc:
+        kind = transaction_error_kind(exc)
+        if kind is None:
+            raise
+        log.warning("decision stamp on %s failed (%s); reading it again", getattr(ref, "path", ref), exc)
+        try:
+            snap = ref.get()
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("decision stamp on %s: the document could not be read again", getattr(ref, "path", ref))
+            raise DecisionNotRecorded(
+                "The decision could not be confirmed as recorded.", outcome="unknown"
+            ) from exc
+        data = (snap.to_dict() or {}) if getattr(snap, "exists", False) else None
+        if data is not None and _recorded(data):
+            return True
+        if data is None or not _still_ours(data):
+            return False
+        raise DecisionNotRecorded(
+            "The decision was not recorded: the database "
+            + ("was busy and aborted it." if kind == "contended" else "did not confirm it."),
+            outcome="not_applied" if kind == "contended" else "unknown",
+        ) from exc
+
+
+def complete_decision_retry_once(
+    ref, token: str, patch: dict, *, expected_status: str,
+    status_field: str = "status", default_status: str = "",
+) -> bool:
+    """HT-2 — `complete_decision`, tried once more when its stamp was not confirmed.
+
+    For a decision whose effects (a grant, a revocation, a lifted ban) are
+    already committed: leaving the stamp unwritten is what leaves the system
+    inconsistent, and completing again under the same lease cannot write it
+    twice (`decisionToken`). One more call, not a loop; if that is not
+    confirmed either, `DecisionNotRecorded` reaches the caller, which says so.
+    """
+    try:
+        return complete_decision(
+            ref, token, patch, expected_status=expected_status,
+            status_field=status_field, default_status=default_status,
+        )
+    except DecisionNotRecorded:
+        log.warning("decision stamp on %s not confirmed; completing once more", getattr(ref, "path", ref))
+        return complete_decision(
+            ref, token, patch, expected_status=expected_status,
+            status_field=status_field, default_status=default_status,
+        )
+
+
+def release_decision(ref, token: str) -> str:
+    """Give a lease back after a decision failed part-way. Blocking; never raises.
+
+    HT-2: says what happened instead of swallowing it — "released" (it was ours
+    and it is gone), "not_held" (it was not ours any more, or the decision was
+    recorded), "failed" (it could not be released; it lapses by itself after
+    `DECISION_LEASE_SECONDS`, and until then the item reads as being decided).
+    A failure is logged as an ERROR with its cause. It still never raises: it
+    runs inside other error paths, and raising would hide the error that matters.
+    """
+    path = getattr(ref, "path", ref)
+    #: An attempt of THIS call queued the delete. If the lease is then found
+    #: gone, that is this release having landed (its answer lost), not "not
+    #: held". Read only to interpret an ABSENT lease: an attempt that was rolled
+    #: back finds the lease still ours and deletes it again.
+    queued: list[bool] = []
+    try:
+        client = firestore_client()
+
+        @firestore.transactional
+        def _release(transaction) -> str:
+            snap = ref.get(transaction=transaction)
+            data = (snap.to_dict() or {}) if getattr(snap, "exists", False) else {}
+            if _lease_token(data) == token:
+                queued.append(True)
+                transaction.update(ref, {DECISION_LEASE_FIELD: firestore.DELETE_FIELD})
+                return "released"
+            return "released" if queued and not data.get(DECISION_LEASE_FIELD) else "not_held"
+
+        return _release(client.transaction())
+    except Exception:  # noqa: BLE001 — reported, see the docstring
+        try:
+            snap = ref.get()
+            data = (snap.to_dict() or {}) if getattr(snap, "exists", False) else {}
+            if _lease_token(data) != token:
+                return "released"
+        except Exception:  # noqa: BLE001
+            pass
+        log.error(
+            "The decision lease on %s was not released; it lapses in %ss and the item reads "
+            "as being decided until then", path, DECISION_LEASE_SECONDS, exc_info=True,
+        )
+        return "failed"
+
+
+CLAWBACK_NOT_APPLIED = (
+    "The database was busy and did not take the diamonds back: nothing is recorded as "
+    "taken. Running it again is safe — it cannot take twice."
+)
+CLAWBACK_UNKNOWN = (
+    "The database did not confirm taking the diamonds back, and nothing is recorded as "
+    "taken yet — but it may still complete. Running it again is safe: it records what was "
+    "taken if it happened and takes it once if it did not."
+)
+
+
+class LiveBalanceShort(Exception):
+    """UGP-D: the live balance will not cover a debit that must be taken whole."""
+
+    def __init__(self, uid: str, available: int, requested: int):
+        super().__init__(f"available {available}, requested {requested}")
+        self.uid = uid
+        self.available = available
+        self.requested = requested
+
+
+def clawback_user_diamonds(
+    uid: str, requested: int, *, reason: str, history_id: str, require_full: bool = False,
+) -> dict:
+    """Take back up to `requested` diamonds from a user's LIVE balance. Blocking.
+
+    THE AUTHORITATIVE WRITE FOR A RECHARGE REVERSAL, for the same reason
+    `debit_host_beans` is: the number that says how many of a credited batch
+    are still there lives only in Firestore, and it is moved by gifts and
+    calls Mongo never hears about. A refund decided from the Mongo balance
+    would "reverse" diamonds the person has already spent and drive the live
+    wallet negative.
+
+    So this runs inside a Firestore transaction that re-reads `diamonds`,
+    takes `min(requested, available)`, never less than zero, and writes the
+    app-visible history row in the same transaction. The caller records the
+    Mongo movement afterwards with `replica_applied_by_caller=True`, exactly
+    as a host withdrawal does, and records the shortfall — the part already
+    spent — as unrecoverable rather than inventing a negative balance.
+
+    Returns `{"taken": n, "available_before": m}`. A missing document takes
+    nothing: there is no wallet to take from.
+
+    HT-2: after a Firestore error the history row is read again — there: the
+    recorded outcome (`verified_after_error`); not there:
+    `TransactionNotApplied` / `TransactionOutcomeUnknown`.
+    """
+    if requested <= 0:
+        raise ValueError("A clawback must be for a positive number of diamonds")
+
+    requested = int(requested)
+    client = firestore_client()
+    ref = client.collection("users").document(uid)
+    history = ref.collection("diamondTransactions").document(history_id)
+
+    @firestore.transactional
+    def _take(transaction) -> dict:
+        # IDEMPOTENT ON `history_id`. The history row is written in the SAME
+        # transaction as the debit, so its existence proves this exact clawback
+        # already happened. A replay — a retry after a crash between this
+        # transaction and the caller's bookkeeping — returns the recorded
+        # outcome and moves nothing. Both reads happen before any write, as a
+        # Firestore transaction requires.
+        prior = history.get(transaction=transaction)
+        snap = ref.get(transaction=transaction)
+        if getattr(prior, "exists", False):
+            p = prior.to_dict() or {}
+            return {
+                "taken": int(p.get("amount") or 0),
+                "available_before": int(p.get("availableBefore") or 0),
+                "replayed": True,
+            }
+        if not getattr(snap, "exists", False):
+            # UGP review: a debit that must be taken WHOLE cannot be "taken" from
+            # a wallet that does not exist — refusing is what stops the caller
+            # from ledgering a debit and closing the card with nothing taken.
+            if require_full:
+                raise LiveBalanceShort(uid, 0, requested)
+            return {"taken": 0, "available_before": 0, "replayed": False}
+        data = snap.to_dict() or {}
+        available = data.get("diamonds")
+        available = int(available) if isinstance(available, (int, float)) else 0
+        # UGP-D: a signed debit (a warning deduction, a balance adjustment) is
+        # taken WHOLE or not at all. The recharge reversal keeps its "take what
+        # is still there" behaviour by not asking for this.
+        if require_full and available < requested:
+            raise LiveBalanceShort(uid, available, requested)
+        taken = max(0, min(requested, available))
+        if taken > 0:
+            transaction.update(ref, {"diamonds": firestore.Increment(-taken)})
+            transaction.set(
+                history,
+                {
+                    "type": "debit",
+                    "amount": taken,
+                    "availableBefore": available,
+                    "requested": requested,
+                    "reason": reason,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                },
+            )
+        return {"taken": taken, "available_before": available, "replayed": False}
+
+    # HT-2: after a Firestore error the history row is read again — written in
+    # the same transaction as the debit, it is the record that it committed.
+    try:
+        return _take(client.transaction())
+    except Exception as exc:
+        kind = transaction_error_kind(exc)
+        if kind is None:
+            raise
+        log.warning("diamond clawback %s failed in Firestore (%s); reading it again", history_id, exc)
+        try:
+            prior = history.get()
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("diamond clawback %s: its history row could not be read again", history_id)
+            raise TransactionOutcomeUnknown(CLAWBACK_UNKNOWN) from exc
+        if getattr(prior, "exists", False):
+            p = prior.to_dict() or {}
+            return {
+                "taken": int(p.get("amount") or 0),
+                "available_before": int(p.get("availableBefore") or 0),
+                "replayed": True,
+                "verified_after_error": True,
+            }
+        raise unresolved(kind, CLAWBACK_NOT_APPLIED, CLAWBACK_UNKNOWN) from exc
 
 
 def read_firestore_balance(holder_type: str, holder_id: str, currency: str) -> int | None:
@@ -390,3 +1276,16 @@ def read_firestore_balance(holder_type: str, holder_id: str, currency: str) -> i
     except Exception:  # noqa: BLE001
         log.exception("Firestore balance read failed for %s/%s", holder_id, currency)
         return None
+
+
+def create_custom_token(uid: str, developer_claims: dict) -> str:
+    """P1-A3b: a Firebase custom token for `uid` carrying `developer_claims`.
+
+    On Cloud Run the Admin SDK signs through the IAM `signBlob` API, which needs
+    the runtime service account to hold `roles/iam.serviceAccountTokenCreator`
+    on itself and the IAM Service Account Credentials API enabled. Against the
+    Auth emulator the SDK emits an unsigned token the emulator accepts.
+    The returned token is a credential: never log it.
+    """
+    token = fb_auth.create_custom_token(uid, developer_claims)
+    return token.decode() if isinstance(token, bytes) else str(token)

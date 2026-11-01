@@ -1,0 +1,336 @@
+/**
+ * firestore.rules — FX phase regression tests (approved fixes FX-01 … FX-15),
+ * against the Firestore emulator.
+ *
+ *   FX-09   no UNAUTHENTICATED partner create: the public signup forms sign in
+ *           first, and a document with no signed-in author named no owner, so
+ *           approval applied no per-person or contact rule to it.
+ *   FX-06 / approved contact rule
+ *           a client-created partner record carries the public signup's
+ *           source (`self_signup`, which the registration path holds to the
+ *           full application eligibility) — never the API's own `self_app`,
+ *           which the registration trigger skips.
+ *   FX-02   the Host lifecycle stamps (`hostRevokedAt`, `hostRestoredAt`, …,
+ *           `agencyTransferredAt/From`) are written by the server only — not
+ *           by the account owner (who could erase their own revocation) and
+ *           not by a staff browser. Ordinary edits are unchanged.
+ *   FX-11   an agency login READS its own roster subcollection (which the
+ *           dashboard now lists) — and, as before, may not LIST `users`, which
+ *           is why the old dashboard query failed.
+ *   FX-12   an invitation at a deterministic id is CREATE-only for an agency:
+ *           a second write to the same id is refused; reading an id that does
+ *           not exist is refused (the CRM treats that as "free"); the agency
+ *           withdraws its OWN pending invitation, and nothing else.
+ *   FX-13   an appeal at a deterministic id is CREATE-only: a second write to
+ *           the same id — by the subject, or by the agency for a contest — is
+ *           refused.
+ *
+ * Each `no(...)` is a path the rules must refuse; each `ok(...)` the
+ * legitimate flow beside it, so a rule that "fixes" a hole by refusing
+ * everything fails.
+ *
+ * ZIPPER_RULES_FILE=<path> runs the same checks against another rules file
+ * (the pre-change copy) to show which `no(...)` checks fail there.
+ *
+ * Failure classes, as in firestore.gov.rules.test.mjs: [no:allowed] is the
+ * only failure that is evidence about the rules; [ok:denied] a legitimate
+ * request refused; [*:error] the request never reached a rules decision. The
+ * last line is always one `FX-RESULT …` summary.
+ *
+ * Run (needs Java 21 + firebase CLI), from the repository root:
+ *     firebase emulators:exec --only firestore --project demo-zipper \
+ *         "node tests/firestore.fx.rules.test.mjs"
+ * `demo-` project ids never reach a real project.
+ */
+
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { initializeTestEnvironment } from '@firebase/rules-unit-testing'
+import {
+  doc, setDoc, getDoc, getDocs, updateDoc, deleteDoc, deleteField, collection, query, where,
+} from 'firebase/firestore'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const RULES_PATH = process.env.ZIPPER_RULES_FILE || join(here, '..', 'firestore.rules')
+const RULES = readFileSync(RULES_PATH, 'utf8')
+const RULES_SHA256 = createHash('sha256').update(RULES, 'utf8').digest('hex')
+console.log(`rules under test: ${RULES_PATH}`)
+console.log(`rules sha256: ${RULES_SHA256}`)
+
+// ── The check harness (same shape as firestore.gov.rules.test.mjs) ──────────
+const tally = { checks: 0, failures: 0, ok_denied: 0, ok_error: 0, no_allowed: 0, no_error: 0 }
+const failed = []
+
+function isPermissionDenied(err) {
+  const code = String(err?.code ?? '').toLowerCase()
+  const msg = String(err?.message ?? '').toLowerCase()
+  return code === 'permission-denied' || code === 'permission_denied'
+    || msg.includes('permission_denied') || msg.includes('permission denied')
+}
+async function outcomeOf(run) {
+  try {
+    await run()
+    return { kind: 'allowed' }
+  } catch (err) {
+    return { kind: isPermissionDenied(err) ? 'denied' : 'error', err }
+  }
+}
+async function expect(claim, run, shouldPass) {
+  tally.checks += 1
+  const o = await outcomeOf(run)
+  const passed = shouldPass ? o.kind === 'allowed' : o.kind === 'denied'
+  if (passed) return
+  tally.failures += 1
+  const tag = `${shouldPass ? 'ok' : 'no'}:${o.kind}`
+  if (tag === 'ok:denied') tally.ok_denied += 1
+  else if (tag === 'ok:error') tally.ok_error += 1
+  else if (tag === 'no:allowed') tally.no_allowed += 1
+  else tally.no_error += 1
+  failed.push(`[${tag}] ${claim}`)
+  const why = o.kind === 'allowed' ? 'the request was ALLOWED' : String(o.err?.message ?? o.err).split('\n')[0]
+  console.error(`  FAIL  [${tag}] ${claim}\n        ${why}`)
+}
+const ok = (claim, run) => expect(claim, run, true)
+const no = (claim, run) => expect(claim, run, false)
+
+function printResult(aborted) {
+  console.log(
+    `FX-RESULT checks=${tally.checks} failures=${tally.failures} ok_denied=${tally.ok_denied} ` +
+    `ok_error=${tally.ok_error} no_allowed=${tally.no_allowed} no_error=${tally.no_error} ` +
+    `aborted=${aborted ? 1 : 0} rules_sha256=${RULES_SHA256}`,
+  )
+}
+
+const testEnv = await initializeTestEnvironment({
+  projectId: 'demo-zipper',
+  firestore: { rules: RULES, host: '127.0.0.1', port: 8080 },
+})
+async function seed(path, data) {
+  await testEnv.withSecurityRulesDisabled(async (c) => { await setDoc(doc(c.firestore(), path), data) })
+}
+
+// P1-A3b — Owner authority in the rules holds only for a Firebase sign-in the
+// backend bound to an MFA-verified session (ownerMfaSessions/{uid}). The mock
+// token's defaults are auth_time 0 and provider 'custom', so that is the key
+// the Owners in this suite are bound under. Pending/unbound Owners are covered
+// in tests/firestore.p1mfa.rules.test.mjs.
+const OWNER_MFA_BOUND = { active: { '0:custom': new Date(Date.now() + 7 * 864e5) } }
+// One handle per context — rules-unit-testing 3.x calls useEmulator() on every
+// firestore(), which throws once an instance has been used.
+const handles = new Map()
+function fs(ctx) {
+  if (!handles.has(ctx)) handles.set(ctx, ctx.firestore())
+  return handles.get(ctx)
+}
+const D = (ctx, path) => doc(fs(ctx), path)
+const C = (ctx, path) => collection(fs(ctx), path)
+
+async function main() {
+  await testEnv.clearFirestore()
+
+  const STAFF = (uid, role) => ({ uid, role, isActive: true, status: 'approved' })
+  await seed('crmUsers/uidFxOps', STAFF('uidFxOps', 'ops_admin'))
+  await seed('crmUsers/uidFxOwner', STAFF('uidFxOwner', 'superadmin'))
+  await seed('ownerMfaSessions/uidFxOwner', OWNER_MFA_BOUND)  // P1-A3b
+  const opsAdmin = testEnv.authenticatedContext('uidFxOps', { email: 'ops@zipper.test', email_verified: true })
+  const ownerStaff = testEnv.authenticatedContext('uidFxOwner', { email: 'own@zipper.test', email_verified: true })
+  const nobody = testEnv.unauthenticatedContext()
+  const phone = (uid, n) => testEnv.authenticatedContext(uid, {
+    phone_number: `+91981110${String(n).padStart(4, '0')}`, firebase: { sign_in_provider: 'phone' },
+  })
+
+  // ════════════════════════════════════════════════════════════════════════
+  console.log('FX-09 / FX-06 — partner records: signed-in signup only, never `self_app`')
+  // ════════════════════════════════════════════════════════════════════════
+  const AGENCY = (over = {}) => ({
+    agencyName: 'FX Talents', ownerEmail: 'fx@example.test', type: 'main', status: 'pending',
+    kycStatus: 'pending', isActive: false, source: 'self_signup', ...over,
+  })
+  const SELLER = (over = {}) => ({
+    crmId: 'FXS00001', displayName: 'FX Coins', phone: '+919811100099', email: 'fxs@example.test',
+    registrationProofUrl: '', idDocUrls: [], isApproved: false, isActive: false, status: 'pending',
+    coinBalance: 0, totalCoinsSold: 0, qrCodeUrl: '', source: 'self_signup', ...over,
+  })
+  const applicant = phone('uidFxApplicant', 1)
+  await no('FX-09: an UNAUTHENTICATED caller cannot create an agency',
+    () => setDoc(D(nobody, 'agencies/FX_AG_ANON'), AGENCY()))
+  await no('FX-09: …nor a coin seller',
+    () => setDoc(D(nobody, 'sellers/FX_SL_ANON'), SELLER()))
+  await ok('a signed-in applicant with a verified phone still applies (agency, self_signup)',
+    () => setDoc(D(applicant, 'agencies/FX_AG_OK'), AGENCY({ ownerUid: 'uidFxApplicant' })))
+  await ok('…and as a coin seller (self_signup, naming themselves)',
+    () => setDoc(D(applicant, 'sellers/FX_SL_OK'), SELLER({ ownerUid: 'uidFxApplicant' })))
+  await no('FX-06: a client cannot write the API\'s own `self_app` source on an agency',
+    () => setDoc(D(applicant, 'agencies/FX_AG_SELFAPP'), AGENCY({ ownerUid: 'uidFxApplicant', source: 'self_app' })))
+  await no('FX-06: …nor on a seller',
+    () => setDoc(D(applicant, 'sellers/FX_SL_SELFAPP'), SELLER({ ownerUid: 'uidFxApplicant', source: 'self_app' })))
+  await no('FX-06: …and the signup arm needs the signup source (none → refused)',
+    () => setDoc(D(applicant, 'sellers/FX_SL_NOSRC'), SELLER({ ownerUid: 'uidFxApplicant', source: '' })))
+  await no('FX-06: staff cannot write `self_app` either (it is the Admin SDK\'s alone)',
+    () => setDoc(D(opsAdmin, 'agencies/FX_AG_STAFF_SELFAPP'), AGENCY({ source: 'self_app' })))
+
+  // ════════════════════════════════════════════════════════════════════════
+  console.log('FX-02 — the Host lifecycle stamps are the server\'s')
+  // ════════════════════════════════════════════════════════════════════════
+  const STAMPS = [
+    'hostAddedAt', 'hostGrantedAt', 'hostGrantedBy', 'hostGrantedByName', 'hostGrantedByRole',
+    'hostRemovedAt', 'hostRevokedAt', 'hostRevokedBy', 'hostRevokedByName', 'hostRevokedByRole',
+    'hostRevokedReason', 'hostRestoredAt', 'hostRestoredBy', 'hostRestoredByName', 'hostRestoredByRole',
+    'hostActivatedAt', 'agencyTransferredAt', 'agencyTransferredFrom',
+  ]
+  const REVOKED = {
+    uid: 'uidFxRevoked', name: 'Revoked Host', isProfileComplete: true, isHost: false,
+    hostRevokedAt: new Date('2026-10-01T00:00:00Z'), hostRemovedAt: new Date('2026-10-01T00:00:00Z'),
+    hostRevokedReason: 'policy', hostRevokedBy: 'uidFxOps', bio: 'before',
+  }
+  await seed('users/uidFxRevoked', REVOKED)
+  const revoked = phone('uidFxRevoked', 2)
+  await no('the owner cannot ERASE their own revocation (delete hostRevokedAt)',
+    () => updateDoc(D(revoked, 'users/uidFxRevoked'), { hostRevokedAt: deleteField(), hostRemovedAt: deleteField() }))
+  await no('…nor fake a reinstatement (write hostRestoredAt)',
+    () => updateDoc(D(revoked, 'users/uidFxRevoked'), { hostRestoredAt: new Date() }))
+  for (const field of STAMPS) {
+    await no(`the owner cannot write ${field}`,
+      () => updateDoc(D(revoked, 'users/uidFxRevoked'), { [field]: field.endsWith('At') ? new Date() : 'x' }))
+  }
+  await ok('the owner still edits their own profile (bio) — unchanged',
+    () => updateDoc(D(revoked, 'users/uidFxRevoked'), { bio: 'after' }))
+  for (const field of ['hostRevokedAt', 'hostRestoredAt', 'hostRevokedReason', 'agencyTransferredFrom']) {
+    await no(`a staff browser cannot write ${field} (the API is the only path)`,
+      () => updateDoc(D(opsAdmin, 'users/uidFxRevoked'), { [field]: field.endsWith('At') ? new Date() : 'x' }))
+  }
+  await no('…nor erase a revocation',
+    () => updateDoc(D(ownerStaff, 'users/uidFxRevoked'), { hostRevokedAt: deleteField() }))
+  await ok('staff still edit an ordinary field — unchanged',
+    () => updateDoc(D(opsAdmin, 'users/uidFxRevoked'), { warnings: 1 }))
+
+  // ════════════════════════════════════════════════════════════════════════
+  console.log('FX-11 — an agency reads its own roster (and still may not list users)')
+  // ════════════════════════════════════════════════════════════════════════
+  for (const [id, uid, code] of [['FXA', 'uidFxAgA', 'FXA111'], ['FXB', 'uidFxAgB', 'FXB222']]) {
+    await seed(`agencies/${id}`, {
+      agencyName: id, ownerEmail: `${id}@example.test`, type: 'main', parentAgencyId: null,
+      status: 'approved', isActive: true, kycStatus: 'approved', crmUid: uid, referralCode: code,
+    })
+    await seed(`crmUsers/${uid}`, {
+      uid, role: 'agency', isActive: true, status: 'approved', agencyId: id,
+      roleStatus: { agency: 'approved' },
+    })
+  }
+  const agA = testEnv.authenticatedContext('uidFxAgA', { email: 'fxa@example.test', email_verified: true })
+  const agB = testEnv.authenticatedContext('uidFxAgB', { email: 'fxb@example.test', email_verified: true })
+  await seed('agencies/FXA/agencyHosts/uidFxH1', { uid: 'uidFxH1', name: 'H1', agencyId: 'FXA' })
+  await seed('agencies/FXA/agencyHosts/uidFxH2', { uid: 'uidFxH2', name: 'H2', agencyId: 'FXA', active: false, removedReason: 'revoked' })
+  await seed('users/uidFxH1', { uid: 'uidFxH1', name: 'H1', isHost: true, agencyId: 'FXA', isProfileComplete: true })
+  await ok('FX-11: an agency lists its OWN roster subcollection',
+    () => getDocs(C(agA, 'agencies/FXA/agencyHosts')))
+  await ok('…and GETs each host\'s user document (the dashboard completes the row)',
+    () => getDoc(D(agA, 'users/uidFxH1')))
+  await no('…but not another agency\'s roster',
+    () => getDocs(C(agB, 'agencies/FXA/agencyHosts')))
+  await no('RF-16 (unchanged): an agency may not LIST users — why the old dashboard query failed',
+    () => getDocs(query(C(agA, 'users'), where('agencyId', '==', 'FXA'))))
+  await no('…and no client writes the roster (server-written)',
+    () => setDoc(D(agA, 'agencies/FXA/agencyHosts/uidFxH3'), { uid: 'uidFxH3', agencyId: 'FXA' }))
+
+  // ════════════════════════════════════════════════════════════════════════
+  console.log('FX-12 — invitations: create-only at a deterministic id; withdraw your own pending one')
+  // ════════════════════════════════════════════════════════════════════════
+  const INVITE = (agencyId, code, over = {}) => ({
+    referralCode: code, agencyId, agencyName: agencyId, hostName: 'Invited', applicantPhone: '+919811100500',
+    applicantEmail: 'inv@example.test', isActivated: false, status: 'pending', kycStatus: 'submitted',
+    createdAt: new Date(), ...over,
+  })
+  const INV_ID = `inv_${'a'.repeat(40)}`
+  await no('reading an invitation id that does not exist is refused (the CRM reads that as "free")',
+    () => getDoc(D(agA, `hostApplications/${INV_ID}`)))
+  await ok('FX-12: an agency creates its invitation at the deterministic id',
+    () => setDoc(D(agA, `hostApplications/${INV_ID}`), INVITE('FXA', 'FXA111')))
+  await no('FX-12: a SECOND write to that id (a re-submit, a second tab) is refused — create-only',
+    () => setDoc(D(agA, `hostApplications/${INV_ID}`), INVITE('FXA', 'FXA111', { hostName: 'Invited again' })))
+  await ok('…and the agency reads its own invitation back',
+    () => getDoc(D(agA, `hostApplications/${INV_ID}`)))
+  await no('another agency cannot write at that id',
+    () => setDoc(D(agB, `hostApplications/${INV_ID}`), INVITE('FXB', 'FXB222')))
+  await no('…nor withdraw it',
+    () => deleteDoc(D(agB, `hostApplications/${INV_ID}`)))
+  await ok('FX-12: the agency WITHDRAWS its own pending invitation',
+    () => deleteDoc(D(agA, `hostApplications/${INV_ID}`)))
+  await seed('hostApplications/FX_INV_APPROVED', INVITE('FXA', 'FXA111', {
+    status: 'approved', kycStatus: 'approved', decidedByUid: 'uidFxOps', decidedAt: new Date(),
+  }))
+  await no('…but not one that is already approved (unchanged: the rule allows pending only)',
+    () => deleteDoc(D(agA, 'hostApplications/FX_INV_APPROVED')))
+  await seed('hostApplications/FX_INV_REDEEMED', INVITE('FXA', 'FXA111', {
+    status: 'approved', isActivated: true, activatedByUid: 'uidFxH1',
+  }))
+  await no('…nor a redeemed one',
+    () => deleteDoc(D(agA, 'hostApplications/FX_INV_REDEEMED')))
+
+  // ════════════════════════════════════════════════════════════════════════
+  console.log('FX-13 — appeals: create-only at a deterministic id')
+  // ════════════════════════════════════════════════════════════════════════
+  const APPEAL = (subject, over = {}) => ({
+    subjectUid: subject, subjectName: 'S', raisedByUid: subject, raisedByName: 'S', raisedByRole: 'self',
+    agencyId: '', kind: 'ban', reportId: '', statement: 'I was banned by mistake; please look again at it.',
+    evidenceUrls: [], status: 'pending', createdAt: new Date(), originalDecidedBy: '', ...over,
+  })
+  await seed('users/uidFxBanned', { uid: 'uidFxBanned', name: 'S', isBanned: true, accountState: 'banned' })
+  const banned = phone('uidFxBanned', 3)
+  const SELF_ID = 'self_uidFxBanned_ban-1760000000000'
+  await no('reading an appeal id that does not exist is refused (the app reads that as "free")',
+    () => getDoc(D(banned, `appeals/${SELF_ID}`)))
+  await ok('FX-13: the subject files their appeal at the restriction\'s id',
+    () => setDoc(D(banned, `appeals/${SELF_ID}`), APPEAL('uidFxBanned')))
+  await no('FX-13: a SECOND filing at that id (another device, a retry) is refused — create-only',
+    () => setDoc(D(banned, `appeals/${SELF_ID}`), APPEAL('uidFxBanned', { statement: 'Second copy of the same appeal text.' })))
+  await ok('…the subject reads it back (status, decision)',
+    () => getDoc(D(banned, `appeals/${SELF_ID}`)))
+  // RC (confirmed): "another appeal after a decision only with new evidence
+  // or a valid reason" — slot 2 needs slot 1 DECIDED, and new evidence or a
+  // statement that is not the decided one's. (FX-13 left this unchanged.)
+  await no('RC: slot 2 is refused while slot 1 is still pending',
+    () => setDoc(D(banned, `appeals/${SELF_ID}_2`), APPEAL('uidFxBanned', { statement: 'A different statement, filed early.' })))
+  await seed(`appeals/${SELF_ID}`, { ...APPEAL('uidFxBanned'), status: 'upheld' })
+  await no('RC: after the decision, the SAME statement again is refused',
+    () => setDoc(D(banned, `appeals/${SELF_ID}_2`), APPEAL('uidFxBanned')))
+  await ok('RC: …a NEW reason is accepted at the next slot',
+    () => setDoc(D(banned, `appeals/${SELF_ID}_2`), APPEAL('uidFxBanned', {
+      statement: 'Since the decision I found the call recording that shows it was not me.' })))
+  await no('RC: an appeal at an id that is not the pinned format is refused',
+    () => setDoc(D(banned, 'appeals/RANDOM_AUTO_ID'), APPEAL('uidFxBanned', { statement: 'Filed at an automatic id instead.' })))
+  const CONTEST_ID = 'contest_FXA_REPORT1'
+  const CONTEST = APPEAL('uidFxH1', {
+    subjectName: 'H1', raisedByUid: 'uidFxAgA', raisedByName: 'FXA', raisedByRole: 'agency',
+    agencyId: 'FXA', kind: 'report', reportId: 'REPORT1',
+    statement: 'The report was about another account; our host was not in that call.',
+  })
+  await ok('FX-13: an agency contests a report decision at the (agency, report) id',
+    () => setDoc(D(agA, `appeals/${CONTEST_ID}`), CONTEST))
+  await no('FX-13: a second contest at that id is refused — create-only',
+    () => setDoc(D(agA, `appeals/${CONTEST_ID}`), { ...CONTEST, statement: 'Pressing contest again with the same text.' }))
+  await ok('…and the agency lists its own appeals (to hide Contest while one is pending)',
+    () => getDocs(query(C(agA, 'appeals'), where('agencyId', '==', 'FXA'))))
+}
+
+// ── Result ──────────────────────────────────────────────────────────────────
+let aborted = false
+try {
+  await main()
+} catch (err) {
+  aborted = true
+  console.error(`ABORTED: ${String(err?.message ?? err).split('\n')[0]}`)
+} finally {
+  await testEnv.cleanup().catch(() => undefined)
+}
+if (tally.failures > 0) {
+  console.error(`\n${tally.failures} of ${tally.checks} FX rule checks FAILED:`)
+  for (const f of failed) console.error(`  · ${f}`)
+}
+if (!aborted && tally.failures === 0) console.log(`\nAll ${tally.checks} FX rule checks passed.`)
+printResult(aborted)
+const code = aborted || tally.failures > 0 ? 1 : 0
+process.exitCode = code
+setTimeout(() => process.exit(code), 2000).unref()

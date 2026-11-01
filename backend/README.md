@@ -29,19 +29,25 @@ python3 -m venv .venv
 source .venv/bin/activate
 python --version                                 # confirm 3.12.x
 pip install -r requirements.txt
-cp .env.example .env                             # then fill it in
-uvicorn app.main:app --reload --port 8080
+cp .env.example .env.local                       # local only: emulators + local MongoDB
+uvicorn app.main:app --reload --port 8000        # 8080 belongs to the Firestore emulator
 ```
 
-Interactive API docs: <http://localhost:8080/docs>
+Interactive API docs: <http://localhost:8000/docs>
+
+Outside production the API refuses to reach anything but this machine: a local
+MongoDB, the Firebase emulators under a `demo-` project, and no email. See
+[LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md) for the setup and for how a
+deliberate production operation is confirmed.
 
 ### MongoDB must be a replica set
 
 Transactions are used for every money movement, and a standalone `mongod`
-cannot start one. Either use Atlas, or run a single-node replica set locally:
+cannot start one. Production uses Atlas; locally, run a single-node replica set
+on this machine (a remote server is refused outside production):
 
 ```bash
-docker run -d -p 27017:27017 --name zipper-mongo mongo:7 --replSet rs0
+docker run -d -p 127.0.0.1:27017:27017 --name zipper-mongo mongo:7 --replSet rs0
 docker exec zipper-mongo mongosh --eval 'rs.initiate()'
 ```
 

@@ -26,21 +26,22 @@
  *   rate line comes from the rates the reports API says it used.
  */
 
-import UploadField from '@/components/UploadField'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import {
-  AlertTriangle, ArrowLeft, Calendar, Check, CheckCircle2, ChevronRight,
+  AlertTriangle, ArrowLeft, Check, CheckCircle2, ChevronRight,
   Copy, Download, ExternalLink, FileImage, Hash, Info, Loader2, Wallet, X,
   XCircle,
 } from 'lucide-react'
 
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, CrmRole } from '@/lib/auth'
+import { nameOrReference, referenceOf } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import api, { ApiError, type Card } from '@/lib/api'
 import {
-  getWithdrawalRequests, approveWithdrawal, markWithdrawalPaid, rejectWithdrawal,
-  type WithdrawalRequest, type PaymentProof,
+  getWithdrawalRequests, approveWithdrawal, rejectWithdrawal,
+  type WithdrawalRequest,
 } from '@/lib/firestore'
 import { Column, DataTable } from '@/components/ui/DataTable'
 import { DateRangePicker, Range, defaultRange, toParams } from '@/components/ui/DateRange'
@@ -68,11 +69,6 @@ const FINANCE_ROLES: CrmRole[] = ['superadmin', 'finance_admin']
 /** The Firestore query behind this list is capped; say so rather than imply completeness. */
 const QUEUE_LIMIT = 100
 
-const PAYMENT_MODES = [
-  'NEFT', 'IMPS', 'UPI', 'Binance', 'USDT TRC20', 'USDT ERC20', 'Bank Transfer',
-]
-const FOREIGN_MODES = ['Binance', 'USDT TRC20', 'USDT ERC20']
-
 const STATUS_STYLE: Record<WithdrawalRequest['status'], string> = {
   pending: 'bg-yellow-500/15 text-yellow-300 border border-yellow-500/30',
   approved: 'bg-blue-500/15 text-blue-300 border border-blue-500/30',
@@ -95,219 +91,16 @@ function ageDays(iso: string): number {
   return (Date.now() - new Date(iso).getTime()) / 86_400_000
 }
 
-// ── Mark paid ─────────────────────────────────────────────────────────────────
-
-function MarkPaidModal({
-  req, onClose, onPaid,
-}: {
-  req: WithdrawalRequest
-  onClose: () => void
-  onPaid: (id: string, proof: PaymentProof) => void
-}) {
-  const isForeign = req.paymentType === 'foreign'
-  const [proof, setProof] = useState<PaymentProof>({
-    utrNumber: '',
-    transactionRef: '',
-    transactionProofUrl: '',
-    transactionDate: new Date().toISOString().slice(0, 10),
-    paymentMode: isForeign ? 'Binance' : 'IMPS',
-    notes: '',
-  })
-  const [saving, setSaving] = useState(false)
-  const [err, setErr] = useState('')
-
-  function set<K extends keyof PaymentProof>(k: K, v: string) {
-    setProof((p) => ({ ...p, [k]: v }))
-  }
-
-  async function submit() {
-    if (!proof.utrNumber?.trim() && !proof.transactionRef?.trim()) {
-      setErr('Enter at least a UTR number or a transaction reference — a payment with no reference cannot be reconciled later.')
-      return
-    }
-    setSaving(true)
-    setErr('')
-    try {
-      await markWithdrawalPaid(req.id, proof)
-      onPaid(req.id, proof)
-      onClose()
-    } catch {
-      setErr('The payment was not recorded. Nothing was changed — try again.')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
-          <div>
-            <h3 className="text-white font-semibold">Mark as paid</h3>
-            <p className="text-slate-500 text-xs mt-0.5">
-              Every transfer is offline — record the proof, or it cannot be reconciled.
-            </p>
-          </div>
-          <button onClick={onClose} className="text-slate-500 hover:text-white">
-            <X size={18} />
-          </button>
-        </div>
-
-        <div className="mx-6 my-4 bg-slate-800 rounded-xl p-4 flex items-center justify-between gap-4">
-          <div className="min-w-0">
-            <p className="text-white font-semibold truncate">{req.hostName || req.uid}</p>
-            <p className="text-slate-400 text-xs">{req.phoneNumber || '—'}</p>
-          </div>
-          <div className="text-right shrink-0">
-            <p className="text-2xl font-bold text-green-400 tabular-nums">
-              {formatNativeAmount(req.inrAmount, 'inr')}
-            </p>
-            <p className="text-slate-500 text-xs tabular-nums">
-              {formatCount(req.beans)} beans
-              {isForeign && ' · settles abroad'}
-            </p>
-          </div>
-        </div>
-
-        <div className="mx-6 mb-4 flex items-start gap-2 bg-blue-500/10 border border-blue-500/20 rounded-lg px-3 py-2">
-          <Info size={13} className="text-blue-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-blue-300">
-            {isForeign ? (
-              <span>
-                Pay via <strong>Binance UID {req.binanceUid || '—'}</strong>. The amount
-                above is the rupee figure on the request; the settled foreign amount is
-                whatever the transfer actually cost — record it in the notes.
-              </span>
-            ) : req.upiId ? (
-              <span>
-                Pay via <strong>UPI {req.upiId}</strong>
-              </span>
-            ) : (
-              <span>
-                Pay to <strong>{req.bankName || 'the bank on file'}</strong> · A/C{' '}
-                {req.accountNumber || '—'} · IFSC {req.ifscCode || '—'}
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="px-6 space-y-4 pb-2">
-          <div>
-            <label className="block text-slate-400 text-xs mb-1.5 font-medium">
-              Payment mode
-            </label>
-            <div className="flex flex-wrap gap-2">
-              {PAYMENT_MODES.filter((m) =>
-                isForeign ? FOREIGN_MODES.includes(m) : !FOREIGN_MODES.includes(m),
-              ).map((m) => (
-                <button
-                  key={m}
-                  onClick={() => set('paymentMode', m)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition ${
-                    proof.paymentMode === m
-                      ? 'bg-pink-500 border-pink-500 text-white'
-                      : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
-                  }`}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-slate-400 text-xs mb-1.5 font-medium">
-                <Hash size={10} className="inline mr-1" />
-                UTR number
-              </label>
-              <input
-                value={proof.utrNumber}
-                onChange={(e) => set('utrNumber', e.target.value)}
-                placeholder="e.g. HDFC12345678"
-                className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-pink-500 transition"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-400 text-xs mb-1.5 font-medium">
-                <Hash size={10} className="inline mr-1" />
-                Transaction reference
-              </label>
-              <input
-                value={proof.transactionRef}
-                onChange={(e) => set('transactionRef', e.target.value)}
-                placeholder="Bank / UPI / Binance ref"
-                className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-pink-500 transition"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-slate-400 text-xs mb-1.5 font-medium">
-                <Calendar size={10} className="inline mr-1" />
-                Transaction date
-              </label>
-              <input
-                type="date"
-                value={proof.transactionDate}
-                onChange={(e) => set('transactionDate', e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-pink-500 transition"
-              />
-            </div>
-            <UploadField
-              label="Transfer screenshot"
-              value={proof.transactionProofUrl ?? ''}
-              onChange={(url) => set('transactionProofUrl', url)}
-              storagePath="evidence/withdrawals"
-              accept="image/*,application/pdf"
-            />
-          </div>
-
-          <div>
-            <label className="block text-slate-400 text-xs mb-1.5 font-medium">
-              Notes (optional)
-            </label>
-            <input
-              value={proof.notes}
-              onChange={(e) => set('notes', e.target.value)}
-              placeholder={
-                isForeign
-                  ? 'e.g. settled 118.40 USDT at the rate on the day'
-                  : 'Anything worth recording…'
-              }
-              className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-pink-500 transition"
-            />
-          </div>
-
-          {err && (
-            <p className="text-red-400 text-xs flex items-start gap-1.5">
-              <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-              {err}
-            </p>
-          )}
-        </div>
-
-        <div className="flex gap-3 px-6 py-4 border-t border-slate-800 mt-3">
-          <button
-            onClick={onClose}
-            className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={submit}
-            disabled={saving}
-            className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors flex items-center justify-center gap-2"
-          >
-            {saving ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
-            Confirm payment
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
+// ── There is no "Mark paid" ──────────────────────────────────────────────────
+//
+// P0-7 (FIN-5). This page used to record a payment by writing `status: 'paid'`
+// and the bank proof straight onto the request. Nothing debited the host's
+// beans and nothing wrote a ledger row, so the same earnings stayed
+// convertible and withdrawable — a payout the books never saw. A request is
+// now paid ONLY by executing the host-withdrawal card raised for it (below):
+// the executor debits the wallet, writes the ledger row and marks the request
+// paid in one Firestore transaction, and `firestore.rules` refuses `paid` from
+// any browser.
 
 // ── The money board half of a withdrawal ──────────────────────────────────────
 //
@@ -341,9 +134,12 @@ function RaiseCardDialog({
     setBusy(true)
     setErr('')
     try {
-      const card = await api.partnerOps.requestHostWithdrawal(req.uid, {
+      // P0-7: the card carries this request, and executing it settles it.
+      const card = await api.partnerOps.requestHostWithdrawal(req.hostUid || req.uid, {
         beans: Math.trunc(beans),
         reason: reason.trim(),
+        request_collection: 'withdrawalRequests',
+        request_id: req.id,
       })
       onRaised(
         `Card raised for ${formatCount(Math.trunc(beans))} beans. Nothing has moved — `
@@ -569,11 +365,12 @@ export default function WithdrawalsPage() {
 
   const [rejectTarget, setRejectTarget] = useState<WithdrawalRequest | null>(null)
   const [rejectReason, setRejectReason] = useState('')
-  const [markPaidTarget, setMarkPaidTarget] = useState<WithdrawalRequest | null>(null)
   const [proofViewer, setProofViewer] = useState<WithdrawalRequest | null>(null)
   const [raiseTarget, setRaiseTarget] = useState<WithdrawalRequest | null>(null)
   /** Advisory notes the API attaches to a raised card — never a refusal. */
   const [cardWarnings, setCardWarnings] = useState<string[]>([])
+  // B1: `agencyId` is an agencies/{id} record id — named from `agencies`.
+  const agencies = useIdentities({ enabled: allowed, partners: requests.map((r) => r.agencyId) })
 
   const loadList = useCallback(() => {
     if (!allowed) return
@@ -757,7 +554,9 @@ export default function WithdrawalsPage() {
       hideOnMobile: true,
       render: (r) =>
         r.agencyId ? (
-          <span className="text-purple-300 text-xs font-mono">{r.agencyId}</span>
+          <span className="text-purple-300 text-xs" title={referenceOf('agency', r.agencyId)}>
+            {nameOrReference(agencies.partners.get(r.agencyId), r.agencyId, 'agency')}
+          </span>
         ) : (
           <span className="text-slate-600 text-xs">none</span>
         ),
@@ -864,7 +663,7 @@ export default function WithdrawalsPage() {
               className="flex items-center gap-1 text-blue-400 hover:text-blue-300 text-xs transition-colors"
             >
               <Hash size={11} />
-              {r.utrNumber || r.transactionRef || 'Proof'}
+              {r.paymentRef || r.utrNumber || r.transactionRef || 'Proof'}
             </button>
           )}
           {r.status === 'pending' && canAct && (
@@ -896,21 +695,15 @@ export default function WithdrawalsPage() {
           )}
           {r.status === 'approved' && canAct && (
             <>
-              {/* The card is what moves the beans. Offered beside "Mark paid"
-                  rather than instead of it because the two record different
-                  things: the card debits the wallet and files the ledger row,
-                  this Firestore row is the request the host can see. */}
+              {/* The card is what moves the beans, and executing it is the
+                  ONLY thing that marks this request paid (P0-7): the executor
+                  debits the wallet, writes the ledger row and settles this
+                  request in one transaction. */}
               <button
                 onClick={(e) => { e.stopPropagation(); setRaiseTarget(r) }}
                 className="flex items-center gap-1 text-pink-400 hover:text-pink-300 text-xs transition-colors"
               >
                 <Wallet size={11} /> Raise card
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setMarkPaidTarget(r) }}
-                className="flex items-center gap-1 text-blue-400 hover:text-blue-300 text-xs transition-colors"
-              >
-                <Check size={11} /> Mark paid
               </button>
             </>
           )}
@@ -1248,20 +1041,6 @@ export default function WithdrawalsPage() {
         />
       )}
 
-      {/* Mark paid */}
-      {markPaidTarget && (
-        <MarkPaidModal
-          req={markPaidTarget}
-          onClose={() => setMarkPaidTarget(null)}
-          onPaid={(id, proof) => {
-            patchRequest(id, { status: 'paid', ...proof })
-            setFlash(
-              `Payment recorded for ${markPaidTarget.hostName || markPaidTarget.uid}.`,
-            )
-          }}
-        />
-      )}
-
       {/* Reject */}
       {rejectTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
@@ -1337,7 +1116,9 @@ export default function WithdrawalsPage() {
                   label: 'Amount',
                   value: formatNativeAmount(proofViewer.inrAmount, 'inr'),
                 },
-                { label: 'Paid on', value: whenOf(proofViewer.processedAt) },
+                { label: 'Paid on', value: whenOf(proofViewer.paidAt ?? proofViewer.processedAt) },
+                { label: 'Payment reference', value: proofViewer.paymentRef },
+                { label: 'Paid by card', value: proofViewer.cardId },
                 { label: 'Payment mode', value: proofViewer.paymentMode },
                 { label: 'UTR number', value: proofViewer.utrNumber },
                 { label: 'Transaction ref', value: proofViewer.transactionRef },

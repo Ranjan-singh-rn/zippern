@@ -1,0 +1,16 @@
+# PROPOSED — not applied. Base: pre-P1 copy (P1 stage mfa-sid backup)
+# Base confidence: UNCERTAIN: pre-P1 copy, but the file may have changed between 20 Oct and P1; needs the downloaded source
+# Note: syncStorageRoleClaim is deployed; this keeps mfa_sid out of account-wide claims.
+--- a/functions/src/storageClaims.ts
++++ b/functions/src/storageClaims.ts
+@@ -246,6 +246,10 @@
+   const rest = { ...existing }
+   delete rest.role
+   delete rest.aid
++  // P1-A3b: `mfa_sid` is a per-session developer claim (Owner MFA custom-token
++  // sign-in). An account-wide claim of that name would apply to every sign-in
++  // of the account, so it is never carried forward here.
++  delete (rest as Record<string, unknown>).mfa_sid
+ 
+   if (decision.kind === 'clear') {
+     await auth.setClaims(uid, rest)

@@ -82,11 +82,12 @@ fun MainScreen(
     onNavigateToChat: (String) -> Unit = {},
     onNavigateToAgencyDashboard: () -> Unit = {},
     onNavigateToSellerDashboard: () -> Unit = {},
+    onNavigateToWork: () -> Unit = {},
     onNavigateToFeedback: () -> Unit = {},
     /** The liveness capture, for a host who has not completed it. */
     onNavigateToFaceVerification: (String) -> Unit = {},
-    /** Redeem an agency code, for a user who is not a host yet. */
-    onNavigateToJoinAgency: () -> Unit = {},
+    /** "Become a partner" — apply as Host, Agency, Sub-agency or Coin Seller. */
+    onNavigateToPartnerHub: () -> Unit = {},
     onLogout: () -> Unit = {},
 ) {
     val tabNavController  = rememberNavController()
@@ -163,9 +164,10 @@ fun MainScreen(
                     onNavigateToDailyRewards        = onNavigateToDailyRewards,
                     onNavigateToAgencyDashboard     = onNavigateToAgencyDashboard,
                     onNavigateToSellerDashboard     = onNavigateToSellerDashboard,
+                    onNavigateToWork                = onNavigateToWork,
                     onNavigateToFeedback            = onNavigateToFeedback,
                     onNavigateToFaceVerification    = onNavigateToFaceVerification,
-                    onNavigateToJoinAgency          = onNavigateToJoinAgency,
+                    onNavigateToPartnerHub          = onNavigateToPartnerHub,
                     onLogout                        = onLogout,
                 )
             }

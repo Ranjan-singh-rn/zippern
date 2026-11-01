@@ -61,8 +61,15 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import admin from 'firebase-admin'
+import { guardKeyScript } from './_keyScriptGuard.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('backfill-public-sellers', {
+  keyPath: new URL('../../serviceAccountKey.json', import.meta.url),
+  writes: process.argv.includes('--apply'),
+})
 const keyPath = resolve(here, '../../serviceAccountKey.json')
 
 const argv = process.argv.slice(2)
@@ -231,7 +238,9 @@ async function main() {
   for (const [id, pub] of shouldPublish) {
     const now = existingById.get(id)
     if (!now) toCreate.push(id)
-    else if (PUBLIC_FIELDS.some((f) => now[f] !== pub[f]) || now.sellerId !== pub.sellerId) toUpdate.push(id)
+    // Structural comparison: `paymentMethods` is an array, and `!==` on two
+    // equal arrays is always true, which would rewrite every seller every run.
+    else if (PUBLIC_FIELDS.some((f) => JSON.stringify(now[f]) !== JSON.stringify(pub[f])) || now.sellerId !== pub.sellerId) toUpdate.push(id)
     else unchanged.push(id)
   }
   // Present in the public collection and no longer entitled to be — a seller

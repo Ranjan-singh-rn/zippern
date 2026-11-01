@@ -1,9 +1,35 @@
-const admin = require('firebase-admin');
-const serviceAccount = require('./serviceAccountKey.json');
+/*
+ * P0-10 (OPS-A) — QUARANTINED. This deletes EVERY Firebase Auth user in the
+ * project it reaches. It used to load ./serviceAccountKey.json — the production
+ * key — with no prompt and no guard.
+ *
+ * It now runs ONLY against the Auth emulator on this machine, under a demo-
+ * project, and never reads a key:
+ *
+ *   FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 node deleteUsers.js --project demo-zipper
+ *
+ * There is no production mode. Removing the file itself awaits owner approval.
+ */
+(() => {
+  const args = process.argv.slice(2);
+  const i = args.indexOf('--project');
+  const project = i >= 0 ? String(args[i + 1] || '').trim() : '';
+  const emulator = String(process.env.FIREBASE_AUTH_EMULATOR_HOST || '').trim();
+  const loopback = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\]|::1)(:\d+)?$/.test(emulator);
+  if (!project.startsWith('demo-') || !loopback) {
+    console.error(
+      'deleteUsers.js: refusing — this deletes EVERY Firebase Auth user. It runs only ' +
+      'against the Auth emulator on this machine:\n' +
+      '  FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 node deleteUsers.js --project demo-<name>',
+    );
+    process.exit(2);
+  }
+  module.exports.__project = project;
+})();
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+const admin = require('firebase-admin');
+
+admin.initializeApp({ projectId: module.exports.__project });
 
 async function deleteAllUsers() {
   let nextPageToken;

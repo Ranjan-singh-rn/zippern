@@ -1,0 +1,263 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...) (= HEAD)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/routers/auth.py
++++ b/backend/app/routers/auth.py
+@@ -8,11 +8,12 @@
+ from pydantic import BaseModel, Field
+ 
+ from app.core import audit
+-from app.core.deps import current_user
++from app.core.deps import current_user, require_owner_provisioner
+ from app.core.roles import Role
+ from app.core.security import (
+     AuthError,
+     DirectoryUnavailable,
++    issue_session,
+     renew_at,
+     renew_session,
+     request_observer_code,
+@@ -108,7 +109,7 @@
+         reason="Signed in",
+         meta={"method": "firebase", "ip": request.client.host if request.client else None},
+     )
+-    return session_response(token, expires, profile)
++    return session_response(token, expires, await _with_mfa(profile))
+ 
+ 
+ @router.post("/refresh", response_model=SessionResponse)
+@@ -174,7 +175,7 @@
+         reason="Session renewed",
+         meta={"method": "refresh", "ip": ip},
+     )
+-    return session_response(token, expires, profile)
++    return session_response(token, expires, await _with_mfa(profile, token))
+ 
+ 
+ @router.post("/observer/request-code")
+@@ -240,6 +241,8 @@
+         "name": user["name"],
+         "role": str(user["role"]),
+         "team": user["team"],
++        # P1-A3: present on an Owner session only.
++        **({"mfa_verified": bool(user.get("mfa_verified"))} if user["role"] == Role.OWNER else {}),
+     }
+ 
+ 
+@@ -264,6 +267,12 @@
+     """
+     jti = str(user.get("jti", "") or "")
+     if jti:
++        if user.get("role") == Role.OWNER:
++            # P1-A3b: release THIS session's Firestore/Storage binding only —
++            # another browser or the Android app keeps its own.
++            from app.services import owner_mfa
++
++            await owner_mfa.unbind_session(jti, actor=user)
+         await revoke_session(jti)
+ 
+     await audit.record(
+@@ -279,3 +288,204 @@
+         },
+     )
+     return {"message": "Signed out"}
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# Owner two-step sign-in (P1-A3)
++# ══════════════════════════════════════════════════════════════════════════════
++#
++# An Owner's session from `/signin` carries `mfa=False`, and `deps.current_user`
++# refuses it on every route except the ones below (plus `me` and `signout`).
++# `/mfa/verify` and `/mfa/enrol/confirm` answer with a NEW session carrying
++# `mfa=True`; the pending one is revoked in the same step.
++
++
++class MfaCode(BaseModel):
++    code: str = Field(default="", max_length=12)
++    #: P1-A3b — the client's CURRENT Firebase ID token, so Firestore/Storage
++    #: Owner authority can be bound to this sign-in. Optional: without it the
++    #: API session is upgraded and Firestore/Storage stay locked (`firestore_binding`).
++    firebase_id_token: str = Field(default="", max_length=8192)
++    client: str = Field(default="crm", max_length=16)
++
++
++class MfaVerify(BaseModel):
++    code: str = Field(default="", max_length=12)
++    recovery_code: str = Field(default="", max_length=20)
++    firebase_id_token: str = Field(default="", max_length=8192)
++    client: str = Field(default="crm", max_length=16)
++
++
++class MfaBind(BaseModel):
++    firebase_id_token: str = Field(min_length=10, max_length=8192)
++    client: str = Field(default="crm", max_length=16)
++
++
++class MfaBindConfirm(BaseModel):
++    #: The ID token of the Firebase session that redeemed the custom token.
++    firebase_id_token: str = Field(min_length=10, max_length=8192)
++
++
++class MfaReset(BaseModel):
++    reason: str = Field(min_length=10, max_length=1000)
++
++
++async def _with_mfa(profile: dict, token: str | None = None) -> dict:
++    """Tell the CRM where an Owner stands, so it can show the right step."""
++    if str(profile.get("role")) != str(Role.OWNER):
++        return profile
++    from app.services import owner_mfa
++
++    verified = False
++    if token:
++        try:
++            from app.core.security import verify_session
++
++            verified = bool((await verify_session(token)).get("mfa_verified"))
++        except AuthError:
++            verified = False
++    try:
++        st = await owner_mfa.status({**profile, "mfa_verified": verified})
++    except Exception:  # noqa: BLE001
++        # Advisory only — `deps.current_user` enforces MFA whatever this says,
++        # so a failed status read must not fail a sign-in or a renewal. The
++        # CRM calls `/auth/mfa/status` again before showing the step.
++        log.exception("could not read the MFA status of %s", profile.get("uid"))
++        st = {"required": True, "enrolled": None, "verified": verified}
++    # P1-A3b: a renewal reports what happened to the Firestore/Storage binding.
++    carried = profile.pop("mfa_firestore_binding", None) if isinstance(profile, dict) else None
++    if carried is not None:
++        st = {**st, "firestore_binding": {"state": carried}}
++    return {**profile, "mfa": st}
++
++
++def _mfa_fail(exc) -> HTTPException:
++    return HTTPException(status_code=exc.status_code, detail=str(exc))
++
++
++async def _upgraded_session(user: dict, firebase_id_token: str = "", client: str = "crm") -> SessionResponse:
++    """Swap the pending Owner session for one that passed MFA, then bind the
++    caller's Firebase sign-in to it (P1-A3b). The binding result is reported in
++    `user.mfa.firestore_binding`; a failed or missing binding grants nothing in
++    Firestore or Storage, and the client is told so explicitly."""
++    from app.core.security import verify_session
++    from app.services import owner_mfa
++
++    old = str(user.get("jti") or "")
++    if old:
++        await revoke_session(old)
++    token, expires = await issue_session(
++        uid=user["uid"], email=user.get("email", ""), name=user.get("name", ""),
++        role=Role.OWNER, renewed_from=old or None, mfa_verified=True,
++    )
++    new_jti = str((await verify_session(token)).get("jti") or "")
++    # Step 1 of the mfa_sid binding: a custom token for a NEW Firebase session
++    # (CRM: replaces its sign-in; Android: the `ownerWork` app). The client
++    # redeems it and calls /mfa/bind/confirm; until then nothing is unlocked.
++    binding = await owner_mfa.mint_owner_session(
++        user, firebase_id_token, api_jti=new_jti, api_expires=expires, client=client)
++    profile = {"uid": user["uid"], "email": user.get("email", ""), "name": user.get("name", ""),
++               "role": str(Role.OWNER), "team": None}
++    profile = await _with_mfa(profile, token)
++    profile["mfa"] = {**profile.get("mfa", {}), "firestore_binding": binding}
++    return session_response(token, expires, profile)
++
++
++@router.get("/mfa/status")
++async def mfa_status(user: dict = Depends(current_user)):
++    from app.services import owner_mfa
++
++    try:
++        return await owner_mfa.status(user)
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++
++
++@router.post("/mfa/enrol/start")
++async def mfa_enrol_start(user: dict = Depends(current_user)):
++    """A new authenticator secret for the Owner to scan. Shown once."""
++    from app.services import owner_mfa
++
++    try:
++        return await owner_mfa.start_enrolment(user)
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++
++
++@router.post("/mfa/enrol/confirm")
++async def mfa_enrol_confirm(body: MfaCode, user: dict = Depends(current_user)):
++    """First code from the app → recovery codes (shown once) and a full session."""
++    from app.services import owner_mfa
++
++    try:
++        codes = await owner_mfa.confirm_enrolment(user, body.code)
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++    session = await _upgraded_session(user, body.firebase_id_token, body.client)
++    return {"recovery_codes": codes, "session": session.model_dump()}
++
++
++@router.post("/mfa/verify", response_model=SessionResponse)
++async def mfa_verify(body: MfaVerify, user: dict = Depends(current_user)):
++    from app.services import owner_mfa
++
++    if not body.code and not body.recovery_code:
++        raise HTTPException(status_code=400, detail="Enter the code from your authenticator app.")
++    try:
++        await owner_mfa.verify(user, code=body.code, recovery_code=body.recovery_code)
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++    return await _upgraded_session(user, body.firebase_id_token, body.client)
++
++
++@router.post("/mfa/recovery-codes")
++async def mfa_new_recovery_codes(body: MfaCode, user: dict = Depends(current_user)):
++    """Replace the recovery codes. Needs a verified session and a fresh code
++    (this route is NOT open to a pending session — `deps` refuses it)."""
++    from app.services import owner_mfa
++
++    try:
++        return {"recovery_codes": await owner_mfa.regenerate_recovery_codes(user, body.code)}
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++
++
++@router.post("/mfa/owners/{owner_uid}/reset")
++async def mfa_reset_owner(owner_uid: str, body: MfaReset, user: dict = Depends(require_owner_provisioner)):
++    """Observer only: remove an Owner's authenticator (lost phone). Every
++    session of that Owner ends; they set MFA up again on next sign-in."""
++    from app.services import owner_mfa
++
++    try:
++        return await owner_mfa.reset_by_observer(user, owner_uid, body.reason)
++    except owner_mfa.MfaError as exc:
++        raise _mfa_fail(exc) from exc
++
++
++@router.post("/mfa/bind")
++async def mfa_bind(body: MfaBind, user: dict = Depends(current_user)):
++    """Retry unlock: mint a fresh `mfa_sid` custom token for THIS verified
++    Owner session (replacing its previous binding). The caller must present a
++    current Firebase ID token of the same account. A pending session cannot
++    reach this route (`deps` refuses it), so it never substitutes for MFA."""
++    from app.core.security import _session_expiry
++    from app.services import owner_mfa
++
++    if user.get("role") != Role.OWNER or not user.get("mfa_verified"):
++        raise HTTPException(status_code=403, detail="Finish two-step sign-in first.")
++    expires = await _session_expiry(str(user.get("jti") or ""))
++    return await owner_mfa.mint_owner_session(
++        user, body.firebase_id_token, api_jti=str(user.get("jti") or ""), api_expires=expires,
++        client=body.client)
++
++
++@router.post("/mfa/bind/confirm")
++async def mfa_bind_confirm(body: MfaBindConfirm, user: dict = Depends(current_user)):
++    """Step 3: confirm the Firebase session that redeemed this API session's
++    custom token. Only then do Firestore, Storage and the Owner callables
++    accept its `mfa_sid`."""
++    from app.services import owner_mfa
++
++    if user.get("role") != Role.OWNER or not user.get("mfa_verified"):
++        raise HTTPException(status_code=403, detail="Finish two-step sign-in first.")
++    return await owner_mfa.confirm_owner_session(user, body.firebase_id_token)

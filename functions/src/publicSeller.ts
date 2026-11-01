@@ -53,6 +53,18 @@ export const PUBLIC_FIELDS = [
   'description',
   'photoUrl',
   'isOnline',
+  // ── Payment DESTINATIONS, derived from the private `payment` block ─────
+  // A buyer paying a seller outside the app has to be told where to send
+  // the money. A UPI id, a UPI QR and a Binance UID are receiving addresses
+  // the seller publishes for exactly that purpose; they identify where money
+  // goes TO, not the seller's own funds. The bank ACCOUNT NUMBER, IFSC,
+  // holder name and branch are not here and never will be — a bank account
+  // can be debited with a mandate, and it is reviewed by staff in the CRM
+  // like any KYC field.
+  'upiId',
+  'upiQrUrl',
+  'binanceUid',
+  'paymentMethods',
 ] as const
 
 /**
@@ -78,6 +90,10 @@ export const NEVER_PUBLIC = [
   // Account and linkage metadata
   'crmId', 'crmUid', 'ownerUid', 'secondRoleOwnerUid', 'linkedAgencyId',
   'isAgency', 'createdAt', 'updatedAt',
+  // The private settlement block itself, and every bank field inside it.
+  // Only the three receiving addresses above are lifted out of it.
+  'payment', 'accountNumber', 'accountHolderName', 'ifscCode', 'bankName',
+  'branch', 'internationalDetails',
 ] as const
 
 export interface PublicSeller {
@@ -88,6 +104,12 @@ export interface PublicSeller {
   description: string
   photoUrl: string
   isOnline: boolean
+  /** Where a buyer sends money. Receiving addresses only; never a bank account. */
+  upiId: string
+  upiQrUrl: string
+  binanceUid: string
+  /** Which of `upi | qr | binance | bank | international` the seller accepts. */
+  paymentMethods: string[]
 }
 
 /** A seller document, as Firestore hands it over. */
@@ -110,6 +132,14 @@ export function isPubliclyVisible(doc: SellerDoc | undefined | null): boolean {
   if (!doc) return false
   if (doc.isApproved !== true) return false
   if (doc.isActive !== true) return false
+  // GOV C4 (B06): the OWNER's account is suspended or banned. The backend
+  // writes `ownerRestricted` on every seller record the person owns when the
+  // account is restricted, and clears it when the restriction is lifted. The
+  // seller's own status — the role — is not touched by an account action, so
+  // without this a suspended person stayed in the public directory and buyers
+  // went on paying them. Clients cannot write the field (the sellers update
+  // rules are allow-lists that do not name it).
+  if (doc.ownerRestricted === true) return false
   const status = String(doc.status ?? '').trim()
   if (status === '') return true // legacy record, decided by the two flags above
   return status === 'approved'
@@ -127,6 +157,29 @@ export function toPublicSeller(sellerId: string, doc: SellerDoc): PublicSeller {
     const v = doc[key]
     return typeof v === 'string' ? v : ''
   }
+  // The settlement block the application wrote (`payment: {...}`), read
+  // defensively: it is a private sub-document and may be absent on older
+  // records.
+  const payment = (doc.payment && typeof doc.payment === 'object')
+    ? doc.payment as Record<string, unknown>
+    : {}
+  const pstr = (key: string): string => {
+    const v = payment[key]
+    return typeof v === 'string' ? v : ''
+  }
+  const upiId = pstr('upiId')
+  const upiQrUrl = pstr('upiQrUrl') || str('qrCodeUrl')
+  const binanceUid = pstr('binanceUid')
+  const methods: string[] = []
+  if (upiId) methods.push('upi')
+  if (upiQrUrl) methods.push('qr')
+  if (binanceUid) methods.push('binance')
+  // A bank account is OFFERED without being PUBLISHED: the buyer is told the
+  // seller accepts bank transfer and gets the details from the seller
+  // directly, in chat — the account number itself never leaves the CRM.
+  if (pstr('accountNumber')) methods.push('bank')
+  if (pstr('internationalDetails') || pstr('internationalMethod')) methods.push('international')
+
   return {
     sellerId,
     displayName: str('displayName'),
@@ -135,6 +188,10 @@ export function toPublicSeller(sellerId: string, doc: SellerDoc): PublicSeller {
     description: str('description'),
     photoUrl: str('photoUrl'),
     isOnline: doc.isOnline === true,
+    upiId,
+    upiQrUrl,
+    binanceUid,
+    paymentMethods: methods,
   }
 }
 
@@ -158,7 +215,7 @@ export function publicViewChanged(
   const a = toPublicSeller('x', before ?? {})
   const b = toPublicSeller('x', after ?? {})
   return (PUBLIC_FIELDS as readonly string[]).some(
-    (f) => (a as unknown as Record<string, unknown>)[f]
-        !== (b as unknown as Record<string, unknown>)[f],
+    (f) => JSON.stringify((a as unknown as Record<string, unknown>)[f])
+        !== JSON.stringify((b as unknown as Record<string, unknown>)[f]),
   )
 }

@@ -246,9 +246,14 @@ PINS: list[tuple[str, str, object]] = [
         is_crm_user,
     ),
     ("isSuperAdmin", "isCrmUser() && crmRole() == 'superadmin'", is_super_admin),
+    # P1-A3b: a pending Owner (no MFA-bound sign-in) reads as
+    # 'superadmin_mfa_pending' from crmRole() and is refused here before the
+    # permissions array — which lists every capability for an Owner — is read.
+    # This model assumes a BOUND Owner; tests/firestore.p1mfa.rules.test.mjs
+    # covers the pending case in the emulator.
     (
         "hasPerm",
-        "isCrmUser() && (crmRole() == 'superadmin' || p in crmPermissions())",
+        "isCrmUser() && crmRole() != 'superadmin_mfa_pending' && (crmRole() == 'superadmin' || p in crmPermissions())",
         None,
     ),
     (
@@ -327,10 +332,13 @@ ok(
 #: and the loop below asserts the denial explicitly for every one of them — so a
 #: role added to PRINCIPALS cannot slip through untested.
 MATRIX: dict[str, tuple[object, set[str]]] = {
-    # The money-moving write in this system. Finance admin and the owner.
-    "rechargeRequests.update (staff authority)": (can_decide_coin_ops, {"owner", "finance_admin"}),
-    # Destroying the record of a cash payment. Owner alone.
-    "rechargeRequests.delete": (is_super_admin, {"owner"}),
+    # The money-moving document is NOBODY's to write from a client now. The
+    # API decides recharges (services/recharges.py) through the Admin SDK and
+    # credits through the ledger; the rule is `allow create, update: if false`
+    # and `allow delete: if false`. Not even the owner — a browser write that
+    # the server must then undo is not an authority.
+    "rechargeRequests.update (no client)": (lambda p: False, set()),
+    "rechargeRequests.delete (no client)": (lambda p: False, set()),
     # Rejection only, by Finance admin or the owner; approval left the browser.
     "coinPurchaseRequests.update": (can_decide_coin_ops, {"owner", "finance_admin"}),
     "coinPurchaseRequests.delete": (is_super_admin, {"owner"}),
@@ -355,7 +363,13 @@ for label, (model, allowed) in MATRIX.items():
 
 print("\n── the six groups the matrix has to get right ────────────────────────────")
 for label, (model, allowed) in MATRIX.items():
-    ok(f"{label}: owner allowed", model("owner"))
+    # "owner allowed" holds for every operation with a staff authority. The two
+    # rechargeRequests rows have NONE — the owner is denied there too, by
+    # design — so for them the assertion is the opposite.
+    if not allowed:
+        ok(f"{label}: owner DENIED — no client authority exists", not model("owner"))
+    else:
+        ok(f"{label}: owner allowed", model("owner"))
     for name in DEPT_ADMINS_OFF_DUTY:
         ok(f"{label}: {name} denied — unrelated department", not model(name))
     for name in OUTSIDERS:
@@ -401,18 +415,14 @@ ok(
 
 print("\n── the rule text itself ──────────────────────────────────────────────────")
 
-rr_update = allow("rechargeRequests", "update")
-ok("rechargeRequests.update is gated by canDecideCoinOps()", "canDecideCoinOps()" in rr_update)
-ok("rechargeRequests.update no longer admits isAdmin()", "isAdmin()" not in rr_update)
-ok(
-    "the seller's own-sale path survives",
-    "resource.data.get('sellerUid', '') == request.auth.uid" in rr_update,
-)
-ok(
-    "and so does the self-dealing guard beside it",
-    "resource.data.get('buyerUid', '') != request.auth.uid" in rr_update,
-)
-check("rechargeRequests.delete is the owner alone", allow("rechargeRequests", "delete"), "isSuperAdmin()")
+# The seller's own-sale path and the finance break-glass path are both gone:
+# every write to this collection is the API's. Pinned on the rule text.
+check("rechargeRequests create/update is closed to every client",
+      allow("rechargeRequests", "update"), "false")
+check("rechargeRequests.create is the same clause", allow("rechargeRequests", "create"), "false")
+check("rechargeRequests.delete is closed too — even to the owner",
+      allow("rechargeRequests", "delete"), "false")
+ok("no seller clause survives", "sellerUid', '') == request.auth.uid" not in strip_comments(block("rechargeRequests")).split("allow read")[0] + strip_comments(block("rechargeRequests")).split("allow create")[-1])
 
 cpr_update = allow("coinPurchaseRequests", "update")
 ok("coinPurchaseRequests.update is gated by canDecideCoinOps()", "canDecideCoinOps()" in cpr_update)
@@ -536,7 +546,10 @@ executable = strip_comments(RULES)
 remaining = len(re.findall(r"isAdmin\(\)", executable))
 ok(
     f"isAdmin() still governs the operational collections ({remaining} clauses)",
-    70 <= remaining <= 90,
+    # Phase 1A removed a handful of `isAdmin()` arms on purpose (the crmUsers
+    # partner-status arm; agencies/sellers/hostApplications admin arms now
+    # carry extra guards). The tripwire still catches a large unexplained move.
+    60 <= remaining <= 90,
 )
 for keep in ("feedbackTickets", "supportTickets", "announcements"):
     ok(f"{keep} is untouched and still isAdmin()", "isAdmin()" in strip_comments(block(keep)))
@@ -551,7 +564,7 @@ if failures:
     sys.exit(1)
 
 print(f"\nAll {checks} money-permission checks passed.")
-print("  · rechargeRequests approval: Finance admin or the owner, never marketing_admin")
+print("  · rechargeRequests: no client write of any kind; the API alone decides")
 print("  · coinPurchaseRequests: rejection only from a browser; born pending")
 print("  · rechargeHistory: no CRM user can write into another seller's ledger")
 print("  · coinPurchases: a dead collection is no longer writable")

@@ -13,6 +13,7 @@ import {
 } from 'firebase/firestore'
 import { db } from '@/lib/firebase'
 import type { Dept } from '@/lib/auth'
+import { tickets as apiTickets } from '@/lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -140,19 +141,47 @@ function withoutUndefined<T extends Record<string, unknown>>(data: T): Partial<T
   ) as Partial<T>
 }
 
-export async function createTicket(data: Omit<TechTicket, 'id' | 'createdAt' | 'updatedAt'>): Promise<void> {
-  await addDoc(collection(db, 'techTickets'), {
-    ...withoutUndefined(data),
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  })
+/**
+ * P1-D — Team Tickets are written by the API, not the browser. Firestore rules
+ * refuse client writes to `techTickets`. The server sets the reporter (name,
+ * uid, department) from the session and the assignee's name from their staff
+ * record, so neither is sent from here.
+ */
+export interface NewTicket {
+  title: string
+  description?: string
+  category: TechTicket['category']
+  priority: TechTicket['priority']
+  assignedTeam: Dept
+  assignedTo?: string
 }
 
-export async function updateTicket(id: string, updates: Partial<TechTicket>): Promise<void> {
-  await updateDoc(doc(db, 'techTickets', id), {
-    ...withoutUndefined(updates),
-    updatedAt: serverTimestamp(),
-  })
+export async function createTicket(data: NewTicket): Promise<void> {
+  await apiTickets.createTeam(withoutUndefined({ ...data }) as NewTicket)
+}
+
+/** Fields the server accepts on a Team Ticket. */
+export type TicketChange = Partial<Pick<TechTicket,
+  'status' | 'priority' | 'assignedTeam' | 'assignedTo' | 'title' | 'description' | 'category' | 'labels'>>
+  & { blockedBy?: string | null }
+
+/**
+ * Routing to another team, closing, reopening and changing a dependency need
+ * a `reason`; the API refuses them without one and says so.
+ */
+export async function updateTicket(id: string, changes: TicketChange, reason = ''): Promise<void> {
+  await apiTickets.update('team', id, withoutUndefined(changes as Record<string, unknown>), reason)
+}
+
+/** Does this change need a reason? Mirrors the server rule so the UI can ask first. */
+export function ticketChangeNeedsReason(ticket: Pick<TechTicket, 'status' | 'assignedTeam'>, changes: TicketChange): string | null {
+  if ('blockedBy' in changes) return 'change this ticket’s dependency'
+  if (changes.assignedTeam && changes.assignedTeam !== ticket.assignedTeam) return 'route this ticket to another team'
+  if (changes.status && changes.status !== ticket.status) {
+    if (changes.status === 'done') return 'close this ticket'
+    if (ticket.status === 'done') return 'reopen this ticket'
+  }
+  return null
 }
 
 // ── Gifts ────────────────────────────────────────────────────────────────────

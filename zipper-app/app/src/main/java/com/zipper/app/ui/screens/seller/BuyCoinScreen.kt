@@ -162,7 +162,12 @@ fun BuyCoinScreen(
             return@LaunchedEffect
         }
         try {
-            val snap = Firebase.firestore.collection("sellers").document(currentUid).get().await()
+            // FX-05: the seller record named on the login document, not `sellers/{uid}`.
+            val crmSellerId = try {
+                Firebase.firestore.collection("crmUsers").document(currentUid).get().await().getString("sellerId")
+            } catch (_: Exception) { null }
+            val snap = Firebase.firestore.collection("sellers")
+                .document(com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)).get().await()
             sellerName  = snap.getString("displayName") ?: currentUser?.displayName ?: ""
             sellerEmail = snap.getString("email") ?: currentUser?.email ?: ""
             coinBalance = snap.getLong("coinBalance") ?: 0L

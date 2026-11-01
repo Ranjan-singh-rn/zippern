@@ -24,10 +24,40 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings  # noqa: E402
+from app.core import isolation  # noqa: E402
 
 FIREBASE_SIGNIN = (
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={key}"
 )
+
+
+def signin_url() -> str:
+    """Where the email + password exchange goes.
+
+    Outside production: the Auth emulator on this machine, which accepts any API
+    key, and nothing else — this script must not sign anybody in to the real
+    project from a development environment. In production mode: the real
+    endpoint, and a run off Cloud Run must be confirmed like every other
+    production operation (app/core/isolation.py).
+    """
+    if not settings.is_production:
+        host = isolation.emulator_value(
+            settings, "FIREBASE_AUTH_EMULATOR_HOST", "firebase_auth_emulator_host", os.environ
+        )
+        if not host or not isolation.is_loopback_host(isolation.host_of(host)):
+            raise SystemExit(
+                f"ENVIRONMENT={settings.environment}: refusing to sign in against the "
+                "real Firebase Auth. Start the emulators and set "
+                "FIREBASE_AUTH_EMULATOR_HOST (see backend/LOCAL_DEVELOPMENT.md)."
+            )
+        return (
+            f"http://{host}/identitytoolkit.googleapis.com/v1/"
+            "accounts:signInWithPassword?key=local-emulator"
+        )
+    problems = isolation.production_problems(settings)
+    if problems:
+        raise SystemExit(" ".join(problems))
+    return FIREBASE_SIGNIN.format(key=firebase_web_api_key())
 
 
 def firebase_web_api_key() -> str:
@@ -58,14 +88,23 @@ def main() -> int:
         return 1
 
     email = sys.argv[1].strip()
-    password = getpass.getpass(f"Password for {email}: ")
+    # Both destinations are decided — and refused — before a password is asked.
+    url = signin_url()
     api_base = os.getenv("API_BASE", f"http://127.0.0.1:{settings.api_port}")
+    if not settings.is_production and not isolation.is_loopback_host(
+        isolation.host_of(api_base)
+    ):
+        raise SystemExit(
+            f"ENVIRONMENT={settings.environment}: API_BASE must be on this machine "
+            "outside production."
+        )
+    password = getpass.getpass(f"Password for {email}: ")
 
     # 1 — Firebase: email + password → ID token
     print("\n  Signing in to Firebase...")
     try:
         fb = httpx.post(
-            FIREBASE_SIGNIN.format(key=firebase_web_api_key()),
+            url,
             json={"email": email, "password": password, "returnSecureToken": True},
             timeout=30,
         )

@@ -38,11 +38,12 @@ export type GuestClaimStatus =
    */
   | 'conflict'
   /**
-   * The bound account has grown into a full one — Google or a phone attached.
+   * The bound account has grown into a full one — Google, email or a phone
+   * attached — and this caller cannot present the device secret.
    *
-   * The binding stands, so the device still gets no second guest, but no session
-   * is handed out for it either: an account with its own credentials should be
-   * reached with them, not by holding the handset.
+   * The binding stands, so the device still gets no second guest. With the
+   * secret (same installation) the account is reopened as `existing_guest`;
+   * without it, it must be reached with its own credentials.
    */
   | 'upgraded'
   /**
@@ -54,6 +55,21 @@ export type GuestClaimStatus =
    * should let go of that account and ask again for the device's actual guest.
    */
   | 'not_a_guest'
+  /**
+   * AUTH-001 (Phase 1A). The caller named a uid it is not signed in as.
+   *
+   * The uid in the request is a claim, and the only proof of it is a verified
+   * Firebase ID token for that same uid. Without this, anybody could bind a
+   * stranger's guest uid (harvested from a profile or a chat) to their own
+   * device and be handed a custom token for it. Nothing is written.
+   */
+  | 'not_owner'
+  /**
+   * AUTH-001 (Phase 1A). The uid is already this-or-that device's guest — on
+   * ANOTHER device. One guest identity belongs to one device; a second device
+   * may not adopt it, even with a valid session for it. Nothing is written.
+   */
+  | 'bound_elsewhere'
 
 export type GuestClaimWrite =
   /** Write the binding, replacing a released one if there was one. */
@@ -112,6 +128,22 @@ export interface GuestClaimInput {
    * cannot have it back.
    */
   callerIsBoundUid: boolean
+  /**
+   * AUTH-001: the uid of the verified Firebase ID token on the call, or '' when
+   * the caller is not signed in. A `wantedUid` that differs from it is refused.
+   */
+  callerUid: string
+  /**
+   * AUTH-001: the reverse index (`guestUidBindings/{wantedUid}`) says the wanted
+   * uid is already bound to a DIFFERENT device whose binding still points at it.
+   */
+  wantedBoundElsewhere: boolean
+  /**
+   * AUTH-001: the binding was written (or re-keyed) by a caller that proved it
+   * owned the uid. Bindings from before Phase 1A carry no such proof, so they
+   * may still return a plain guest but never re-open an UPGRADED account.
+   */
+  bindingVerified: boolean
 }
 
 export interface GuestClaimDecision {
@@ -170,8 +202,21 @@ export function decideGuestClaim(input: GuestClaimInput): GuestClaimDecision {
   const {
     deviceBanned, boundUid, secretMatches, boundUserExists,
     boundIsUpgraded, bindingAgeMs, wantedUid, wantedUserExists, wantedIsUpgraded,
-    callerIsBoundUid,
+    callerIsBoundUid, callerUid, wantedBoundElsewhere, bindingVerified,
   } = input
+
+  /*
+   * ── AUTH-001: A UID IN THE REQUEST IS ONLY A CLAIM ──────────────────────
+   *
+   * Checked first, before anything else reads `wantedUid`. The caller must be
+   * signed in AS the uid it offers. This is what closes the guest takeover:
+   * previously an unauthenticated caller could name any guest uid, have it
+   * bound to a fresh device id under its own secret, and on the next call be
+   * minted a custom token for somebody else's account.
+   */
+  if (wantedUid !== '' && wantedUid !== callerUid) {
+    return { status: 'not_owner', uid: '', write: 'none', replacedReason: '' }
+  }
 
   /*
    * ── THE CALLER'S ACCOUNT IS NOT A GUEST ──────────────────────────────────
@@ -228,6 +273,10 @@ export function decideGuestClaim(input: GuestClaimInput): GuestClaimDecision {
     if (deviceBanned) {
       return { status: 'device_banned', uid: '', write: 'none', replacedReason: '' }
     }
+    // AUTH-001: one guest identity, one device — in both directions.
+    if (wantedBoundElsewhere) {
+      return { status: 'bound_elsewhere', uid: '', write: 'none', replacedReason: '' }
+    }
     return {
       status: 'bound',
       uid: wantedUid,
@@ -264,16 +313,28 @@ export function decideGuestClaim(input: GuestClaimInput): GuestClaimDecision {
   /*
    * THE BOUND ACCOUNT IS NO LONGER A GUEST.
    *
-   * The binding stays — the device does not get a second guest — but no session
-   * is handed out for an account that has its own way in. Otherwise "Continue as
-   * guest" on a handset whose owner has signed out would open their full account
-   * for whoever is holding it, with no credential presented at all.
+   * The binding stays — the device does not get a second guest.
    *
-   * Unless the caller already IS that account, with a verified token for it — in
-   * which case nothing is being released to anybody, and refusing would log
-   * somebody out of their own session for having upgraded it.
+   * PRODUCT DECISION (2026-10-08, owner): on the SAME installation the guest
+   * button keeps opening the account after an email or phone has been added.
+   * The proof is the same one a plain guest presents — the device secret held
+   * in this install's key store — so the bar is unchanged from before the
+   * upgrade. Accepted trade-off: anyone holding the unlocked handset can open
+   * it, exactly as they could the guest account.
+   *
+   * Without the secret (a different install, a wiped key store) the answer is
+   * still `upgraded`: the account has its own credentials and must be reached
+   * with them. That is the half that keeps the device id — readable by any
+   * signed-in account — from ever being enough on its own.
    */
-  if (boundIsUpgraded && !callerIsBoundUid) {
+  /*
+   * Phase 1A re-examination of Option B: the secret is only trustworthy for an
+   * UPGRADED account if the binding itself was created by the account's owner
+   * (`bindingVerified`). A binding from before the ownership check could have
+   * been written by anyone, and honouring it would make a historical takeover
+   * permanent after the victim added their email or phone.
+   */
+  if (boundIsUpgraded && !callerIsBoundUid && (!secretMatches || !bindingVerified)) {
     return { status: 'upgraded', uid: boundUid, write: 'none', replacedReason: '' }
   }
 

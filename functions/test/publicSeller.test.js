@@ -73,11 +73,44 @@ const fullSeller = (over = {}) => ({
 })
 
 describe('what reaches the public document', () => {
-  test('exactly the six fields and the id — no more', () => {
+  test('exactly the ten fields and the id — no more', () => {
+    // Six directory fields, plus the four payment-DESTINATION fields a buyer
+    // needs to pay the seller outside the app: a UPI id, a UPI QR, a Binance
+    // UID and the list of methods accepted. Never a bank account number.
     const pub = toPublicSeller('sl-1', fullSeller())
     expect(Object.keys(pub).sort()).toEqual(
-      ['description', 'displayName', 'isOnline', 'phone', 'photoUrl', 'qrCodeUrl', 'sellerId'],
+      ['binanceUid', 'description', 'displayName', 'isOnline', 'paymentMethods',
+       'phone', 'photoUrl', 'qrCodeUrl', 'sellerId', 'upiId', 'upiQrUrl'],
     )
+  })
+
+  test('payment destinations are lifted from the private block; bank details are not', () => {
+    const pub = toPublicSeller('sl-1', fullSeller({
+      payment: {
+        upiId: 'corner@upi', upiQrUrl: 'https://pay/upi.png', binanceUid: '123456789',
+        accountHolderName: 'Coin Corner Pvt', accountNumber: '001122334455',
+        ifscCode: 'HDFC0001234', bankName: 'HDFC', branch: 'Pune',
+        internationalMethod: 'wise', internationalDetails: 'wise@corner',
+      },
+    }))
+    expect(pub.upiId).toBe('corner@upi')
+    expect(pub.upiQrUrl).toBe('https://pay/upi.png')
+    expect(pub.binanceUid).toBe('123456789')
+    expect(pub.paymentMethods).toEqual(['upi', 'qr', 'binance', 'bank', 'international'])
+    const blob = JSON.stringify(pub)
+    expect(blob.includes('001122334455')).toBe(false)
+    expect(blob.includes('HDFC0001234')).toBe(false)
+    expect(blob.includes('Coin Corner Pvt')).toBe(false)
+    expect(blob.includes('wise@corner')).toBe(false)
+  })
+
+  test('a seller with no payment block publishes empty destinations', () => {
+    const pub = toPublicSeller('sl-1', fullSeller())
+    expect(pub.upiId).toBe('')
+    expect(pub.binanceUid).toBe('')
+    // The legacy top-level qrCodeUrl still counts as a QR destination.
+    expect(pub.upiQrUrl).toBe('https://pay/qr.png')
+    expect(pub.paymentMethods).toEqual(['qr'])
   })
 
   test('and they carry the right values', () => {
@@ -127,7 +160,7 @@ describe('what reaches the public document', () => {
       payoutReference: 'UTR-00099',
       internalRiskScore: 0.82,
     }))
-    expect(Object.keys(pub).length).toBe(7)
+    expect(Object.keys(pub).length).toBe(11)
     expect(JSON.stringify(pub).includes('ABCDE1234F')).toBe(false)
     expect(JSON.stringify(pub).includes('UTR-00099')).toBe(false)
   })
@@ -174,6 +207,21 @@ describe('who appears in the directory', () => {
 
   test('approved but deactivated does not', () => {
     expect(isPubliclyVisible(fullSeller({ isActive: false }))).toBe(false)
+  })
+
+  test('GOV C4 (B06): an approved seller whose OWNER account is restricted does not', () => {
+    // A suspension or ban is an account action: the seller record stays
+    // approved, and the backend marks it `ownerRestricted` instead.
+    expect(isPubliclyVisible(fullSeller({ ownerRestricted: true }))).toBe(false)
+    expect(isPubliclyVisible(fullSeller({ ownerRestricted: false }))).toBe(true)
+  })
+
+  test('GOV C4 (B06): the restriction flipping is a public-view change, both ways', () => {
+    const listed = fullSeller()
+    const hidden = fullSeller({ ownerRestricted: true })
+    expect(publicViewChanged(listed, hidden)).toBe(true)
+    expect(publicViewChanged(hidden, fullSeller({ ownerRestricted: false }))).toBe(true)
+    expect(publicViewChanged(hidden, fullSeller({ ownerRestricted: true }))).toBe(false)
   })
 
   test('a legacy record with no status is decided by the two flags', () => {

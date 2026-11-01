@@ -1,0 +1,79 @@
+# PROPOSED — not applied. Base: none (new file)
+# Base confidence: NEW FILE: does not exist in production
+--- a/functions/src/ownerMfa.ts
++++ b/functions/src/ownerMfa.ts
+@@ -0,0 +1,74 @@
++/**
++ * P1-A3b — the Owner MFA boundary, for Cloud Functions.
++ *
++ * Mirrors `ownerMfaOk()` in firestore.rules / storage.rules. After an Owner
++ * passes MFA the backend (`backend/app/services/owner_mfa.py`) mints a Firebase
++ * custom token carrying the developer claim `mfa_sid` for ONE new Firebase
++ * session, and — once that session's ID token is presented back — marks
++ *
++ *   ownerMfaSessions/{uid}.bindings[<mfa_sid>] = { state: 'active', authTime, expiresAt, … }
++ *
++ * An Owner callable accepts the caller only when the token's `mfa_sid` names an
++ * ACTIVE, unexpired binding whose `authTime` equals the token's `auth_time`,
++ * and the sign-in provider is 'custom'. `crmUsers.role == 'superadmin'` alone
++ * is true for a password-only sign-in that never passed MFA.
++ */
++
++/** The token fields the binding is checked against. */
++export interface OwnerMfaToken {
++  auth_time?: number
++  mfa_sid?: string
++  firebase?: { sign_in_provider?: string }
++}
++
++interface Binding {
++  state?: string
++  authTime?: number
++  expiresAt?: unknown
++}
++
++function toMillis(v: unknown): number {
++  if (v == null) return 0
++  if (typeof v === 'number') return v
++  if (v instanceof Date) return v.getTime()
++  const t = v as { toMillis?: () => number }
++  return typeof t.toMillis === 'function' ? t.toMillis() : 0
++}
++
++/** Is this token's per-session binding live in the given ownerMfaSessions data? */
++export function ownerMfaBindingValid(
++  data: { bindings?: Record<string, Binding> } | undefined,
++  token: OwnerMfaToken | undefined,
++  nowMs: number = Date.now(),
++): boolean {
++  if (!data || !token) return false
++  const sid = typeof token.mfa_sid === 'string' ? token.mfa_sid : ''
++  if (!sid) return false
++  if (token.firebase?.sign_in_provider !== 'custom') return false
++  const b = (data.bindings ?? {})[sid]
++  if (!b || b.state !== 'active') return false
++  if (typeof b.authTime !== 'number' || b.authTime !== token.auth_time) return false
++  return toMillis(b.expiresAt) > nowMs
++}
++
++/** Minimal Firestore surface, so tests can pass a fake. */
++interface DocReader {
++  collection(name: string): { doc(id: string): { get(): Promise<{ exists: boolean; data(): unknown }> } }
++}
++
++/** Read the binding document and decide. Never throws: unreadable = not verified. */
++export async function ownerMfaVerified(
++  db: DocReader,
++  uid: string,
++  token: OwnerMfaToken | undefined,
++  nowMs: number = Date.now(),
++): Promise<boolean> {
++  if (!token?.mfa_sid) return false
++  try {
++    const snap = await db.collection('ownerMfaSessions').doc(uid).get()
++    if (!snap.exists) return false
++    return ownerMfaBindingValid(snap.data() as { bindings?: Record<string, Binding> }, token, nowMs)
++  } catch {
++    return false
++  }
++}

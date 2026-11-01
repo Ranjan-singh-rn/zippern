@@ -34,7 +34,13 @@
  */
 
 export type PartnerRole = 'agency' | 'seller'
-export type PartnerRoleStatus = 'pending' | 'approved' | 'rejected'
+/**
+ * `awaiting_verification` — Decision 15 (RC): the Owner approved the role
+ * while the login did not yet hold BOTH a verified phone and a verified email.
+ * It routes exactly like `pending` (the waiting room, never the dashboard);
+ * the waiting room shows the verification steps instead of "under review".
+ */
+export type PartnerRoleStatus = 'pending' | 'awaiting_verification' | 'approved' | 'rejected'
 
 /** Both capabilities, in the order a dual-role partner sees them. */
 export const PARTNER_ROLES: readonly PartnerRole[] = ['agency', 'seller']
@@ -162,14 +168,27 @@ export function partnerRoleStatus(
   if (!user) return 'pending'
 
   const explicit = user.roleStatus?.[role]
-  if (explicit === 'approved' || explicit === 'pending' || explicit === 'rejected') {
+  if (explicit === 'approved' || explicit === 'pending' || explicit === 'rejected'
+      || explicit === 'awaiting_verification') {
     return explicit
   }
+  /*
+   * Phase 1A (role-revocation leak): ANY other explicit per-role value —
+   * 'revoked', 'suspended', or something this build does not know — is a
+   * refusal. It used to fall through to the legacy single `status`, which on a
+   * login whose agency role had been revoked still said 'approved', so the
+   * revoked capability kept routing to its dashboard.
+   */
+  if (typeof explicit === 'string' && explicit !== '') return 'rejected'
 
   if (role === primaryPartnerRole(user)) {
     const legacy = user.status
     if (!legacy || legacy === 'pending') return 'pending'
     if (legacy === 'rejected') return 'rejected'
+    // Decision 15 (RC): approved but NOT started. Without this a login whose
+    // only status said so would have read as approved — "anything else means
+    // approved" is the legacy predicate — and opened the dashboard.
+    if (legacy === 'awaiting_verification') return 'awaiting_verification'
     return 'approved'
   }
 

@@ -162,6 +162,10 @@ NOW = datetime(2026, 9, 29, 10, 0, tzinfo=timezone.utc)
 
 db = FakeDb()
 audit_mod.get_db = lambda: db  # type: ignore[assignment]
+# `users.ensure_ordinary_target` reads the Mongo `staff` collection to
+# decide whether a subject is a protected internal identity, so the
+# service needs the same fake db the audit writer has.
+svc.get_db = lambda: db  # type: ignore[assignment]
 
 fs = FakeFirestore()
 firebase_mod.firestore_client = lambda: fs  # type: ignore[assignment]
@@ -224,7 +228,19 @@ def bans() -> dict[str, dict]:
 
 
 def entries(uid: str) -> list[dict]:
-    return [d for d in db[C.AUDIT].docs if d["subject"]["id"] == uid]
+    """The MODERATION entries about one account.
+
+    RC (confirmed, CRM-FLOW 9.48): a suspension or ban now also freezes the
+    account's money for the Owner's review, audited as `money.frozen` before
+    the restriction itself. That entry is asserted on its own (`freezes()`);
+    it is left out here so every check below still reads the moderation
+    entry it was written about.
+    """
+    return [d for d in db[C.AUDIT].docs if d["subject"]["id"] == uid and d["action"] != "money.frozen"]
+
+
+def freezes(uid: str) -> list[dict]:
+    return [d for d in db[C.AUDIT].docs if d["subject"]["id"] == uid and d["action"] == "money.frozen"]
 
 
 def actions(uid: str) -> list[str]:
@@ -275,6 +291,10 @@ ok("…and no device audit entry was written", not any(
     d["subject"]["type"] == "device" for d in db[C.AUDIT].docs
 ))
 
+# RC (confirmed, CRM-FLOW 9.48): a suspension also freezes the account's money
+# for the Owner's review, which is an audit entry of its own (`money.frozen`),
+# written before the suspension. The suspension's own entry is still exactly one.
+check("the money behind the suspension is frozen, audited once", len(freezes("u-suspend")), 1)
 log = entries("u-suspend")
 check("exactly one audit entry", len(log), 1)
 check("…as its own action", log[0]["action"], "user.suspended")
@@ -289,6 +309,21 @@ check(
 check("…which is what a suspension means", log[0]["meta"]["devices_barred"], 0)
 check("…and says the sweep will lift it", log[0]["meta"]["lifted_by"], "scheduled sweep")
 ok("the response says no device was barred", "No device was barred" in result["note"])
+
+# Phase 1A (SESSION-003): a suspension ends the live sessions — the rules
+# cut-off moves past now and the refresh tokens are revoked — without
+# disabling the login (they must still be able to sign in and see why).
+import time as _time  # noqa: E402
+ok("Phase 1A — the session cut-off moves past now",
+   int(stored("u-suspend").get("credentialsValidAfter", 0)) > int(_time.time()))
+from app.db import firebase as _fb  # noqa: E402
+_rev = []
+_orig_revoke = _fb.revoke_sessions
+_fb.revoke_sessions = lambda uid: (_rev.append(uid), "")[1]
+user("u-suspend-2", devices=("phone-z",))
+run(users_router.suspend_user("u-suspend-2", suspend_body(days=1), OPS))
+check("Phase 1A — the refresh tokens are revoked on suspension", _rev, ["u-suspend-2"])
+_fb.revoke_sessions = _orig_revoke
 
 
 # ── The term comes through the ROUTE, which is what was missing ──────────────

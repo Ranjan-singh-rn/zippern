@@ -65,8 +65,25 @@ class Reason(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+#: UGP review: a change to a user's balance is raised only where the balance
+#: permission is checked and the card's subject IS the account the money moves
+#: on — `POST /users/{uid}/balance` (Adjust balance) and a warning deduction.
+#: Through this generic route any writing staff member could raise one, with a
+#: payload naming a different account from the subject the signer is shown.
+#: No CRM screen raises these here.
+_BALANCE_CARD_TYPES = frozenset({CardType.BALANCE_CREDIT, CardType.BALANCE_DEBIT})
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def raise_card(body: RaiseCard, user: dict = Depends(require_write)):
+    if body.type in _BALANCE_CARD_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "A balance change is raised from the person's page (Adjust balance, or a "
+                "warning with a deduction), not as a generic card."
+            ),
+        )
     try:
         return await svc.raise_card(
             NewCard(

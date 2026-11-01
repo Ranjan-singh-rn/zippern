@@ -39,6 +39,7 @@ import {
   type CreditStanding, type OverdueSeller, type Partner,
   type PartnerStatus, type SellerStatement,
 } from '@/lib/apiPartners'
+import { awaitingLabel } from '@/lib/contactVerification'
 
 const PAGE_ROLES = [
   'superadmin', 'app_admin', 'ops_admin', 'ops_member',
@@ -390,12 +391,16 @@ export default function Sellers() {
       value: () => '',
       render: (r) => (
         <div className="flex items-center justify-end gap-1.5">
-          {mayDecide && r.status !== 'approved' && (
+          {/* UGP-B: Approve decides an application (pending, or a rejected one
+              reconsidered) and Reject only a PENDING one. A suspended or revoked
+              record is restored from its own page, and Approve on it there IS
+              that restore — the API routes it through reactivation. */}
+          {mayDecide && (r.status === 'pending' || r.status === 'rejected') && (
             <RowButton tone="green" onClick={() => setPending({ row: r, action: 'approve' })}>
               <CheckCircle2 size={11} /> Approve
             </RowButton>
           )}
-          {mayDecide && r.status !== 'rejected' && (
+          {mayDecide && r.status === 'pending' && (
             <RowButton tone="red" onClick={() => setPending({ row: r, action: 'reject' })}>
               <XCircle size={11} /> Reject
             </RowButton>
@@ -632,6 +637,8 @@ export default function Sellers() {
               { value: 'approved', label: 'Approved' },
               { value: 'rejected', label: 'Rejected' },
               { value: 'suspended', label: 'Suspended' },
+              // UGP-G (I-27): a revoked record was visible only under "all".
+              { value: 'revoked', label: 'Revoked' },
             ],
           },
           {
@@ -675,7 +682,16 @@ export default function Sellers() {
           onClose={() => setPending(null)}
           onConfirm={async (reason) => {
             const { row, action } = pending
-            if (action === 'approve') await partnerOps.approve(row.id, reason)
+            if (action === 'approve') {
+              const out = await partnerOps.approve(row.id, reason)
+              // Decision 15 (RC): approved by the Owner, waiting for contacts.
+              if (out?.awaiting_verification) {
+                setPending(null)
+                setNotice(`${row.name}: ${awaitingLabel(out.missing ?? [])}`)
+                load()
+                return
+              }
+            }
             else if (action === 'reject') await partnerOps.reject(row.id, reason)
             else await partnerOps.deactivate(row.id, reason)
             setPending(null)

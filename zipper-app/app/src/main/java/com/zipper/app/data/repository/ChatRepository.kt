@@ -8,6 +8,7 @@ import com.zipper.app.data.model.BroadcastMessage
 import com.zipper.app.data.model.ChatMessage
 import com.zipper.app.data.model.Conversation
 import com.zipper.app.data.model.SupportTicket
+import com.zipper.app.data.model.UserNotification
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -24,7 +25,11 @@ class ChatRepository @Inject constructor(
 
     private val convoCol get() = firestore.collection("conversations")
     private val broadcastCol get() = firestore.collection("broadcasts")
-    private val ticketsCol get() = firestore.collection("supportTickets")
+    // B2: the collection FeedbackScreen writes and the CRM support page answers.
+    // It was `supportTickets`, which nothing in the app writes — the tab was
+    // permanently empty. Same owner rule on both (firestore.rules).
+    private val ticketsCol get() = firestore.collection("feedbackTickets")
+    private val notifCol get() = firestore.collection("notifications")
 
     // ── Conversation ID: sorted pair of UIDs ─────────────────────────────────
     fun convoId(uid1: String, uid2: String): String =
@@ -213,34 +218,100 @@ class ChatRepository @Inject constructor(
         awaitClose { listener.remove() }
     }
 
+    // ── Notifications (addressed to one user) ────────────────────────────────
+
+    /**
+     * Everything in `notifications` addressed to [myUid], newest first.
+     *
+     * This is the other half of the Official tab. `broadcastsFlow` is what the
+     * team sends to everybody; this is what the system sends to one person —
+     * an official warning, a recharge that went through or stalled, an agency
+     * approval, a payout approval. All of it was being written and none of it
+     * was being read.
+     *
+     * ── THE QUERY NEEDS AN INDEX, AND IT IS DECLARED ────────────────────────
+     *
+     * An equality filter plus an `orderBy` on a DIFFERENT field is exactly the
+     * shape Firestore needs a composite index for — the same shape that took
+     * four of the five CRM appeal tabs down. `notifications(userId ASC,
+     * createdAt DESC)` is declared in `firestore.indexes.json`; without it
+     * deployed, this listener fails and the tab falls back to broadcasts
+     * alone.
+     *
+     * The equality on `userId` is also what makes the query legal: the
+     * deployed rule allows a read only where `resource.data.userId ==
+     * request.auth.uid`, and Firestore rejects a query it cannot prove in
+     * advance will stay inside that. Widening this filter would not return
+     * more rows — it would return `PERMISSION_DENIED`.
+     */
+    fun myNotificationsFlow(myUid: String): Flow<List<UserNotification>> = callbackFlow {
+        if (myUid.isBlank()) {
+            // Signed out, or called before auth resolved. `whereEqualTo` on an
+            // empty string would be a real query for a real (empty) uid, which
+            // the rule denies — so emit nothing and hold the flow open rather
+            // than firing one off.
+            trySend(emptyList())
+            awaitClose { }
+            return@callbackFlow
+        }
+        val listener = notifCol
+            .whereEqualTo("userId", myUid)
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(50)
+            .addSnapshotListener { snap, err ->
+                if (err != null) {
+                    // Logged rather than swallowed. A silent empty list here is
+                    // indistinguishable from "you have no messages", which is
+                    // how an undeployed index or a rules change would present
+                    // itself: as the user having been told nothing.
+                    android.util.Log.w("Notifications", "listener failed for $myUid", err)
+                    return@addSnapshotListener
+                }
+                val list = snap?.documents?.map { doc ->
+                    UserNotification(
+                        id        = doc.id,
+                        type      = doc.getString("type") ?: "",
+                        title     = doc.getString("title") ?: "",
+                        // `body` is the canonical field, written by the backend
+                        // and by all four Cloud Functions. `message` is what
+                        // the CRM's own notification writer used; reading only
+                        // one of them renders the other as a blank card.
+                        body      = doc.getString("body") ?: doc.getString("message") ?: "",
+                        createdAt = doc.millis("createdAt"),
+                        isRead    = doc.getBoolean("isRead") ?: false,
+                    )
+                } ?: emptyList()
+                trySend(list)
+            }
+        awaitClose { listener.remove() }
+    }
+
     // ── Support tickets ───────────────────────────────────────────────────────
 
     fun myTicketsFlow(myUid: String): Flow<List<SupportTicket>> = callbackFlow {
         val listener = ticketsCol
             .whereEqualTo("userId", myUid)
-            .orderBy("updatedAt", Query.Direction.DESCENDING)
+            // `createdAt` — the field the writer sets, and the order of the
+            // existing (userId, createdAt desc) index on feedbackTickets.
+            // `updatedAt` is never written there, and ordering on a field a
+            // document lacks drops that document from the result.
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(50)
             .addSnapshotListener { snap, _ ->
                 val list = snap?.documents?.mapNotNull { doc ->
-                    SupportTicket(
-                        id            = doc.id,
-                        userId        = doc.getString("userId") ?: "",
-                        subject       = doc.getString("subject") ?: "",
-                        body          = doc.getString("body") ?: "",
-                        status        = doc.getString("status") ?: "open",
-                        // The reply staff actually write is `adminReply`
-                        // (`respondToTicket` in the CRM). `statusMessage` is
-                        // read here and written by nothing in the system, so
-                        // the "Reply from Zipper" block below never appeared —
-                        // support answered tickets and the answer reached
-                        // nobody. It is kept as a fallback rather than dropped,
-                        // in case an older document carries one.
-                        statusMessage = doc.getString("adminReply")
-                            ?: doc.getString("statusMessage") ?: "",
-                        createdAt     = doc.millis("createdAt"),
-                        // `millis`, not `getLong`: the CRM writes this with
-                        // `serverTimestamp()`, which arrives as a Timestamp and
-                        // made `getLong` return null on every replied ticket.
-                        updatedAt     = doc.millis("updatedAt"),
+                    SupportTicket.fromFeedbackTicket(
+                        id              = doc.id,
+                        userId          = doc.getString("userId"),
+                        subject         = doc.getString("subject"),
+                        message         = doc.getString("message"),
+                        body            = doc.getString("body"),
+                        status          = doc.getString("status"),
+                        response        = doc.getString("response"),
+                        adminReply      = doc.getString("adminReply"),
+                        statusMessage   = doc.getString("statusMessage"),
+                        // `millis`, not `getLong`: both are serverTimestamp()s.
+                        createdAt       = doc.millis("createdAt"),
+                        statusChangedAt = doc.millis("statusChangedAt"),
                     )
                 } ?: emptyList()
                 trySend(list)

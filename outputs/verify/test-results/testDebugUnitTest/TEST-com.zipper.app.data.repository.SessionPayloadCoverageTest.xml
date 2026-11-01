@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.SessionPayloadCoverageTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.803Z" hostname="CW253.local" time="0.038">
+  <properties/>
+  <testcase name="every getHttpsCallable call goes through withSession" classname="com.zipper.app.data.repository.SessionPayloadCoverageTest" time="0.038"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

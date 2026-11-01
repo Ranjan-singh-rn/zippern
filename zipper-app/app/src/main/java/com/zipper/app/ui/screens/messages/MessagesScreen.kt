@@ -27,6 +27,7 @@ import coil.compose.AsyncImage
 import com.zipper.app.data.model.BroadcastMessage
 import com.zipper.app.data.model.Conversation
 import com.zipper.app.data.model.SupportTicket
+import com.zipper.app.data.model.UserNotification
 import com.zipper.app.ui.components.*
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
@@ -85,7 +86,7 @@ fun MessagesScreen(
 
         when {
             state.isLoading -> LoadingState()
-            tab == 0 -> BroadcastsTab(state.broadcasts)
+            tab == 0 -> OfficialTab(state.broadcasts, state.notifications)
             tab == 1 -> TicketsTab(state.tickets, onNavigateToFeedback)
             else -> ConversationsTab(state.conversations, viewModel.myUid()) { convo -> onNavigateToChat(convo.otherUserUid, convo.id) }
         }
@@ -131,27 +132,100 @@ private fun ConversationsTab(convos: List<Conversation>, myUid: String, onOpen: 
     }
 }
 
+/**
+ * One row of the Official tab. Two sources, one list.
+ *
+ * A broadcast goes to everybody; a notification is addressed to this user
+ * alone. The user has no reason to care which collection a message came out
+ * of, so they are interleaved by time — but a warning is marked, because a
+ * moderation decision read as an announcement is a moderation decision missed.
+ */
+private sealed interface OfficialItem {
+    val key: String
+    val at: Long
+
+    data class Announcement(val b: BroadcastMessage) : OfficialItem {
+        // Prefixed: a broadcast id and a notification id come from different
+        // collections and could collide, and a duplicate key crashes LazyColumn.
+        override val key get() = "b:${b.id}"
+        override val at get() = b.createdAt
+    }
+
+    data class Personal(val n: UserNotification) : OfficialItem {
+        override val key get() = "n:${n.id}"
+        override val at get() = n.createdAt
+    }
+}
+
 @Composable
-private fun BroadcastsTab(items: List<BroadcastMessage>) {
-    val c = ZipperTheme.colors
+private fun OfficialTab(broadcasts: List<BroadcastMessage>, notifications: List<UserNotification>) {
+    val items: List<OfficialItem> = remember(broadcasts, notifications) {
+        (broadcasts.map { OfficialItem.Announcement(it) } +
+            notifications.map { OfficialItem.Personal(it) })
+            .sortedByDescending { it.at }
+    }
+
     if (items.isEmpty()) { EmptyState(Icons.Outlined.Campaign, "Nothing from Zipper yet", "Announcements, events and rewards from the team show up here."); return }
+
     LazyColumn(contentPadding = PaddingValues(horizontal = Space.lg, vertical = Space.sm), verticalArrangement = Arrangement.spacedBy(Space.md)) {
-        items(items, key = { it.id }) { b ->
-            Column(
-                Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(Color(0x12FFFFFF), Color(0x05FFFFFF))), RoundedCornerShape(Radius.lg)).border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.lg)).clip(RoundedCornerShape(Radius.lg)),
-            ) {
-                if (b.imageUrl.isNotBlank()) AsyncImage(b.imageUrl, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().height(140.dp))
-                Column(Modifier.padding(Space.lg), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
-                        Chip("OFFICIAL", tint = c.tintDiamondSubtle, contentColor = c.currencyDiamond)
-                        Spacer(Modifier.weight(1f))
-                        Text(timeAgo(b.createdAt), style = ZipperTheme.type.caption, color = c.textMuted)
-                    }
-                    Text(b.title, style = ZipperTheme.type.labelL, color = c.textPrimary)
-                    Text(b.body, style = ZipperTheme.type.bodyM, color = c.textSecondary)
-                }
+        items(items, key = { it.key }) { item ->
+            when (item) {
+                is OfficialItem.Announcement -> AnnouncementCard(item.b)
+                is OfficialItem.Personal -> PersonalNoticeCard(item.n)
             }
         }
+        item { Spacer(Modifier.height(Space.sm)) }
+    }
+}
+
+@Composable
+private fun AnnouncementCard(b: BroadcastMessage) {
+    val c = ZipperTheme.colors
+    Column(
+        Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(Color(0x12FFFFFF), Color(0x05FFFFFF))), RoundedCornerShape(Radius.lg)).border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.lg)).clip(RoundedCornerShape(Radius.lg)),
+    ) {
+        if (b.imageUrl.isNotBlank()) AsyncImage(b.imageUrl, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().height(140.dp))
+        Column(Modifier.padding(Space.lg), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+                Chip("OFFICIAL", tint = c.tintDiamondSubtle, contentColor = c.currencyDiamond)
+                Spacer(Modifier.weight(1f))
+                Text(timeAgo(b.createdAt), style = ZipperTheme.type.caption, color = c.textMuted)
+            }
+            Text(b.title, style = ZipperTheme.type.labelL, color = c.textPrimary)
+            Text(b.body, style = ZipperTheme.type.bodyM, color = c.textSecondary)
+        }
+    }
+}
+
+/**
+ * A notice addressed to this user. A warning is drawn in the warning colour
+ * with its own label, so it does not read as news alongside a rewards
+ * announcement — it is a decision about their account, and the body is the
+ * reason the reviewer wrote.
+ */
+@Composable
+private fun PersonalNoticeCard(n: UserNotification) {
+    val c = ZipperTheme.colors
+    val tint = if (n.isWarning) c.statusWarning else c.currencyDiamond
+    val label = if (n.isWarning) "WARNING" else "OFFICIAL"
+    Column(
+        Modifier.fillMaxWidth()
+            .background(Brush.verticalGradient(listOf(Color(0x12FFFFFF), Color(0x05FFFFFF))), RoundedCornerShape(Radius.lg))
+            .border(1.dp, if (n.isWarning) tint.copy(alpha = 0.45f) else c.borderSubtle, RoundedCornerShape(Radius.lg))
+            .clip(RoundedCornerShape(Radius.lg))
+            .padding(Space.lg),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+            Chip(label, tint = tint.copy(alpha = 0.14f), contentColor = tint)
+            // An unread dot rather than a count: there is one message per card,
+            // so a number would always read "1".
+            if (!n.isRead) Box(Modifier.size(6.dp).background(c.brandPrimary, CircleShape))
+            Spacer(Modifier.weight(1f))
+            Text(timeAgo(n.createdAt), style = ZipperTheme.type.caption, color = c.textMuted)
+        }
+        if (n.title.isNotBlank()) Text(n.title, style = ZipperTheme.type.labelL, color = c.textPrimary)
+        Text(n.body, style = ZipperTheme.type.bodyM, color = c.textSecondary)
     }
 }
 
@@ -163,6 +237,8 @@ private fun TicketsTab(tickets: List<SupportTicket>, onNew: () -> Unit) {
         items(tickets, key = { it.id }) { t ->
             val (tint, label) = when (t.status) {
                 "open" -> c.statusWarning to "Open"
+                // B2: the CRM's support page moves a claimed ticket to `assigned`.
+                "assigned" -> c.currencyDiamond to "Assigned"
                 "in_progress" -> c.currencyDiamond to "In progress"
                 // What the CRM stamps when support answers — it was falling to
                 // the `else` branch and showing the raw word "replied" in grey,

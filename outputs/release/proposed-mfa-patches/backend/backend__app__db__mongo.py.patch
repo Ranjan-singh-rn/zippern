@@ -1,0 +1,14 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/db/mongo.py
++++ b/backend/app/db/mongo.py
+@@ -40,6 +40,9 @@
+     STAFF = "staff"                 # CRM staff and owners
+     OBSERVER_OTP = "observer_otp"   # one-time codes for observer login
+     SESSIONS = "sessions"           # issued session tokens (revocable)
++    #: P1-A3 — one row per Owner: encrypted TOTP secret, hashed recovery codes,
++    #: failure counter / lock, last accepted time-step (replay guard).
++    OWNER_MFA = "owner_mfa"
+     AUDIT = "audit"                 # append-only history
+     LEDGER = "ledger"               # every balance movement
+     BALANCES = "balances"           # current balance per holder

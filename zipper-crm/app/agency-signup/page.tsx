@@ -57,10 +57,11 @@ import { useState, useRef } from 'react'
 import { auth, db, storage } from '@/lib/firebase'
 import { addDoc, collection, serverTimestamp, updateDoc, doc } from 'firebase/firestore'
 import {
-  createAgencyAccount, createPartnerLogin, discardPartnerLogin, generateCrmId,
-  partnerSignUpWithGoogle,
+  createAgencyAccount, createPartnerLogin, discardPartnerLogin, ensurePartnerEmailVerified,
+  generateCrmId, partnerSignUpWithGoogle,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { signupDocName } from '@/lib/signupDocName'
 import {
   Upload,
   CheckCircle,
@@ -85,6 +86,8 @@ import {
   findPartnersByEmail, normaliseEmail, statusPhrase,
   type ExistingPartner,
 } from '@/lib/partnerDuplicates'
+import PhoneInput from '@/components/PhoneInput'
+import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
 
 /** Whether the login was finished, kept separate from "the form was filed". */
 type LoginOutcome =
@@ -332,6 +335,9 @@ export default function AgencySignupPage() {
     )
   }
 
+  // Flags an already-registered email / phone while it is being typed.
+  const registered = useRegisteredCheck(form.ownerEmail, form.ownerPhone)
+
   // ── Step 1: Basic Info ─────────────────────────────────────────────────────
   function Step1() {
     function next() {
@@ -343,6 +349,10 @@ export default function AgencySignupPage() {
       }
       if (!/^\S+@\S+\.\S+$/.test(form.ownerEmail)) {
         setError('Please enter a valid email address.')
+        return
+      }
+      if (registered.email || registered.phone) {
+        setError(registered.email || registered.phone)
         return
       }
       // A Google signup has no password to check, now or ever — the login it
@@ -377,8 +387,9 @@ export default function AgencySignupPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <div>
               <label className={labelClass}><span className="flex items-center gap-1.5"><Phone className="w-4 h-4 text-pink-400" />Phone Number *</span></label>
-              <input type="tel" className={inputClass} placeholder="10-digit mobile number"
-                value={form.ownerPhone} onChange={(e) => set('ownerPhone', e.target.value)} />
+              <PhoneInput className={inputClass} placeholder="Mobile number"
+                value={form.ownerPhone} onChange={(v) => set('ownerPhone', v)} />
+              {registered.phone && <p className="text-xs text-red-400 mt-1">{registered.phone}</p>}
             </div>
             <div>
               <label className={labelClass}><span className="flex items-center gap-1.5"><Mail className="w-4 h-4 text-pink-400" />Email Address *</span></label>
@@ -387,6 +398,7 @@ export default function AgencySignupPage() {
                 placeholder="your@email.com"
                 readOnly={!!googleUid}
                 value={form.ownerEmail} onChange={(e) => set('ownerEmail', e.target.value)} />
+              {registered.email && <p className="text-xs text-red-400 mt-1">{registered.email}</p>}
               {googleUid && (
                 <p className="text-xs text-slate-500 mt-1">
                   Verified by Google. Your application is filed against this address.
@@ -546,21 +558,21 @@ export default function AgencySignupPage() {
             description={form.paymentType === 'foreign' ? 'Valid passport photo page (JPG, PNG or PDF)' : 'Front side (JPG, PNG or PDF)'}
             file={aadhaarFile} url={aadhaarUrl} progress={aadhaarProgress}
             inputRef={aadhaarRef} icon={FileText}
-            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/doc1_${Date.now()}`, setAadhaarProgress, setAadhaarUrl, setAadhaarFile)} />
+            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/${signupDocName('doc1')}`, setAadhaarProgress, setAadhaarUrl, setAadhaarFile)} />
 
           <UploadArea
             label={form.paymentType === 'foreign' ? 'Government / National ID' : 'PAN Card'}
             description={form.paymentType === 'foreign' ? 'National ID, driver\'s license or equivalent (JPG, PNG or PDF)' : 'Clear photo (JPG, PNG or PDF)'}
             file={panFile} url={panUrl} progress={panProgress}
             inputRef={panRef} icon={CreditCard}
-            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/doc2_${Date.now()}`, setPanProgress, setPanUrl, setPanFile)} />
+            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/${signupDocName('doc2')}`, setPanProgress, setPanUrl, setPanFile)} />
 
           <UploadArea
             label={form.paymentType === 'foreign' ? 'Proof of Address' : 'Bank Passbook'}
             description={form.paymentType === 'foreign' ? 'Recent utility bill or bank statement (JPG, PNG or PDF)' : 'First page (JPG, PNG or PDF)'}
             file={passbookFile} url={passbookUrl} progress={passbookProgress}
             inputRef={passbookRef} icon={Landmark}
-            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/doc3_${Date.now()}`, setPassbookProgress, setPassbookUrl, setPassbookFile)} />
+            onFileChange={(f) => handleFileUpload(f, `kyc/agencies/signup/${signupDocName('doc3')}`, setPassbookProgress, setPassbookUrl, setPassbookFile)} />
         </div>
 
         <div className="mt-4 bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 flex items-start gap-2">
@@ -644,47 +656,93 @@ export default function AgencySignupPage() {
           }
         }
 
+        // ── 1b. A CONFIRMED address, before anything is read or written ─────
+        //
+        // P0-5 (AUTHN-2): every rule that matches this application to its
+        // login by email — the duplicate check below, the record, the CRM
+        // account and the back-link — now requires Firebase to have seen the
+        // address confirmed. A Google login already is; a new password login
+        // is not, so the confirmation email goes out and nothing is filed
+        // until the applicant has opened it and pressed Submit again (this
+        // browser stays signed in, so the retry reuses the same login).
+        const verified = await ensurePartnerEmailVerified()
+        if (!verified.ok) {
+          setError(verified.message)
+          return
+        }
+
         // ── 2. Now signed in: has this address already applied? ─────────────
-        const existing = await findPartnersByEmail('agency', emailLower)
-        if (existing.checked && existing.matches.length > 0) {
-          // The login was made purely to run this check and holds nothing, so
-          // it goes back — otherwise this address is locked out for good.
-          //
-          // A Google login goes back too, even though `reusing` is true of it:
-          // `partnerSignUpWithGoogle` only ever hands back an account this form
-          // created, so it is ours to undo. A resumed PASSWORD session is not —
-          // it may be an account the applicant already had, and deleting that
-          // would be far worse than leaving it.
-          if (!reusing || googleUid !== '') {
-            try {
-              await discardPartnerLogin(crmUid)
-              setGoogleUid('')
-            } catch (undoErr: unknown) {
-              setCheckWarning(
-                `A login was created for ${emailLower} while checking and could not `
-                + `be removed again: ${errorMessage(undoErr)}. Contact support — `
-                + 'nothing else was created.',
-              )
-            }
+        //
+        // A lookup that could NOT be completed is NOT a clean result. This
+        // read `if (existing.checked && matches.length > 0)`, so a refused or
+        // dropped query fell through to the create — "could not verify" was
+        // being treated as "no duplicate". `/agencies/register` has always
+        // done the opposite; this is the same guard, failing the same way.
+        //
+        // The browser is not the enforcement point either way: the API claims
+        // the role family in Mongo before any partner record is written (see
+        // `backend/app/services/partner_roles.py`). This stops a pointless
+        // round trip and gives the applicant a sentence instead of a 409.
+        // The login was made purely to run this check and holds nothing, so
+        // it goes back — otherwise this address is locked out for good: the
+        // next attempt gets `auth/email-already-in-use` and the form refuses
+        // it, with no way forward but support.
+        //
+        // A Google login goes back too, even though `reusing` is true of it:
+        // `partnerSignUpWithGoogle` only ever hands back an account this form
+        // created, so it is ours to undo. A resumed PASSWORD session is not —
+        // it may be an account the applicant already had, and deleting that
+        // would be far worse than leaving it.
+        //
+        // Shared by both ways out below. It was written inline in the
+        // duplicate branch, and the fail-closed branch added next to it
+        // returned WITHOUT it — so a failed lookup, having created nothing,
+        // still burned the applicant's address. One copy cannot do that.
+        const undoLoginMadeForTheCheck = async () => {
+          if (reusing && googleUid === '') return
+          try {
+            await discardPartnerLogin(crmUid)
+            setGoogleUid('')
+          } catch (undoErr: unknown) {
+            setCheckWarning(
+              `A login was created for ${emailLower} while checking and could not `
+              + `be removed again: ${errorMessage(undoErr)}. Contact support — `
+              + 'nothing else was created.',
+            )
           }
+        }
+
+        const existing = await findPartnersByEmail('agency', emailLower)
+        if (!existing.checked) {
+          await undoLoginMadeForTheCheck()
+          setError(
+            'The check for an existing agency under this address could not be '
+            + `run, so nothing was created: ${existing.reason}. Please try `
+            + 'again in a moment.',
+          )
+          return          // `finally` below clears `submitting`
+        }
+        if (existing.matches.length > 0) {
+          await undoLoginMadeForTheCheck()
           setDuplicates(existing.matches)
           return
         }
-        if (!existing.checked) {
-          setCheckWarning(
-            'We could not check whether an application already exists under this '
-            + `address (${existing.reason}). Your application was submitted — if it `
-            + 'turns out to be a second one, our team will see both.',
-          )
-        }
-
         // ── 3. The agency record ────────────────────────────────────────────
         //
         // No `crmUid` yet: if step 4 fails, the record shows on /agencies as
         // having no login attached rather than pointing at one that does not
         // work.
+        //
+        // `ownerUid` IS written now, and it is a different fact from `crmUid`:
+        // `crmUid` says "this login can open the CRM portal for this record",
+        // `ownerUid` says "this human owns this application". The registration
+        // trigger fires on create, so this is the only moment the API can
+        // learn who applied — without it the one-agency-per-human rule saw an
+        // unowned record and applied nothing, and the approval notice had
+        // nobody to address. The create rule binds it to the signed-in uid.
         const docRef = await addDoc(collection(db, 'agencies'), {
           crmId:            generateCrmId(),
+          ownerUid:         crmUid,
           agencyName:       form.agencyName,
           ownerName:        form.ownerName,
           ownerPhone:       form.ownerPhone,

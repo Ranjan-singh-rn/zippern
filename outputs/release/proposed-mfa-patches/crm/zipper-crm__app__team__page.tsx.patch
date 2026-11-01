@@ -1,0 +1,138 @@
+# PROPOSED — not applied. Base: pre-P1 copy, last modified 2 Oct (= HEAD)
+# Base confidence: PROBABLE: unchanged since HEAD before P1, and HEAD predates the deploy; confirm against the downloaded source
+# Note: Adaptation, not a hunk copy: in P1 this control lived inside the P1-B AccessPanel.
+--- a/zipper-crm/app/team/page.tsx
++++ b/zipper-crm/app/team/page.tsx
+@@ -163,6 +163,7 @@
+   const [changingRole, setChangingRole] = useState<StaffMember | null>(null)
+   const [revoking, setRevoking] = useState<StaffMember | null>(null)
+   const [resettingUid, setResettingUid] = useState<string | null>(null)
++  const [resettingMfa, setResettingMfa] = useState<StaffMember | null>(null)
+ 
+   const load = useCallback(async () => {
+     if (!apiReady) return
+@@ -219,6 +220,18 @@
+       `${member.name || member.email} no longer has access — in the CRM and in the API.`,
+     )
+     setRevoking(null)
++    await load()
++  }
++
++  // P1-A3: the Observer's recovery for an Owner who lost their authenticator and
++  // recovery codes. The API refuses anyone else; this control is offered, not trusted.
++  async function resetMfa(member: StaffMember, reason: string) {
++    await api.auth.mfaResetOwner(member.uid, reason.trim())
++    setNotice(
++      `${member.name || member.email}'s two-step sign-in was reset and every session ended. ` +
++      'They set up their authenticator again at their next sign-in.',
++    )
++    setResettingMfa(null)
+     await load()
+   }
+ 
+@@ -443,6 +456,16 @@
+                         <UserX size={15} />
+                       </button>
+                     )}
++
++                    {m.role === 'owner' && me?.role === 'observer' && (
++                      <button
++                        onClick={() => { setError(''); setResettingMfa(m) }}
++                        title="Reset two-step sign-in (lost authenticator)"
++                        className="text-slate-500 hover:text-sky-300 transition-colors p-1.5 rounded hover:bg-slate-800"
++                      >
++                        <ShieldCheck size={15} />
++                      </button>
++                    )}
+                   </div>
+                 </div>
+               ))}
+@@ -490,6 +513,14 @@
+           onConfirm={(reason) => revoke(revoking, reason)}
+         />
+       )}
++
++      {resettingMfa && (
++        <MfaResetPanel
++          member={resettingMfa}
++          onCancel={() => setResettingMfa(null)}
++          onConfirm={(reason) => resetMfa(resettingMfa, reason)}
++        />
++      )}
+     </div>
+   )
+ }
+@@ -749,6 +780,73 @@
+             await onConfirm(reason)
+           } catch (e) {
+             setErr(saidWhy(e, 'Could not revoke access.'))
++          } finally {
++            setBusy(false)
++          }
++        }}
++      />
++    </Modal>
++  )
++}
++
++// The API (backend MfaReset) requires a reason of at least 10 characters.
++const MFA_RESET_MIN_REASON = 10
++
++function MfaResetPanel({ member, onCancel, onConfirm }: {
++  member: StaffMember
++  onCancel: () => void
++  onConfirm: (reason: string) => Promise<void>
++}) {
++  const [reason, setReason] = useState('')
++  const [busy, setBusy] = useState(false)
++  const [err, setErr] = useState('')
++
++  const ready = reason.trim().length >= MFA_RESET_MIN_REASON
++
++  return (
++    <Modal title="Reset two-step sign-in" onClose={onCancel}>
++      <div className="px-6 py-5 space-y-4">
++        <p className="text-slate-300 text-sm">
++          {member.name || member.email} loses their authenticator and recovery codes, and every
++          session ends. They set up two-step sign-in again at their next sign-in. Use this only when
++          the authenticator and the recovery codes are both lost.
++        </p>
++
++        <Field
++          label="Why"
++          hint={`At least ${MFA_RESET_MIN_REASON} characters. It cannot be edited afterwards.`}
++        >
++          <textarea
++            value={reason}
++            onChange={(e) => setReason(e.target.value)}
++            rows={3}
++            placeholder="Phone lost on 2 November; identity confirmed on a video call."
++            className={INPUT}
++          />
++        </Field>
++
++        {err && (
++          <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3">
++            <AlertTriangle size={15} className="text-red-400 mt-0.5 shrink-0" />
++            <p className="text-red-300 text-sm whitespace-pre-line">{err}</p>
++          </div>
++        )}
++      </div>
++
++      <Footer
++        onCancel={onCancel}
++        confirmLabel="Reset two-step sign-in"
++        confirmIcon={<ShieldCheck size={15} />}
++        tone="danger"
++        disabled={busy || !ready}
++        busy={busy}
++        onConfirm={async () => {
++          setBusy(true)
++          setErr('')
++          try {
++            await onConfirm(reason)
++          } catch (e) {
++            setErr(saidWhy(e, 'Could not reset two-step sign-in.'))
+           } finally {
+             setBusy(false)
+           }

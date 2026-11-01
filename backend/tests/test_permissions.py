@@ -602,7 +602,8 @@ def gates_of(module: str) -> dict[tuple[str, str], tuple[frozenset[str], bool]]:
 
 
 GATES: dict[tuple[str, str], tuple[frozenset[str], bool]] = {}
-for module in ("users", "staff", "partner_ops", "verification", "chance", "cards"):
+for module in ("users", "staff", "partner_ops", "verification", "chance", "cards",
+               "role_appeals", "transfer_requests"):
     GATES.update(gates_of(module))
 
 #: What each privileged route must ask for. Written out rather than derived, so
@@ -617,6 +618,8 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     ("POST", "/users/devices/bans/{device_id}/unban"): {"can_ban_users"},
     # An overturn unbans, so it costs what unbanning costs.
     ("POST", "/users/appeals/{appeal_id}/decide"): {"can_ban_users"},
+    # UGP review: the private attachments are read by the people who decide.
+    ("GET", "/users/appeals/{appeal_id}/evidence"): {"can_ban_users"},
     # ── Balance ─────────────────────────────────────────────────────────────
     ("POST", "/users/{uid}/balance-request"): {"can_adjust_balance"},
     ("POST", "/users/balance-cards/{card_id}/execute"): {"can_adjust_balance"},
@@ -626,8 +629,11 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
         "POST",
         "/users/host-applications/{application_id}/pending-changes/decide",
     ): {"can_approve_kyc"},
-    ("POST", "/users/{uid}/grant-host"): {"can_approve_kyc"},
+    # `/users/{uid}/grant-host` no longer exists: a host comes through an
+    # application decided at `/users/host-applications/{id}/decide`.
     ("POST", "/users/{uid}/revoke-host"): {"can_approve_kyc"},
+    # UGP-B: restoring a revoked Host costs what revoking it costs.
+    ("POST", "/users/{uid}/restore-host"): {"can_approve_kyc"},
     ("POST", "/users/{uid}/seller-flag"): {"can_approve_seller"},
     ("GET", "/host-verification/pending"): {"can_approve_kyc"},
     ("GET", "/host-verification/{uid}"): {"can_approve_kyc"},
@@ -637,6 +643,9 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     ("PATCH", "/staff/{uid}/role"): {"can_manage_team"},
     ("PATCH", "/staff/{uid}/employment"): {"can_manage_team"},
     ("POST", "/staff/{uid}/deactivate"): {"can_manage_team"},
+    # P1-B2 / B3 — same authority as deactivation.
+    ("POST", "/staff/{uid}/suspend"): {"can_manage_team"},
+    ("POST", "/staff/{uid}/reactivate"): {"can_manage_team"},
     # ── Partner onboarding ──────────────────────────────────────────────────
     ("POST", "/partner-ops/partners"): {"can_approve_kyc", "can_approve_seller"},
     ("POST", "/partner-ops/partners/{partner_id}/approve"): {
@@ -646,6 +655,12 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     ("POST", "/partner-ops/partners/{partner_id}/deactivate"): {
         "can_approve_kyc", "can_approve_seller"},
     ("POST", "/partner-ops/partners/{partner_id}/reactivate"): {
+        "can_approve_kyc", "can_approve_seller"},
+    ("POST", "/partner-ops/partners/{partner_id}/revoke"): {
+        "can_approve_kyc", "can_approve_seller"},
+    # Decision 15 (RC): start an Owner-approved role whose contacts are now
+    # both verified. Same gate as approving it, and it never bypasses them.
+    ("POST", "/partner-ops/partners/{partner_id}/activate"): {
         "can_approve_kyc", "can_approve_seller"},
     ("POST", "/partner-ops/partners/{partner_id}/attach-login"): {
         "can_approve_kyc", "can_approve_seller"},
@@ -668,6 +683,11 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     ("POST", "/partner-ops/partners/{partner_id}/write-off"): {"can_coin_operations"},
     ("POST", "/partner-ops/write-offs/{card_id}/execute"): {"can_coin_operations"},
     ("POST", "/partner-ops/sales/{sale_id}/approve"): {"can_coin_operations"},
+    # Manual recharge through a Coin Seller — money moves, same gate as a sale.
+    ("POST", "/partner-ops/recharges/{recharge_id}/approve"): {"can_coin_operations"},
+    ("POST", "/partner-ops/recharges/{recharge_id}/reject"): {"can_coin_operations"},
+    ("POST", "/partner-ops/recharges/{recharge_id}/refund"): {"can_coin_operations"},
+    ("POST", "/partner-ops/recharges/{recharge_id}/refund/decide"): {"can_coin_operations"},
     # ── Money out ───────────────────────────────────────────────────────────
     ("POST", "/partner-ops/agencies/{agency_id}/commission-payouts"): {
         "can_process_payout"},
@@ -695,6 +715,16 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     # that ban or take money carry their own — see `_REPORT_ACTION_PERMISSION`.
     ("POST", "/users/reports/{report_id}/action"): {"can_view_users"},
     ("POST", "/users/{uid}/warn"): {"can_view_users"},
+    # ── C2 — reinstatement of a revoked role ────────────────────────────────
+    # Reviewers of either kind reach the queue and the recommendation; the
+    # per-kind check is the service's, and DECIDING declares no capability on
+    # purpose — it is the Owner's, refused in the service for everybody else.
+    ("GET", "/partner-ops/role-appeals"): {"can_approve_kyc", "can_approve_seller"},
+    ("POST", "/partner-ops/role-appeals/{appeal_id}/recommend"): {
+        "can_approve_kyc", "can_approve_seller"},
+    # ── C3 — transfers: requested by a KYC reviewer, decided by the Owner ──
+    ("POST", "/partner-ops/transfers"): {"can_approve_kyc"},
+    ("GET", "/partner-ops/transfers"): {"can_approve_kyc"},
 }
 
 for key, wanted in sorted(EXPECTED.items()):

@@ -19,7 +19,6 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.zipper.app.navigation.Screen
 import com.zipper.app.navigation.ZipperNavGraph
-import com.zipper.app.ui.screens.auth.EmailLinkReturn
 import com.zipper.app.ui.screens.auth.ForcedSignOut
 import com.zipper.app.ui.screens.auth.SessionEvent
 import com.zipper.app.ui.screens.auth.SessionViewModel
@@ -63,54 +62,15 @@ class MainActivity : ComponentActivity() {
         data class Call(val callId: String) : PendingNav()
         data class Chat(val uid: String) : PendingNav()
         data class Live(val roomId: String) : PendingNav()
-
-        /**
-         * A guest tapped the email sign-in link we sent them.
-         *
-         * Carries no payload. The link is a one-time credential in a query
-         * string and it travels through [EmailLinkReturn] instead of through
-         * anything the nav library will hold on to. See that object.
-         */
-        object EmailLink : PendingNav()
+        // UGP-C: no EmailLink case. Email binding is a code typed into the app;
+        // no link comes back through an intent any more.
     }
     private val pendingNav = mutableStateOf<PendingNav?>(null)
 
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best-effort */ }
 
-    /**
-     * Is this intent the email sign-in link coming home?
-     *
-     * ── WHY IT IS ASKED HERE ─────────────────────────────────────────────────
-     *
-     * An email link is an `ACTION_VIEW` on an https URL, which arrives at the
-     * Activity and nowhere else — there is no ViewModel, no composition and
-     * possibly no process when it is sent, because the person has been away in
-     * a mail client. So the Activity is the only place that can catch it, and
-     * `FirebaseAuth.isSignInWithEmailLink` is the only reliable way to tell one
-     * from any other link the intent filter happens to match: the filter is
-     * declared on a path prefix, and a path prefix is a guess.
-     *
-     * Handled BEFORE the notification extras below, because a link intent has
-     * no extras at all and that branch returns immediately on one.
-     *
-     * @return true when this intent was a sign-in link and has been taken.
-     */
-    private fun consumeEmailLink(intent: Intent?): Boolean {
-        if (intent == null) return false
-        val link = intent.data?.toString() ?: return false
-        if (!FirebaseAuth.getInstance().isSignInWithEmailLink(link)) return false
-        EmailLinkReturn.deliver(link)
-        pendingNav.value = PendingNav.EmailLink
-        // Cleared for the same reason the extras below are: so a recreate does
-        // not replay it — and because it is a credential, which has no business
-        // sitting on the Activity's intent for the rest of the session.
-        intent.setData(null)
-        return true
-    }
-
     private fun consumeIntent(intent: Intent?) {
-        if (consumeEmailLink(intent)) return
         val extras = intent?.extras ?: return
         val callId = extras.getString(PushNotifications.EXTRA_CALL_ID)
         val chatUid = extras.getString(PushNotifications.EXTRA_CHAT_UID)
@@ -254,10 +214,12 @@ class MainActivity : ComponentActivity() {
                                  * answer, clears SessionManager — which this handler
                                  * never did — and only then signs out of Firebase.
                                  *
-                                 * Not awaited: being displaced is not a moment to
-                                 * hold somebody on a spinner. It runs to completion
-                                 * in the ViewModel's scope, which outlives this
-                                 * navigation.
+                                 * B11: AWAITED now, and only then Login. It used to
+                                 * be fired and forgotten so as not to hold anybody
+                                 * on a spinner — and its last steps then signed out
+                                 * whatever had been signed in on Login meanwhile.
+                                 * It runs in the ViewModel's scope, which outlives
+                                 * this effect, and its network steps are bounded.
                                  */
                                 sessionViewModel.forceSignOut()
                                 navController.navigate(Screen.Login.route) {
@@ -309,6 +271,19 @@ class MainActivity : ComponentActivity() {
                                 navController.navigate(
                                     Screen.Suspended.createRoute(event.reason, event.untilMillis)
                                 ) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            }
+                            /*
+                             * P0-1: the server refused this sign-in and no other
+                             * screen says why (see SessionEvent.SignedOut). The
+                             * same teardown as KickedOut, with its own message —
+                             * and, like it, finished before Login is shown (B11).
+                             */
+                            is SessionEvent.SignedOut -> {
+                                ForcedSignOut.raise(event.message)
+                                sessionViewModel.forceSignOut()
+                                navController.navigate(Screen.Login.route) {
                                     popUpTo(0) { inclusive = true }
                                 }
                             }
@@ -430,15 +405,6 @@ class MainActivity : ComponentActivity() {
                         is PendingNav.Call -> navController.navigate(Screen.IncomingCall.createRoute(p.callId)) { launchSingleTop = true }
                         is PendingNav.Chat -> navController.navigate(Screen.Chat.createRoute(p.uid)) { launchSingleTop = true }
                         is PendingNav.Live -> navController.navigate(Screen.LiveViewer.createRoute(p.roomId)) { launchSingleTop = true }
-                        /*
-                         * `launchSingleTop` is load-bearing here, not tidiness.
-                         * The common case is that the person is ALREADY on this
-                         * screen — the app was in the background showing "check
-                         * your email" — and a second copy would bring a second
-                         * ViewModel with an empty state, leaving the one
-                         * collecting [EmailLinkReturn] behind it on the stack.
-                         */
-                        is PendingNav.EmailLink -> navController.navigate(Screen.SecureEmail.route) { launchSingleTop = true }
                     }
                 }
 

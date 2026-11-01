@@ -21,6 +21,11 @@ data class LiveRoom(
     val welcomeMessage: String = "",
     val likeCount: Long = 0L,
     val kickedViewers: List<String> = emptyList(), // UIDs of kicked/blocked viewers
+    // ── Staff moderation (B2) — written by backend/app/services/live.py ─────
+    val endedByStaff: Boolean = false,
+    val endReason: String = "",
+    val hostMuted: Boolean = false,
+    val hostMuteReason: String = "",
 
     // ── PK Battle ────────────────────────────────────────────────────────────
     val pkWaiting: Boolean = false,     // host is in the matchmaking queue
@@ -66,6 +71,10 @@ data class LiveRoom(
                 welcomeMessage     = doc.getString("welcomeMessage") ?: "",
                 likeCount          = doc.getLong("likeCount") ?: 0L,
                 kickedViewers      = kicked,
+                endedByStaff       = doc.getBoolean("endedByStaff") ?: false,
+                endReason          = doc.getString("endReason") ?: "",
+                hostMuted          = doc.getBoolean("hostMuted") ?: false,
+                hostMuteReason     = doc.getString("hostMuteReason") ?: "",
                 pkWaiting          = doc.getBoolean("pkWaiting") ?: false,
                 pkActive           = doc.getBoolean("pkActive") ?: false,
                 pkPartnerId        = doc.getString("pkPartnerId") ?: "",

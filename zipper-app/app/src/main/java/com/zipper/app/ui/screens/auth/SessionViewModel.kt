@@ -7,6 +7,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import com.zipper.app.data.model.AccountRestriction
 import com.zipper.app.data.model.restrictionOf
 import com.zipper.app.data.repository.AuthRepository
+import com.zipper.app.util.ServerRefusals
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.millis
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -68,6 +69,15 @@ sealed class SessionEvent {
      * "already over", and the screen must not format it as a date.
      */
     data class Suspended(val reason: String, val untilMillis: Long) : SessionEvent()
+
+    /**
+     * P0-1: the server refused this device's sign-in and no other screen
+     * explains why — the account's cut-off moved past this sign-in without a new
+     * session being claimed (a lifted suspension, a deletion request), or the
+     * account is restricted in a way the listener has no screen for. Signed out
+     * to Login with [message].
+     */
+    data class SignedOut(val message: String) : SessionEvent()
 }
 
 /**
@@ -106,6 +116,16 @@ object ForcedSignOut {
     /** The Firebase credential no longer loads — expired, revoked, or disabled. */
     const val SESSION_EXPIRED =
         "Your session has expired. Please sign in again."
+
+    /**
+     * FX-07: a live session with no `users` document — a sign-in that never
+     * finished (the app stopped between the Firebase sign-in and the account
+     * being set up). It is restarted rather than completed by Profile Setup,
+     * which would create the document without the checks a sign-in makes
+     * (the Google adoption question, the mobile session, the guest binding).
+     */
+    const val SIGN_IN_INCOMPLETE =
+        "Your last sign-in did not finish. Please sign in again."
 
     /**
      * The same message, naming the handset that took over.
@@ -191,12 +211,70 @@ class SessionViewModel @Inject constructor(
      */
     private var watchingUid: String? = null
 
+    /**
+     * P0-1: one refusal handled per signed-in stretch. A burst of callables
+     * failing at once must not navigate to Login five times.
+     */
+    private var refusalHandled = false
+
+    init {
+        viewModelScope.launch {
+            ServerRefusals.events.collect { kind -> onServerRefusal(kind) }
+        }
+    }
+
+    /**
+     * P0-1: a protected callable answered SESSION_DISPLACED or
+     * ACCOUNT_RESTRICTED. Turned into the same events the listener raises, read
+     * from the account's document once so the person lands on the screen that
+     * says what actually happened.
+     */
+    private suspend fun onServerRefusal(kind: ServerRefusals.Kind) {
+        val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
+        if (refusalHandled) return
+        refusalHandled = true
+        val snap = try {
+            firestore.collection("users").document(uid).get().await()
+        } catch (_: Exception) {
+            null
+        }
+        if (snap != null && snap.exists()) {
+            when (restrictionOf(snap)) {
+                AccountRestriction.Suspended -> {
+                    val reason = snap.getString("banReason")
+                        .orEmpty().ifBlank { "Your account has been suspended." }
+                    _events.emit(SessionEvent.Suspended(reason, snap.millis("suspendedUntil", 0L)))
+                    return
+                }
+                AccountRestriction.Banned -> {
+                    val reason = snap.getString("banReason")
+                        .orEmpty().ifBlank { "Your account has been banned." }
+                    _events.emit(SessionEvent.Banned(reason))
+                    return
+                }
+                AccountRestriction.None -> Unit
+            }
+            if (kind == ServerRefusals.Kind.Displaced) {
+                val remote = snap.getString("activeMobileSession.sessionId").orEmpty()
+                val local = try { sessionManager.sessionToken.first() } catch (_: Exception) { "" }
+                if (remote.isNotBlank() && remote != local) {
+                    _events.emit(
+                        SessionEvent.KickedOut(snap.getString("activeMobileSession.deviceName").orEmpty())
+                    )
+                    return
+                }
+            }
+        }
+        _events.emit(SessionEvent.SignedOut(ForcedSignOut.SESSION_EXPIRED))
+    }
+
     fun startWatching() {
         val uid = FirebaseAuth.getInstance().currentUser?.uid ?: return
         // Already attached to this account's document. Do not churn it.
         if (listenerRegistration != null && watchingUid == uid) return
         stopWatching()
         watchingUid = uid
+        refusalHandled = false
 
         listenerRegistration = firestore.collection("users").document(uid)
             .addSnapshotListener { snap, _ ->
@@ -349,6 +427,9 @@ class SessionViewModel @Inject constructor(
      */
     suspend fun tearDownSession() {
         stopWatching()
+        // B11: whose session this is tearing down, so the hand-rolled fallback
+        // below can never sign out an account that signed in since.
+        val startedUid = FirebaseAuth.getInstance().currentUser?.uid
         try {
             /*
              * `mintQuickLogin = false`. This is a FORCED teardown — the session
@@ -369,23 +450,37 @@ class SessionViewModel @Inject constructor(
              * and those two are the ones that must not be skipped: a person
              * whose session was taken cannot be left holding a live Firebase
              * credential and a local session token. Do them by hand and move on.
+             *
+             * Only for the account this started with (B11) — the same rule the
+             * repository's own tail now follows.
              */
-            try { sessionManager.clear() } catch (_: Exception) {}
-            FirebaseAuth.getInstance().signOut()
+            if (FirebaseAuth.getInstance().currentUser?.uid == startedUid) {
+                try { sessionManager.clear() } catch (_: Exception) {}
+                FirebaseAuth.getInstance().signOut()
+            }
         }
     }
 
     /**
-     * [tearDownSession] for a caller that cannot suspend.
+     * [tearDownSession], run in `viewModelScope` and AWAITED.
      *
-     * Runs in `viewModelScope`, which for the instance MainActivity holds lives
-     * as long as the Activity — so the teardown finishes even though the caller
-     * navigates to Login in the next line rather than waiting. Being displaced
-     * is not a moment to sit on a spinner.
+     * ── B11: LOGIN AFTER THE TEARDOWN, NOT BEFORE IT ─────────────────────────
+     *
+     * This used to launch the teardown and return at once, and MainActivity
+     * navigated to Login on the next line — "being displaced is not a moment to
+     * sit on a spinner". But the teardown's last two steps clear the session
+     * and sign Firebase out, so a person who signed straight back in on the
+     * Login screen it had just shown was signed out again by it.
+     *
+     * Launched in `viewModelScope` and joined, rather than run in the caller's
+     * scope: the instance MainActivity holds lives as long as the Activity, so
+     * the teardown still completes if the caller's composition goes away
+     * half-way. Its network steps are bounded (see `AuthRepository.signOut`),
+     * so the wait is short.
      */
-    fun forceSignOut() {
+    suspend fun forceSignOut() {
         stopWatching()
-        viewModelScope.launch { tearDownSession() }
+        viewModelScope.launch { tearDownSession() }.join()
     }
 
     override fun onCleared() {

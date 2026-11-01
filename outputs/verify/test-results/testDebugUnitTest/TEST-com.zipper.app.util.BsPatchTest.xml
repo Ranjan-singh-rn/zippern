@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.BsPatchTest" tests="13" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.079Z" hostname="CW253.local" time="0.056">
+  <properties/>
+  <testcase name="a truncated patch is refused before anything is decompressed" classname="com.zipper.app.util.BsPatchTest" time="0.023"/>
+  <testcase name="a negative oldpos is out of range, not an error" classname="com.zipper.app.util.BsPatchTest" time="0.013"/>
+  <testcase name="offtout writes the sign in bit 63 and the magnitude below it" classname="com.zipper.app.util.BsPatchTest" time="0.0"/>
+  <testcase name="apply handles a negative seek and two wraparounds" classname="com.zipper.app.util.BsPatchTest" time="0.005"/>
+  <testcase name="a patch without the BSDIFF40 magic is refused" classname="com.zipper.app.util.BsPatchTest" time="0.003"/>
+  <testcase name="offtin and offtout round-trip across positive, negative and zero" classname="com.zipper.app.util.BsPatchTest" time="0.001"/>
+  <testcase name="offtin reads at an offset, which is how the header is parsed" classname="com.zipper.app.util.BsPatchTest" time="0.0"/>
+  <testcase name="a control block claiming more output than the header allows is refused" classname="com.zipper.app.util.BsPatchTest" time="0.004"/>
+  <testcase name="offtin is not two's complement" classname="com.zipper.app.util.BsPatchTest" time="0.0"/>
+  <testcase name="apply reports progress that ends at the declared size" classname="com.zipper.app.util.BsPatchTest" time="0.003"/>
+  <testcase name="bytes past the end of the old file contribute nothing" classname="com.zipper.app.util.BsPatchTest" time="0.002"/>
+  <testcase name="adding two bytes and truncating is addition modulo 256" classname="com.zipper.app.util.BsPatchTest" time="0.001"/>
+  <testcase name="offtout refuses the one magnitude the format cannot hold" classname="com.zipper.app.util.BsPatchTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

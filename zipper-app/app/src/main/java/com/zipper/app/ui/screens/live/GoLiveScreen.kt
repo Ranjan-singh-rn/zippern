@@ -302,6 +302,16 @@ fun GoLiveScreen(
             dismissButton = { TextButton({ showEnd = false }) { Text("Keep going", color = c.textSecondary) } },
         )
     }
+    // B2: the room was ended from outside (staff End). The broadcast has
+    // already stopped; tell the host why, then show the session summary.
+    if (state.endedRemotely) {
+        AlertDialog(
+            onDismissRequest = {}, containerColor = c.bgElevated,
+            title = { Text("Live ended", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text(state.remoteEndMessage, style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+            confirmButton = { TextButton({ onLiveEnded(viewModel.sessionSummary()) }) { Text("OK", color = c.textBrand) } },
+        )
+    }
     if (state.pkState == PKState.WAITING) PKSearchingDialog(onCancel = viewModel::cancelPKSearch)
     if (state.pkState == PKState.INVITED) state.pkInvite?.let { PKMatchFoundDialog(invite = it, myUid = state.myUid, onAccept = viewModel::acceptPKInvite, onReject = viewModel::rejectPKInvite) }
     if (showViewers) ViewerManagementSheet(

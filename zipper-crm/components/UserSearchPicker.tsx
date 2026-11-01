@@ -19,6 +19,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { getUsersPage, searchUsers, getUser, type UserRecord as FullUserRecord } from '@/lib/firestore'
 import { X, Search, Loader2, User, AlertTriangle } from 'lucide-react'
 import { failureReason } from '@/lib/readState'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
 
 interface UserRecord {
   uid: string
@@ -188,8 +189,8 @@ export default function UserSearchPicker({ value, onChange }: Props) {
       >
         {selected ? (
           <>
-            {selected.photoUrl
-              ? <img src={selected.photoUrl} alt="" className="w-4 h-4 rounded-full shrink-0 object-cover" />
+            {profilePhotoSrc(selected.photoUrl)
+              ? <img src={profilePhotoSrc(selected.photoUrl)} alt="" className="w-4 h-4 rounded-full shrink-0 object-cover" />
               : <User size={12} className="shrink-0 text-slate-400" />
             }
             <span className="truncate flex-1 text-yellow-200">{selected.name || selected.uid.slice(0, 10)}</span>
@@ -267,8 +268,8 @@ export default function UserSearchPicker({ value, onChange }: Props) {
                   u.uid === value ? 'bg-yellow-500/10' : ''
                 }`}
               >
-                {u.photoUrl
-                  ? <img src={u.photoUrl} alt="" className="w-7 h-7 rounded-full shrink-0 object-cover border border-slate-700" />
+                {profilePhotoSrc(u.photoUrl)
+                  ? <img src={profilePhotoSrc(u.photoUrl)} alt="" className="w-7 h-7 rounded-full shrink-0 object-cover border border-slate-700" />
                   : <div className="w-7 h-7 rounded-full shrink-0 bg-slate-700 flex items-center justify-center">
                       <User size={13} className="text-slate-400" />
                     </div>

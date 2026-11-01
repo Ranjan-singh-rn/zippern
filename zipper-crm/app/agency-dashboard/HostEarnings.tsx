@@ -42,6 +42,7 @@ import { when, type AgencyHostRow } from '@/lib/apiPartners'
 import type { ReadResult } from '@/lib/readState'
 import { Section, Th } from './MoneyUI'
 import { periodDates, type Period } from './MoneyUI'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
 
 /** What this dashboard knows about a host, from the `users` read. */
 export interface RosterHost {
@@ -194,10 +195,10 @@ export function HostEarnings({
                   >
                     <td className="px-4 sm:px-5 py-3">
                       <div className="flex items-center gap-2.5">
-                        {h.photoUrl ? (
+                        {profilePhotoSrc(h.photoUrl) ? (
                           // eslint-disable-next-line @next/next/no-img-element
                           <img
-                            src={h.photoUrl}
+                            src={profilePhotoSrc(h.photoUrl)}
                             alt={h.name}
                             className="w-7 h-7 rounded-full object-cover shrink-0"
                           />

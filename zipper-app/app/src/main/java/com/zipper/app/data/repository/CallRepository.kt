@@ -224,7 +224,15 @@ class CallRepository @Inject constructor(
      * Fetch up to [limit] call history entries for [myUid].
      * Runs two queries (caller + receiver) and merges, sorted by timestamp desc.
      */
-    suspend fun getCallHistory(myUid: String, limit: Long = 50): List<CallRecord> {
+    suspend fun getCallHistory(myUid: String, limit: Long = 50): List<CallRecord> =
+        loadCallHistory(myUid, limit).getOrDefault(emptyList())
+
+    /**
+     * B2: the same read, but a failure is a FAILURE, not an empty list. Call
+     * history used to say "No calls yet" when the query was refused or the
+     * network was down, and `CallHistoryUiState.error` was never set.
+     */
+    suspend fun loadCallHistory(myUid: String, limit: Long = 50): Result<List<CallRecord>> {
         return try {
             val historyCol = firestore.collection("callHistory")
 
@@ -287,12 +295,16 @@ class CallRepository @Inject constructor(
             }
 
             // Merge and sort by timestamp descending, deduplicate by id
-            records
-                .distinctBy { it.id }
-                .sortedByDescending { it.timestamp }
-                .take(limit.toInt())
+            Result.success(
+                records
+                    .distinctBy { it.id }
+                    .sortedByDescending { it.timestamp }
+                    .take(limit.toInt())
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
-            emptyList()
+            Result.failure(e)
         }
     }
 

@@ -219,6 +219,34 @@ def fake_crm_write(
 
 ops.get_db = lambda: db
 partner_svc.get_db = lambda: db
+# `partner_ops.create` now claims the human's role family before it writes
+# (one Agency per Firebase identity), and `partner_roles` reads Mongo
+# through its own import, so it needs the same fake db.
+from app.services import partner_roles as _partner_roles  # noqa: E402
+_partner_roles.get_db = lambda: db  # type: ignore[assignment]
+# Approval re-checks the role table (partner_applications) and staff identity
+# (users), so both read the same fake Mongo.
+from app.services import partner_applications as _apps  # noqa: E402
+
+# Phase 1A (AUTH-002): these fixtures are verified people; the guest refusal
+# is covered by tests/test_phase1a_identity.py.
+_apps.is_unverified_guest = lambda uid: False
+from app.services import users as _users_mod  # noqa: E402
+_apps.get_db = lambda: db  # type: ignore[assignment]
+_users_mod.get_db = lambda: db  # type: ignore[assignment]
+# …and the role table reads the person's app profile (Host or not) from
+# Firestore. An empty fake: nobody in this file is a Host or staff.
+from app.db import firebase as _firebase_mod  # noqa: E402
+from tests import harness as _rc_harness  # noqa: E402
+
+# Decision 15 (RC): every login in these fixtures holds BOTH verified contacts
+# (an SMS-linked phone and a code-verified email) — the subject of this module
+# is not the contact rule, which tests/test_rc_contact_verification.py runs with
+# per-uid records, verified and not.
+_firebase_mod.get_user = _rc_harness.verified_auth  # type: ignore[assignment]
+from tests.fakes import FakeFirestore as _FakeFirestore  # noqa: E402
+_role_fs = _FakeFirestore()
+_firebase_mod.firestore_client = lambda: _role_fs  # type: ignore[assignment]
 # The statement readers go through `money.get_balance` / `money.ledger_for`, and
 # those are the real functions — a coin balance and a commission balance must be
 # read the way production reads them, or "the money stays apart" proves nothing.
@@ -427,7 +455,20 @@ ok("the refusal is about the partner not existing yet", "seller-orphan" in messa
 
 # A partner document with no `crmUid` names no login, so there is nobody to
 # grant anything to.
-asyncio.run(ops.approve_partner("seller-orphan", REASON, ACTOR))
+#
+# FX-09: such a record can no longer be APPROVED ("attach a login first"), so an
+# approved login-less record now exists only as legacy data, approved before
+# that rule. It is created the way it would have been (approval), then shown to
+# be refused today, and the legacy state is seeded directly for the rest of the
+# scenario.
+_fx09 = refuses(
+    "FX-09: approving a record that names no login is refused",
+    lambda: ops.approve_partner("seller-orphan", REASON, ACTOR),
+)
+ok("FX-09: …saying to attach a login first", "Attach a login first" in _fx09)
+_legacy = stored("seller-orphan")
+_legacy["status"] = "approved"
+_legacy["is_active"] = True
 message = refuses(
     "a partner with no CRM login applying",
     lambda: ops.request_second_role("seller-orphan", "agency-meena", APPLY, ACTOR),
@@ -716,7 +757,14 @@ check("its audit trail is unchanged", actions_for("seller-plain"), PLAIN_AUDIT_B
 check("its login is unchanged", crm_users["login-plain"], PLAIN_CRM_BEFORE)
 ok("it carries no second-capability link", "second_role_of" not in PLAIN_BEFORE)
 ok("and no reverse link", "linked_partner_id" not in PLAIN_BEFORE)
-ok("and no owner uid", "owner_crm_uid" not in PLAIN_BEFORE)
+# `owner_crm_uid` IS present on a plain partner now — written at creation
+# from the Firestore document's `crmUid`, because a record that reaches Mongo
+# belonging to nobody is a record the one-agency-per-human rule cannot see.
+# The second-role flow is no longer the only writer, and this control checks
+# the field is simply the login uid, not something the second-role path put
+# there. (It used to assert absence; absence was the bug.)
+ok("its owner uid is its own login, written at birth",
+   PLAIN_BEFORE.get("owner_crm_uid") == "login-plain")
 
 # Approving and rejecting an ordinary partner takes none of the new path.
 FIRESTORE["seller-ordinary"] = (

@@ -69,6 +69,28 @@ async def fake_audit_record(**kwargs):
 
 audit_mod.record = fake_audit_record
 
+# `users.ensure_ordinary_target` reads the Mongo `staff` collection to decide
+# whether a subject is a protected internal identity. This file stubs the
+# audit writer rather than using a FakeDb, so the service gets an empty one:
+# every subject here is an ordinary app user, which is exactly what "no staff
+# row" means.
+_staff_db = FakeDb()
+svc.get_db = lambda: _staff_db  # type: ignore[assignment]
+from app.services import partner_applications as _apps  # noqa: E402
+
+# Phase 1A (AUTH-002): these fixtures are verified people; the guest refusal
+# is covered by tests/test_phase1a_identity.py.
+_apps.is_unverified_guest = lambda uid: False
+_apps.get_db = lambda: _staff_db  # type: ignore[assignment]  — the host grant re-checks the role table
+# B18: a grant re-validates the agency it attaches the Host to, so the agencies
+# these fixtures name exist and are approved and active.
+_staff_db.seed("partners", [
+    {"_id": "agency-1", "kind": "agency", "status": "approved", "is_active": True,
+     "name": "Agency One", "owner_crm_uid": "agency-owner-1"},
+    {"_id": "agency-2", "kind": "agency", "status": "approved", "is_active": True,
+     "name": "Agency Two", "owner_crm_uid": "agency-owner-2"},
+])
+
 OPS = {"uid": "ops-1", "name": "Ops Admin", "role": "ops_admin"}
 
 failures: list[str] = []
@@ -199,6 +221,47 @@ check("and so does the rejection history",
       ver_c.get("lastRejectedAt"), datetime(2026, 2, 1, tzinfo=timezone.utc))
 check("createdAt is not rewritten",
       ver_c.get("createdAt"), datetime(2026, 1, 1, tzinfo=timezone.utc))
+# B23: the history stays, but the record names the agency the Host belongs to NOW.
+check("B23: the surviving record names the agency of this grant", ver_c.get("agencyId"), "agency-1")
+
+seed_user("host-e")
+seed_application("app-e", agencyId="agency-2")
+store.collection("hostVerification").document("host-e").set(
+    {"uid": "host-e", "status": "verified", "attemptCount": 1, "agencyId": "agency-old",
+     "applicationId": "app-old"}
+)
+run(svc.grant_host("host-e", "agency-2", "Re-granted under a new agency", OPS,
+                   {"application_id": "app-e"}))
+ver_e = verification("host-e")
+check("B23: a re-grant moves the verification record's agency", ver_e.get("agencyId"), "agency-2")
+check("B23: …and its application", ver_e.get("applicationId"), "app-e")
+check("B23: …and keeps its status", ver_e.get("status"), "verified")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  B18 — the agency is re-validated at the grant
+# ══════════════════════════════════════════════════════════════════════════════
+
+_staff_db.seed("partners", [
+    {"_id": "agency-suspended", "kind": "agency", "status": "suspended", "is_active": False,
+     "name": "Paused Agency"},
+    {"_id": "sub-under-paused", "kind": "sub_agency", "status": "approved", "is_active": True,
+     "name": "Sub Of Paused", "parent_id": "agency-suspended"},
+])
+for label, agency in (("a suspended agency", "agency-suspended"),
+                      ("a sub-agency whose main agency is suspended", "sub-under-paused"),
+                      ("an agency that does not exist", "agency-gone")):
+    uid = f"host-b18-{agency}"
+    seed_user(uid)
+    refused = False
+    try:
+        run(svc.grant_host(uid, agency, "Approved after review", OPS))
+    except svc.UserError:
+        refused = True
+    ok(f"B18: granting Host under {label} is refused", refused)
+    user_x = store.collection("users").document(uid).get().to_dict() or {}
+    ok(f"B18: …and nothing was written for {label}", user_x.get("isHost") is not True
+       and verification(uid) == {})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

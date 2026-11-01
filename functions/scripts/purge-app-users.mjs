@@ -37,8 +37,15 @@
 import admin from 'firebase-admin'
 import { createRequire } from 'module'
 import readline from 'readline'
+import { guardKeyScript, requireDataCanary } from './_keyScriptGuard.mjs'
 
 const require = createRequire(import.meta.url)
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('purge-app-users', {
+  keyPath: new URL('../../serviceAccountKey.json', import.meta.url),
+  writes: process.argv.includes('--confirm'),
+})
 const serviceAccount = require('../../serviceAccountKey.json')
 
 const CONFIRM = process.argv.includes('--confirm')
@@ -232,6 +239,8 @@ async function main() {
   console.log(CONFIRM
     ? '\n*** LIVE RUN — this deletes data permanently ***\n'
     : '\nDRY RUN — nothing will be changed. Re-run with --confirm to delete.\n')
+  // P0-10: a live run needs this project's data canary before anything is read for deletion.
+  if (CONFIRM) await requireDataCanary('purge-app-users', db, GUARDED_PROJECT)
 
   // Everybody with a CRM login is spared, checked by uid rather than by role.
   const crmSnap = await db.collection('crmUsers').select().get()

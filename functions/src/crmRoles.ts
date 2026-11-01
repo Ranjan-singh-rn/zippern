@@ -103,6 +103,20 @@ export function deriveRoleFlags(
   roles: unknown,
   isActive: boolean,
   exists: boolean,
+  /**
+   * `crmUsers.roleStatus` — per-capability state on a login that can hold two
+   * (`{agency: 'approved', seller: 'revoked'}`). A capability whose status is
+   * revoked, rejected or suspended is not HELD, even though it is still listed
+   * in `roles` (the list is history; the status is the decision). Absent on
+   * older documents, where `roles` alone decides as before.
+   */
+  roleStatus?: unknown,
+  /**
+   * `crmUsers.status` — the LOGIN's state. A capability with no `roleStatus`
+   * entry (single-role and legacy documents) takes this; absent too, it is
+   * treated as approved (pre-status documents were approved by construction).
+   */
+  status?: unknown,
 ): RoleFlags {
   const normalised = normaliseCrmRole(role)
 
@@ -112,10 +126,19 @@ export function deriveRoleFlags(
   const usable =
     exists && isActive && normalised !== '' && normalised !== OBSERVER_ROLE
 
+  const statuses = (roleStatus && typeof roleStatus === 'object')
+    ? roleStatus as Record<string, unknown>
+    : {}
+  // A capability earns its tag only when APPROVED — not pending, revoked,
+  // rejected or suspended. Identical to `crm_directory.app_role_flags`.
+  const stateOf = (cap: string) =>
+    String(statuses[cap] ?? '').trim() || String(status ?? '').trim() || 'approved'
+  const withdrawn = (cap: string) => stateOf(cap) !== 'approved'
+
   const held: string[] = usable
     ? (Array.isArray(roles) && roles.length > 0 ? roles : [normalised])
         .map(normaliseCrmRole)
-        .filter((r) => r !== '')
+        .filter((r) => r !== '' && !withdrawn(r))
     : []
 
   const isAgent = held.includes('agency')
@@ -135,4 +158,58 @@ export function deriveRoleFlags(
     isOfficial,
     held,
   }
+}
+
+/**
+ * Why this login may NOT become a Host, or '' if it may. Pure.
+ *
+ * The role table (backend `partner_applications._ALLOWS`) forbids a Host who
+ * also holds — or is applying for — an Agency or Sub-agency, and ZIPPER staff
+ * hold no partner role at all. The backend enforces both at application and
+ * approval; this is the same rule for the one path that grants Host without
+ * the backend, `activateHost` (redeeming an agency's referral code).
+ *
+ * An agency capability counts while it is pending, approved, suspended or
+ * REVOKED — held, like the backend's HELD_STATUSES — and stops counting only
+ * once rejected. C1 (B04): a revoked record still constrains the role table
+ * exactly like a held one, because restoring it must never produce a
+ * forbidden pair (Agency + Host). Per-capability `roleStatus` wins, then the
+ * login `status`.
+ */
+export function hostBlockedBy(crm: Record<string, unknown> | undefined | null): string {
+  if (!crm) return ''
+  const role = normaliseCrmRole(crm.role)
+  if (role === OWNER_ROLE || role === OBSERVER_ROLE || DEPARTMENT_ROLES.has(role)) {
+    return 'ZIPPER staff accounts cannot hold partner roles.'
+  }
+  const roles = Array.isArray(crm.roles) && crm.roles.length > 0 ? crm.roles.map(normaliseCrmRole) : [role]
+  if (!roles.includes('agency')) return ''
+  const statuses = (crm.roleStatus && typeof crm.roleStatus === 'object')
+    ? crm.roleStatus as Record<string, unknown> : {}
+  const state = String(statuses.agency ?? '').trim() || String(crm.status ?? '').trim() || 'approved'
+  if (state === 'rejected') return ''
+  return AGENCY_HOST_REFUSAL
+}
+
+export const AGENCY_HOST_REFUSAL = 'An Agency or Sub-agency cannot also be a Host.'
+
+/**
+ * RC (confirmed role rule): `hostBlockedBy`, with the one exception the rule
+ * makes — a Sub-agency under main Agency X may ALSO be a Host directly under
+ * X, and nowhere else (not under another agency, not under any sub-agency).
+ * Pure. `subParentId` is the main agency of the login's Sub-agency (blank for
+ * a main agency or no agency); `invitationAgencyIsMain` says whether the
+ * agency issuing the invitation is a MAIN agency.
+ */
+export function hostBlockedFor(
+  crm: Record<string, unknown> | undefined | null,
+  ctx: { subParentId: string; invitationAgencyId: string; invitationAgencyIsMain: boolean },
+): string {
+  const base = hostBlockedBy(crm)
+  if (base !== AGENCY_HOST_REFUSAL) return base
+  const sub = String(ctx.subParentId ?? '').trim()
+  if (!sub) return base
+  if (ctx.invitationAgencyIsMain && sub === String(ctx.invitationAgencyId ?? '').trim()) return ''
+  return 'As a Sub-agency, you may be a Host only directly under your own main agency — not under ' +
+    'another agency and not under any sub-agency.'
 }

@@ -295,9 +295,9 @@ fun SuspendedScreen(
              * out after typing four paragraphs is how an appeal gets abandoned.
              */
             Text(
-                "This signs you out of the suspended account. Send your appeal " +
-                    "first if you mean to write one — it has to be sent while you " +
-                    "are signed in here.",
+                "This signs you out of the suspended account. The appeal form below " +
+                    "works while you are signed in here; after that you can still appeal " +
+                    "on the web with your account ID — see below.",
                 style = ZipperTheme.type.caption, color = c.textMuted,
                 textAlign = TextAlign.Center,
             )

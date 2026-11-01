@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.EconomyConfigTest" tests="18" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.798Z" hostname="CW253.local" time="0.005">
+  <properties/>
+  <testcase name="case and whitespace do not change a price" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.002"/>
+  <testcase name="bean value is shown below the payout threshold" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="an unrecorded gender is priced, never refused" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="a configured bean rule can block an otherwise eligible payout" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="a nonsense cell falls back to the specified table rather than to zero" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="per-diamond rates derive from the per-lakh price" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="threshold is met at the boundary" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="the table is not symmetric, which is the whole point" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="a wholesale price equal to retail leaves the seller nothing" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="the matrix matches the server's table cell for cell" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="the user pays, whoever dialled" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="fallback config is flagged so the UI can say so" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="no pairing ever produces a free call" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.001"/>
+  <testcase name="between two of a kind the caller pays" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="seller margin is the gap between retail and wholesale" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="absent bean rule means the rupee rule decides alone" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <testcase name="the earner's income is the input, and only the payer's price moves" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.001"/>
+  <testcase name="rounding never favours the payer" classname="com.zipper.app.data.repository.EconomyConfigTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

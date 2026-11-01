@@ -86,6 +86,11 @@ store.collection("crmUsers").document(AGENCY_UID).set(
         "role": "agency",
         "agencyId": "ag-1",
         "isActive": True,
+        # P0-5 (AUTHN-1): the server stamped this address as verified on the
+        # login's own Auth record — the only kind of document the address
+        # fallback may match. tests/test_identity_integrity_p0.py covers the
+        # unproven case.
+        "emailProven": True,
     }
 )
 

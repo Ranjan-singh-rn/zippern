@@ -29,12 +29,45 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from app.config import settings
-from app.core.roles import ALL_PERMISSIONS, Role, permissions_of, team_of
+from app.core.roles import ALL_PERMISSIONS, INTERNAL_ROLES, Role, permissions_of, team_of
 from app.db import firebase
 
 log = logging.getLogger(__name__)
 
 COLLECTION = "crmUsers"
+
+#: P1-E — the names-only staff list every member of staff may read (assignee
+#: pickers, routing). `crmUsers` carries phone numbers and contact details and
+#: is readable only by its owner, an Owner, and a department admin for their own
+#: members (firestore.rules). Written here, by the Admin SDK, and by nothing else.
+ROSTER = "staffRoster"
+ROSTER_FIELDS = ("uid", "name", "role", "dept", "isActive")
+
+
+def write_roster(uid: str, *, name: str, crm_role: str, dept: str | None, is_active: bool) -> str:
+    """Upsert one roster row. Best effort: returns a note on failure, never raises.
+
+    It only names people for pickers — it decides no access — so a failure here
+    must not fail an invite or a deactivation that has otherwise landed."""
+    try:
+        firebase.firestore_client().collection(ROSTER).document(uid).set({
+            "uid": uid, "name": name or "", "role": crm_role, "dept": dept or None,
+            "isActive": bool(is_active), "updatedAt": datetime.now(timezone.utc),
+        })
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("staffRoster/%s was not written: %s", uid, exc)
+        return f"staffRoster/{uid} not written ({exc}); re-run scripts/backfill_staff_roster.py"
+
+
+def set_roster_active(uid: str, is_active: bool) -> str:
+    try:
+        firebase.firestore_client().collection(ROSTER).document(uid).set(
+            {"isActive": bool(is_active), "updatedAt": datetime.now(timezone.utc)}, merge=True)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("staffRoster/%s isActive was not written: %s", uid, exc)
+        return f"staffRoster/{uid} not updated ({exc})"
 
 #: The Android app queries this on every login and stamps `crmRole` on the
 #: account when it finds a match, so a staff member is recognised in the app as
@@ -118,6 +151,13 @@ PARTNER_CRM_ROLE: dict[Role, str] = {
     Role.AGENCY: "agency",
     Role.SELLER: "seller",
 }
+
+#: The CRM spellings of every INTERNAL role (Owner = `superadmin`, department
+#: admins and members). Derived from `CRM_ROLE` and `INTERNAL_ROLES`, so there
+#: is one definition of "internal". Partner spellings are never in it.
+INTERNAL_CRM_ROLES: frozenset[str] = frozenset(
+    crm for role, crm in CRM_ROLE.items() if role in INTERNAL_ROLES
+)
 
 #: The reverse direction, used when repairing a `crmUsers` document that has no
 #: Mongo row. `superadmin` is deliberately absent: see `MONGO_ROLE_REFUSED`.
@@ -515,16 +555,54 @@ def attach_phone_to_login(uid: str, phone: str) -> str:
     e164 = to_e164(phone)
     if not uid.strip() or not e164:
         return ""
-    try:
-        firebase.update_user_phone(uid, e164)
+    # ── Phase 1A (CONTACT-002): A TYPED NUMBER IS NEVER ATTACHED ────────────
+    #
+    # This used to call `update_user_phone(uid, <number from a form>)`. The
+    # number was typed — by the applicant on an application, or by staff on an
+    # invitation — and nobody had proved they hold it. Attaching it made that
+    # unverified claim the account's sign-in identity: whoever later passed OTP
+    # for the number landed on THIS uid, and the real holder of the number could
+    # be locked out of, or into, an account that was not theirs.
+    #
+    # The number reaches the account only by the holder verifying it in the app
+    # (`bindVerifiedIdentity`, phone OTP). If it is already on the account —
+    # because they did exactly that — there is nothing to do.
+    if typed_phone_already_verified(uid, e164):
         return ""
-    except Exception as exc:  # noqa: BLE001 — reported, never fatal
-        log.warning("Could not attach %s to Firebase user %s: %s", e164, uid, exc)
-        return (
-            f"their phone could not be attached to the sign-in ({exc}); they will "
-            "not be able to reach this account from the app with phone sign-in "
-            "until it is"
-        )
+    return (
+        "their phone was not attached to the sign-in: a typed number is never "
+        "attached automatically. They add it by verifying it with an OTP in the "
+        "app (Settings → add phone number)"
+    )
+
+
+def typed_phone_already_verified(uid: str, e164: str) -> bool:
+    """Is this exact number already on the uid's Firebase account (OTP-verified)?"""
+    try:
+        rec = firebase.get_user(uid)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(rec is not None and getattr(rec, "phone_number", None) == e164)
+
+
+def typed_email_already_verified(uid: str, email: str) -> bool:
+    """P0-5 (AUTHN-1): is this exact address on the uid's Firebase account, VERIFIED?
+
+    The email twin of `typed_phone_already_verified`. A partner's address is
+    typed into an application form; it is a claim, not an identity, until the
+    sign-in itself holds it confirmed. Unknown is not verified.
+    """
+    wanted = (email or "").strip().lower()
+    if not wanted or not uid:
+        return False
+    try:
+        rec = firebase.get_user(uid)
+    except Exception:  # noqa: BLE001
+        return False
+    if rec is None:
+        return False
+    held = str(getattr(rec, "email", "") or "").strip().lower()
+    return held == wanted and bool(getattr(rec, "email_verified", False))
 
 
 def ensure_app_phone(uid: str, document: dict | None) -> str:
@@ -633,6 +711,131 @@ def to_e164(raw: str) -> str:
     return DEFAULT_DIAL_CODE + digits
 
 
+#: Per-capability states that mean the capability is not held. Mirrors
+#: `functions/src/crmRoles.ts::deriveRoleFlags` and `storageClaims.ts` — the
+#: three readers of `roleStatus` must agree or the app tag, the storage claim
+#: and the session disagree about whether somebody is an Agency.
+WITHDRAWN_PARTNER_STATES = frozenset({"revoked", "rejected", "suspended"})
+
+#: The only per-capability state that earns an app tag.
+HELD_FOR_APP = "approved"
+
+#: The app fields this module may write for a PARTNER. Nothing else on
+#: `users/{uid}` — not isProfileComplete, not isSuspended/isBanned, not
+#: isOfficial, not a staff crmRole — is ever touched by the push or the repair.
+APP_ROLE_FIELDS = ("isAgent", "isSeller", "ownAgencyId", "agencyId", "crmRole")
+
+
+def _capability_state(doc: dict, capability: str) -> str:
+    """One capability's state: its own `roleStatus` entry, else the login's
+    `status` (single-role and legacy documents carry only that), else
+    'approved' (pre-status documents, which were approved by construction)."""
+    statuses = doc.get("roleStatus") if isinstance(doc.get("roleStatus"), dict) else {}
+    own = str(statuses.get(capability) or "").strip()
+    if own:
+        return own
+    return str(doc.get("status") or "").strip() or HELD_FOR_APP
+
+
+def app_role_flags(crm_doc: dict | None) -> dict:
+    """The app-side role flags a `crmUsers` document earns. Pure.
+
+    A capability earns its tag only when it is listed on the login (`roles`, or
+    the primary `role` on a document with no list) AND its state is approved —
+    never from the one `role` string alone (how Agency + Seller became "Seller
+    only"), and never for a pending, revoked, rejected or suspended capability.
+    Mirrors `functions/src/crmRoles.ts::deriveRoleFlags`.
+    """
+    doc = crm_doc or {}
+    if not doc or doc.get("isActive") is False:
+        return {"isAgent": False, "isSeller": False}
+    role = str(doc.get("role") or "")
+    listed = doc.get("roles") if isinstance(doc.get("roles"), list) and doc.get("roles") else [role]
+    held = {str(r) for r in listed if str(r) and _capability_state(doc, str(r)) == HELD_FOR_APP}
+    return {
+        "isAgent": PARTNER_CRM_ROLE[Role.AGENCY] in held,
+        "isSeller": PARTNER_CRM_ROLE[Role.SELLER] in held,
+    }
+
+
+def app_role_patch(crm_doc: dict | None, users_doc: dict) -> dict:
+    """The minimal change that makes `users_doc` agree with `crm_doc`. Pure.
+
+    Empty when they already agree — which is what makes the push and the repair
+    idempotent. Only `APP_ROLE_FIELDS` can appear in the result.
+
+      * isAgent / isSeller — set to the entitlement, independently.
+      * ownAgencyId — the person's OWN Agency / Sub-agency, set while the Agency
+        capability is held and removed when it is not.
+      * agencyId — NEVER written with the person's own agency any more. It
+        means one thing: the agency a HOST works under (commission, roster,
+        payouts, live rooms). Overloading it with the owner's agency is what
+        overwrote a Host's parent when they became a Sub-agency, and then
+        deleted it on revocation. The only touch here is a one-off cleanup: a
+        value equal to their own agency on someone who is NOT a Host is a
+        leftover of the old overload and is removed. A Host's agencyId is never
+        changed by this function.
+      * crmRole — a partner value ('agency' / 'seller', written by the old
+        `_attach_app_identity`) becomes '' as `syncMyRoles` writes it, so the
+        badge does not render a partner as a staff label. A staff crmRole is
+        never touched.
+    """
+    from firebase_admin import firestore as fb_firestore
+
+    doc = crm_doc or {}
+    users_doc = users_doc or {}
+    flags = app_role_flags(doc)
+    patch: dict = {}
+    for key in ("isAgent", "isSeller"):
+        if (users_doc.get(key) is True) != flags[key] or key not in users_doc:
+            patch[key] = flags[key]
+    own_agency = str(doc.get(PARTNER_LINK_FIELD[Role.AGENCY]) or "").strip()
+    current_own = str(users_doc.get("ownAgencyId") or "").strip()
+    if flags["isAgent"] and own_agency:
+        if current_own != own_agency:
+            patch["ownAgencyId"] = own_agency
+    elif "ownAgencyId" in users_doc:
+        patch["ownAgencyId"] = fb_firestore.DELETE_FIELD
+    host_agency = str(users_doc.get("agencyId") or "").strip()
+    if own_agency and host_agency == own_agency and users_doc.get("isHost") is not True:
+        patch["agencyId"] = fb_firestore.DELETE_FIELD
+    if str(users_doc.get("crmRole") or "") in PARTNER_CRM_ROLE.values():
+        patch["crmRole"] = ""
+    return patch
+
+
+def push_app_role_flags(uid: str) -> str:
+    """Write the current partner flags onto `users/{uid}`, if it exists. Blocking.
+
+    Called after every partner decision (approve, reject, suspend, reactivate,
+    revoke) so the Android app — which renders the Agency / Seller tag from
+    `users/{uid}` through a live listener — changes at the moment of the
+    decision, not at the person's next sign-in. `syncMyRoles` derives the same
+    flags at sign-in and on every cold start; this is the push half.
+
+    Does NOT create the document: `update`, not `set`, so a document deleted
+    between the read and the write is refused rather than resurrected. Writes
+    only `APP_ROLE_FIELDS`, and nothing at all when they already agree.
+    Never raises — returns '' or a sentence.
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return ""
+    try:
+        crm_doc = read(uid)
+        ref = firebase.firestore_client().collection("users").document(uid)
+        snap = ref.get()
+        if not snap.exists:
+            return ""
+        patch = app_role_patch(crm_doc, snap.to_dict() or {})
+        if patch:
+            ref.update(patch)
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("users/%s role flags not pushed: %s", uid, exc)
+        return f"the app role flags on users/{uid} were not updated ({exc})"
+
+
 def _attach_app_identity(
     *,
     uid: str,
@@ -642,6 +845,7 @@ def _attach_app_identity(
     crm_role: str,
     agency_id: str | None = None,
     seller_id: str | None = None,
+    email_proven: bool = False,
 ) -> str:
     """Make the CRM account and the app account ONE Firebase account.
 
@@ -718,36 +922,60 @@ def _attach_app_identity(
     attached = False
 
     if e164:
-        try:
-            firebase.update_user_phone(uid, e164)
+        # Phase 1A (CONTACT-002): the typed number is NOT attached to the
+        # Firebase account — see `attach_phone_to_login`. It is recorded on the
+        # user document only when the account already holds it, verified.
+        if typed_phone_already_verified(uid, e164):
             attached = True
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not attach %s to Firebase user %s: %s", e164, uid, exc)
+        else:
             notes.append(
-                f"their phone could not be attached to the sign-in ({exc}); "
-                "they will not be able to reach this account from the app until "
-                "it is"
+                "their phone was not attached to the sign-in (a typed number is "
+                "never attached automatically); they verify it with an OTP in "
+                "the app"
             )
 
+    is_partner = crm_role in (PARTNER_CRM_ROLE.get(Role.AGENCY), PARTNER_CRM_ROLE.get(Role.SELLER))
+    # From the WHOLE login (every capability, minus withdrawn ones), not from
+    # the one role being written now — see `app_role_flags`.
+    try:
+        flags = app_role_flags(read(uid)) if is_partner else {"isAgent": False, "isSeller": False}
+    except Exception:  # noqa: BLE001
+        # Unknown is not "none" and not "the one role being written": leave the
+        # flags as they are. `syncMyRoles` and the next push correct them.
+        flags = {}
+    # P0-5 (AUTHN-1): a partner's address reaches the app account only once the
+    # sign-in holds it VERIFIED. A typed `ownerEmail` written here squatted the
+    # address (its real owner was refused as `active_holder` when binding it)
+    # and misrouted every lookup by email. Staff addresses are set by an Owner
+    # through the audited staff API and are unchanged.
+    app_email = email if (not is_partner or email_proven) else ""
+    if is_partner and email and not email_proven:
+        notes.append(
+            "their email was not written to the app account: a partner's address "
+            "is recorded there only once it is verified on the sign-in"
+        )
     patch: dict = {
         "uid": uid,
-        "name": name or "Team",
-        "email": email,
-        "crmRole": crm_role,
-        "isAgent": crm_role == PARTNER_CRM_ROLE.get(Role.AGENCY),
-        "isSeller": crm_role == PARTNER_CRM_ROLE.get(Role.SELLER),
+        # '' for a partner, exactly as `syncMyRoles` writes it. Writing 'agency'
+        # here while `syncMyRoles` wrote '' made the badge depend on which of
+        # the two had written last.
+        "crmRole": "" if is_partner else crm_role,
+        **flags,
         # Staff carry the official badge; a partner does not — they are external.
-        "isOfficial": crm_role
-        not in (PARTNER_CRM_ROLE.get(Role.AGENCY), PARTNER_CRM_ROLE.get(Role.SELLER)),
+        "isOfficial": not is_partner,
         "lastSeen": int(datetime.now(timezone.utc).timestamp() * 1000),
     }
+    if app_email:
+        patch["email"] = app_email
     if attached:
         # The number as Firebase now holds it, and the key derived from that
         # same value — never a reconstructed one.
         patch["phoneNumber"] = e164
         patch["phoneKey"] = key
-    if agency_id:
-        patch["agencyId"] = agency_id
+    if agency_id and flags.get("isAgent"):
+        # Only while the Agency capability is actually held (approved). Into
+        # `ownAgencyId` — `agencyId` is the agency a Host works under.
+        patch["ownAgencyId"] = agency_id
     if seller_id:
         patch["sellerId"] = seller_id
 
@@ -758,6 +986,11 @@ def _attach_app_identity(
             patch["isProfileComplete"] = False
             patch["createdAt"] = datetime.now(timezone.utc)
             patch["createdVia"] = "crm"
+            # B19: the display name only seeds a document being CREATED. On an
+            # existing app account it is the person's own — chosen at profile
+            # setup — and applying for a role, or a staff record being saved,
+            # must not replace it with a business or form name.
+            patch["name"] = name or "Team"
         # Merge, always. This runs again on every role change and must never
         # flatten a profile the person has since filled in themselves.
         ref.set(patch, merge=True)
@@ -831,10 +1064,16 @@ def mirror(
     because a staff row with no CRM document is an account that cannot sign in.
     """
     email = (email or "").strip().lower()
-    if not email:
+    partner_id = str(partner_id or "").strip()
+    # FX-04: a STAFF document is found by address and signs in with it, so it
+    # needs one. A PARTNER login document is keyed by uid and is what the app's
+    # role flags are derived from (`app_role_flags`, `deriveRoleFlags`): an
+    # applicant who signed in with a verified PHONE and has no email must still
+    # get one, or an approved partner never sees their role (RF-01). Such a
+    # document carries no address and `emailProven: False` — nothing invented.
+    if not email and not partner_id:
         raise DirectoryError("A crmUsers document needs an email address.")
 
-    partner_id = str(partner_id or "").strip()
     if partner_id and role not in PARTNER_LINK_FIELD:
         raise DirectoryError(
             f"A partner record was named for '{role}', which is not an external "
@@ -917,10 +1156,29 @@ def mirror(
         payload[PARTNER_LINK_FIELD[role]] = partner_id
         payload["roles"] = held + ([crm_role] if crm_role not in held else [])
         payload["status"] = partner_status
+        # ── A SECOND CAPABILITY DOES NOT REPLACE THE FIRST ──────────────────
+        #
+        # `role` and `status` name the capability the account was created
+        # with; `roles` / `roleStatus` carry each capability. An Agency that
+        # applies to be a Coin Seller too (the self-application path) used to
+        # come out of here as `role: 'seller', status: 'pending'` — which
+        # moved the Storage claim off `agency` (so the agency lost access to
+        # its own KYC prefix) and routed an approved agency to the waiting
+        # room. When the login already holds a different partner role, both
+        # stay as they were and only the per-capability fields move.
+        prior_role = str(existing.get("role") or "")
+        if prior_role in PARTNER_CRM_ROLE.values() and prior_role != crm_role:
+            payload["role"] = prior_role
+            payload["status"] = existing.get("status") or partner_status
         payload["roleStatus"] = {
             **(existing.get("roleStatus") or {}),
             crm_role: partner_status,
         }
+        # P0-5 (AUTHN-1): stamped by the server from the Auth record, never
+        # from a form. Only a document whose address the sign-in itself holds
+        # VERIFIED may be found by address (`core/security.py`'s fallback).
+        email_proven = typed_email_already_verified(uid, email)
+        payload["emailProven"] = email_proven
     else:
         payload["dept"] = str(team) if team else None
         payload["fieldCharge"] = field_charge or None
@@ -967,12 +1225,17 @@ def mirror(
         crm_role=crm_role,
         agency_id=payload.get(PARTNER_LINK_FIELD[Role.AGENCY]) if partner_id else None,
         seller_id=payload.get(PARTNER_LINK_FIELD[Role.SELLER]) if partner_id else None,
+        email_proven=bool(payload.get("emailProven")) if partner_id else True,
     )
+
+    # P1-E: staff only — a partner is not on the staff roster.
+    roster_note = "" if partner_id else write_roster(
+        uid, name=name, crm_role=crm_role, dept=payload.get("dept"), is_active=is_active)
 
     detail = f"{email} → {crm_role}" + ("" if is_active else " (no access)")
     if partner_id:
         detail += f" ({PARTNER_LINK_FIELD[role]}={partner_id}, {partner_status})"
-    for note in (identity_note, app_note):
+    for note in (identity_note, app_note, roster_note):
         if note:
             detail += f"; {note}"
     return Outcome(
@@ -1034,12 +1297,13 @@ def set_active(*, uid: str, email: str, role: Role, is_active: bool) -> Outcome:
             f"for {email}: {exc}"
         ) from exc
 
+    roster_note = "" if existing.get("agencyId") or existing.get("sellerId") else set_roster_active(uid, is_active)
     return Outcome(
         action="written",
         uid=uid,
         email=email,
         crm_role=str(existing.get("role", "")) or None,
-        detail=f"{email} → {'active' if is_active else 'no access'}",
+        detail=f"{email} → {'active' if is_active else 'no access'}" + (f"; {roster_note}" if roster_note else ""),
     )
 
 

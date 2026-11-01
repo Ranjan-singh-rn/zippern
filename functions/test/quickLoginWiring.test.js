@@ -463,7 +463,7 @@ describe('[source] a refusal destroys the credential only when it should', () =>
   })
 })
 
-describe('[source] forgetting this device destroys the binding too', () => {
+describe('[source] sign-out keeps quick login; "forget this device" is gone (UGP-E2)', () => {
   const body = kotlin(REPO)
 
   /** One function body, from its signature to the next top-level `suspend fun`. */
@@ -475,13 +475,17 @@ describe('[source] forgetting this device destroys the binding too', () => {
     return next < 0 ? rest : rest.slice(0, next)
   }
 
-  test('"sign out and forget" deletes the key, not just the secret', () => {
-    // Clearing the secret alone leaves the binding alive. Deleting the Keystore
-    // entry is what makes "forget this device" true: no credential minted here
-    // can be signed for again, whatever became of its bytes.
-    const fn = bodyOf('suspend fun signOutAndForget()')
-    expect(fn.includes('quickLogin.clear()')).toBe(true)
-    expect(fn.includes('deviceKey.clear()')).toBe(true)
+  test('"sign out and forget this device" no longer exists (brief E)', () => {
+    // It revoked the quick-login credential and the Keystore key but left the
+    // guest device secret, so "Continue as Guest" re-opened the same guest and
+    // its dialog promised something it did not do. Removed with its row; Log out
+    // and Switch account are the sign-out paths.
+    expect(body.includes('suspend fun signOutAndForget(')).toBe(false)
+    expect(kotlin(app('ui', 'screens', 'auth', 'AuthViewModel.kt')).includes('fun signOutAndForget(')).toBe(false)
+    const settings = kotlin(app('ui', 'screens', 'settings', 'SettingsScreen.kt'))
+    expect(settings.includes('Sign out and forget this device')).toBe(false)
+    expect(settings.includes('onSignOutAndForget')).toBe(false)
+    expect(kotlin(app('navigation', 'ZipperNavGraph.kt')).includes('onSignOutAndForget')).toBe(false)
   })
 
   test('…and an ORDINARY sign-out deletes neither', () => {
@@ -641,13 +645,33 @@ describe('[source] the Android session-less appeal', () => {
     // rather than told to write more, which is the wrong instruction.
     //
     // Scoped to the FUNCTION BODY. The first version compared against the whole
-    // file, where the first `MIN_STATEMENT` is the companion-object declaration
-    // near the top — so it was comparing a constant's declaration with a use
-    // hundreds of lines away, and a mutation that moved the session check
-    // earlier did not register.
+    // file, where the first mention of the minimum was the companion-object
+    // declaration near the top — so it was comparing a constant's declaration
+    // with a use hundreds of lines away, and a mutation that moved the session
+    // check earlier did not register.
+    //
+    // The marker is `AppealStatement.isSendable`, which is where the rule now
+    // lives. It used to be `MIN_STATEMENT`, a constant on `AppealRepository`'s
+    // own companion object; the rule was moved to a dependency-free object so
+    // the Android unit tests could reach it without a device, and so the
+    // comparison stopped being written out separately on the Send button, in
+    // the character counter and here. `posOf` throws on a marker it cannot
+    // find, so that rename failed this test rather than silently passing — see
+    // the confession above `posOf`.
     const start = posOf(APPEAL, 'suspend fun appealMyBan(')
     const fn = APPEAL.slice(start, posOf(APPEAL, 'private suspend fun appealWithoutSession'))
-    expect(posOf(fn, 'MIN_STATEMENT')).toBeLessThan(posOf(fn, 'auth.currentUser'))
+    expect(posOf(fn, 'AppealStatement.isSendable')).toBeLessThan(posOf(fn, 'auth.currentUser'))
+  })
+
+  test('the statement rule is not spelled out a second time here', () => {
+    // The gate, the Send button and the on-screen counter each measured the
+    // statement for themselves, and only one of the three was visible to the
+    // person being stopped by it. `AppealStatement` is the single copy now;
+    // this fails if the repository grows its own again.
+    const start = posOf(APPEAL, 'suspend fun appealMyBan(')
+    const fn = APPEAL.slice(start, posOf(APPEAL, 'private suspend fun appealWithoutSession'))
+    expect(/text\.length\s*[<>]=?\s*\d/.test(fn)).toBe(false)
+    expect(fn.includes('AppealStatement.TOO_SHORT')).toBe(true)
   })
 
   test('the route is challenge, sign, submit', () => {

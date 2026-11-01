@@ -16,7 +16,10 @@ import com.zipper.app.data.repository.ProfileRepository
 import com.zipper.app.data.repository.ProfileResult
 import com.zipper.app.ui.screens.live.AgoraManager
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -452,6 +455,19 @@ class VideoCallViewModel @Inject constructor(
     fun clearGiftEvent() { _state.update { it.copy(lastGiftEvent = null) } }
 
     override fun onCleared() {
+        /*
+         * P0-6: a call screen that goes away without hanging up still closes the
+         * call on the server. It used to leave it `connected` until the watchdog
+         * found it two minutes later. `viewModelScope` is already cancelled here,
+         * so this runs on its own scope; `endCall` is idempotent — the server
+         * ignores a call that has already ended.
+         */
+        if (_state.value.endReason == null && !_state.value.ending) {
+            val id = callId
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                try { callRepo.endCall(id, "teardown") } catch (_: Exception) {}
+            }
+        }
         super.onCleared()
         durationJob?.cancel()
         tickJob?.cancel()

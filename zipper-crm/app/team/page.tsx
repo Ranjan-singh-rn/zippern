@@ -46,9 +46,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   AlertTriangle, CheckCircle2, Info, KeyRound, Loader2, Mail, Plus,
-  RefreshCw, Search, Shield, ShieldCheck, UserCog, UserX, X,
+  PauseCircle, RefreshCw, RotateCcw, Search, Shield, ShieldCheck, UserCog, UserX, X,
 } from 'lucide-react'
-import api, { ApiError, type ApiRole, type StaffMember } from '@/lib/api'
+import api, { ApiError, staffStatus, type ApiRole, type StaffMember } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
 import { sendCrmPasswordReset } from '@/lib/auth'
@@ -162,6 +162,8 @@ export default function TeamPage() {
   const [inviting, setInviting] = useState(false)
   const [changingRole, setChangingRole] = useState<StaffMember | null>(null)
   const [revoking, setRevoking] = useState<StaffMember | null>(null)
+  // P1-B2/B3 — suspend (reversible) and reactivate, beside revoke.
+  const [accessAction, setAccessAction] = useState<{ member: StaffMember; mode: AccessMode } | null>(null)
   const [resettingUid, setResettingUid] = useState<string | null>(null)
 
   const load = useCallback(async () => {
@@ -216,9 +218,28 @@ export default function TeamPage() {
   async function revoke(member: StaffMember, reason: string) {
     await api.staff.deactivate(member.uid, reason.trim())
     setNotice(
-      `${member.name || member.email} no longer has access — in the CRM and in the API.`,
+      `${member.name || member.email} no longer has staff access — in the CRM and in the API. ` +
+      'Their personal Zipper app account is not affected.',
     )
     setRevoking(null)
+    await load()
+  }
+
+  async function changeAccess(member: StaffMember, mode: AccessMode, reason: string) {
+    const owner = member.role === 'owner'
+    if (mode === 'mfa_reset') {
+      // P1-A3 — Observer only (the API refuses anyone else).
+      await api.auth.mfaResetOwner(member.uid, reason.trim())
+      setNotice(`${member.name || member.email}'s two-step sign-in was reset and every session ended. ` +
+        'They set up their authenticator again at their next sign-in, and were told by email and in-app.')
+    } else if (mode === 'suspend') {
+      await (owner ? api.staff.suspendOwner : api.staff.suspend)(member.uid, reason.trim())
+      setNotice(`${member.name || member.email} is suspended. Their sessions ended; their personal app account is not affected.`)
+    } else {
+      await (owner ? api.staff.reactivateOwner : api.staff.reactivate)(member.uid, reason.trim())
+      setNotice(`${member.name || member.email} has staff access again. They sign in afresh — old sessions stay revoked.`)
+    }
+    setAccessAction(null)
     await load()
   }
 
@@ -396,7 +417,11 @@ export default function TeamPage() {
                     <p className="text-white text-sm font-medium truncate">
                       {m.name || '—'}
                       {m.uid === me?.uid && <span className="ml-2 text-xs text-pink-400">(you)</span>}
-                      {!m.is_active && <span className="ml-2 text-xs text-red-400">no access</span>}
+                      {!m.is_active && (
+                        <span className="ml-2 text-xs text-red-400">
+                          {staffStatus(m) === 'suspended' ? 'suspended' : 'no access'}
+                        </span>
+                      )}
                     </p>
                     <p className="text-slate-500 text-xs truncate">
                       {m.email}
@@ -434,6 +459,19 @@ export default function TeamPage() {
                       </button>
                     )}
 
+                    {/* The API decides authority (manages(): own-department
+                        members for a department admin, staff for an owner, owners
+                        for the observer). These controls are offered, not trusted. */}
+                    {m.is_active && m.uid !== me?.uid && (m.role !== 'owner' || me?.role === 'observer') && (
+                      <button
+                        onClick={() => { setError(''); setAccessAction({ member: m, mode: 'suspend' }) }}
+                        title="Suspend access (reversible)"
+                        className="text-slate-500 hover:text-amber-300 transition-colors p-1.5 rounded hover:bg-slate-800"
+                      >
+                        <PauseCircle size={15} />
+                      </button>
+                    )}
+
                     {m.is_active && m.uid !== me?.uid && m.role !== 'owner' && (
                       <button
                         onClick={() => { setError(''); setRevoking(m) }}
@@ -441,6 +479,26 @@ export default function TeamPage() {
                         className="text-slate-500 hover:text-red-400 transition-colors p-1.5 rounded hover:bg-slate-800"
                       >
                         <UserX size={15} />
+                      </button>
+                    )}
+
+                    {m.role === 'owner' && me?.role === 'observer' && (
+                      <button
+                        onClick={() => { setError(''); setAccessAction({ member: m, mode: 'mfa_reset' }) }}
+                        title="Reset two-step sign-in (lost authenticator)"
+                        className="text-slate-500 hover:text-sky-300 transition-colors p-1.5 rounded hover:bg-slate-800"
+                      >
+                        <ShieldCheck size={15} />
+                      </button>
+                    )}
+
+                    {!m.is_active && m.uid !== me?.uid && m.role !== 'observer' && (m.role !== 'owner' || me?.role === 'observer') && (
+                      <button
+                        onClick={() => { setError(''); setAccessAction({ member: m, mode: 'reactivate' }) }}
+                        title="Reactivate access"
+                        className="text-slate-500 hover:text-emerald-300 transition-colors p-1.5 rounded hover:bg-slate-800"
+                      >
+                        <RotateCcw size={15} />
                       </button>
                     )}
                   </div>
@@ -480,6 +538,15 @@ export default function TeamPage() {
           roles={assignable}
           onCancel={() => setChangingRole(null)}
           onConfirm={(role, reason) => changeRole(changingRole, role, reason)}
+        />
+      )}
+
+      {accessAction && (
+        <AccessPanel
+          member={accessAction.member}
+          mode={accessAction.mode}
+          onCancel={() => setAccessAction(null)}
+          onConfirm={(reason) => changeAccess(accessAction.member, accessAction.mode, reason)}
         />
       )}
 
@@ -710,8 +777,9 @@ function RevokePanel({ member, onCancel, onConfirm }: {
     <Modal title="Revoke access" onClose={onCancel}>
       <div className="px-6 py-5 space-y-4">
         <p className="text-slate-300 text-sm">
-          {member.name || member.email} will no longer be able to sign in — not to the CRM,
-          and not to the API. The record is kept so past actions stay attributable.
+          {member.name || member.email} will lose staff access — the CRM and the API.
+          Their personal Zipper app account stays as it is. The record is kept so past
+          actions stay attributable, and access can be restored later with a reason.
         </p>
 
         <Field
@@ -749,6 +817,73 @@ function RevokePanel({ member, onCancel, onConfirm }: {
             await onConfirm(reason)
           } catch (e) {
             setErr(saidWhy(e, 'Could not revoke access.'))
+          } finally {
+            setBusy(false)
+          }
+        }}
+      />
+    </Modal>
+  )
+}
+
+// ── Suspend / reactivate (P1-B2/B3) ─────────────────────────────────────────
+
+type AccessMode = 'suspend' | 'reactivate' | 'mfa_reset'
+
+function AccessPanel({ member, mode, onCancel, onConfirm }: {
+  member: StaffMember
+  mode: AccessMode
+  onCancel: () => void
+  onConfirm: (reason: string) => Promise<void>
+}) {
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const reset = mode === 'mfa_reset'
+  // The MFA reset needs a fuller reason: the server asks for 10 characters.
+  const minReason = reset ? 10 : MIN_REASON
+  const ready = reason.trim().length >= minReason
+  const suspend = mode === 'suspend'
+
+  return (
+    <Modal title={reset ? 'Reset two-step sign-in' : suspend ? 'Suspend access' : 'Reactivate access'} onClose={onCancel}>
+      <div className="px-6 py-5 space-y-4">
+        <p className="text-slate-300 text-sm">
+          {reset
+            ? `Removes ${member.name || member.email}'s authenticator and ends every session they hold. ` +
+              'They set it up again at their next sign-in. Only do this after confirming who is asking — ' +
+              'anyone who also holds the password could then enrol their own phone.'
+            : suspend
+            ? `${member.name || member.email}'s staff access is paused now — every live session ends. ` +
+              'Their personal Zipper app account is not affected. You can reactivate them later.'
+            : `${member.name || member.email} gets staff access back and signs in again. ` +
+              'Old sessions stay revoked.'}
+        </p>
+        <Field label="Why" hint={`At least ${minReason} characters. Recorded in the audit log.`}>
+          <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}
+            placeholder={suspend ? 'On leave from 1 to 15 November.' : 'Returned from leave.'} className={INPUT} />
+        </Field>
+        {err && (
+          <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3">
+            <AlertTriangle size={15} className="text-red-400 mt-0.5 shrink-0" />
+            <p className="text-red-300 text-sm whitespace-pre-line">{err}</p>
+          </div>
+        )}
+      </div>
+      <Footer
+        onCancel={onCancel}
+        confirmLabel={reset ? 'Reset two-step sign-in' : suspend ? 'Suspend access' : 'Reactivate'}
+        confirmIcon={reset ? <ShieldCheck size={15} /> : suspend ? <PauseCircle size={15} /> : <RotateCcw size={15} />}
+        tone={suspend || reset ? 'danger' : undefined}
+        disabled={busy || !ready}
+        busy={busy}
+        onConfirm={async () => {
+          setBusy(true)
+          setErr('')
+          try {
+            await onConfirm(reason)
+          } catch (e) {
+            setErr(saidWhy(e, reset ? 'Could not reset two-step sign-in.' : suspend ? 'Could not suspend access.' : 'Could not reactivate access.'))
           } finally {
             setBusy(false)
           }

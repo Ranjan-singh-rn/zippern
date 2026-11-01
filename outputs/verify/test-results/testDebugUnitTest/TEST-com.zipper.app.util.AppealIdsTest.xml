@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.AppealIdsTest" tests="12" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.071Z" hostname="CW253.local" time="0.002">
+  <properties/>
+  <testcase name="slot walk - nothing filed yet is slot 1 with no decided statement" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="the repository walks the slots with chooseSlot and never makes an automatic id" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="slot walk - every slot decided means nowhere to file, never an automatic id" classname="com.zipper.app.util.AppealIdsTest" time="0.001"/>
+  <testcase name="slot walk - a pending appeal stops the walk and nothing is filed" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="a pending appeal occupies its slot, a decided one does not" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="a suspension wins over the ban flag it also sets" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="a ban is keyed by when it was imposed" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="the app files at the slot, create-only, and finds the slot before uploading" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="slot walk - decided slots are stepped past, carrying the statement just before the free one" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="slot 1 is the bare id, later slots are suffixed" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="no stamp still gives a stable key" classname="com.zipper.app.util.AppealIdsTest" time="0.0"/>
+  <testcase name="the device-key path derives the same id" classname="com.zipper.app.util.AppealIdsTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

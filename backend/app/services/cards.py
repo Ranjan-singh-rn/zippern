@@ -377,9 +377,26 @@ async def reject(card_id: str, actor: dict, reason: str) -> dict:
     if card["stage"] == Stage.AWAITING_SIGNOFF and not R.can_sign_money(actor["role"]):
         raise CardError("Only an owner can reject a card awaiting signature.")
 
+    # UGP review: once an execution has started (`claim_execution`), money may
+    # already have left the live balance — a debit is taken from Firestore
+    # before the ledger is written. Rejecting it then would leave the money
+    # gone, no ledger row and a card that says "rejected". The way forward is
+    # to run the execution again: every step of it is idempotent on the card.
+    if card["stage"] == Stage.APPROVED and card.get("execution_claimed_at"):
+        raise CardError(
+            "This card's execution has already started, so money may have moved. "
+            "Run the execution again to finish it — it cannot be rejected now."
+        )
+
     now = datetime.now(timezone.utc)
-    await get_db()[C.CARDS].update_one(
-        {"_id": ObjectId(card_id)},
+    # Conditional on the stage just read, and — for an approved card — on no
+    # execution having started since: a reject racing an execution loses
+    # instead of overwriting it.
+    query: dict = {"_id": ObjectId(card_id), "stage": str(card["stage"])}
+    if card["stage"] == Stage.APPROVED:
+        query["execution_claimed_at"] = {"$exists": False}
+    res = await get_db()[C.CARDS].update_one(
+        query,
         {
             "$set": {
                 "stage": str(Stage.REJECTED),
@@ -390,6 +407,8 @@ async def reject(card_id: str, actor: dict, reason: str) -> dict:
             }
         },
     )
+    if getattr(res, "matched_count", 1) != 1:
+        raise CardError("The card changed while it was being rejected. Reload it and try again.")
 
     await audit.record(
         actor=actor,
@@ -404,6 +423,30 @@ async def reject(card_id: str, actor: dict, reason: str) -> dict:
     return await _get(card_id, as_dict=True)
 
 
+async def claim_execution(card_id: str, actor: dict) -> None:
+    """Mark an APPROVED card as being executed — the point of no return.
+
+    UGP review. Called by an executor immediately BEFORE the first step that
+    can move money it cannot take back by itself (a live-balance debit). From
+    then on the card cannot be rejected (`reject` refuses), so a crash between
+    the money moving and the card being closed can only end one way: the
+    execution is run again, and every step of it is idempotent on the card.
+
+    Idempotent: a retry of an interrupted execution finds the card still
+    approved and claimed, keeps the first claim, and carries on. Refuses a card
+    that is not approved — including one a reject got to first.
+    """
+    now = datetime.now(timezone.utc)
+    oid = ObjectId(card_id)
+    await get_db()[C.CARDS].update_one(
+        {"_id": oid, "stage": str(Stage.APPROVED), "execution_claimed_at": {"$exists": False}},
+        {"$set": {"execution_claimed_at": now, "execution_claimed_by": _who(actor), "updated_at": now}},
+    )
+    card = await _get(card_id)
+    if card["stage"] != Stage.APPROVED or not card.get("execution_claimed_at"):
+        raise CardError(f"Card is {card['stage']}, not approved for execution.")
+
+
 async def mark_executed(
     card_id: str, actor: dict, result: dict, succeeded: bool
 ) -> dict:
@@ -415,8 +458,11 @@ async def mark_executed(
     now = datetime.now(timezone.utc)
     stage = Stage.EXECUTED if succeeded else Stage.FAILED
 
-    await get_db()[C.CARDS].update_one(
-        {"_id": ObjectId(card_id)},
+    # Conditional on the card still being approved (UGP review): two
+    # executions finishing at once, or an execution racing a reject, record
+    # one outcome — the second finds the card already decided and says so.
+    res = await get_db()[C.CARDS].update_one(
+        {"_id": ObjectId(card_id), "stage": str(Stage.APPROVED)},
         {
             "$set": {
                 "stage": str(stage),
@@ -426,6 +472,9 @@ async def mark_executed(
             }
         },
     )
+    if getattr(res, "matched_count", 1) != 1:
+        latest = await _get(card_id)
+        raise CardError(f"Card is {latest['stage']}, not approved for execution.")
 
     await audit.record(
         actor=actor,

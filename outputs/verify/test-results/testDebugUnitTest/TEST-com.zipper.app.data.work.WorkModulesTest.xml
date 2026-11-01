@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.work.WorkModulesTest" tests="15" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.878Z" hostname="CW253.local" time="0.133">
+  <properties/>
+  <testcase name="partners get their portals, not staff screens" classname="com.zipper.app.data.work.WorkModulesTest" time="0.022"/>
+  <testcase name="owner work never starts a backend mobile session (P1-A3b)" classname="com.zipper.app.data.work.WorkModulesTest" time="0.095"/>
+  <testcase name="codeOnly strips comments and nothing else" classname="com.zipper.app.data.work.WorkModulesTest" time="0.001"/>
+  <testcase name="owner-only decisions are offered to the owner only" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="write the role-by-screen matrix" classname="com.zipper.app.data.work.WorkModulesTest" time="0.002"/>
+  <testcase name="owner work uses a separate Firebase app and never the personal sign-in (P1-A3b)" classname="com.zipper.app.data.work.WorkModulesTest" time="0.003"/>
+  <testcase name="module ids are unique and every link resolves" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="every write is behind a confirmation" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="every API route a screen calls exists on the backend" classname="com.zipper.app.data.work.WorkModulesTest" time="0.007"/>
+  <testcase name="the observer is offered reads only" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="a member without a permission is not offered its action" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="owner two-step sign-in is offered to owners only, and verify is a route ApiClient adopts (P1-A3)" classname="com.zipper.app.data.work.WorkModulesTest" time="0.001"/>
+  <testcase name="app permission names are the server's" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="ticket screens write through the API, never Firestore (P1-D)" classname="com.zipper.app.data.work.WorkModulesTest" time="0.0"/>
+  <testcase name="a partner session only ever calls routes on the partner allowlist" classname="com.zipper.app.data.work.WorkModulesTest" time="0.002"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

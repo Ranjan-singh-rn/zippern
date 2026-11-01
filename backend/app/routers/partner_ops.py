@@ -57,6 +57,7 @@ from app.core.deps import (
     enforce_permission,
     internal_or_accrual_service,
     own_partner_id_or_403,
+    own_session_uid,
     partner_ids_of,
     require_owner,
     require_permission,
@@ -64,13 +65,18 @@ from app.core.deps import (
     require_write,
     require_write_or_partner,
     team_admin_or_accrual_service,
+    team_admin_or_partner_apply_service,
     team_admin_or_partner_registration_service,
+    team_admin_or_recharge_request_service,
 )
 from app.core.roles import Permission
 from app.core.security import is_service_actor
 from app.services import cards as cards_svc
 from app.services import commission as commission_svc
+from app.services import partner_applications as applications
+from app.services import partner_activation as activation_svc
 from app.services import partner_ops as svc
+from app.services import recharges as recharges_svc
 from app.services.partner_ops import PartnerOpsError
 from app.services.partners import PartnerKind, PartnerStatus
 
@@ -80,8 +86,20 @@ router = APIRouter(prefix="/partner-ops", tags=["partner operations"])
 
 
 def _fail(exc: PartnerOpsError) -> HTTPException:
-    """A partner rule refused this. The message is written to be shown to a user."""
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    """A partner rule refused this. The message is written to be shown to a user.
+
+    403 when the refusal is about WHO is asking — restoring a revoked role or
+    a revocation that moves dependents, both the Owner's (C2 / C3) — rather
+    than about what was asked. `PartnerOpsForbidden` carries that status on
+    the class, so this reads it rather than naming the class.
+    """
+    code = getattr(exc, "status_code", None) or status.HTTP_400_BAD_REQUEST
+    # Approved contact rule: a refusal that carries a structured detail
+    # (`ContactRequired.api_detail()` — the machine-readable code, with the same
+    # sentence as `message`) sends it; every other refusal stays the plain
+    # sentence it always was.
+    structured = getattr(exc, "api_detail", None)
+    return HTTPException(status_code=code, detail=structured() if callable(structured) else str(exc))
 
 
 #: Staff may read any partner; a partner may read only their own records. One
@@ -244,6 +262,11 @@ class HostWithdrawal(BaseModel):
 
     beans: int = Field(gt=0)
     reason: str = Field(min_length=3, max_length=1000)
+    # P0-7 (FIN-5): the queued request this card pays — `withdrawalRequests` or
+    # `salaryRequests` and its id. Executing the card is the only way that
+    # request becomes `paid`.
+    request_collection: str = Field(default="", max_length=40)
+    request_id: str = Field(default="", max_length=200)
 
 
 class CommissionAccrual(BaseModel):
@@ -412,7 +435,22 @@ async def attach_login(
     login on either side of the link, because re-pointing a record at somebody
     new is a handover and would orphan the current holder; an address that is a
     staff account; an address that already holds a `crmUsers` document naming a
-    different partner; an address whose uid already signs in as another partner.
+    different partner; and an address whose human already holds a record in the
+    same ROLE FAMILY.
+
+    **The role-family refusal is the one-agency-per-human rule**, applied here
+    because this endpoint is the other way a human becomes the owner of an
+    agency. Creating a partner record claims the family
+    (`ensure_partner_record`); linking an already-created one now claims it
+    too, through the same `services/partner_roles` and the same `_id` lock, so
+    two simultaneous links cannot both win. One agency-family record — an
+    Agency *or* a Sub-agency, never both and never two — plus one Coin Seller.
+
+    This used to refuse if the address signed in as **any** other partner,
+    while its own message described the correct rule. Attaching a coin-seller
+    login to someone who runs an agency — a combination the business requires —
+    was rejected by that check. It is permitted now, and a second agency is
+    not.
     """
     deny_service_actor(user)
     try:
@@ -680,9 +718,44 @@ async def deactivate_partner(
 async def reactivate_partner(
     partner_id: str, body: Reason, user: dict = Depends(require_write)
 ):
-    """Lift a suspension."""
+    """Lift a suspension — or, for the Owner only, restore a REVOKED record (C2).
+
+    Restoring a revoked role answers 403 for anyone but the Owner; the way for
+    everyone else is a recommendation on the person's reinstatement request.
+    A role-level suspension keeps this route's ordinary permission."""
     try:
         return await svc.reactivate_partner(partner_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+class Revoke(Reason):
+    #: A live main agency to receive the revoked agency's sub-agencies and
+    #: hosts. Required when there are any; a sub-agency's hosts default to its
+    #: parent. See `partner_ops.revoke_partner`.
+    transfer_to: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/partners/{partner_id}/revoke", dependencies=[_APPROVE_PARTNER])
+async def revoke_partner(
+    partner_id: str, body: Revoke, user: dict = Depends(require_write)
+):
+    """Take the role away — and ONLY the role.
+
+    The person's account is untouched (that is moderation, on `/users`), their
+    other partner roles stay live, and every historical record stays. The
+    role-family slot is KEPT (C1): a revoked role still counts, and the way
+    back is a reinstatement request the Owner decides. Distinct from
+    `deactivate`, which is a temporary suspension.
+
+    An agency with sub-agencies or hosts is refused unless `transfer_to` names
+    a live main agency to receive them; the refusal lists what is attached.
+    A revocation that moves dependents at all is a transfer, and is the
+    Owner's (C3): anyone else gets 403 and is pointed at
+    `POST /partner-ops/transfers`.
+    """
+    try:
+        return await svc.revoke_partner(partner_id, body.reason, user, body.transfer_to)
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
 
@@ -914,6 +987,39 @@ async def record_sale(body: Sale, user: dict = Depends(require_write_or_partner)
         )
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
+
+
+@router.get("/registration/availability")
+async def registration_availability(
+    email: str = Query(default="", max_length=254),
+    phone: str = Query(default="", max_length=32),
+    kind: str = Query(default="", pattern=r"^(|agency|seller)$"),
+):
+    """PUBLIC. Is this email / phone already registered as an Agency or Seller?
+
+    Called by the public signup forms as the applicant leaves each field, so
+    the form says "already registered as an Agency" there and then. Returns
+    only the role kind per field (or null) — never a name, an id or a status.
+
+    `kind` (optional) asks about one role only — the seller signup's duplicate
+    check, which the browser cannot run against `sellers` itself (UGP-G, I-5).
+    """
+    from app.services import users as users_svc
+
+    return await users_svc.registration_availability(email, phone, kind)
+
+
+@router.get("/buyers/lookup")
+async def lookup_buyer(q: str = Query(min_length=3, max_length=128), user: dict = Depends(current_user)):
+    """Resolve a buyer for a sale by exact uid, email or phone. Masked results.
+
+    Staff, or a login holding a Coin Seller role. Nobody else has a sale to file.
+    """
+    if not R.is_internal(user["role"]) and not partner_ids_of(user, "seller"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only a coin seller can look up a buyer.")
+    from app.services import users as users_svc
+
+    return await users_svc.lookup_buyers(q)
 
 
 @router.get("/sales")
@@ -1307,7 +1413,8 @@ async def request_host_withdrawal(
     """
     try:
         return await svc.request_host_withdrawal(
-            host_uid, body.beans, body.reason, user
+            host_uid, body.beans, body.reason, user,
+            request_collection=body.request_collection, request_id=body.request_id,
         )
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
@@ -1412,5 +1519,389 @@ async def confirm_subagency_leg(
     """Leg 2 — the main agency confirms it paid the sub. The payout closes."""
     try:
         return await svc.confirm_subagency_leg(payout_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Applying from the app. See `services/partner_applications`.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Reached by the Cloud Function callables with the partner-registration
+# service key, carrying the signed-in user's uid — or by a team admin filing
+# on somebody's behalf. The uid is a body field here because the caller is a
+# machine speaking for a user; the callable copies it from `context.auth` and
+# the app cannot set it. Every rule is applied in the service, server-side.
+
+
+class PartnerApplication(BaseModel):
+    applicant_uid: str = Field(min_length=1, max_length=128)
+    kind: str = Field(pattern="^(agency|sub_agency|seller)$")
+    form: dict = Field(default_factory=dict)
+    parent_id: str | None = Field(default=None, max_length=128)
+
+
+class HostApplication(BaseModel):
+    applicant_uid: str = Field(min_length=1, max_length=128)
+    form: dict = Field(default_factory=dict)
+    parent_id: str = Field(min_length=1, max_length=128)
+
+
+@router.get("/applications/eligibility/{uid}")
+async def application_eligibility(
+    uid: str, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """What this user may apply for, from authoritative records — the app's
+    "Join as …" list is exactly this, and nothing is decided client-side."""
+    try:
+        return await applications.eligibility(uid)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/applications/parents")
+async def application_parents(
+    for_kind: str = Query(default="sub_agency", pattern="^(sub_agency|host)$"),
+    user: dict = Depends(team_admin_or_partner_apply_service),
+):
+    """Approved, active agencies a sub-agency (main only) or a host (main and
+    sub) may join. The app shows this list; the server re-validates the pick."""
+    return await applications.eligible_parents(for_kind)
+
+
+@router.get("/applications/of/{uid}")
+async def applications_of(
+    uid: str, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """Every partner-role application this user has, with status."""
+    return await applications.applications_of(uid)
+
+
+@router.post("/applications", status_code=status.HTTP_201_CREATED)
+async def submit_partner_application(
+    body: PartnerApplication, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """Apply as Agency, Sub-agency or Coin Seller. Pending; approves nothing."""
+    try:
+        return await applications.submit_partner_application(
+            body.applicant_uid, body.kind, body.form, body.parent_id, user
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Decision 15 (RC) — approved roles that wait for BOTH verified contacts.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Two doors onto the same service (`services/partner_activation`): the app,
+# through the callables with the partner-registration service key and the
+# signed-in uid in the body; and a CRM partner's own session (`/me/...`,
+# allowlisted in `core/deps.PARTNER_ROUTES` for pending and waiting logins).
+# Neither starts a role on the caller's word — the verification is re-read
+# from Firebase Auth and the server's ledger, and the role table, restriction
+# and parent are re-checked as at any approval.
+
+
+class VerificationCheck(BaseModel):
+    applicant_uid: str = Field(min_length=1, max_length=128)
+
+
+class ContactConflict(BaseModel):
+    """The app's door (service key): the signed-in uid travels in the body."""
+
+    applicant_uid: str = Field(min_length=1, max_length=128)
+    contact: str = Field(pattern="^(phone|email)$")
+    value: str = Field(min_length=3, max_length=320)
+
+
+class MyContactConflict(BaseModel):
+    """A CRM partner's own door. Deliberately NO account field: the subject is
+    the session (`own_session_uid`), so this body cannot name anybody else."""
+
+    contact: str = Field(pattern="^(phone|email)$")
+    value: str = Field(min_length=3, max_length=320)
+
+
+@router.get("/applications/verification/{uid}")
+async def verification_of(uid: str, user: dict = Depends(team_admin_or_partner_apply_service)):
+    """What is verified on this account, and which approved roles wait for it."""
+    return await activation_svc.overview(uid)
+
+
+@router.post("/applications/verification/check")
+async def verification_check(
+    body: VerificationCheck, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """Re-read this person's verification and start every waiting role it allows."""
+    try:
+        return await activation_svc.check_and_activate(body.applicant_uid, activation_svc.activation_actor(body.applicant_uid, user))
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/applications/verification/conflict")
+async def verification_conflict(
+    body: ContactConflict, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """The contact this person tried to verify is held by another account.
+
+    The answer is the same whether or not a conflict was found, so this is not
+    a way to ask "does some account hold this number?".
+    """
+    await activation_svc.report_conflict(
+        body.applicant_uid, body.contact, body.value, activation_svc.activation_actor(body.applicant_uid, user)
+    )
+    return {"received": True}
+
+
+@router.get("/me/verification")
+async def my_verification(user: dict = Depends(current_user)):
+    """A CRM partner's own login: what is verified, what is missing, what waits."""
+    return await activation_svc.overview(own_session_uid(user))
+
+
+@router.post("/me/verification/check")
+async def my_verification_check(user: dict = Depends(require_write_or_partner)):
+    """A CRM partner's own login: re-check, and start what is now allowed.
+
+    Self-scoped: no id is taken from the request. Allowlisted in
+    `core/deps.PARTNER_REACHABLE`; the observer is refused by the guard.
+    """
+    uid = own_session_uid(user)
+    try:
+        return await activation_svc.check_and_activate(uid, activation_svc.activation_actor(uid, user))
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/me/verification/conflict")
+async def my_verification_conflict(
+    body: MyContactConflict, user: dict = Depends(require_write_or_partner)
+):
+    """A CRM partner's own login: the phone or email they tried belongs to another account.
+
+    Self-scoped, and answered the same whether or not a conflict was found.
+    """
+    uid = own_session_uid(user)
+    await activation_svc.report_conflict(uid, body.contact, body.value, activation_svc.activation_actor(uid, user))
+    return {"received": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Decision 16 (RC) — a fresh Sub-agency application after a rejection.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SubAgencyReapply(BaseModel):
+    """What the parent agency's Add Sub-Agency form collected, for a person
+    whose login already exists from an application that was rejected."""
+
+    email: str = Field(min_length=3, max_length=320)
+    form: dict = Field(default_factory=dict)
+    reason: str = Field(default="", max_length=2000)
+
+
+@router.post("/agencies/{agency_id}/sub-agencies/reapply", status_code=status.HTTP_201_CREATED)
+async def reapply_sub_agency(
+    agency_id: str, body: SubAgencyReapply, user: dict = Depends(require_write_or_partner)
+):
+    """File a NEW pending Sub-agency application under `agency_id` for a person
+    whose earlier Sub-agency application was rejected.
+
+    A partner may name only its OWN agency (`_own_id_or_403`, kind agency);
+    staff need team-admin authority, as for creating any partner record. The
+    rejected record and its history are untouched; the new one is a separate
+    record, pending, holding nothing (`partner_applications.reapply_sub_agency`).
+    """
+    parent_id = _own_id_or_403(user, agency_id, kind="agency")
+    if R.is_internal(user["role"]) and not (
+        R.is_team_admin(user["role"]) or R.is_owner(user["role"])
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Filing a partner application for somebody needs a team admin or an Owner.",
+        )
+    try:
+        return await applications.reapply_sub_agency(
+            parent_id, body.email, body.form, user, reason=body.reason,
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RC (confirmed, CRM-FLOW 9.48) — money frozen by a suspension, ban or revocation
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class FreezeDecision(BaseModel):
+    decision: str = Field(pattern="^(release|withhold|adjust)$")
+    note: str = Field(min_length=5, max_length=2000)
+    adjustment: dict | None = None
+
+
+@router.get("/frozen-money")
+async def list_frozen_money(status: str | None = Query(default=None), user: dict = Depends(require_owner)):
+    """The Owner's queue: every subject whose money is frozen (or was decided)."""
+    from app.services import money_freeze
+
+    return {"freezes": await money_freeze.list_freezes(status)}
+
+
+@router.post("/frozen-money/{freeze_key}/decide")
+async def decide_frozen_money(freeze_key: str, body: FreezeDecision, user: dict = Depends(require_owner)):
+    """Release, withhold or adjust a frozen subject's money. Owner only, with a note."""
+    from app.services import money_freeze
+
+    try:
+        return await money_freeze.decide(freeze_key, body.decision, body.note, user, adjustment=body.adjustment)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post("/partners/{partner_id}/activate", dependencies=[_APPROVE_PARTNER])
+async def activate_partner(partner_id: str, user: dict = Depends(require_write)):
+    """Staff: start an Owner-approved role whose contacts are now verified. Never bypasses them."""
+    try:
+        return await svc.activate_partner_if_verified(partner_id, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/applications/host", status_code=status.HTTP_201_CREATED)
+async def submit_host_application(
+    body: HostApplication, user: dict = Depends(team_admin_or_partner_apply_service)
+):
+    """Apply as Host under a chosen agency or sub-agency. Pending; the role is
+    granted — UNVERIFIED — only when a reviewer approves."""
+    try:
+        return await applications.submit_host_application(
+            body.applicant_uid, body.form, body.parent_id, user
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Manual recharge through a Coin Seller. See `services/recharges`.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Filing is the buyer's act (through the app's callable, with the service key)
+# and moves nothing. Approving is a MONEY decision — seller coins become buyer
+# diamonds — so it carries the same authority as approving a seller sale:
+# `CAN_COIN_OPERATIONS` plus an owner session. Refund decisions likewise.
+
+
+class RechargeRequest(BaseModel):
+    buyer_uid: str = Field(min_length=1, max_length=128)
+    seller_id: str = Field(min_length=1, max_length=128)
+    diamonds: int = Field(gt=0, le=1_000_000)
+    amount_minor: int = Field(gt=0, le=1_000_000_000)
+    currency: str = Field(default="INR", max_length=8)
+    payment_method: str = Field(min_length=2, max_length=24)
+    reference: str = Field(default="", max_length=128)
+    proof_url: str = Field(default="", max_length=2048)
+    #: RF-30: one id per recharge form, the same on every retry of it. Optional
+    #: (older apps send none); its shape is checked by `services/recharges`.
+    client_request_id: str = Field(default="", max_length=64)
+
+
+class RefundDecision(Reason):
+    approve: bool
+
+
+@router.post("/recharges", status_code=status.HTTP_201_CREATED)
+async def submit_recharge(
+    body: RechargeRequest, user: dict = Depends(team_admin_or_recharge_request_service)
+):
+    """A buyer says they paid a seller. Pending; nothing moves."""
+    try:
+        return await recharges_svc.submit_recharge(
+            body.buyer_uid, body.seller_id, diamonds=body.diamonds,
+            amount_minor=body.amount_minor, currency=body.currency,
+            payment_method=body.payment_method, reference=body.reference,
+            proof_url=body.proof_url, actor=user,
+            client_request_id=body.client_request_id,
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/recharges")
+async def list_recharges(
+    recharge_status: str | None = Query(default=None, alias="status"),
+    seller_id: str | None = Query(default=None),
+    buyer_uid: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    user: dict = Depends(current_user),
+):
+    """The queue. A seller session sees only its own; staff see all.
+
+    Plain session, like `list_sales`: the scoping is done here, by partner id,
+    and a staff session needs no write capability to read a queue."""
+    if not R.is_internal(user["role"]):
+        own = sorted(partner_ids_of(user))
+        if not own or (seller_id and seller_id not in own):
+            return []
+        seller_id = seller_id or own[0]
+        buyer_uid = None
+    return await recharges_svc.list_recharges(recharge_status, limit, seller_id, buyer_uid)
+
+
+@router.get("/recharges/{recharge_id}")
+async def get_recharge(recharge_id: str, user: dict = Depends(current_user)):
+    try:
+        doc = await recharges_svc.get_recharge(recharge_id)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+    if not R.is_internal(user["role"]) and doc.get("seller_id") not in partner_ids_of(user):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No recharge request with that id.")
+    return doc
+
+
+@router.post("/recharges/{recharge_id}/approve", dependencies=[_COIN_OPS])
+async def approve_recharge(
+    recharge_id: str, body: Reason, user: dict = Depends(require_owner)
+):
+    """Payment verified: seller coins → buyer diamonds, exactly once."""
+    try:
+        return await recharges_svc.approve_recharge(recharge_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/recharges/{recharge_id}/reject", dependencies=[_COIN_OPS])
+async def reject_recharge(
+    recharge_id: str, body: Reason, user: dict = Depends(require_write)
+):
+    try:
+        return await recharges_svc.reject_recharge(recharge_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/recharges/{recharge_id}/refund", dependencies=[_COIN_OPS])
+async def request_recharge_refund(
+    recharge_id: str, body: Reason, user: dict = Depends(require_write)
+):
+    """Open a refund review. Nothing moves until it is decided."""
+    try:
+        return await recharges_svc.request_refund(recharge_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/recharges/{recharge_id}/refund/decide", dependencies=[_COIN_OPS])
+async def decide_recharge_refund(
+    recharge_id: str, body: RefundDecision, user: dict = Depends(require_owner)
+):
+    """Approve the refund (takes back only what is still there) or refuse it."""
+    try:
+        return await recharges_svc.decide_refund(recharge_id, body.approve, body.reason, user)
     except PartnerOpsError as exc:
         raise _fail(exc) from exc

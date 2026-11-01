@@ -1,0 +1,28 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -83,6 +83,23 @@
+     #: Making a one-time code into a week-long credential would undo the control
+     #: it exists to be. Twelve hours is exactly what it was before this change.
+     observer_session_ttl_minutes: int = 720
++
++    # ── Owner MFA (P1-A3) ───────────────────────────────────────────────────
++    #: An Owner session is limited to the MFA routes until it has passed a TOTP
++    #: (or recovery-code) check. Replaces the browser-only three-question gate.
++    owner_mfa_required: bool = True
++    #: Fernet key (urlsafe base64, 32 bytes) that encrypts TOTP secrets at rest.
++    #: Generate with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
++    #: and deliver it like JWT_SECRET (Secret Manager). Unset = enrolment is
++    #: refused (fail closed): an Owner cannot finish signing in until it is set.
++    owner_mfa_encryption_key: str = ""
++    #: Shown in the authenticator app beside the account name.
++    owner_mfa_issuer: str = "Zipper CRM"
++    #: Consecutive wrong codes before the account's MFA is locked for a while.
++    owner_mfa_max_failures: int = 5
++    owner_mfa_lock_minutes: int = 15
++    #: How long a started-but-unconfirmed enrolment stays valid.
++    owner_mfa_enrol_minutes: int = 15
+ 
+     #: How long after a token's `exp` it may still be renewed silently.
+     #:

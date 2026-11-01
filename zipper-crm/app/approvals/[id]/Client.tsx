@@ -8,6 +8,7 @@ import {
   getApproval, approveRequest, rejectRequest,
   type ApprovalRequest,
 } from '@/lib/approvals'
+import SecureDocuments from '@/components/SecureDocuments'
 import { db } from '@/lib/firebase'
 import { doc, getDoc } from 'firebase/firestore'
 import {
@@ -68,7 +69,9 @@ function DocImage({ url, label }: { url: string; label: string }) {
   )
 }
 
-function HostApplicationDetail({ app }: { app: Record<string, unknown> }) {
+function HostApplicationDetail(
+  { app, recordId }: { app: Record<string, unknown>; recordId: string },
+) {
   const paymentType = app.paymentType as string
 
   return (
@@ -76,11 +79,14 @@ function HostApplicationDetail({ app }: { app: Record<string, unknown> }) {
       {/* Identity */}
       <Section label="Host Identity">
         <div className="flex items-start gap-5">
-          {!!app.photoUrl && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={app.photoUrl as string} alt="Host photo"
-              className="w-20 h-20 rounded-xl object-cover border border-slate-700 shrink-0" />
-          )}
+          {/* The reference photograph is not rendered from `app.photoUrl`.
+              It lives in `hostPhotos/{agencyId}/` and that stored string is a
+              permanent bearer URL; it arrives labelled "Reference photo" in
+              the signed-URL block below instead. */}
+          <div className="w-20 h-20 rounded-xl bg-slate-800 border border-slate-700 shrink-0
+                          flex items-center justify-center text-slate-300 font-bold text-2xl">
+            {String(app.hostName ?? '?')[0]?.toUpperCase() ?? '?'}
+          </div>
           <div className="space-y-2 flex-1">
             <Row label="Full Name"    value={app.hostName as string} />
             <Row label="Phone"        value={app.applicantPhone as string} />
@@ -118,25 +124,22 @@ function HostApplicationDetail({ app }: { app: Record<string, unknown> }) {
         )}
       </Section>
 
-      {/* KYC Documents */}
-      {Array.isArray(app.kycDocUrls) && (app.kycDocUrls as string[]).length > 0 && (
-        <Section label="KYC Documents">
-          <p className="text-slate-400 text-xs mb-1">
-            KYC Status: <span className={`font-semibold ${app.kycStatus === 'approved' ? 'text-green-400' : 'text-yellow-400'}`}>
-              {app.kycStatus as string ?? 'submitted'}
-            </span>
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
-            {(app.kycDocUrls as string[]).map((url, i) => (
-              <DocImage key={i} url={url} label={
-                paymentType === 'foreign'
-                  ? ['Passport', 'National ID', 'Proof of Address'][i]
-                  : ['Aadhaar Card', 'PAN Card', 'Bank Passbook'][i]
-              } />
-            ))}
-          </div>
-        </Section>
-      )}
+      {/* KYC Documents.
+
+          Fetched from the API behind short-lived signed URLs rather than
+          rendered from `app.kycDocUrls`. Those stored strings are
+          `?alt=media&token=` download URLs — permanent bearer credentials that
+          Storage Rules are never consulted for — so putting one in an <img>
+          hands anybody who ever sees the page source a forever-link to
+          somebody's Aadhaar. See components/SecureDocuments.tsx. */}
+      <Section label="KYC Documents">
+        <p className="text-slate-400 text-xs mb-2">
+          KYC Status: <span className={`font-semibold ${app.kycStatus === 'approved' ? 'text-green-400' : 'text-yellow-400'}`}>
+            {app.kycStatus as string ?? 'submitted'}
+          </span>
+        </p>
+        <SecureDocuments kind="host" recordId={recordId} />
+      </Section>
     </div>
   )
 }
@@ -254,7 +257,7 @@ export default function ApprovalDetailClient({ id: paramId }: { id: string }) {
 
       {/* Host application detail — shown for add_host approvals */}
       {req.type === 'add_host' && hostApp && (
-        <HostApplicationDetail app={hostApp} />
+        <HostApplicationDetail app={hostApp} recordId={String(req.targetDocId ?? '')} />
       )}
 
       {/*

@@ -46,6 +46,12 @@ const ask = (over = {}) => decideGuestClaim({
   wantedUserExists: false,
   wantedIsUpgraded: false,
   callerIsBoundUid: false,
+  // AUTH-001: by default the caller is signed in as whatever uid it offers, so
+  // the pre-existing cases keep describing the legitimate client. The takeover
+  // cases below override this explicitly.
+  callerUid: over.wantedUid ?? '',
+  wantedBoundElsewhere: false,
+  bindingVerified: true,
   ...over,
 })
 
@@ -158,15 +164,28 @@ describe('an install that cannot prove it owns the bound account', () => {
   test('a session for a DIFFERENT account buys nothing', () => {
     // `callerIsBoundUid` is computed from the bound uid, never from a uid the
     // caller supplies, so this is the only thing it can mean.
-    const d = healthy({ secretMatches: false, callerIsBoundUid: false, wantedUid: 'UID_A' })
-    expect(d.status).toBe('unrecoverable')
+    // Phase 1A: a caller signed in as some OTHER account that names UID_A is
+    // now refused before the secret is even looked at (AUTH-001), which is a
+    // strictly stronger answer than the old `unrecoverable`.
+    const d = healthy({ secretMatches: false, callerIsBoundUid: false, wantedUid: 'UID_A', callerUid: 'UID_X' })
+    expect(d.status).toBe('not_owner')
     expect(d.write).toBe('none')
+    // …and with no uid offered at all, still nothing.
+    const q = healthy({ secretMatches: false, callerIsBoundUid: false, callerUid: 'UID_X' })
+    expect(q.status).toBe('unrecoverable')
+    expect(q.write).toBe('none')
   })
 
   test('re-keying never moves the binding to another uid', () => {
-    const d = healthy({ secretMatches: false, callerIsBoundUid: true, wantedUid: 'UID_C' })
-    expect(d.uid).toBe('UID_A')
-    expect(d.write).toBe('rekey')
+    // Signed in as UID_A (the bound uid) but offering UID_C: refused outright;
+    // nothing is written and the binding stays on UID_A.
+    const d = healthy({ secretMatches: false, callerIsBoundUid: true, wantedUid: 'UID_C', callerUid: 'UID_A' })
+    expect(d.status).toBe('not_owner')
+    expect(d.write).toBe('none')
+    // The legitimate re-key (offering its own uid) still works.
+    const r = healthy({ secretMatches: false, callerIsBoundUid: true, wantedUid: 'UID_A' })
+    expect(r.uid).toBe('UID_A')
+    expect(r.write).toBe('rekey')
   })
 })
 
@@ -333,19 +352,37 @@ describe('a guest account that has grown into a full one', () => {
      */
     const d = healthy({ boundIsUpgraded: true, wantedUid: 'UID_NEW' })
     expect(d.status).not.toBe('bound')
+    expect(d.write).not.toBe('bind')
+    // The caller is pointed at the EXISTING account, never its fresh uid.
+    expect(d.uid).toBe('UID_A')
+  })
+
+  test('is reopened by the guest button on the SAME installation (owner decision 2026-10-08)', () => {
+    /*
+     * Same proof a plain guest presents: the device secret from this install's
+     * key store. Adding an email or phone does not take the guest button away.
+     */
+    const d = healthy({ boundIsUpgraded: true })
+    expect(d.status).toBe('existing_guest')
+    expect(d.uid).toBe('UID_A')
+    expect(d.write).toBe('touch')
+  })
+
+  test('but is NOT handed to an installation without the device secret', () => {
+    /*
+     * The device id alone is readable by any signed-in account, so it must never
+     * be enough. A reinstall that lost its key, or another handset spoofing the
+     * id, is told to use the account's own email, phone or Google.
+     */
+    const d = healthy({ boundIsUpgraded: true, secretMatches: false })
+    expect(d.status).toBe('upgraded')
+    expect(d.uid).toBe('UID_A')
     expect(d.write).toBe('none')
   })
 
-  test('but is not handed out to whoever is holding the phone', () => {
-    /*
-     * The other half. The binding exists to rescue an account with no other way
-     * back; this one has Google or a phone, so "Continue as guest" is not a
-     * second door into it — otherwise a sign-out leaves it open to the next
-     * person who picks the handset up.
-     */
-    const d = healthy({ boundIsUpgraded: true })
-    expect(d.status).toBe('upgraded')
-    expect(d.uid).toBe('UID_A')
+  test('a plain guest without the secret is still unrecoverable, not upgraded', () => {
+    const d = healthy({ secretMatches: false })
+    expect(d.status).toBe('unrecoverable')
     expect(d.write).toBe('none')
   })
 
@@ -485,5 +522,90 @@ describe('the invariant', () => {
       const d = healthy({ wantedUid })
       if (d.status === 'existing_guest') expect(d.uid).toBe('UID_A')
     }
+  })
+})
+
+// ── AUTH-001 (Phase 1A): a uid in the request is only a claim ────────────────
+
+describe('AUTH-001 guest takeover is closed', () => {
+  test('a guest binding its OWN uid on a fresh device succeeds', () => {
+    const d = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME' })
+    expect(d.status).toBe('bound')
+    expect(d.uid).toBe('UID_ME')
+    expect(d.write).toBe('bind')
+  })
+
+  test('an UNAUTHENTICATED caller naming a victim uid is refused, nothing written', () => {
+    const d = ask({ wantedUid: 'UID_VICTIM', callerUid: '' })
+    expect(d.status).toBe('not_owner')
+    expect(d.write).toBe('none')
+    expect(d.uid).toBe('')
+  })
+
+  test('a caller signed in as a DIFFERENT uid naming a victim uid is refused', () => {
+    const d = ask({ wantedUid: 'UID_VICTIM', callerUid: 'UID_ATTACKER' })
+    expect(d.status).toBe('not_owner')
+    expect(d.write).toBe('none')
+  })
+
+  test('the refusal wins even on a device whose binding already points at the victim', () => {
+    // The attacker cannot ride a healthy binding either: the uid check runs first.
+    const d = healthy({ boundUid: 'UID_VICTIM', wantedUid: 'UID_VICTIM', callerUid: 'UID_ATTACKER' })
+    expect(d.status).toBe('not_owner')
+  })
+
+  test('a uid already bound to ANOTHER device cannot be bound here, even by its owner', () => {
+    const d = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME', wantedBoundElsewhere: true })
+    expect(d.status).toBe('bound_elsewhere')
+    expect(d.write).toBe('none')
+  })
+
+  test('a guest who later binds email/phone is re-opened on the SAME owner-proven binding', () => {
+    const d = healthy({ boundIsUpgraded: true, bindingVerified: true })
+    expect(d.status).toBe('existing_guest')
+    expect(d.uid).toBe('UID_A')
+  })
+
+  test('an upgraded account is NOT re-opened by a pre-Phase-1A (unproven) binding', () => {
+    // A legacy binding might have been written by an attacker under AUTH-001;
+    // once the account has its own credentials, those are the only way in.
+    const d = healthy({ boundIsUpgraded: true, bindingVerified: false })
+    expect(d.status).toBe('upgraded')
+    expect(d.write).toBe('none')
+  })
+
+  test('an upgraded account is NOT re-opened by a wrong secret, verified binding or not', () => {
+    expect(healthy({ boundIsUpgraded: true, secretMatches: false }).status).toBe('upgraded')
+    expect(healthy({ boundIsUpgraded: true, secretMatches: false, bindingVerified: false }).status).toBe('upgraded')
+  })
+
+  test('the owner signed in as the upgraded account keeps its own session', () => {
+    const d = healthy({ boundIsUpgraded: true, bindingVerified: false, callerIsBoundUid: true,
+      wantedUid: 'UID_A', callerUid: 'UID_A' })
+    expect(d.status).toBe('existing_guest')
+  })
+
+  test('repeated identical requests are stable (idempotent decision)', () => {
+    const a = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME' })
+    const b = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME' })
+    expect(a).toEqual(b)
+    // Second call after the bind landed: same device now bound to UID_ME.
+    const c = healthy({ boundUid: 'UID_ME', wantedUid: 'UID_ME', callerUid: 'UID_ME' })
+    expect(c.status).toBe('existing_guest')
+    expect(c.uid).toBe('UID_ME')
+  })
+
+  test('concurrent binds of the same uid from two devices: the loser sees bound_elsewhere', () => {
+    // Inside the transaction the reverse index is read; the second device to
+    // commit observes the first device's binding pointing at the uid.
+    const first = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME' })
+    const second = ask({ wantedUid: 'UID_ME', callerUid: 'UID_ME', wantedBoundElsewhere: true })
+    expect(first.status).toBe('bound')
+    expect(second.status).toBe('bound_elsewhere')
+  })
+
+  test('the plain question (no uid) still works for an unauthenticated device', () => {
+    expect(ask({}).status).toBe('no_guest')
+    expect(healthy({}).status).toBe('existing_guest')
   })
 })

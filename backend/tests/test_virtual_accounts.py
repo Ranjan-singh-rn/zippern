@@ -47,6 +47,11 @@ from app.services import money as money_mod  # noqa: E402
 from app.services import partner_ops as ops  # noqa: E402
 from app.services import partners as partner_svc  # noqa: E402
 from app.services.partners import PartnerStatus  # noqa: E402
+from app.services import partner_applications as _apps_p1a  # noqa: E402
+
+# Phase 1A (AUTH-002): these fixtures are verified people; the guest refusal
+# is covered by tests/test_phase1a_identity.py.
+_apps_p1a.is_unverified_guest = lambda uid: False
 
 failures: list[str] = []
 checks = 0
@@ -104,13 +109,31 @@ AGENCY_DOC = {
     "type": "main",
     "agencyName": "Skyline Talents",
     "status": "pending",
+    # FX-09: a record that names no login is not approved; this agency is
+    # approved in section 6, so it names one — a different human from every
+    # seller fixture.
+    "crmUid": "crm-uid-agency-1",
 }
+
+
+def _other_seller(n: int, name: str) -> dict:
+    """A seller fixture belonging to a DIFFERENT human.
+
+    Every one of these used to be `dict(SELLER_DOC, displayName=...)`, which
+    inherited `crmUid` — so the eight shops in these scenarios were one
+    person holding eight coin-seller records. `partner_roles` now allows one
+    record per role family per human, and refuses the rest. Two coin sellers
+    are two people; the fixtures say so now.
+    """
+    return dict(SELLER_DOC, displayName=name,
+                crmUid=f"crm-uid-seller-{n}", crmId=f"S{n}A2B3C4")
+
 
 FIRESTORE: dict[str, tuple[str, dict]] = {
     "seller-1": ("sellers", SELLER_DOC),
-    "seller-2": ("sellers", dict(SELLER_DOC, displayName="Corner Shop Coins")),
-    "seller-3": ("sellers", dict(SELLER_DOC, displayName="Third Shop")),
-    "seller-4": ("sellers", dict(SELLER_DOC, displayName="Fourth Shop")),
+    "seller-2": ("sellers", _other_seller(2, "Corner Shop Coins")),
+    "seller-3": ("sellers", _other_seller(3, "Third Shop")),
+    "seller-4": ("sellers", _other_seller(4, "Fourth Shop")),
     "agency-1": ("agencies", AGENCY_DOC),
 }
 
@@ -135,6 +158,30 @@ def fake_sync(partner: dict, fields: dict) -> bool:
 
 ops.get_db = lambda: db
 partner_svc.get_db = lambda: db
+# `partner_ops.create` now claims the human's role family before it writes
+# (one Agency per Firebase identity), and `partner_roles` reads Mongo
+# through its own import, so it needs the same fake db.
+from app.services import partner_roles as _partner_roles  # noqa: E402
+_partner_roles.get_db = lambda: db  # type: ignore[assignment]
+# Approval re-checks the role table (partner_applications) and staff identity
+# (users), so both read the same fake Mongo.
+from app.services import partner_applications as _apps  # noqa: E402
+from app.services import users as _users_mod  # noqa: E402
+_apps.get_db = lambda: db  # type: ignore[assignment]
+_users_mod.get_db = lambda: db  # type: ignore[assignment]
+# …and the role table reads the person's app profile (Host or not) from
+# Firestore. An empty fake: nobody in this file is a Host or staff.
+from app.db import firebase as _firebase_mod  # noqa: E402
+from tests import harness as _rc_harness  # noqa: E402
+
+# Decision 15 (RC): every login in these fixtures holds BOTH verified contacts
+# (an SMS-linked phone and a code-verified email) — the subject of this module
+# is not the contact rule, which tests/test_rc_contact_verification.py runs with
+# per-uid records, verified and not.
+_firebase_mod.get_user = _rc_harness.verified_auth  # type: ignore[assignment]
+from tests.fakes import FakeFirestore as _FakeFirestore  # noqa: E402
+_role_fs = _FakeFirestore()
+_firebase_mod.firestore_client = lambda: _role_fs  # type: ignore[assignment]
 audit_mod.get_db = lambda: db
 money_mod.get_db = lambda: db
 cards_svc.get_db = lambda: db
@@ -384,7 +431,7 @@ ok(
 
 # A client that raises must not take an approval down with it.
 db[C.PARTNERS].docs = [d for d in db[C.PARTNERS].docs if d["_id"] != "seller-4"]
-FIRESTORE["seller-5"] = ("sellers", dict(SELLER_DOC, displayName="Fifth Shop"))
+FIRESTORE["seller-5"] = ("sellers", _other_seller(5, "Fifth Shop"))
 
 
 def exploding_bank(partner: dict) -> dict:
@@ -403,7 +450,7 @@ ok(
 
 # A client that answers with a blank is answering with nothing, and a blank is
 # never filled in from somewhere else.
-FIRESTORE["seller-6"] = ("sellers", dict(SELLER_DOC, displayName="Sixth Shop"))
+FIRESTORE["seller-6"] = ("sellers", _other_seller(6, "Sixth Shop"))
 with_bank(lambda partner: {"number": "   "})
 blank = run(ops.approve_partner("seller-6", REASON, ACTOR))["virtual_account"]
 check("a blank answer issues nothing", blank["issued"], False)
@@ -431,7 +478,7 @@ message = refuses(
 ok("the refusal names the kind", "agency" in message and "seller" in message)
 
 # An application still under review is not somebody we accept money for.
-FIRESTORE["seller-7"] = ("sellers", dict(SELLER_DOC, displayName="Seventh Shop"))
+FIRESTORE["seller-7"] = ("sellers", _other_seller(7, "Seventh Shop"))
 run(ops.create_partner("seller-7", "Registered through the CRM.", ACTOR))
 message = refuses(
     "issuing a VAN for a pending applicant",
@@ -529,7 +576,7 @@ ok("…and the sentence is the same one everywhere else", closed["reason"] == op
 # the live path and it stays exactly as it was.
 
 no_bank()
-FIRESTORE["seller-8"] = ("sellers", dict(SELLER_DOC, displayName="Eighth Shop"))
+FIRESTORE["seller-8"] = ("sellers", _other_seller(8, "Eighth Shop"))
 run(ops.approve_partner("seller-8", REASON, ACTOR))
 card = run(
     ops.request_coin_purchase(

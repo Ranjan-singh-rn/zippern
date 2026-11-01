@@ -1,0 +1,22 @@
+{
+  "name": "zipper-security-rules-tests",
+  "private": true,
+  "type": "module",
+  "//": "Isolated from the app packages on purpose: these dependencies are test-only and must never reach a deploy bundle. Run from the REPO ROOT so the emulator picks up firebase.json (storage emulator 9199, firestore emulator 8080).",
+  "scripts": {
+    "//test": "Needs Java for the emulator. Loads ../storage.rules and ../firestore.rules from disk \u2014 nothing touches the real project.",
+    "test": "npm run test:storage && npm run test:firestore && npm run test:phase1a && npm run test:ugp && npm run test:p1gov && npm run test:p1mfa && npm run test:p1mfa:storage && npm run test:p1mfa:auth",
+    "test:storage": "cd .. && firebase emulators:exec --only storage,firestore --project demo-zipper \"node tests/storage.rules.test.mjs\"",
+    "test:firestore": "cd .. && firebase emulators:exec --only firestore --project demo-zipper \"node tests/firestore.rules.test.mjs\"",
+    "test:phase1a": "cd .. && firebase emulators:exec --only firestore --project demo-zipper \"node tests/firestore.phase1a.rules.test.mjs\"",
+    "test:ugp": "cd .. && firebase emulators:exec --only firestore --project demo-zipper \"node tests/firestore.ugp.rules.test.mjs\"",
+    "test:p1gov": "cd .. && firebase emulators:exec --only firestore --project demo-zipper \"node tests/firestore.p1gov.rules.test.mjs\"",
+    "test:p1mfa": "cd .. && firebase emulators:exec --only firestore --project demo-zipper \"node tests/firestore.p1mfa.rules.test.mjs\"",
+    "test:p1mfa:storage": "cd .. && firebase emulators:exec --only storage,firestore --project demo-zipper \"node tests/storage.p1mfa.rules.test.mjs\"",
+    "test:p1mfa:auth": "cd .. && firebase emulators:exec --only auth,firestore --project demo-zipper \"node tests/auth.p1mfa.emulator.test.mjs\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^3.0.4",
+    "firebase": "^10.12.0"
+  }
+}

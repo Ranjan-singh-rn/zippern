@@ -410,9 +410,24 @@ async def main() -> int:
     )
     args = ap.parse_args()
 
+    # P0-10 (OPS-C): the target, named and confirmed, before anything connects.
+    from app.core.destructive import DestructiveRefused, require_data_canary, require_destructive_target
+    try:
+        print(require_destructive_target("reset_test_data", writes=args.confirm))
+    except DestructiveRefused as exc:
+        print(f"\n  ✗ {exc}\n")
+        return 2
+
     firebase.init()
     await mongo.connect()
     db = mongo.get_db()
+    if args.confirm:
+        try:
+            await require_data_canary(db, "reset_test_data")
+        except DestructiveRefused as exc:
+            print(f"\n  ✗ {exc}\n")
+            await mongo.disconnect()
+            return 2
 
     keep_emails, keep_phones = _split_keeps(args.keep)
     protected = _protected_emails(keep_emails)

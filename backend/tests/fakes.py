@@ -19,6 +19,8 @@ Two layers:
 
 from __future__ import annotations
 
+import asyncio
+
 import sys
 import types
 from typing import Any
@@ -139,6 +141,19 @@ class ArrayRemove:
         self.values = list(values or [])
 
 
+class Increment:
+    """`firestore.Increment(n)` — add to the field, starting at 0 if absent.
+
+    Needed because `sync_balance_to_firestore` and
+    `firebase.clawback_user_diamonds` move live balances with it, and a fake
+    that stored the sentinel object would make every balance assertion in the
+    recharge tests compare a number against an `Increment`.
+    """
+
+    def __init__(self, value: Any):
+        self.value = int(value)
+
+
 def _apply_transform(existing: Any, value: Any) -> tuple[bool, Any]:
     """`(keep, new_value)` for one field of a write.
 
@@ -156,6 +171,9 @@ def _apply_transform(existing: Any, value: Any) -> tuple[bool, Any]:
     if isinstance(value, ArrayRemove):
         current = list(existing) if isinstance(existing, list) else []
         return True, [item for item in current if item not in value.values]
+    if isinstance(value, Increment):
+        base = existing if isinstance(existing, (int, float)) else 0
+        return True, base + value.value
     return True, _deep_copy(value)
 
 
@@ -237,7 +255,10 @@ def install_module_stubs() -> None:
         ApplicationDefault=lambda *a, **k: object(),
     )
     firebase_admin.firestore = _module(
-        "firebase_admin.firestore", client=lambda *a, **k: None
+        "firebase_admin.firestore", client=lambda *a, **k: None,
+        # The sentinels the services write; the fake Firestore resolves them.
+        DELETE_FIELD=DeleteField(), ArrayUnion=ArrayUnion, ArrayRemove=ArrayRemove,
+        Increment=Increment, SERVER_TIMESTAMP="SERVER_TIMESTAMP",
     )
 
     google = sys.modules.get("google") or _module("google")
@@ -250,10 +271,30 @@ def install_module_stubs() -> None:
     base_query = _module(
         "google.cloud.firestore_v1.base_query",
         FieldFilter=FieldFilter,
+        # `services/users` imports it at module level; the role re-check at
+        # approval now reaches that module, so the stub carries it too.
+        BaseQuery=types.SimpleNamespace(ASCENDING="ASCENDING", DESCENDING="DESCENDING"),
     )
     firestore_v1.base_query = base_query
     cloud.firestore_v1 = firestore_v1
     google.cloud = cloud
+
+    # `google.api_core.exceptions.FailedPrecondition` — what Firestore raises
+    # when a composite index is missing. `routers/users.py` and
+    # `routers/partners.py` catch it to turn an opaque 500 into a 503 naming
+    # the index, so the NAME has to resolve at import time or those modules
+    # cannot be imported at all.
+    #
+    # A real exception subclass, not a sentinel: a test that raises it must be
+    # caught by the same `except` clause production uses, otherwise the stub
+    # would quietly make the handler untestable.
+    api_core = _module("google.api_core")
+    _module(
+        "google.api_core.exceptions",
+        FailedPrecondition=type("FailedPrecondition", (Exception,), {}),
+    )
+    api_core.exceptions = sys.modules["google.api_core.exceptions"]
+    google.api_core = api_core
 
 
 # ── An in-memory collection with real `_id` uniqueness ────────────────────────
@@ -271,10 +312,45 @@ def _deep_copy(value: Any) -> Any:
 
 def _set_path(doc: dict, path: str, value: Any) -> None:
     parts = path.split(".")
-    target = doc
+    target: Any = doc
     for part in parts[:-1]:
-        target = target.setdefault(part, {})
-    target[parts[-1]] = value
+        # P1-A3: `recovery.3.used_at` — a numeric segment indexes a list, as in Mongo.
+        if isinstance(target, list) and part.isdigit():
+            target = target[int(part)]
+        else:
+            target = target.setdefault(part, {})
+    if isinstance(target, list) and parts[-1].isdigit():
+        target[int(parts[-1])] = value
+    else:
+        target[parts[-1]] = value
+
+
+def _unset_path(doc: dict, path: str) -> None:
+    parts = path.split(".")
+    target: Any = doc
+    for part in parts[:-1]:
+        target = target.get(part) if isinstance(target, dict) else None
+        if target is None:
+            return
+    if isinstance(target, dict):
+        target.pop(parts[-1], None)
+
+
+def _path_equals(doc: dict, key: str, want: Any) -> bool:
+    """Equality on a plain or dotted key. A plain key behaves exactly as the
+    old `doc.get(k) == v`; a dotted one reads the nested value (list indexes
+    included) instead of looking for a literal key with dots in it."""
+    if "." not in str(key):
+        return doc.get(key) == want
+    node: Any = doc
+    for part in str(key).split("."):
+        if isinstance(node, list) and part.isdigit():
+            node = node[int(part)] if int(part) < len(node) else None
+        elif isinstance(node, dict):
+            node = node.get(part)
+        else:
+            node = None
+    return node == want
 
 
 def _read_path(doc: Any, path: str) -> Any:
@@ -392,20 +468,61 @@ class FakeCollection:
         self.unique = unique
         self.inserts = 0
 
+    @staticmethod
+    def _matches(doc: dict, query: dict) -> bool:
+        """Equality, plus the handful of operators the services actually use.
+
+        `$in` (the eligible-parents query), `$ne` (session revocation), and
+        dotted paths. A fake that answered `{"kind": {"$in": [...]}}` with
+        "no document has a kind equal to that dict" would make the host
+        parent list empty and the test pass for the wrong reason.
+        """
+        for key, want in query.items():
+            parts = key.split(".")
+            have: Any = doc
+            for part in parts:
+                have = have.get(part) if isinstance(have, dict) else None
+            if isinstance(want, dict) and want and all(str(k).startswith("$") for k in want):
+                for op, operand in want.items():
+                    if op == "$in" and have not in list(operand):
+                        return False
+                    if op == "$nin" and have in list(operand):
+                        return False
+                    if op == "$ne" and have == operand:
+                        return False
+                    if op == "$exists" and (have is not None) != bool(operand):
+                        return False
+                    if op == "$gte" and not (have is not None and have >= operand):
+                        return False
+                    if op == "$lte" and not (have is not None and have <= operand):
+                        return False
+                    if op == "$gt" and not (have is not None and have > operand):
+                        return False
+                    if op == "$lt" and not (have is not None and have < operand):
+                        return False
+            elif have != want:
+                return False
+        return True
+
     async def find_one(self, query: dict, session: Any = None) -> dict | None:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         for doc in self.docs.values():
-            if all(doc.get(k) == v for k, v in query.items()):
+            if self._matches(doc, query):
                 return _deep_copy(doc)
         return None
 
     def find(self, query: dict | None = None) -> FakeCursor:
         return FakeCursor(
-            [
-                _deep_copy(d)
-                for d in self.docs.values()
-                if all(d.get(k) == v for k, v in (query or {}).items())
-            ]
+            [_deep_copy(d) for d in self.docs.values() if self._matches(d, query or {})]
         )
+
+    async def count_documents(self, query: dict | None = None, session: Any = None) -> int:
+        """P1: the last-active-owner rule counts owners."""
+        await asyncio.sleep(0)
+        return sum(1 for d in self.docs.values() if self._matches(d, query or {}))
 
     def aggregate(self, pipeline: list[dict]) -> FakeCursor:
         """`$match` and `$group`, which is what the partner aggregates use.
@@ -432,6 +549,10 @@ class FakeCollection:
         return FakeCursor(docs)
 
     async def insert_one(self, doc: dict, session: Any = None) -> Any:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         # `partners` documents carry their own `_id` (the Firestore id) and the
         # uniqueness of it is what these tests rest on. `staff` does not — Mongo
         # mints one — so one is minted here rather than making the caller invent
@@ -439,25 +560,54 @@ class FakeCollection:
         if "_id" not in doc:
             doc = {**doc, "_id": f"{self.name}-{len(self.docs) + 1}"}
         _id = doc["_id"]
+        # Raise the class the code under test will CATCH: whichever
+        # `pymongo.errors.DuplicateKeyError` is installed right now (this
+        # module's own, or `tests/harness.py`'s when a test combines the two
+        # stub sets). Raising a sibling class would turn a handled race into
+        # an unhandled crash in the test and nowhere else.
+        import sys as _sys
+        dup = getattr(_sys.modules.get("pymongo.errors"), "DuplicateKeyError", DuplicateKeyError)
         if _id in self.docs:
-            raise DuplicateKeyError(f"E11000 duplicate key on _id: {_id!r}")
+            raise dup(f"E11000 duplicate key on _id: {_id!r}")
         for field in self.unique:
             if field not in doc:
                 continue
             if any(other.get(field) == doc[field] for other in self.docs.values()):
-                raise DuplicateKeyError(
-                    f"E11000 duplicate key on {field}: {doc[field]!r}"
-                )
+                raise dup(f"E11000 duplicate key on {field}: {doc[field]!r}")
         self.docs[_id] = _deep_copy(doc)
         self.inserts += 1
         return types.SimpleNamespace(inserted_id=_id)
 
+    async def delete_one(self, query: dict, session: Any = None) -> Any:
+        """Remove at most one matching document.
+
+        Needed because `partner_roles` gives a claim back when the operation
+        that took it then fails — a sentinel left behind would bar that human
+        from ever holding the role family. `tests/harness.py` has had this
+        since the claim was written; this fake had not, so the rollback path
+        died with an AttributeError and the refusal it was rolling back never
+        reached the caller.
+        """
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
+        doc = await self._raw(query)
+        if doc is None:
+            return types.SimpleNamespace(deleted_count=0)
+        del self.docs[doc["_id"]]
+        return types.SimpleNamespace(deleted_count=1)
+
     async def update_one(self, query: dict, update: dict, upsert: bool = False,
                          session: Any = None) -> Any:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         doc = await self._raw(query)
         if doc is None:
             if not upsert:
-                return types.SimpleNamespace(modified_count=0, upserted_id=None)
+                return types.SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
             # Mongo seeds an upsert from the equality terms of the query, then
             # applies `$setOnInsert` and `$set`. `scripts/repair_staff_accounts`
             # depends on that being an insert-or-nothing, so a second run — or a
@@ -469,15 +619,19 @@ class FakeCollection:
             self._apply(seed, {"$set": update.get("$set") or {}})
             result = await self.insert_one(seed)
             return types.SimpleNamespace(
-                modified_count=0, upserted_id=result.inserted_id
+                matched_count=0, modified_count=0, upserted_id=result.inserted_id
             )
         self._apply(doc, update)
-        return types.SimpleNamespace(modified_count=1, upserted_id=None)
+        return types.SimpleNamespace(matched_count=1, modified_count=1, upserted_id=None)
 
     async def update_many(self, query: dict, update: dict, session: Any = None) -> Any:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         touched = 0
         for doc in self.docs.values():
-            if all(doc.get(k) == v for k, v in query.items()):
+            if all(_path_equals(doc, k, v) for k, v in query.items()):
                 self._apply(doc, update)
                 touched += 1
         return types.SimpleNamespace(modified_count=touched)
@@ -486,6 +640,10 @@ class FakeCollection:
         self, query: dict, update: dict, return_document: bool = True,
         session: Any = None,
     ) -> dict | None:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         doc = await self._raw(query)
         if doc is None:
             return None
@@ -495,7 +653,7 @@ class FakeCollection:
 
     async def _raw(self, query: dict) -> dict | None:
         for doc in self.docs.values():
-            if all(doc.get(k) == v for k, v in query.items()):
+            if all(_path_equals(doc, k, v) for k, v in query.items()):
                 return doc
         return None
 
@@ -509,6 +667,8 @@ class FakeCollection:
             for part in parts[:-1]:
                 target = target.setdefault(part, {})
             target[parts[-1]] = int(target.get(parts[-1], 0)) + int(value)
+        for path in (update.get("$unset") or {}):
+            _unset_path(doc, path)
         for path, value in (update.get("$push") or {}).items():
             parts = path.split(".")
             target = doc
@@ -616,11 +776,26 @@ class FakeDocument:
                 target.pop(leaf, None)
         return doc
 
+    @classmethod
+    def _merge_into(cls, data: dict, doc: dict) -> None:
+        """`set(..., merge=True)` semantics: nested maps merge, they do not replace.
+
+        Real Firestore merges a map value key by key under `merge=True`. A fake
+        that replaced the whole map would make `roleStatus: {seller: 'approved'}`
+        wipe `roleStatus.agency` — and a dual-role login would look like it lost
+        a capability that production keeps.
+        """
+        for key, value in data.items():
+            if isinstance(value, dict) and isinstance(doc.get(key), dict):
+                cls._merge_into(value, doc[key])
+            else:
+                cls._write({key: value}, doc, dotted_paths=False)
+
     def set(self, data: dict, merge: bool = False) -> None:
         self.col.writes.append((self.id, _deep_copy(data), merge))
         self.col.fail_if_asked("set", self.id)
         if merge and self.id in self.col.docs:
-            self._write(data, self.col.docs[self.id], dotted_paths=False)
+            self._merge_into(data, self.col.docs[self.id])
         else:
             self.col.docs[self.id] = self._write(data, {}, dotted_paths=False)
 
@@ -640,7 +815,14 @@ class FakeDocument:
         self.col.writes.append((self.id, _deep_copy(data), True))
         self._write(data, self.col.docs[self.id], dotted_paths=True)
 
-    def get(self) -> FakeSnapshot:
+    def get(self, transaction: "FakeTransaction | None" = None) -> FakeSnapshot:
+        # `transaction=` is accepted and ignored. The real SDK routes the read
+        # through the transaction so the server can detect a conflicting write
+        # and retry; this store is single-threaded and in-memory, so a plain
+        # read returns the same thing. What the fake DOES preserve is the shape
+        # the code under test depends on — a read inside the transaction that
+        # sees writes made before it — which is what the compare-and-set in
+        # `appeals.auto_resolve_pending` is checking.
         self.col.fail_if_asked("get", self.id)
         return FakeSnapshot(self, self.col.docs.get(self.id))
 
@@ -774,8 +956,43 @@ class FakeFsCollection:
             if exc is not None:
                 raise exc
 
-    def document(self, doc_id: str) -> FakeDocument:
+    def document(self, doc_id: str | None = None) -> FakeDocument:
+        # `collection.document()` with no id mints one, as the real client does.
+        # The application and recharge services create their documents that
+        # way — the auto id becomes the partner / recharge `_id`.
+        if doc_id is None:
+            # Prefixed with the collection: real auto-ids are unique across
+            # the whole database, and the partner `_id` (which IS this id)
+            # must not collide between `agencies` and `sellers`. A counter
+            # rather than a length, because two concurrent callers may both
+            # mint an id before either writes — as two racing applications do.
+            self._minted = getattr(self, "_minted", 0) + 1
+            doc_id = f"{self.name}-auto-{self._minted}"
+            while doc_id in self.docs:                 # pragma: no cover
+                self._minted += 1
+                doc_id = f"{self.name}-auto-{self._minted}"
         return FakeDocument(self, doc_id)
+
+    def add(self, data: dict) -> tuple[Any, FakeDocument]:
+        """Firestore's `add`: write under a server-chosen id.
+
+        Returns `(update_time, document_reference)` IN THAT ORDER, which is
+        the real SDK's shape and the reason every caller here reads it as
+        `_, ref = ...`. A fake that returned the reference alone, or the pair
+        the other way round, would make `doc_ref.id` either an AttributeError
+        or a timestamp — and `warn_user` puts that id in the audit row and in
+        the notification document id, so the wrong one would be silently
+        wrong rather than loudly broken.
+
+        The id is sequential rather than random so a test can assert on the
+        document that was written without having to find it first.
+        """
+        doc_id = f"auto-{len(self.docs) + 1}"
+        while doc_id in self.docs:                     # pragma: no cover
+            doc_id = f"auto-{doc_id}"
+        ref = self.document(doc_id)
+        ref.set(data)
+        return (None, ref)
 
     def where(self, filter: Any = None, **kw) -> FakeQuery:  # noqa: A002
         return FakeQuery(self, list(self.docs.items())).where(filter, **kw)
@@ -837,12 +1054,68 @@ class FakeWriteBatch:
         return []
 
 
+class FakeTransaction:
+    """A Firestore transaction, as much of one as an in-memory store can be.
+
+    Writes are applied immediately rather than queued to a commit, which is the
+    one way this differs from `FakeWriteBatch` above — and the difference is
+    deliberate. A transaction's reads and writes interleave: the code under test
+    re-reads a document inside the transaction and decides whether to write
+    based on what it finds. Queueing the write until the end would still give
+    the right answer here, but applying it immediately matches the order the
+    real SDK produces within a single attempt.
+
+    What it does NOT model is contention. The real thing aborts and retries when
+    another writer touches the read set; this store has one thread and no
+    competing writer, so there is nothing to abort. The property that CAN be
+    tested against it — and is, in `test_appeal_auto_resolve.py` — is the
+    compare-and-set itself: a second call must find the status already moved and
+    write nothing.
+    """
+
+    def __init__(self, store: "FakeFirestore") -> None:
+        self._store = store
+        #: Every write this transaction made, so a test can assert on the
+        #: number as well as the result. One event must not write twice.
+        self.writes: list[tuple] = []
+
+    def update(self, ref, data):
+        self.writes.append(("update", ref.id, data))
+        ref.update(data)
+        return self
+
+    def set(self, ref, data, merge: bool = False):
+        self.writes.append(("set", ref.id, data))
+        ref.set(data, merge=merge)
+        return self
+
+    def delete(self, ref):
+        self.writes.append(("delete", ref.id, None))
+        ref.delete()
+        return self
+
+
+def transactional(fn):
+    """Stand-in for `firebase_admin.firestore.transactional`.
+
+    The real decorator wraps the function in the retry loop that makes a
+    transaction a transaction. Here it is the identity: the function is called
+    once with whatever `client.transaction()` handed back. That is enough for
+    the logic under test and honest about what is not being exercised — no
+    retry, no abort, no contention.
+    """
+    return fn
+
+
 class FakeFirestore:
     def __init__(self) -> None:
         self.collections: dict[str, FakeFsCollection] = {}
         #: Handed out by `batch()`. A test can set `fail_on_commit` on it to
         #: prove that a failed batch writes nothing.
         self.last_batch: FakeWriteBatch | None = None
+        #: Handed out by `transaction()`, so a test can count the writes one
+        #: transaction made.
+        self.last_transaction: FakeTransaction | None = None
 
     def collection(self, name: str) -> FakeFsCollection:
         if name not in self.collections:
@@ -852,3 +1125,7 @@ class FakeFirestore:
     def batch(self) -> FakeWriteBatch:
         self.last_batch = FakeWriteBatch(self)
         return self.last_batch
+
+    def transaction(self) -> FakeTransaction:
+        self.last_transaction = FakeTransaction(self)
+        return self.last_transaction

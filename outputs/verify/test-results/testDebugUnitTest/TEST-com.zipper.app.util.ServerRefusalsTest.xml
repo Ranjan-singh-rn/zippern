@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.ServerRefusalsTest" tests="5" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.150Z" hostname="CW253.local" time="0.019">
+  <properties/>
+  <testcase name="every callable wrapper reports its FirebaseFunctionsException" classname="com.zipper.app.util.ServerRefusalsTest" time="0.016"/>
+  <testcase name="the two server codes are recognised" classname="com.zipper.app.util.ServerRefusalsTest" time="0.003"/>
+  <testcase name="a session that cannot be started fails the sign-in (SESS-4)" classname="com.zipper.app.util.ServerRefusalsTest" time="0.0"/>
+  <testcase name="anything else is not a session refusal" classname="com.zipper.app.util.ServerRefusalsTest" time="0.0"/>
+  <testcase name="SessionViewModel acts on reported refusals and MainActivity handles the new event" classname="com.zipper.app.util.ServerRefusalsTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

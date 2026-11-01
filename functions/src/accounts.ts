@@ -2,6 +2,8 @@ import { onCall, HttpsError, CallableRequest } from 'firebase-functions/v2/https
 import * as functions from 'firebase-functions/v1'
 import * as logger from 'firebase-functions/logger'
 import * as admin from 'firebase-admin'
+import { SESSION_DISPLACED, presentedSessionId } from './mobileSession'
+import { rosterRemovalFields, rosterRowIsCurrent } from './roster'
 
 const db = admin.firestore()
 const REGION = 'asia-south1' as const
@@ -152,6 +154,320 @@ export const RETAINED_SUBCOLLECTIONS = [
   'weeklyEarnings', 'warnings', 'giftShowcase', 'blocked',
 ]
 
+/*
+ * ── WHO MAY MOVE AN ACCOUNT THROUGH DELETION (B1, Phase 1A.2) ─────────────────
+ *
+ * N3. These three callables used to check only that the caller was signed in.
+ * A device that had been displaced by a newer sign-in — or any token issued
+ * before the account's credential cut-off — could request a deletion, and then
+ * finish it at once: `requestAccountDeletion` revokes refresh tokens, but an
+ * ID token already issued stays valid for up to an hour and callables do not
+ * check revocation. Now every one of them refuses a sign-in whose `auth_time`
+ * predates `credentialsValidAfter` — the same test the rules' `sessionCurrent()`
+ * applies — and refuses a missing, invalid or future `auth_time` outright.
+ *
+ *   requestAccountDeletion  runs inside the app, on the account's active
+ *                           mobile session, so that session is REQUIRED: the
+ *                           presented `sessionId` must equal the recorded one.
+ *                           A missing id is not proof of anything.
+ *   recoverAccount,         run after a FRESH sign-in. The request deleted the
+ *   purgeMyAccountNow       session and moved the cut-off past its own time,
+ *                           and the app's sign-in stops at the recovery screen
+ *                           before starting a new session — so there is
+ *                           usually no session to present. The cut-off is what
+ *                           proves freshness here. If a session IS on record,
+ *                           it must be presented and match. A left-over local
+ *                           id with nothing on record is ignored: it proves
+ *                           nothing either way, and refusing it would strand a
+ *                           second device the person signed back in on.
+ *
+ * "Delete now" additionally needs a sign-in no older than ten minutes, by the
+ * server's clock (DELETE_NOW_MAX_SIGN_IN_AGE_SECONDS). Nothing else does.
+ *
+ * STAFF-005. Staff and partners sign in to the CRM with the same Firebase
+ * identity the app uses. Deleting the app account deleted that identity — an
+ * Owner tapping "Delete account" in Settings lost the CRM. So a login with
+ * protected CRM access cannot request or finish a deletion, and the nightly
+ * sweep holds such an account rather than deleting it. "Protected" is read
+ * from the server's own `crmUsers/{uid}` record — written by the backend, and
+ * the rules let no client change its role, roles, roleStatus, status or
+ * isActive — never from anything the caller sends:
+ *
+ *   staff     any non-partner CRM role on a login that is not switched off;
+ *   partner   an agency or coin-seller capability whose status is approved,
+ *             pending or suspended — or any status this build does not know.
+ *             A capability that is only rejected or revoked protects nothing.
+ *
+ * Error codes, in `HttpsError.details.code`:
+ *
+ *   SESSION_DISPLACED        the sign-in predates the cut-off; its auth_time is
+ *                            missing, invalid or in the future; or the presented
+ *                            session id is not the active one.
+ *   SESSION_REQUIRED         the active mobile session must be presented and
+ *                            was not, or the account has none on record.
+ *   RECENT_SIGN_IN_REQUIRED  "Delete now" needs a sign-in within ten minutes; a
+ *                            missing, invalid or future auth_time fails it too.
+ *   CRM_ACCESS_HELD          the login is a protected CRM identity
+ *                            (`details.access` is 'staff' or 'partner').
+ */
+export const SESSION_REQUIRED = 'SESSION_REQUIRED'
+export const RECENT_SIGN_IN_REQUIRED = 'RECENT_SIGN_IN_REQUIRED'
+export const CRM_ACCESS_HELD = 'CRM_ACCESS_HELD'
+
+/** "Delete now" needs a sign-in no older than this. Approved: ten minutes. */
+export const DELETE_NOW_MAX_SIGN_IN_AGE_SECONDS = 10 * 60
+
+/**
+ * How far ahead of this server's clock an `auth_time` may be before it counts
+ * as "in the future". Firebase Auth and Cloud Functions keep separate clocks;
+ * a sign-in that is seconds old must not be refused because the two disagree
+ * by a second. Anything further ahead than this is refused.
+ */
+export const AUTH_TIME_CLOCK_SKEW_SECONDS = 60
+
+export type LifecycleRefusal =
+  | ''
+  | typeof SESSION_DISPLACED
+  | typeof SESSION_REQUIRED
+  | typeof RECENT_SIGN_IN_REQUIRED
+
+/**
+ * Decide, without touching Firestore, whether this credential may move the
+ * account through deletion. Returns the refusal code, or '' to proceed.
+ */
+export function lifecycleCredentialRefusal(p: {
+  authTime: unknown
+  nowSec: number
+  credentialsValidAfter: unknown
+  presentedSessionId: string
+  recordedSessionId: string
+  requireActiveSession: boolean
+  maxSignInAgeSec?: number
+}): LifecycleRefusal {
+  const recentRequired = typeof p.maxSignInAgeSec === 'number'
+  const authTime = typeof p.authTime === 'number' ? p.authTime : Number.NaN
+  const authTimeValid = Number.isFinite(authTime)
+    && authTime > 0
+    && authTime <= p.nowSec + AUTH_TIME_CLOCK_SKEW_SECONDS
+  if (!authTimeValid) return recentRequired ? RECENT_SIGN_IN_REQUIRED : SESSION_DISPLACED
+
+  const cutoffRaw = Number(p.credentialsValidAfter)
+  const cutoff = Number.isFinite(cutoffRaw) && cutoffRaw > 0 ? cutoffRaw : 0
+  if (cutoff > 0 && authTime < cutoff) return SESSION_DISPLACED
+
+  if (p.requireActiveSession || p.recordedSessionId !== '') {
+    if (p.presentedSessionId === '' || p.recordedSessionId === '') return SESSION_REQUIRED
+    if (p.presentedSessionId !== p.recordedSessionId) return SESSION_DISPLACED
+  }
+
+  if (recentRequired && p.nowSec - authTime > (p.maxSignInAgeSec as number)) {
+    return RECENT_SIGN_IN_REQUIRED
+  }
+  return ''
+}
+
+const LIFECYCLE_MESSAGES: Record<Exclude<LifecycleRefusal, ''>, string> = {
+  [SESSION_DISPLACED]:
+    'This sign-in is no longer valid for your account. Sign in again, then try again.',
+  [SESSION_REQUIRED]:
+    'Your session on this device is not active. Sign in again, then try again.',
+  [RECENT_SIGN_IN_REQUIRED]:
+    'For your security, sign in again to delete your account now.',
+}
+
+/** Throw the refusal for this credential, if there is one. */
+function refuseUnlessCurrentCredential(
+  req: CallableRequest<Record<string, unknown>>,
+  uid: string,
+  snap: FirebaseFirestore.DocumentSnapshot,
+  operation: string,
+  opts: { requireActiveSession: boolean; maxSignInAgeSec?: number },
+): void {
+  const session = (snap.get('activeMobileSession') ?? {}) as Record<string, unknown>
+  const refusal = lifecycleCredentialRefusal({
+    authTime: req.auth?.token?.auth_time,
+    nowSec: Math.floor(Date.now() / 1000),
+    credentialsValidAfter: snap.get('credentialsValidAfter'),
+    presentedSessionId: presentedSessionId(req.data),
+    recordedSessionId: typeof session.sessionId === 'string' ? session.sessionId : '',
+    requireActiveSession: opts.requireActiveSession,
+    maxSignInAgeSec: opts.maxSignInAgeSec,
+  })
+  if (refusal === '') return
+  logger.warn('account lifecycle refused', { uid, operation, refusal })
+  throw new HttpsError(
+    refusal === RECENT_SIGN_IN_REQUIRED ? 'failed-precondition' : 'permission-denied',
+    LIFECYCLE_MESSAGES[refusal],
+    { code: refusal },
+  )
+}
+
+const PARTNER_CAPABILITIES = new Set(['agency', 'seller'])
+
+/**
+ * Partner statuses that leave nothing to protect. Every other status —
+ * approved, pending, suspended, a missing one, or one this build does not
+ * know — keeps the identity protected: the cost of a wrong "protected" is a
+ * deletion that waits for an Owner; the cost of a wrong "not protected" is a
+ * CRM login nobody can get back.
+ */
+const RELEASED_PARTNER_STATUSES = new Set(['rejected', 'revoked'])
+
+export type ProtectedCrmAccess = '' | 'staff' | 'partner'
+
+/** Pure: the protected CRM access a `crmUsers/{uid}` document grants, or ''. */
+export function protectedCrmAccess(
+  doc: Record<string, unknown> | null | undefined,
+): ProtectedCrmAccess {
+  if (!doc) return ''
+  const norm = (v: unknown): string => (typeof v === 'string' ? v.trim().toLowerCase() : '')
+
+  const role = norm(doc.role)
+  if (role !== '' && !PARTNER_CAPABILITIES.has(role) && doc.isActive !== false) return 'staff'
+
+  const statusOf = new Map<string, string>()
+  const roleStatus = doc.roleStatus
+  if (roleStatus && typeof roleStatus === 'object' && !Array.isArray(roleStatus)) {
+    for (const [k, v] of Object.entries(roleStatus as Record<string, unknown>)) {
+      statusOf.set(norm(k), norm(v))
+    }
+  }
+  const capabilities = new Set<string>()
+  if (PARTNER_CAPABILITIES.has(role)) capabilities.add(role)
+  if (Array.isArray(doc.roles)) {
+    for (const r of doc.roles) if (PARTNER_CAPABILITIES.has(norm(r))) capabilities.add(norm(r))
+  }
+  for (const k of statusOf.keys()) if (PARTNER_CAPABILITIES.has(k)) capabilities.add(k)
+
+  for (const capability of capabilities) {
+    let status = statusOf.get(capability) ?? ''
+    // A login written before per-capability statuses existed carries one
+    // status, at the top level, for its primary role.
+    if (status === '' && capability === role) status = norm(doc.status)
+    if (!RELEASED_PARTNER_STATUSES.has(status)) return 'partner'
+  }
+  return ''
+}
+
+async function protectedCrmAccessOf(uid: string): Promise<ProtectedCrmAccess> {
+  const snap = await db.collection('crmUsers').doc(uid).get()
+  return snap.exists ? protectedCrmAccess(snap.data() as Record<string, unknown>) : ''
+}
+
+const CRM_MESSAGES: Record<'staff' | 'partner', string> = {
+  staff:
+    'This login is also your Zipper CRM account, so it cannot be deleted from the app — ' +
+    'that would remove your CRM access. Ask an Owner to remove your CRM access first.',
+  partner:
+    'This login also runs your Zipper partner account, so it cannot be deleted from the app — ' +
+    'that would lock you out of it. Ask Zipper to close the partner account first.',
+}
+
+/** Throw CRM_ACCESS_HELD if this login is a protected CRM identity. */
+async function refuseProtectedCrmIdentity(uid: string, operation: string): Promise<void> {
+  const access = await protectedCrmAccessOf(uid)
+  if (access === '') return
+  logger.warn('account lifecycle refused: protected CRM identity', { uid, operation, access })
+  throw new HttpsError('failed-precondition', CRM_MESSAGES[access], {
+    code: CRM_ACCESS_HELD,
+    access,
+  })
+}
+
+// ── RC (confirmed): partner responsibilities block a self-deletion ──────────
+//
+// "Block self-deletion while partner responsibilities remain unresolved." The
+// CRM-login check above covers staff and partner logins. A HOST is a partner
+// role too, and a Host's responsibilities live on the app account itself:
+//
+//   host_role        — `isHost` is still true: the agency's roster, its weekly
+//                      report and its commission all hang on this account;
+//   money_frozen     — `payoutHold`: money behind a suspension, ban or
+//                      revocation waits for the Owner's decision (CRM-FLOW 9.48);
+//   unpaid_earnings  — beans released for withdrawal and not withdrawn;
+//   open_withdrawal  — a withdrawal request still being paid.
+//
+// Deleting would leave each of those owed to, or by, nobody. The person ends
+// the Host role (Zipper staff) or settles the money first. Financial and audit
+// records are never deleted by a purge either way.
+
+export const PARTNER_RESPONSIBILITIES = 'PARTNER_RESPONSIBILITIES'
+
+export type DeletionBlocker = 'host_role' | 'money_frozen' | 'unpaid_earnings' | 'open_withdrawal'
+
+/** Pure: what on the user document (plus open withdrawals) still needs settling. */
+export function deletionBlockersOf(
+  user: Record<string, unknown> | null | undefined,
+  openWithdrawals = 0,
+): DeletionBlocker[] {
+  const u = user ?? {}
+  const out: DeletionBlocker[] = []
+  if (u.isHost === true) out.push('host_role')
+  if (u.payoutHold === true) out.push('money_frozen')
+  if (Number(u.beansAvailable ?? 0) > 0) out.push('unpaid_earnings')
+  if (openWithdrawals > 0) out.push('open_withdrawal')
+  return out
+}
+
+const BLOCKER_SENTENCE: Record<DeletionBlocker, string> = {
+  host_role: 'you are still a Host — ask Zipper to end the Host role first',
+  money_frozen: 'money on this account is on hold for Zipper\'s review',
+  unpaid_earnings: 'you have earnings released for withdrawal — withdraw them first',
+  open_withdrawal: 'a withdrawal is still being paid',
+}
+
+async function openWithdrawalsOf(uid: string): Promise<number> {
+  try {
+    const snap = await db.collection('withdrawalRequests').where('hostUid', '==', uid).get()
+    return snap.docs.filter((d) => ['pending', 'approved', 'processing'].includes(String(d.get('status') ?? ''))).length
+  } catch {
+    return 0
+  }
+}
+
+/** Throw PARTNER_RESPONSIBILITIES if a Host's responsibilities are unsettled. */
+async function refuseUnsettledPartnerResponsibilities(
+  uid: string, user: Record<string, unknown>, operation: string,
+): Promise<void> {
+  const blockers = deletionBlockersOf(user, await openWithdrawalsOf(uid))
+  if (blockers.length === 0) return
+  logger.warn('account lifecycle refused: unsettled partner responsibilities', { uid, operation, blockers })
+  throw new HttpsError(
+    'failed-precondition',
+    'This account cannot be deleted yet: ' + blockers.map((b) => BLOCKER_SENTENCE[b]).join('; ') + '.',
+    { code: PARTNER_RESPONSIBILITIES, blockers },
+  )
+}
+
+/** Firebase Auth's "no such user" — which, for a deletion, is success. */
+function isUserNotFound(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === 'auth/user-not-found'
+}
+
+/**
+ * Delete the Firebase login. "Already gone" is success; anything else is
+ * thrown, so the caller fails and the account stays queued for a retry.
+ */
+async function deleteLogin(uid: string): Promise<void> {
+  try {
+    await admin.auth().deleteUser(uid)
+  } catch (err) {
+    if (isUserNotFound(err)) {
+      logger.info(`purgeAccount: auth account ${uid} was already absent`)
+      return
+    }
+    throw err
+  }
+}
+
+/** Take a finished deletion out of the sweep's queue for good (DEACT-001). */
+async function markPurgeComplete(uid: string): Promise<void> {
+  await db.collection('users').doc(uid).update({
+    deletionDueAt: admin.firestore.FieldValue.delete(),
+    deletionHeld: admin.firestore.FieldValue.delete(),
+  })
+}
+
 async function deleteQuery(
   query: FirebaseFirestore.Query,
   batchSize = 300,
@@ -203,7 +519,29 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
    * existed, what role it held, and which agency it belonged to. Without those
    * the retained transactions are rows about nobody.
    */
-  await db.collection('users').doc(uid).set(
+  /*
+   * FX-10 (RF-15): the agency's roster row stops counting in the same write.
+   * It used to stay, so the weekly payout report and the agency's screens —
+   * which read the roster and nothing else — went on listing a purged account
+   * as one of the agency's hosts. Marked inactive, not deleted: it is the
+   * record of who was on the roster, like the `agencyId` kept below.
+   */
+  const userRef = db.collection('users').doc(uid)
+  const before = await userRef.get()
+  const rosterAgency = String((before.exists ? before.get('agencyId') : '') ?? '').trim()
+  const rosterRef = rosterAgency
+    ? db.collection('agencies').doc(rosterAgency).collection('agencyHosts').doc(uid)
+    : null
+  const rosterRow = rosterRef ? await rosterRef.get() : null
+  const purgeWrite = db.batch()
+  if (rosterRef && rosterRow?.exists && rosterRowIsCurrent(rosterRow.data())) {
+    purgeWrite.update(
+      rosterRef,
+      rosterRemovalFields('purged', admin.firestore.FieldValue.serverTimestamp()),
+    )
+  }
+  purgeWrite.set(
+    userRef,
     {
       accountState: STATE_PERMANENTLY_DEACTIVATED,
       isDeleted: true,
@@ -224,9 +562,31 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
       isLive: false,
       isInCall: false,
       isInParty: false,
+      // RC (confirmed): no active role survives a permanent deletion. The
+      // flags are cleared; `agencyId` (history) and every financial and audit
+      // record are kept.
+      isHost: false,
+      isVerifiedHost: false,
+      isAgent: false,
+      isSeller: false,
+      crmRole: '',
     },
     { merge: true },
-  ).catch(() => undefined)
+  )
+  // RC (confirmed): the partner login (a released one — a live one never
+  // reaches a purge) and any public seller listing go with the account.
+  const crmRef = db.collection('crmUsers').doc(uid)
+  const crmSnap = await crmRef.get()
+  if (crmSnap.exists) purgeWrite.set(crmRef, { isActive: false, purgedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true })
+  const ownSellers = await db.collection('sellers').where('ownerUid', '==', uid).get().catch(() => null)
+  for (const s of ownSellers?.docs ?? []) {
+    purgeWrite.delete(db.collection('publicSellers').doc(s.id))
+  }
+  await purgeWrite.commit()
+  // B1 (DEACT-001): no longer swallowed. If the identity was not released, the
+  // purge must FAIL, keep its due date and be retried — not delete the login,
+  // clear the due date, and leave a phone number bound to an account nobody
+  // can sign into.
   removed += 1
 
   // Uploaded media. Best-effort: a storage failure must not leave the account
@@ -238,15 +598,34 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
     logger.warn(`purgeAccount: storage for ${uid} could not be cleared`, err)
   }
 
-  // Last, for the reason above.
-  try {
-    await admin.auth().deleteUser(uid)
-  } catch (err) {
-    // Already gone is success, not failure.
-    logger.info(`purgeAccount: auth account ${uid} was already absent`, err)
-  }
+  // Last, for the reason above. Already gone is success; any other failure is
+  // thrown, so the due date stays set and the sweep's next run finishes the
+  // job with `finishPurge` — without repeating the steps above.
+  await deleteLogin(uid)
+
+  // Only now is the deletion complete: out of the queue for good (DEACT-001).
+  await markPurgeComplete(uid)
 
   return { uid, removed }
+}
+
+/**
+ * Finish a purge whose identity was already released — `accountState` is
+ * `permanently_deactivated` — but which is still queued: a login deletion that
+ * failed, or a record completed before DEACT-001 was fixed, when a purge never
+ * cleared its due date. Repeats nothing that already happened: the login is
+ * deleted only if it still exists, then the record leaves the queue.
+ */
+async function finishPurge(uid: string): Promise<void> {
+  let loginExists = true
+  try {
+    await admin.auth().getUser(uid)
+  } catch (err) {
+    if (!isUserNotFound(err)) throw err
+    loginExists = false
+  }
+  if (loginExists) await deleteLogin(uid)
+  await markPurgeComplete(uid)
 }
 
 // ── Request deletion ─────────────────────────────────────────────────────────
@@ -269,13 +648,23 @@ async function purgeAccount(uid: string): Promise<{ uid: string; removed: number
  */
 export const requestAccountDeletion = onCall(
   { region: REGION },
-  async (req: CallableRequest<Record<string, never>>) => {
+  async (req: CallableRequest<Record<string, unknown>>) => {
     const uid = req.auth?.uid
     if (!uid) throw new HttpsError('unauthenticated', 'Sign in first.')
 
     const ref = db.collection('users').doc(uid)
     const snap = await ref.get()
     if (!snap.exists) throw new HttpsError('not-found', 'No account to delete.')
+
+    // B1 (N3): only the account's current sign-in, on its active session.
+    refuseUnlessCurrentCredential(req, uid, snap, 'requestAccountDeletion', {
+      requireActiveSession: true,
+    })
+    // B1 (STAFF-005): never a login the CRM depends on.
+    await refuseProtectedCrmIdentity(uid, 'requestAccountDeletion')
+    // RC (confirmed): nor one whose Host responsibilities are unsettled.
+    await refuseUnsettledPartnerResponsibilities(uid, (snap.data() ?? {}) as Record<string, unknown>,
+      'requestAccountDeletion')
 
     if (snap.get('accountState') === STATE_PERMANENTLY_DEACTIVATED) {
       return { requested: false, alreadyDeleted: true, dueAtMs: 0 }
@@ -303,9 +692,29 @@ export const requestAccountDeletion = onCall(
         // on a device somebody handed back.
         activeMobileSession: admin.firestore.FieldValue.delete(),
         sessionToken: '',
+        /*
+         * Phase 1A (SESSION-003): removing the session id did not end the
+         * session. Every ID token already issued kept passing
+         * `sessionCurrent()` and kept calling callables for up to an hour,
+         * and its refresh token kept minting more. The cut-off moves PAST
+         * now (monotonic — never lowered), so every existing token is
+         * refused by the rules, and the refresh tokens are revoked below.
+         * Recovery signs in afresh, which mints a token after the cut-off.
+         */
+        credentialsValidAfter: Math.max(
+          Number(snap.get('credentialsValidAfter') ?? 0) || 0,
+          Math.floor(now.toMillis() / 1000) + 1,
+        ),
       },
       { merge: true },
     )
+    try {
+      await admin.auth().revokeRefreshTokens(uid)
+    } catch (err) {
+      // Reported, not swallowed: the rules cut-off above already refuses the
+      // live tokens; this only stops new ones being minted.
+      logger.error('deletion request: refresh tokens NOT revoked', { uid, err: String(err) })
+    }
 
     logger.info('account deletion requested', { uid, dueAt: dueAt.toMillis() })
     return { requested: true, alreadyDeleted: false, dueAtMs: dueAt.toMillis() }
@@ -314,8 +723,26 @@ export const requestAccountDeletion = onCall(
 
 // ── Recover ───────────────────────────────────────────────────────────────────
 
+/** `HttpsError.details.code` when the recovery window has closed (C8, B27). */
+export const RECOVERY_EXPIRED = 'RECOVERY_EXPIRED'
+
 /**
- * Change your mind, within the thirty days.
+ * Has this account's recovery window closed?
+ *
+ * A due date AT now is closed, not open: the sweep purges `deletionDueAt <=
+ * now`, and `resolveIdentity` answers `deleted_permanent` on the same test, so
+ * all three agree on the boundary. No due date — including one the sweep moved
+ * into `deletionHeld` (STAFF-005) — is not expired.
+ */
+export function recoveryExpired(
+  dueAt: { toMillis?: () => number } | null | undefined,
+  nowMs: number,
+): boolean {
+  return dueAt != null && typeof dueAt.toMillis === 'function' && dueAt.toMillis() <= nowMs
+}
+
+/**
+ * Change your mind, within the recovery window (`GRACE_DAYS`).
  *
  * A callable rather than a client write, for the same reason every other state
  * change about an account is: it is recorded, and the rules do not have to be
@@ -323,7 +750,7 @@ export const requestAccountDeletion = onCall(
  */
 export const recoverAccount = onCall(
   { region: REGION },
-  async (req: CallableRequest<Record<string, never>>) => {
+  async (req: CallableRequest<Record<string, unknown>>) => {
     const uid = req.auth?.uid
     if (!uid) throw new HttpsError('unauthenticated', 'Sign in first.')
 
@@ -335,6 +762,13 @@ export const recoverAccount = onCall(
         'This account has already been deleted and cannot be recovered.',
       )
     }
+
+    // B1 (N3): a sign-in made after the deletion request — the request moved
+    // the cut-off past its own time, so every older token is refused.
+    refuseUnlessCurrentCredential(req, uid, snap, 'recoverAccount', {
+      requireActiveSession: false,
+    })
+
     if (snap.get('isDeleted') !== true) {
       // Idempotent: nothing to undo is not an error.
       return { recovered: false, alreadyActive: true }
@@ -348,12 +782,21 @@ export const recoverAccount = onCall(
      * back a document with no way to sign into it, and might hand back a phone
      * number that now belongs to a different person. The history stays; the
      * account does not come back.
+     *
+     * C8 (B27): decided on the DUE DATE as well as the state. The sweep that
+     * flips the state runs once a day, fifty accounts at a time, so an account
+     * can sit past its deadline still saying `recovery_pending` — and recovery
+     * used to succeed there, into an account the sweep was about to purge.
      */
-    if (snap.get('accountState') === STATE_PERMANENTLY_DEACTIVATED) {
+    if (
+      snap.get('accountState') === STATE_PERMANENTLY_DEACTIVATED ||
+      recoveryExpired(snap.get('deletionDueAt'), Date.now())
+    ) {
       throw new HttpsError(
         'failed-precondition',
         'The recovery period for this account has passed. Its history is kept, ' +
           'but the account cannot be restored.',
+        { code: RECOVERY_EXPIRED },
       )
     }
 
@@ -362,6 +805,8 @@ export const recoverAccount = onCall(
       isDeleted: admin.firestore.FieldValue.delete(),
       deletionRequestedAt: admin.firestore.FieldValue.delete(),
       deletionDueAt: admin.firestore.FieldValue.delete(),
+      // A hold placed by the sweep (STAFF-005) means nothing once recovered.
+      deletionHeld: admin.firestore.FieldValue.delete(),
       recoveredAt: admin.firestore.FieldValue.serverTimestamp(),
     })
 
@@ -382,12 +827,19 @@ export const recoverAccount = onCall(
  */
 export const purgeMyAccountNow = onCall(
   { region: REGION },
-  async (req: CallableRequest<Record<string, never>>) => {
+  async (req: CallableRequest<Record<string, unknown>>) => {
     const uid = req.auth?.uid
     if (!uid) throw new HttpsError('unauthenticated', 'Sign in first.')
 
     const snap = await db.collection('users').doc(uid).get()
     if (!snap.exists) return { purged: true, alreadyGone: true }
+
+    // B1 (N3): a sign-in made after the deletion request, and made within the
+    // last ten minutes — this is the one irreversible step.
+    refuseUnlessCurrentCredential(req, uid, snap, 'purgeMyAccountNow', {
+      requireActiveSession: false,
+      maxSignInAgeSec: DELETE_NOW_MAX_SIGN_IN_AGE_SECONDS,
+    })
 
     // Only from the deleted state. Otherwise this is a one-call account
     // destructor reachable by anything holding a token.
@@ -396,6 +848,21 @@ export const purgeMyAccountNow = onCall(
         'failed-precondition',
         'Request deletion from Settings first.',
       )
+    }
+
+    // B1 (STAFF-005): never a login the CRM depends on — including one whose
+    // deletion was requested before this check existed.
+    await refuseProtectedCrmIdentity(uid, 'purgeMyAccountNow')
+    // RC (confirmed): nor one whose Host responsibilities are unsettled.
+    await refuseUnsettledPartnerResponsibilities(uid, (snap.data() ?? {}) as Record<string, unknown>,
+      'purgeMyAccountNow')
+
+    // Identity already released, login deletion still pending: finish only
+    // that, rather than repeating the purge (DEACT-001).
+    if (snap.get('accountState') === STATE_PERMANENTLY_DEACTIVATED) {
+      await finishPurge(uid)
+      logger.info('account purge finished on request', { uid })
+      return { purged: true, alreadyGone: false }
     }
 
     const result = await purgeAccount(uid)
@@ -412,10 +879,34 @@ export const purgeMyAccountNow = onCall(
  * Daily at 03:30 IST — after the nightly jobs, before anybody is awake to be
  * confused by an account disappearing mid-session.
  *
- * Bounded at fifty an run. This is not a queue that spikes, and a purge does a
- * dozen writes plus a storage listing per account; a sweep that tried to clear
- * a backlog in one pass would be the thing that took the database down.
+ * Bounded at fifty purges a run. This is not a queue that spikes, and a purge
+ * does a dozen writes plus a storage listing per account; a sweep that tried to
+ * clear a backlog in one pass would be the thing that took the database down.
+ *
+ * ── DEACT-001 (B1, Phase 1A.2) ───────────────────────────────────────────────
+ *
+ * A purge used to leave `isDeleted: true` AND its `deletionDueAt` behind, so
+ * every completed deletion matched this query for ever. With fifty of them in
+ * the queue, every run re-purged the same fifty and the next real deletion was
+ * never reached. Now:
+ *
+ *   * a purge clears `deletionDueAt` once it has fully succeeded, so it leaves
+ *     the queue (`markPurgeComplete`);
+ *   * a record already purged but still queued — completed before this fix, or
+ *     whose login deletion failed — is FINISHED, not purged again: its login is
+ *     deleted only if it still exists, then it leaves the queue (`finishPurge`);
+ *   * a protected CRM identity (STAFF-005) is never purged here. It is marked
+ *     `deletionHeld` — reason, which access, its original due date, when — and
+ *     taken out of the queue, so it cannot block the run either. It stays
+ *     hidden and recoverable; once an Owner has removed the CRM access, the
+ *     person can finish the deletion with "Delete now", or recover;
+ *   * up to SWEEP_SCAN_LIMIT records are read per run, so a handful of failures
+ *     at the front of the queue cannot stop the rest. A failure keeps its due
+ *     date and is retried the next night.
  */
+export const SWEEP_PURGE_LIMIT = 50
+export const SWEEP_SCAN_LIMIT = 500
+
 export const purgeDeletedAccounts = functions
   .region(REGION)
   .runWith({ timeoutSeconds: 540, memory: '512MB' })
@@ -426,21 +917,70 @@ export const purgeDeletedAccounts = functions
     const due = await db.collection('users')
       .where('isDeleted', '==', true)
       .where('deletionDueAt', '<=', now)
-      .limit(50)
+      .orderBy('deletionDueAt')
+      .limit(SWEEP_SCAN_LIMIT)
       .get()
 
     let purged = 0
+    let finished = 0
+    let held = 0
+    let failed = 0
     for (const doc of due.docs) {
+      if (purged >= SWEEP_PURGE_LIMIT) break
       try {
+        const access = await protectedCrmAccessOf(doc.id)
+        if (access !== '') {
+          await doc.ref.update({
+            deletionHeld: {
+              reason: 'crm_access',
+              access,
+              dueAt: doc.get('deletionDueAt') ?? null,
+              heldAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            deletionDueAt: admin.firestore.FieldValue.delete(),
+          })
+          held++
+          logger.error(
+            `purgeDeletedAccounts: ${doc.id} is a protected CRM identity (${access}); ` +
+              'its deletion is held until an Owner removes the CRM access',
+          )
+          continue
+        }
+        if (doc.get('accountState') === STATE_PERMANENTLY_DEACTIVATED) {
+          await finishPurge(doc.id)
+          finished++
+          continue
+        }
+        // RC (confirmed): unsettled Host responsibilities hold the deletion,
+        // exactly like a protected CRM identity — never purged around.
+        const blockers = deletionBlockersOf(doc.data() as Record<string, unknown>, await openWithdrawalsOf(doc.id))
+        if (blockers.length > 0) {
+          await doc.ref.update({
+            deletionHeld: {
+              reason: 'partner_responsibilities',
+              blockers,
+              dueAt: doc.get('deletionDueAt') ?? null,
+              heldAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            deletionDueAt: admin.firestore.FieldValue.delete(),
+          })
+          held++
+          logger.error(`purgeDeletedAccounts: ${doc.id} has unsettled responsibilities (${blockers.join(', ')}); held`)
+          continue
+        }
         await purgeAccount(doc.id)
         purged++
       } catch (err) {
-        // One account that will not delete must not stop the other forty-nine.
-        logger.error(`purgeDeletedAccounts: ${doc.id} failed`, err)
+        // One account that will not delete must not stop the others. It keeps
+        // its due date and is retried tomorrow.
+        failed++
+        logger.error(`purgeDeletedAccounts: ${doc.id} failed; retried next run`, err)
       }
     }
 
-    if (purged > 0) logger.info(`purgeDeletedAccounts purged ${purged} account(s)`)
+    if (purged + finished + held + failed > 0) {
+      logger.info('purgeDeletedAccounts', { purged, finished, held, failed })
+    }
     return null
   })
 

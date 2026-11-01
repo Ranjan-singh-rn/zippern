@@ -5,12 +5,33 @@
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
   },
-  "storage": [
-    {
-      "bucket": "zipper-83816.firebasestorage.app",
-      "rules": "storage.rules"
-    }
+  "//storage": [
+    "SINGLE OBJECT, NOT AN ARRAY — and the difference is why the emulator would not start.",
+    "",
+    "This was `\"storage\": [{ \"bucket\": \"zipper-83816.firebasestorage.app\", \"rules\": \"storage.rules\" }]`.",
+    "The ARRAY form is the multi-bucket form: it binds each rules file to a named DEPLOY TARGET,",
+    "registered with `firebase target:apply storage <name> <bucket>` and stored in .firebaserc.",
+    "No storage target was ever registered — .firebaserc carries two hosting targets and no storage",
+    "key at all — so the array had no target to resolve and the emulator refused to start with",
+    "'Must supply target in Storage configuration'.",
+    "",
+    "The `bucket` key does not satisfy that. It is read on the deploy path, not by the emulator's",
+    "rules-config reader, which is why this never surfaced before: `firebase deploy --only storage`",
+    "has never successfully run against this project (the previous audit established the Storage",
+    "rules have never been deployed, and .firebase/ holds hosting caches only).",
+    "",
+    "The single-object form needs no target: it applies the rules to the project's DEFAULT bucket.",
+    "That is the same bucket the array named, which is why this is a fix and not a retarget —",
+    "`google-services.json` gives `project_info.storage_bucket: zipper-83816.firebasestorage.app`",
+    "for project `zipper-83816`, and `project_info.storage_bucket` IS the default bucket. The same",
+    "name is independently recorded in backend/app/config.py and storage-cors.json.",
+    "",
+    "Nothing about which bucket is governed has changed. The bucket is no longer RESTATED here,",
+    "because stating it is what required the target that did not exist."
   ],
+  "storage": {
+    "rules": "storage.rules"
+  },
   "functions": [
     {
       "source": "functions",

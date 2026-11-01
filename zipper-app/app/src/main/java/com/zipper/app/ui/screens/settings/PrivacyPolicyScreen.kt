@@ -10,6 +10,7 @@ import com.zipper.app.ui.components.TopBar
 import com.zipper.app.ui.components.ZipperScreen
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.DeletionWindow
 
 @Composable
 fun PrivacyPolicyScreen(onBack: () -> Unit) {
@@ -66,7 +67,8 @@ fun PrivacyPolicyScreen(onBack: () -> Unit) {
             item {
                 PolicySection(
                     title = "8. Data Retention",
-                    body  = "We retain your personal data for as long as your account is active or as needed to provide our services. You may request deletion of your account and personal data at any time through Settings → Delete Account. Deleted accounts are permanently removed within 30 days.",
+                    // C8 (B28): the recovery window is the server's — sixty days, not thirty.
+                    body  = "We retain your personal data for as long as your account is active or as needed to provide our services. You may request deletion of your account and personal data at any time through Settings → Delete Account. Deleted accounts are permanently removed within ${DeletionWindow.GRACE_DAYS} days.",
                 )
             }
             item {

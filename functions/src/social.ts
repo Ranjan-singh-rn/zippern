@@ -1,6 +1,7 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 import { deriveRoleFlags } from './crmRoles'
+import { assertActiveSession } from './mobileSession'
 
 const db = admin.firestore()
 
@@ -24,6 +25,7 @@ export const toggleLike = functions
   .https.onCall(async (data: { targetUid: string; like: boolean }, context) => {
     const uid = context.auth?.uid
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
+    await assertActiveSession(uid, data, 'toggleLike', context.auth?.token)   // Phase 1A (SESSION-001/003)
 
     const targetUid = String(data?.targetUid ?? '')
     const like = data?.like !== false
@@ -139,18 +141,39 @@ export const syncMyRoles = functions
       crmSnap.get('roles'),
       crmSnap.get('isActive') !== false,
       crmSnap.exists,
+      crmSnap.get('roleStatus'),
+      crmSnap.get('status'),
     )
     const { crmRole, isAgent, isSeller, isOfficial, held } = flags
 
     const next: Record<string, any> = { crmRole, isAgent, isSeller, isOfficial }
-    const agencyId = crmSnap.get('agencyId')
-    if (isAgent && typeof agencyId === 'string' && agencyId) next.agencyId = agencyId
+
+    // The person's OWN agency goes in `ownAgencyId`. `agencyId` means one
+    // thing — the agency a HOST works under — and is never written with the
+    // owner's own agency (that overload overwrote a Host's parent when they
+    // became a Sub-agency). Identical to `crm_directory.app_role_patch`.
+    const ownAgency = String(crmSnap.get('agencyId') ?? '').trim()
+    const del = admin.firestore.FieldValue.delete()
+    const currentOwn = String(userSnap.get('ownAgencyId') ?? '').trim()
+    let ownChanged = false
+    if (isAgent && ownAgency) {
+      if (currentOwn !== ownAgency) { next.ownAgencyId = ownAgency; ownChanged = true }
+    } else if (userSnap.get('ownAgencyId') !== undefined) {
+      next.ownAgencyId = del; ownChanged = true
+    }
+    // One-off cleanup of the old overload: the person's own agency sitting in
+    // `agencyId` on someone who is NOT a Host. A Host's agencyId is untouched.
+    if (ownAgency && String(userSnap.get('agencyId') ?? '').trim() === ownAgency
+        && userSnap.get('isHost') !== true) {
+      next.agencyId = del; ownChanged = true
+    }
 
     // Write only on a real difference. This runs on every sign-in, and an
     // unconditional write would fire the `users/{uid}` onWrite triggers —
     // `syncPhoneKey` among them — once per login for no reason.
-    const changed = Object.entries(next).some(([k, v]) => {
+    const changed = ownChanged || ['crmRole', 'isAgent', 'isSeller', 'isOfficial'].some((k) => {
       const before = userSnap.get(k)
+      const v = next[k]
       return k === 'crmRole' ? String(before ?? '') !== v : (before === true) !== (v === true)
     })
     if (!changed) return { roles: held, changed: false }

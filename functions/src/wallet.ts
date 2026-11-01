@@ -41,7 +41,7 @@ export const convertBeans = functions
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
     // Auth-only guard. See functions/src/mobileSession.ts: refuses when the
     // caller presents a session id that is not the account's active one.
-    await assertActiveSession(uid, data, 'convertBeans')
+    await assertActiveSession(uid, data, 'convertBeans', context.auth?.token)
 
     const { beansAmount, idempotencyKey } = data ?? {}
     if (!Number.isInteger(beansAmount) || beansAmount <= 0) {
@@ -64,6 +64,17 @@ export const convertBeans = functions
       ])
       if (claimSnap.exists) return { ...claimSnap.data(), replayed: true }
       if (!userSnap.exists) throw new functions.https.HttpsError('not-found', 'Account not found.')
+      // RC (confirmed, CRM-FLOW 9.48): earnings frozen for the Owner's review
+      // after a suspension, ban or revocation do not move — converting them to
+      // diamonds would spend them around the freeze. The weekly release reads
+      // the same flag.
+      if (userSnap.get('payoutHold') === true) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Your earnings are on hold while Zipper reviews your account. They cannot be converted right now.',
+          { reason: 'payout_hold', code: 'payout_hold' },
+        )
+      }
 
       const cfg = (cfgSnap.data() ?? {}) as Record<string, any>
       /*
@@ -196,6 +207,7 @@ export const claimDailyReward = functions
   .https.onCall(async (_data, context) => {
     const uid = context.auth?.uid
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
+    await assertActiveSession(uid, _data, 'claimDailyReward', context.auth?.token)   // Phase 1A (SESSION-001/003)
 
     const userRef  = db.collection('users').doc(uid)
     const today    = istDateKey()
@@ -311,7 +323,7 @@ export const purchaseBagItem = functions
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
     // Auth-only guard. See functions/src/mobileSession.ts: refuses when the
     // caller presents a session id that is not the account's active one.
-    await assertActiveSession(uid, data, 'purchaseBagItem')
+    await assertActiveSession(uid, data, 'purchaseBagItem', context.auth?.token)
 
     const { itemId, durationDays, idempotencyKey } = data ?? {}
     if (!itemId) throw new functions.https.HttpsError('invalid-argument', 'itemId is required.')
@@ -507,6 +519,7 @@ export const equipBagItem = functions
   .https.onCall(async (data: { itemId: string; category: string }, context) => {
     const uid = context.auth?.uid
     if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Not signed in.')
+    await assertActiveSession(uid, data, 'equipBagItem', context.auth?.token)   // Phase 1A (SESSION-001/003)
 
     const category = String(data?.category ?? '').trim()
     const itemId   = String(data?.itemId ?? '').trim()

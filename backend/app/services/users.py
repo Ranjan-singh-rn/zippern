@@ -30,12 +30,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 from firebase_admin import firestore as fb_firestore
 from google.cloud.firestore_v1.base_query import BaseQuery, FieldFilter
 
 from app.core import audit
+from app.services import money_freeze
 from app.core.compat import StrEnum
-from app.core.roles import Team
+from app.core.roles import INTERNAL_ROLES, Role, Team
 from app.db import firebase
 from app.db.mongo import C, get_db
 from app.services import cards
@@ -65,6 +67,21 @@ WARNINGS = "warnings"          # subcollection of users/{uid}
 DEVICES = "devices"            # subcollection of users/{uid}
 BANNED_DEVICES = "bannedDevices"
 REPORTS = "reports"
+#: The user-facing inbox — the app's "Official" tab. Top-level, addressed by
+#: `userId`.
+#:
+#: `userId` and NOT `targetUid`, because `userId` is what the deployed rule
+#: enforces (`firestore.rules:2651`):
+#:
+#:     allow read: if request.auth != null
+#:                 && resource.data.userId == request.auth.uid
+#:
+#: The four writers in `functions/src/index.ts` emit `targetUid`, so every
+#: notification they have ever written is unreadable by the person it
+#: addresses — the rule matches no field and denies the read. The rule is live
+#: and verified and is not being changed in this task, so this writer is
+#: written to match it, and those four are corrected to match it too.
+NOTIFICATIONS = "notifications"
 #: The invitation an agency files for a host it wants to recruit. Written by the
 #: Invite Host modal on /agency-dashboard, decided by `decide_host_application`
 #: below, and read by `checkReferralCode` / `activateHost` in the app.
@@ -79,6 +96,190 @@ class UserError(Exception):
 
 class UserNotFound(UserError):
     """The subject does not exist."""
+
+
+class DecisionNotRecordedError(UserError):
+    """HT-2 — a decision's effects are committed, but the decision is not recorded.
+
+    The account was updated under the decision lease, and the application's
+    stamp could not be confirmed (twice). The lease is given back by the
+    caller, so deciding again is possible at once — and safe: an approval finds
+    the Host already granted from this agency (B22) and only records it; a
+    refusal finds nothing left to revoke. `outcome` is "not_applied" or
+    "unknown" (409 / 503).
+    """
+
+    def __init__(self, message: str, *, outcome: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.status_code = 503 if outcome == "unknown" else 409
+
+
+class LiveStepNotConfirmed(UserError):
+    """HT-2 — a Firestore write keyed for retry could not be confirmed, and it is not there.
+
+    A live balance debit or a warning: re-read after the failure, its record is
+    absent. 409 when the database aborted it, 503 when the outcome is unknown
+    (it may still land). Repeating the same request (the same card, the same
+    request id) is safe: it is keyed, so it cannot act twice.
+    """
+
+    def __init__(self, message: str, *, outcome: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.status_code = 503 if outcome == "unknown" else 409
+
+
+class HostContactVerificationRequired(UserError):
+    """Decision 15 (RC): the Host role cannot start — both contacts are not verified."""
+
+    def __init__(self, verification, message: str):
+        super().__init__(message)
+        self.verification = verification
+
+    def api_detail(self) -> dict:
+        from app.services import contact_verification  # local: keeps the import graph acyclic
+
+        return contact_verification.refusal_detail(self.verification, str(self))
+
+
+class ProtectedTarget(UserError):
+    """This uid may not be acted on through ordinary user management.
+
+    Mapped to 403 rather than 400 by `routers/users._fail`: the request is
+    well-formed and the caller is authenticated, they are simply not permitted
+    against this subject.
+    """
+
+
+class OwnerOnly(UserError):
+    """C2: this decision is the Owner's — restoring a revoked role.
+
+    Mapped to 403 by `routers/users._fail`, like `ProtectedTarget`: the request
+    is well-formed, the caller simply is not the one who may make it.
+    """
+
+
+#: C2 — the sentence a non-Owner gets for restoring a revoked Host role.
+OWNER_ONLY_RESTORE = (
+    "Only the Owner can restore a revoked role. Recommend it on the person's "
+    "reinstatement request instead."
+)
+
+
+def _actor_is_owner(actor: dict | None) -> bool:
+    from app.core.roles import is_owner_value
+
+    return is_owner_value((actor or {}).get("role"))
+
+
+# ── WHO MAY NOT BE TARGETED THROUGH ORDINARY USER MANAGEMENT ─────────────────
+#
+# An internal identity — Owner, Observer, or any department role — that has
+# also signed into the Android app has a `users/{uid}` document like anybody
+# else. `/users` in the CRM pages that collection with no staff exclusion, so
+# the Owner appeared in the list with Ban, Suspend, Grant host and Make seller
+# beside their name, and NOTHING IN THE BACKEND REFUSED. `ban_user` loaded the
+# document and patched it; the only accidental protection was that an owner
+# who had never opened the app had no document to load.
+#
+# ── THE AUTHORITY IS MONGO, AND ONLY MONGO ───────────────────────────────────
+#
+# Not `crmUsers.role` (client-written for partners), not `isHost`/`isSeller`
+# on the user document (app flags, not identity), not anything the caller
+# sends. The Mongo `staff` collection is the one record no client can write —
+# it is created solely by `POST /staff` behind `require_write` +
+# `can_manage_team`.
+#
+# ── MATCHED ON uid ALONE, AND THAT IS DELIBERATE ─────────────────────────────
+#
+# An earlier version of this also matched the subject's EMAIL against the
+# staff collection, reasoning that the Observer's Mongo row carries a
+# synthetic uid (`observer:<email>`) that a uid lookup can never find. A test
+# of that branch showed it was either redundant or actively wrong:
+#
+#   * For staff WITH a Firebase account, the email adds nothing. Firebase
+#     enforces one account per address and the staff row carries that
+#     account's uid, so the uid match has already fired.
+#
+#   * For the Observer, which has NO Firebase account, an app document
+#     bearing `314zipper@gmail.com` is not the Observer. That address is
+#     unclaimed precisely because there is no account behind it, so anybody
+#     could register it — and the resulting app user is a stranger, who
+#     should be bannable like any other. `core/security.py` already refuses
+#     them an observer SESSION; protecting their app account would hand an
+#     impostor immunity the real Observer never needed.
+#
+# The Observer is unreachable here anyway: `inspect_identity` confirms it has
+# no `users/{uid}` document, so `_load_user` raises `UserNotFound` before any
+# of this is consulted.
+
+
+def _is_internal_role(raw: object) -> bool:
+    """Is this staff row an internal identity? Unknown strings count as yes.
+
+    Fail-closed deliberately. A role this build does not recognise sitting in
+    the staff collection is far more likely to be an internal role added after
+    this code shipped than an external one, and the cost of the two mistakes
+    is not symmetrical: wrongly protecting an account means somebody files a
+    ticket, wrongly exposing one means an Owner can be banned from the API.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return True
+    try:
+        return Role(text) in INTERNAL_ROLES
+    except ValueError:
+        return True
+
+
+async def protected_staff_row(uid: str) -> dict | None:
+    """The Mongo staff row protecting this subject, or None.
+
+    Read-only. Returns the row rather than a bool so callers can name the
+    person in an audit entry or an error.
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return None
+
+    row = await get_db()[C.STAFF].find_one({"uid": uid})
+    if row is None:
+        return None
+    return row if _is_internal_role(row.get("role")) else None
+
+
+async def ensure_ordinary_target(uid: str, actor: dict, *, action: str) -> None:
+    """Refuse an ordinary user-management action on a protected subject.
+
+    Two refusals, and they are different rules:
+
+    * **self** — nobody moderates their own account, whoever they are. The
+      only self-target guard that existed anywhere in this API was
+      `staff.deactivate`'s, which covers one function.
+    * **internal staff** — an Owner, the Observer or any department role is
+      managed through the staff APIs (`POST /staff`, `PATCH
+      /staff/{uid}/role`, `POST /staff/{uid}/deactivate`), which carry their
+      own authority rules. Those are untouched; this closes the side door.
+
+    One Mongo read, on a collection holding five rows in production.
+    """
+    uid = (uid or "").strip()
+    actor_uid = str(actor.get("uid", "")).strip()
+
+    if uid and uid == actor_uid:
+        raise ProtectedTarget(
+            f"You cannot {action} your own account. If this needs doing, it "
+            "goes through another member of staff."
+        )
+
+    row = await protected_staff_row(uid)
+    if row is not None:
+        raise ProtectedTarget(
+            f"{row.get('email') or uid} is an internal {row.get('role', 'staff')} "
+            f"account and cannot be {action}ed through user management. Internal "
+            "accounts are managed through the staff APIs."
+        )
 
 
 class DeviceType(StrEnum):
@@ -198,6 +399,51 @@ async def _load_user(uid: str) -> dict:
 
 async def _patch_user(uid: str, patch: dict) -> None:
     await _fs(_user_ref(uid).update, patch)
+
+
+# ── FX-10 (RF-15): the roster row's own state ───────────────────────────────
+#
+# `agencies/{agencyId}/agencyHosts/{uid}` is what the weekly payout report, the
+# agency's app screen and the revoke cascade read as "this agency's hosts".
+# Nothing removed or flagged a row when the role ended, so all three kept
+# counting revoked (and purged) Hosts. A row now says whether it is current:
+# `active: False` plus when and why it stopped. An absent `active` is a row
+# written before this — current, as every reader always treated it.
+ROSTER_ACTIVE = "active"
+ROSTER_REMOVED_AT = "removedAt"
+ROSTER_REMOVED_REASON = "removedReason"
+
+
+def roster_removal_fields(why: str, when: Any) -> dict:
+    """The fields that mark a roster row as no longer current."""
+    return {ROSTER_ACTIVE: False, ROSTER_REMOVED_AT: when, ROSTER_REMOVED_REASON: why}
+
+
+def roster_current_fields() -> dict:
+    """The fields a (re)grant or a restore writes: current, and nothing left of a removal."""
+    return {
+        ROSTER_ACTIVE: True,
+        ROSTER_REMOVED_AT: fb_firestore.DELETE_FIELD,
+        ROSTER_REMOVED_REASON: fb_firestore.DELETE_FIELD,
+    }
+
+
+def roster_row_is_current(row: dict) -> bool:
+    """Is this roster row a CURRENT host? `active` absent → yes (a legacy row)."""
+    return (row or {}).get(ROSTER_ACTIVE) is not False
+
+
+def _roster_ref(agency_id: Any, uid: str):
+    agency_id = str(agency_id or "").strip()
+    if not agency_id:
+        return None
+    return (
+        firebase.firestore_client()
+        .collection("agencies")
+        .document(agency_id)
+        .collection("agencyHosts")
+        .document(uid)
+    )
 
 
 async def load_user(uid: str) -> dict:
@@ -421,12 +667,99 @@ def _iso(value: Any) -> str:
 # apart, including on documents written before `accountState` existed.
 
 
+# ── C4 — a restricted app account loses its CRM partner access ───────────────
+#
+# Suspending or banning an account stopped the app and nothing else: the same
+# person's agency or coin-seller portal went on working, on a live session and
+# on every renewal of it. The roles themselves are NOT touched — a suspension
+# is about the account, and lifting it must give back exactly the roles that
+# are still approved — so what changes is access: every CRM session of the uid
+# is revoked (the helper partner revocation uses), `crmUsers/{uid}` is marked
+# `accountRestricted` for the Firestore rules, and `core/account_state` refuses
+# the uid at the next request, sign-in and renewal while the restriction lasts.
+# All best effort and reported: the moderation decision itself never fails on
+# them.
+
+
+def _set_account_restricted(uid: str, restricted: bool) -> bool:
+    """Blocking — `crmUsers/{uid}.accountRestricted`, only if that document exists."""
+    try:
+        ref = firebase.firestore_client().collection("crmUsers").document(uid)
+        if not getattr(ref.get(), "exists", False):
+            return False
+        ref.update({"accountRestricted": bool(restricted)})
+        return True
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        log.warning("crmUsers/%s accountRestricted=%s not written: %s", uid, restricted, exc)
+        return False
+
+
+def _set_seller_listings_restricted(seller_ids: list[str], restricted: bool) -> int:
+    """Blocking — `sellers/{id}.ownerRestricted` on each seller document that exists.
+
+    The public directory (`publicSellers`, mirrored from `sellers` by the
+    Functions trigger `syncPublicSeller`) leaves out a seller whose owner
+    account is restricted (`publicSeller.isPubliclyVisible`). The seller's
+    `status` — the ROLE — is not touched: an account action must not revoke or
+    suspend roles, and lifting it must give back exactly what was approved.
+    """
+    written = 0
+    for sid in seller_ids:
+        try:
+            ref = firebase.firestore_client().collection("sellers").document(sid)
+            if not getattr(ref.get(), "exists", False):
+                continue
+            ref.update({"ownerRestricted": bool(restricted)})
+            written += 1
+        except Exception as exc:  # noqa: BLE001 — reported, never raised
+            log.warning("sellers/%s ownerRestricted=%s not written: %s", sid, restricted, exc)
+    return written
+
+
+async def _owned_seller_ids(uid: str) -> list[str]:
+    """Every seller record this human owns, by either owner link (B07)."""
+    from app.services import partner_roles  # local: keeps this module's import graph light
+
+    try:
+        rows = await partner_roles.records_owned_by(uid)
+    except Exception as exc:  # noqa: BLE001 — the restriction stands regardless
+        log.warning("seller records of %s could not be listed: %s", uid, exc)
+        return []
+    return [str(r.get("_id")) for r in rows if str(r.get("kind") or "") == "seller" and r.get("_id")]
+
+
+async def _close_crm_access(uid: str) -> dict:
+    from app.services import partner_ops  # local: partner_ops imports this module's peers
+
+    revoked = 0
+    try:
+        revoked = await partner_ops._revoke_partner_sessions({"owner_crm_uid": uid})
+    except Exception as exc:  # noqa: BLE001 — the restriction stands regardless
+        log.warning("CRM sessions of %s were not revoked: %s", uid, exc)
+    flagged = await _fs(_set_account_restricted, uid, True)
+    hidden = await _fs(_set_seller_listings_restricted, await _owned_seller_ids(uid), True)
+    return {"crm_sessions_revoked": revoked, "crm_login_flagged": flagged,
+            "seller_listings_hidden": hidden}
+
+
+async def _reopen_crm_access(uid: str) -> dict:
+    """The restriction is lifted. Roles are not touched: whatever is still
+    approved works again at the next sign-in, and nothing else does. A seller
+    listing comes back only if the seller record itself is still approved —
+    `isPubliclyVisible` decides that from the record, not from this flag."""
+    flagged = await _fs(_set_account_restricted, uid, False)
+    shown = await _fs(_set_seller_listings_restricted, await _owned_seller_ids(uid), False)
+    return {"crm_login_flagged": flagged, "seller_listings_unflagged": shown}
+
+
 async def ban_user(
     uid: str,
     reason: str,
     actor: dict,
     meta: dict | None = None,
     ban_device_too: bool = True,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Ban an account, and every handset it has been seen on.
 
@@ -473,6 +806,9 @@ async def ban_user(
     reviewer who is told "banned" and assumes the phone went with it is the
     person who will be surprised in a week.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="ban")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
 
@@ -494,8 +830,19 @@ async def ban_user(
         "suspendedUntil": fb_firestore.DELETE_FIELD,
         "suspensionDays": fb_firestore.DELETE_FIELD,
         "banReason": reason,
+        # GOV B42: the owner-update rule now refuses a banned account, so the app
+        # can no longer clear its own presence. Cleared here, server-side, or the
+        # account would stay "online" in every list for good.
+        "isOnline": False,
         **_stamp(actor, "banned"),
+        # RC (confirmed, CRM-FLOW 9.48): the Host's beans stop moving in the
+        # same write as the ban — the weekly release and `convertBeans` read it.
+        **money_freeze.hold_fields("a ban"),
     }
+    # RC: money behind the ban is frozen for the Owner's review FIRST, so there
+    # is never a banned account whose money still moves.
+    await money_freeze.freeze_user(uid, cause="account_banned", label="a ban", reason=reason, actor=actor,
+                                   db=get_db())
     await _patch_user(uid, patch)
 
     # ── THE CREDENTIAL DIES WITH THE ACCOUNT ─────────────────────────────────
@@ -534,6 +881,9 @@ async def ban_user(
             ),
             meta={"error": firebase_problem},
         )
+
+    # C4: the same person's CRM partner access closes with the account.
+    crm_access = await _close_crm_access(uid)
 
     device_ids: list[str] = []
     barred: list[str] = []
@@ -606,6 +956,7 @@ async def ban_user(
             "known_device_ids": device_ids,
             "device_failures": device_failures,
             "devices_barred": len(barred),
+            "crm_access": crm_access,
             **(meta or {}),
         },
     )
@@ -617,12 +968,15 @@ async def ban_user(
         device_banned=bool(barred),
         devices_barred=barred,
         device_failures=device_failures,
+        crm_access=crm_access,
         note=device_note,
     )
 
 
 async def unban_user(
-    uid: str, reason: str, actor: dict, meta: dict | None = None
+    uid: str, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Lift a ban, and with it the device bans THIS account caused.
 
@@ -668,6 +1022,9 @@ async def unban_user(
     stands, and the response says which handsets were released and which were
     not, with the reason.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="unban")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
 
@@ -711,6 +1068,10 @@ async def unban_user(
     firebase_problem = await asyncio.to_thread(firebase.set_user_disabled, uid, False)
     if firebase_problem:
         log.error("unban_user: Firebase account not re-enabled for %s: %s", uid, firebase_problem)
+
+    # C4: CRM access returns for whatever role is still approved — no role is
+    # touched here, so a role revoked meanwhile stays revoked.
+    crm_access = await _reopen_crm_access(uid)
 
     released, kept, failures = await _release_device_bans(
         uid, f"{reason} (account {uid} unbanned)", actor
@@ -770,6 +1131,7 @@ async def unban_user(
             "device_bans_kept": kept,
             "device_failures": failures,
             "devices_released": len(released),
+            "crm_access": crm_access,
             **(meta or {}),
         },
     )
@@ -779,6 +1141,7 @@ async def unban_user(
         devices_released=released,
         device_bans_kept=kept,
         device_failures=failures,
+        crm_access=crm_access,
         note=device_note,
     )
 
@@ -789,6 +1152,8 @@ async def suspend_user(
     actor: dict,
     meta: dict | None = None,
     days: int | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Suspend an account, for a stated number of days or until lifted by hand.
 
@@ -829,9 +1194,33 @@ async def suspend_user(
     written, the sweep never picks it up, and it stays in force until somebody
     resumes by hand. Which is still the right shape for "off the platform while
     we investigate".
+
+    ── IT REFUSES A BANNED ACCOUNT (B2, ACCT-001) ───────────────────────────
+
+    A ban outranks a suspension, so a banned account is refused by name and
+    told to use Unban first. See the comment at the check.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="suspend")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
+
+    # B2 (ACCT-001): a suspension must never overwrite or clear a ban. It used
+    # to: suspending a banned account set the state to 'suspended' and replaced
+    # the ban's reason, so from then on Unban refused it ("suspended, not
+    # banned") while Resume — or the nightly sweep, once a timed term ran out —
+    # cleared `isBanned` and let the account back in, with the device bans the
+    # ban had placed left behind. Refused here, before anything is written, so
+    # the direct route and a report decision (`action_report` carries the
+    # decision out BEFORE it closes the report) both leave the account, its
+    # sessions, its audit log and the report exactly as they were.
+    if restriction_of(user) == str(AccountState.BANNED):
+        raise UserError(
+            "This account is banned, and a ban outranks a suspension: suspending "
+            "it would replace the ban and let Resume or the end of the term lift "
+            "it. To turn the ban into a suspension, Unban it first, then suspend it."
+        )
 
     if days is not None:
         if days < 1 or days > 365:
@@ -855,6 +1244,15 @@ async def suspend_user(
         "isBanned": True,
         "isSuspended": True,
         "banReason": reason,
+        # GOV B42: as for a ban — the app can no longer write its own presence.
+        "isOnline": False,
+        # Phase 1A (SESSION-003): every token issued before now is refused by
+        # the rules (`sessionCurrent`) and by the callables. Monotonic — never
+        # lowered below a cut-off another path already set.
+        "credentialsValidAfter": max(
+            int(user.get("credentialsValidAfter") or 0),
+            int(datetime.now(timezone.utc).timestamp()) + 1,
+        ),
         **_stamp(actor, "suspended"),
     }
     if until is not None:
@@ -866,7 +1264,22 @@ async def suspend_user(
         patch["suspendedUntil"] = fb_firestore.DELETE_FIELD
         patch["suspensionDays"] = fb_firestore.DELETE_FIELD
 
+    # RC (confirmed, CRM-FLOW 9.48): pending earnings and transfers are frozen
+    # for the Owner's review — FIRST, and the Host's beans stop in the same
+    # write as the suspension. Lifting the suspension does not release them.
+    patch.update(money_freeze.hold_fields("a suspension"))
+    await money_freeze.freeze_user(uid, cause="account_suspended", label="a suspension", reason=reason,
+                                   actor=actor, db=get_db())
     await _patch_user(uid, patch)
+
+    # Phase 1A (SESSION-003): and the refresh tokens, so no new ID token is
+    # minted on the old sign-in. Reported, never swallowed.
+    session_problem = await asyncio.to_thread(firebase.revoke_sessions, uid)
+    if session_problem:
+        log.error("suspend_user: sessions not revoked for %s: %s", uid, session_problem)
+
+    # C4: the same person's CRM partner access closes with the account.
+    crm_access = await _close_crm_access(uid)
 
     after = {
         "accountState": str(AccountState.SUSPENDED),
@@ -891,6 +1304,7 @@ async def suspend_user(
             # did not mention devices would read as one where nobody checked.
             "affectedDeviceIds": [],
             "devices_barred": 0,
+            "crm_access": crm_access,
             **(meta or {}),
         },
     )
@@ -900,6 +1314,7 @@ async def suspend_user(
         after,
         audit_id,
         suspended_until=after["suspendedUntil"],
+        crm_access=crm_access,
         note=(
             "The account is suspended and cannot use the app. No device was "
             "barred — another account may be used on the same phone. Lift it "
@@ -909,7 +1324,9 @@ async def suspend_user(
 
 
 async def resume_user(
-    uid: str, reason: str, actor: dict, meta: dict | None = None
+    uid: str, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Lift a suspension. Touches no device, ever.
 
@@ -950,6 +1367,9 @@ async def resume_user(
     endpoint at all. The account showed as suspended in the CRM for ever and
     nothing would lift it.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="resume")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
 
@@ -988,6 +1408,10 @@ async def resume_user(
     }
     await _patch_user(uid, patch)
 
+    # C4: CRM access returns for whatever role is still approved — no role is
+    # touched here, so a role revoked meanwhile stays revoked.
+    crm_access = await _reopen_crm_access(uid)
+
     after = {
         "accountState": str(AccountState.ACTIVE),
         "isBanned": False,
@@ -1010,6 +1434,7 @@ async def resume_user(
             # it from an unban, and the one somebody will want to check.
             "affectedDeviceIds": [],
             "devices_released": 0,
+            "crm_access": crm_access,
             **(meta or {}),
         },
     )
@@ -1020,6 +1445,7 @@ async def resume_user(
         audit_id,
         device_unbanned=False,
         devices_released=[],
+        crm_access=crm_access,
         note=(
             "The suspension is lifted and the account can use the app again. "
             "No device ban was touched — a suspension never placed one, and a "
@@ -1063,11 +1489,19 @@ async def lift_expired_suspensions(actor: dict, limit: int = 200) -> dict:
             # the schedule off after the unban — which meant an account whose
             # unban succeeded and whose second write failed stayed in this
             # query for ever, being lifted again every night.
+            # `enforce_target_policy=False`: this is the nightly sweep, not a
+            # person acting through user management. The target-protection
+            # guard refuses internal identities and self-targeting, both of
+            # which are about WHO is pressing a button — neither applies to a
+            # scheduled job, and leaving it on would abort the whole sweep for
+            # every ordinary user the moment one protected account was found
+            # holding a stale suspension.
             await resume_user(
                 d.id,
                 "Suspension period ended.",
                 actor,
                 meta={"lifted_by": "scheduled sweep"},
+                enforce_target_policy=False,
             )
             lifted.append(d.id)
         except Exception as exc:  # noqa: BLE001 — one failure must not stop the sweep
@@ -1077,19 +1511,65 @@ async def lift_expired_suspensions(actor: dict, limit: int = 200) -> dict:
 
 
 async def warn_user(
-    uid: str, reason: str, actor: dict, meta: dict | None = None
+    uid: str, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
+    request_id: str | None = None,
+    deduction: dict | None = None,
 ) -> dict:
-    """Record a formal warning against an account.
+    """Record a formal warning against an account — optionally with a deduction.
 
     The warning is written with the real actor's uid and name. It used to be
     issued by "Admin", so a pattern of warnings could not be attributed to
     anyone and the user could not be told who to appeal to.
+
+    ── UGP-D: THE OPTIONAL DEDUCTION ─────────────────────────────────────────
+
+    `deduction = {"currency", "amount"}`. The currency follows the person's
+    AUTHORITATIVE roles (`user_roles.deduction_currencies`): beans for a Host,
+    diamonds for a User, Agency, Sub-agency or Coin Seller — both offered only
+    for a Host who also holds a diamond role. The live balance the app shows
+    must cover the amount now (released `beansAvailable` for beans), or the
+    whole request is refused and NOTHING is recorded, so staff can correct it.
+
+    The warning takes effect at once (moderation is direct). The deduction does
+    not: "money is never direct" (module header), so it becomes a
+    `balance_debit` card linked to the warning — verified and signed on the
+    money board like every other balance change, and executed against the live
+    balance by `execute_balance_card`. The route checks `can_adjust_balance`
+    before this is reached.
+
+    ── UGP-D: IDEMPOTENT ON THE CLIENT'S REQUEST ID ──────────────────────────
+
+    With `request_id`, the warning's id is derived from it and the warning is
+    created in a transaction that refuses to create it twice. A retried request
+    (a timeout, a double-press) returns the first outcome — no second warning,
+    no second count, no second card, no second notice.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="warn")
+
     reason = _require_reason(reason)
+    # UGP review: money is never moved on a request that cannot be retried
+    # safely. Without a request id, a timed-out request repeated by the client
+    # is a second warning and a second card.
+    if deduction and not request_id:
+        raise UserError("A warning with a deduction needs a request id, so a retry cannot deduct twice.")
     user = await _load_user(uid)
 
+    # A retry of a request that already created its warning is answered from
+    # that warning — BEFORE the deduction is re-planned against a balance that
+    # may since have changed, and without trusting anything but what this
+    # request itself carries (see `_replay_warning`).
+    warning_id = warning_id_for(uid, request_id) if request_id else ""
+    if request_id:
+        prior = await _load_warning(uid, warning_id)
+        if prior is not None:
+            return await _replay_warning(uid, user, warning_id, prior, actor, reason, deduction)
+
+    plan = await _plan_warning_deduction(uid, user, deduction) if deduction else None
+
     count_before = int(user.get("warnings", 0) or 0)
-    count_after = count_before + 1
     now = datetime.now(timezone.utc)
 
     entry = {
@@ -1101,12 +1581,46 @@ async def warn_user(
     }
     if meta:
         entry.update({k: v for k, v in meta.items() if v is not None})
+    if plan:
+        entry["deduction"] = {
+            "currency": plan["currency"],
+            "amount": plan["amount"],
+            "balanceAtRequest": plan["balance_at_request"],
+            "status": "requested",
+        }
 
-    _, doc_ref = await _fs(_user_ref(uid).collection(WARNINGS).add, entry)
-    await _patch_user(uid, {"warnings": count_after, "lastWarnedAt": now})
+    if request_id:
+        try:
+            created = await _fs(firebase.create_warning_once, uid, warning_id, entry)
+        except (firebase.TransactionNotApplied, firebase.TransactionOutcomeUnknown) as exc:
+            # HT-2: the warning was read again and is not there; the same request
+            # id makes a resend safe.
+            raise LiveStepNotConfirmed(str(exc), outcome=exc.outcome) from exc
+        if not created:
+            # Lost a race with the same request: answer as the replay would.
+            prior = await _load_warning(uid, warning_id) or {}
+            return await _replay_warning(uid, user, warning_id, prior, actor, reason, deduction)
+    else:
+        _, doc_ref = await _fs(_user_ref(uid).collection(WARNINGS).add, entry)
+        warning_id = doc_ref.id
+        # Atomic, rather than the read-then-write it was: two warnings issued
+        # at once both count.
+        await _patch_user(
+            uid, {"warnings": fb_firestore.Increment(1), "lastWarnedAt": now}
+        )
+
+    card = None
+    if plan:
+        card = await _raise_warning_deduction_card(uid, user, warning_id, plan, reason, actor)
 
     before = {"warnings": count_before}
-    after = {"warnings": count_after}
+    after = {"warnings": count_before + 1}
+    audit_meta = {"warning_id": warning_id, **(meta or {})}
+    if plan:
+        audit_meta["deduction"] = {
+            "currency": plan["currency"], "amount": plan["amount"],
+            "card_id": (card or {}).get("id", ""), "result": "card_raised",
+        }
     audit_id = await audit.record(
         actor=actor,
         action=audit.Action.USER_WARNED,
@@ -1115,13 +1629,348 @@ async def warn_user(
         reason=reason,
         before=before,
         after=after,
-        meta={"warning_id": doc_ref.id, **(meta or {})},
+        meta=audit_meta,
+        card_id=(card or {}).get("id") or None,
     )
-    return _result(uid, before, after, audit_id, warning_id=doc_ref.id)
+
+    # ── AND TELL THE PERSON ─────────────────────────────────────────────────
+    #
+    # Until now "Warn" wrote three things — the subcollection entry above, the
+    # counter, and the audit row — and not one of them was reachable by the
+    # user. The CRM told staff "The user may be shown this"; the app's Official
+    # tab said "Nothing from Zipper yet". A warning nobody receives is not a
+    # warning, and it cannot be appealed.
+    #
+    # LAST, and deliberately after the audit. The authoritative record is the
+    # subcollection entry plus the audit row, both already committed by the
+    # time this runs. Delivery is best effort: if Firestore refuses this write
+    # the warning still happened, still counts, and is still in the history.
+    # The reverse order would let a delivery failure lose the decision.
+    await _deliver_warning_notice(uid, reason, warning_id, now)
+
+    return _result(
+        uid, before, after, audit_id, warning_id=warning_id,
+        deduction=_deduction_view(plan, card),
+    )
+
+
+def warning_id_for(uid: str, request_id: str) -> str:
+    """The warning's id for one client request — the same request, the same id."""
+    import hashlib
+
+    digest = hashlib.sha256(f"{uid}\x00{request_id}".encode()).hexdigest()
+    return f"w_{digest[:24]}"
+
+
+def _deduction_view(plan: dict | None, card: dict | None) -> dict | None:
+    if not plan:
+        return None
+    return {
+        "currency": plan["currency"],
+        "amount": plan["amount"],
+        "card_id": (card or {}).get("id", ""),
+        "card_stage": (card or {}).get("stage", ""),
+        "moved": False,
+        "note": (
+            "No money has moved. The deduction is a card on the money board and "
+            "an owner has to sign it before it is taken from the live balance."
+        ),
+    }
+
+
+def _parse_deduction(deduction: dict) -> tuple[str, int]:
+    """`(currency, amount)` from a request, or UserError. Strict on purpose:
+    `True` is not 1 and 2.9 is not 2 (UGP review) — an amount of money is a
+    whole number the person typed, or the request is refused."""
+    currency = str((deduction or {}).get("currency") or "").strip()
+    raw = (deduction or {}).get("amount")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise UserError("The deduction amount must be a whole number.")
+    if raw < 1:
+        raise UserError("A deduction must be at least 1.")
+    return currency, int(raw)
+
+
+async def _load_warning(uid: str, warning_id: str) -> dict | None:
+    snap = await _fs(_user_ref(uid).collection(WARNINGS).document(warning_id).get)
+    return (snap.to_dict() or {}) if getattr(snap, "exists", False) else None
+
+
+async def _plan_warning_deduction(uid: str, user: dict, deduction: dict) -> dict:
+    """Validate a warning deduction against the authoritative roles and the
+    LIVE balance. Raises UserError; writes nothing."""
+    currency, amount = _parse_deduction(deduction)
+
+    from app.services import user_roles  # local: keeps the import graph acyclic
+
+    inventory = await user_roles.role_inventory(uid, user=user, db=get_db())
+    allowed = user_roles.deduction_currencies(inventory["roles"])
+    if currency not in allowed:
+        raise UserError(
+            f"A deduction from this account is taken in {' or '.join(allowed)}, "
+            f"not '{currency or 'nothing'}'. Nothing was recorded."
+        )
+
+    def _count(v: Any) -> int:
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    if currency == "beans":
+        # Released beans — and never more than `beans` itself, which execution
+        # also debits (UGP review: the two checks must agree, or a card is
+        # raised that can only fail).
+        live = min(_count(user.get("beansAvailable")), _count(user.get("beans")))
+        what = "released beans"
+    else:
+        live, what = _count(user.get("diamonds")), "diamonds"
+    if live < amount:
+        raise UserError(
+            f"This account has {live:,} {what}, so {amount:,} cannot be deducted. "
+            "Nothing was recorded."
+        )
+    return {"currency": currency, "amount": amount, "balance_at_request": live}
+
+
+async def _find_warning_card(warning_id: str) -> dict | None:
+    existing = await get_db()[C.CARDS].find_one(
+        {"payload.warning_id": warning_id, "type": str(CardType.BALANCE_DEBIT)}
+    )
+    if not existing:
+        return None
+    out = dict(existing)
+    out["id"] = str(out.pop("_id", ""))
+    return out
+
+
+async def _raise_warning_deduction_card(
+    uid: str, user: dict, warning_id: str, plan: dict, reason: str, actor: dict,
+) -> dict:
+    """One `balance_debit` card per warning — found again on a retry, never doubled.
+
+    The look-up alone is not enough: two requests in flight with the same
+    request id both find nothing. The unique index on `payload.warning_id`
+    (`mongo.ensure_warning_card_index`) refuses the second insert, and the
+    loser answers with the winner's card.
+    """
+    existing = await _find_warning_card(warning_id)
+    if existing:
+        return existing
+
+    name = user.get("name", "") or uid
+    currency, amount = plan["currency"], plan["amount"]
+    try:
+        card = await cards.raise_card(
+            NewCard(
+                type=CardType.BALANCE_DEBIT,
+                team=Team.FINANCE,
+                title=f"Warning deduction: {amount} {currency} — {name}",
+                amount=-amount,
+                currency=currency,
+                reason=reason,
+                subject_type="user",
+                subject_id=uid,
+                payload={
+                    "uid": uid,
+                    "name": name,
+                    "currency": currency,
+                    "amount": -amount,
+                    "balance_before_request": plan["balance_at_request"],
+                    "source": "warning",
+                    "warning_id": warning_id,
+                },
+            ),
+            actor,
+        )
+    except CardError as exc:
+        raise UserError(str(exc)) from exc
+    except DuplicateKeyError:
+        winner = await _find_warning_card(warning_id)
+        if winner is None:
+            raise
+        return winner
+
+    await audit.record(
+        actor=actor,
+        action=audit.Action.BALANCE_CHANGE_REQUESTED,
+        subject_type="user",
+        subject_id=uid,
+        reason=reason,
+        after={"requested": {currency: -amount}},
+        card_id=card["id"],
+        meta={"card_type": str(CardType.BALANCE_DEBIT), "stage": card["stage"],
+              "source": "warning", "warning_id": warning_id},
+    )
+    try:
+        await _fs(
+            _user_ref(uid).collection(WARNINGS).document(warning_id).update,
+            {"deductionCardId": card["id"]},
+        )
+    except Exception:  # noqa: BLE001 — the card is found again by its payload
+        log.warning("warning %s: card id not written back", warning_id)
+    return card
+
+
+async def _replay_warning(
+    uid: str, user: dict, warning_id: str, prior: dict, actor: dict,
+    reason: str, deduction: dict | None,
+) -> dict:
+    """A retried request: answer with what the first one did, and finish what
+    an interrupted first attempt left undone.
+
+    UGP review — the STORED warning is never trusted to carry money. Staff can
+    write `users/{uid}/warnings` from a browser (firestore.rules), and the
+    warning id is derived from a request id the caller chooses, so a document
+    planted at that id could otherwise turn a plain retry into a deduction
+    card that skipped the permission check, the currency rule and the balance
+    check. So a replay:
+
+      * must come from the reviewer who issued the warning;
+      * must ask for exactly what the warning records — the same deduction
+        (currency and amount) or none. The route has already enforced
+        `can_adjust_balance` on a request that carries one;
+      * re-checks the currency against the person's roles before raising a card
+        the first attempt never got to (one it did raise is just found again).
+
+    Then the audit row and the person's notice — both keyed on the warning, so
+    neither is written twice — in case the first attempt died before them.
+    """
+    if str(prior.get("issuedBy") or "") != str(actor.get("uid") or ""):
+        raise UserError(
+            "This request id belongs to a warning another reviewer issued. Nothing was changed."
+        )
+    stored = prior.get("deduction") or None
+    if stored is not None and (
+        not isinstance(stored, dict)
+        or isinstance(stored.get("amount"), bool)
+        or not isinstance(stored.get("amount"), int)
+    ):
+        # Staff can write warning documents from a browser; a malformed one is
+        # refused cleanly rather than crashing the retry.
+        raise UserError(
+            "The warning this request id points at is malformed. Nothing was "
+            "changed — start a new warning."
+        )
+    stored_key = (
+        (str(stored.get("currency") or ""), int(stored["amount"])) if stored else None
+    )
+    asked_key = _parse_deduction(deduction) if deduction else None
+    if stored_key != asked_key:
+        raise UserError(
+            "This request id was already used for a different warning. Nothing was "
+            "changed — start a new warning."
+        )
+
+    plan = None
+    card = None
+    if stored_key:
+        plan = {"currency": stored_key[0], "amount": stored_key[1],
+                "balance_at_request": int(stored.get("balanceAtRequest") or 0)}
+        card = await _find_warning_card(warning_id)
+        if card is None:
+            from app.services import user_roles  # local: keeps the import graph acyclic
+
+            inventory = await user_roles.role_inventory(uid, user=user, db=get_db())
+            if stored_key[0] not in user_roles.deduction_currencies(inventory["roles"]):
+                raise UserError(
+                    f"A deduction in {stored_key[0]} no longer applies to this account. "
+                    "The warning stands; no deduction card was raised."
+                )
+            card = await _raise_warning_deduction_card(
+                uid, user, warning_id, plan, str(prior.get("reason") or reason), actor
+            )
+
+    count = int(user.get("warnings", 0) or 0)
+    before, after = {"warnings": max(0, count - 1)}, {"warnings": count}
+    audit_id = ""
+    already = await get_db()[C.AUDIT].find_one({
+        "action": str(audit.Action.USER_WARNED),
+        "subject.id": uid,
+        "meta.warning_id": warning_id,
+    })
+    if already is None:
+        audit_meta: dict = {"warning_id": warning_id, "completed_on_retry": True}
+        if plan:
+            audit_meta["deduction"] = {
+                "currency": plan["currency"], "amount": plan["amount"],
+                "card_id": (card or {}).get("id", ""), "result": "card_raised",
+            }
+        audit_id = await audit.record(
+            actor=actor,
+            action=audit.Action.USER_WARNED,
+            subject_type="user",
+            subject_id=uid,
+            reason=str(prior.get("reason") or reason),
+            before=before,
+            after=after,
+            meta=audit_meta,
+            card_id=(card or {}).get("id") or None,
+        )
+    issued_at = prior.get("issuedAt")
+    if not isinstance(issued_at, datetime):
+        issued_at = datetime.now(timezone.utc)
+    # Only if the first attempt never delivered it: re-delivering would mark a
+    # notice the person has already read as unread again (UGP review).
+    from app.services import notices as _notices
+
+    try:
+        delivered = await _fs(
+            firebase.firestore_client().collection(_notices.NOTIFICATIONS)
+            .document(f"warning_{warning_id}").get
+        )
+        already_delivered = bool(getattr(delivered, "exists", False))
+    except Exception:  # noqa: BLE001 — unknown: deliver, an unread notice is the lesser harm
+        already_delivered = False
+    if not already_delivered:
+        await _deliver_warning_notice(uid, str(prior.get("reason") or reason), warning_id, issued_at)
+
+    return _result(
+        uid, before, after, audit_id,
+        warning_id=warning_id, replayed=True, deduction=_deduction_view(plan, card),
+    )
+
+
+async def _deliver_warning_notice(
+    uid: str, reason: str, warning_id: str, now: datetime
+) -> None:
+    """Put an official warning in the user's inbox. Never raises.
+
+    ── WHAT THE USER SEES, AND WHAT THEY DO NOT ────────────────────────────
+
+    `reason` is the sentence the reviewer wrote, and the CRM already tells
+    them it may be shown — the Warn form says so above the field. What is NOT
+    carried, and why `actor` is not a parameter here: the actor's uid, name or
+    role, the audit id, and anything in `meta`. Who moderated an account is
+    internal, and naming the staff member on the warning invites them to be
+    contacted about it directly.
+
+    ── IDEMPOTENT ON THE WARNING ID ────────────────────────────────────────
+
+    The document id is derived from the warning, so a retried request — the
+    CRM's own retry, a double-press, a timed-out POST the caller repeats —
+    overwrites rather than stacking a second identical notice in somebody's
+    inbox. Each distinct warning still gets its own notice, because each gets
+    its own `warning_id`.
+    """
+    # `services/notices.deliver` is the one writer for every Official message
+    # — approvals, rejections, revocations and recharges go through the same
+    # function with the same three guarantees (addressed on `userId`,
+    # idempotent on the key, never raises). This was the first caller; it was
+    # generalised rather than copied.
+    from app.services import notices
+
+    await notices.deliver(
+        uid,
+        f"warning_{warning_id}",
+        type="warning",
+        title="Official warning",
+        body=reason,
+        now=now,
+    )
 
 
 async def grant_host(
-    uid: str, agency_id: str, reason: str, actor: dict, meta: dict | None = None
+    uid: str, agency_id: str, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Make a user a host, optionally attached to an agency.
 
@@ -1160,7 +2009,25 @@ async def grant_host(
     about somebody's face, and the capture is the host's own act. The four
     states stay distinct: applied, activated, capture submitted, verified.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="grant host to")
+
     reason = _require_reason(reason)
+
+    # The role table, re-checked at the grant: an Agency or Sub-agency may not
+    # also be a Host, whatever was true when the application was filed. The
+    # application being decided is not counted against itself.
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    try:
+        await apps.recheck_at_decision(
+            uid, "host",
+            exclude_host_application_id=str((meta or {}).get("application_id") or ""),
+            # RC role rule: a Sub-agency of main Agency X is a Host only under X.
+            parent_id=str(agency_id or "").strip(),
+        )
+    except apps.ApplicationError as exc:
+        raise UserError(str(exc)) from exc
     user = await _load_user(uid)
 
     before = {
@@ -1174,6 +2041,20 @@ async def grant_host(
         patch["agencyId"] = agency_id.strip()
 
     resolved_agency = patch.get("agencyId", before["agencyId"])
+
+    # B18: the agency is re-validated at the GRANT, not only when the
+    # application was filed — it may have been suspended or revoked since, and
+    # a sub-agency's own main agency must still be live too. The same checks
+    # the application had to pass (`_validate_host_parent`), and the same ones
+    # `restore_host` and the app's referral path already apply.
+    if resolved_agency:
+        try:
+            await apps._validate_host_parent(resolved_agency, uid)
+        except apps.ApplicationError as exc:
+            raise UserError(
+                f"{exc} The Host role was not granted — decide the application "
+                "again once the agency is active, or refuse it."
+            ) from exc
     app_id = str((meta or {}).get("application_id") or "").strip()
     app: dict = {}
     if app_id:
@@ -1222,6 +2103,17 @@ async def grant_host(
                 agency_photo_url=str(app.get("photoUrl") or ""),
             ),
         )
+    else:
+        # B23: the record's history — status, attempts, capture, rejections —
+        # stays exactly as it is, but it names the agency and application the
+        # Host belongs to NOW. Left alone, the reviewer's queue showed the old
+        # agency after a re-grant.
+        ver_patch: dict = {"updatedAt": datetime.now(timezone.utc)}
+        if resolved_agency:
+            ver_patch["agencyId"] = resolved_agency
+        if app_id:
+            ver_patch["applicationId"] = app_id
+        batch.update(_host_verification_ref(uid), ver_patch)
 
     await _fs(batch.commit)
 
@@ -1230,16 +2122,10 @@ async def grant_host(
         # than duplicating or clearing one. Mirrors `writeAgencyMembership` in
         # functions/src/hosts.ts, including the field names its readers use:
         # the weekly report reads `uid`/`name`, the dashboards read the rest.
-        roster: dict = {
-            "uid": uid,
-            "name": str(app.get("hostName") or user.get("name") or ""),
-            "agencyId": resolved_agency,
-            "joinedAt": datetime.now(timezone.utc),
-        }
-        if app_id:
-            roster["applicationId"] = app_id
-        if patch.get("callRateBeans"):
-            roster["callRateBeans"] = patch["callRateBeans"]
+        roster = _host_roster_row(
+            uid, str(app.get("hostName") or user.get("name") or ""), resolved_agency,
+            app_id, patch.get("callRateBeans"),
+        )
         await _fs(
             firebase.firestore_client()
             .collection("agencies")
@@ -1251,6 +2137,12 @@ async def grant_host(
             merge=True,
         )
 
+    # FX-12 (RF-05 / DUP-06): the person's OTHER open host applications are
+    # closed now that they hold the role — they would otherwise sit in /kyc as
+    # a second application for somebody who is already a Host, and refusing
+    # one later was how RF-04 took the role away.
+    superseded = await supersede_other_host_applications(uid, app_id, actor)
+
     after = {"isHost": True, "agencyId": patch.get("agencyId", before["agencyId"])}
     audit_id = await audit.record(
         actor=actor,
@@ -1260,13 +2152,324 @@ async def grant_host(
         reason=reason,
         before=before,
         after=after,
-        meta={"agency_id": after["agencyId"], **(meta or {})},
+        meta={"agency_id": after["agencyId"], "superseded_applications": superseded, **(meta or {})},
     )
-    return _result(uid, before, after, audit_id)
+    return _result(uid, before, after, audit_id, superseded_applications=superseded)
+
+
+def _host_roster_row(uid: str, name: str, agency_id: str, application_id: str, call_rate) -> dict:
+    """The roster row a grant writes under `agencies/{agency}/agencyHosts/{uid}`.
+
+    Mirrors `writeAgencyMembership` in functions/src/hosts.ts, including the
+    field names its readers use: the weekly report reads `uid`/`name`, the
+    dashboards read the rest.
+    """
+    roster: dict = {
+        "uid": uid,
+        "name": name,
+        "agencyId": agency_id,
+        "joinedAt": datetime.now(timezone.utc),
+        # FX-10: a grant makes the row current again, whatever it said.
+        **roster_current_fields(),
+    }
+    if application_id:
+        roster["applicationId"] = application_id
+    if call_rate:
+        roster["callRateBeans"] = call_rate
+    return roster
+
+
+#: HT-2 — what an activation reports when the role started but the application
+#: could not be recorded as approved, and what it reports when another decision
+#: took the application over first.
+ACTIVATION_NOT_RECORDED = (
+    "The Host role has started, but the application could not be recorded as approved "
+    "yet: the database did not confirm it. The next check finishes it; nothing is "
+    "granted twice."
+)
+ACTIVATION_SUPERSEDED = (
+    "The Host role has started, but another decision took this application over before "
+    "it could be recorded here. Reload it to see how it was recorded."
+)
+
+
+async def _host_granted_for_application(uid: str, application_id: str, user: dict | None) -> bool:
+    """HT-2 — did a grant from THIS application already land?
+
+    `grant_host` writes `isHost` on the account and this application's id on the
+    host's verification record in ONE batch, so the pair is the trace of a grant
+    made from this application — an activation that was interrupted after the
+    grant (the decision stamp failed, or something after the batch did). Agency
+    equality alone, which a reviewer's decision uses (B22), would also match a
+    Host of the same agency granted from somewhere else.
+    """
+    if not application_id or not user or not user.get("isHost"):
+        return False
+    ver = await _fs(_host_verification_ref(uid).get)
+    return bool(getattr(ver, "exists", False)) and (
+        str((ver.to_dict() or {}).get("applicationId") or "") == application_id
+    )
+
+
+async def _resume_host_grant(
+    uid: str, user: dict, app: dict, application_id: str, reason: str, actor: dict,
+) -> dict:
+    """HT-2 — finish a grant from this application that an interruption left part-done.
+
+    Runs under the application's decision lease. Re-granting is refused by the
+    role table ("You are already a Host") — that refusal is what used to leave
+    the application `awaiting_verification` for good — and would re-stamp the
+    grant. So only the steps after `grant_host`'s batch are repeated, each
+    idempotent: the roster row when it is missing or not current (an existing
+    current row, its `joinedAt` and its rate are left alone); the person's other
+    open applications closed; and the `HOST_GRANTED` audit entry written only
+    when none exists for this application.
+    """
+    agency = str(user.get("agencyId") or app.get("agencyId") or "").strip()
+    roster_repaired = False
+    if agency:
+        row_ref = (
+            firebase.firestore_client().collection("agencies").document(agency)
+            .collection("agencyHosts").document(uid)
+        )
+        row = await _fs(row_ref.get)
+        if not getattr(row, "exists", False) or not roster_row_is_current(row.to_dict() or {}):
+            await _fs(
+                row_ref.set,
+                _host_roster_row(
+                    uid, str(app.get("hostName") or user.get("name") or ""), agency,
+                    application_id, user.get("callRateBeans"),
+                ),
+                merge=True,
+            )
+            roster_repaired = True
+    superseded = await supersede_other_host_applications(uid, application_id, actor)
+    prior = next(
+        (e for e in await audit.history_for("user", uid)
+         if e.get("action") == audit.Action.HOST_GRANTED
+         and str((e.get("meta") or {}).get("application_id") or "") == application_id),
+        None,
+    )
+    after = {"isHost": True, "agencyId": agency}
+    if prior is not None:
+        audit_id = str(prior.get("id") or "")
+    else:
+        audit_id = await audit.record(
+            actor=actor,
+            action=audit.Action.HOST_GRANTED,
+            subject_type="user",
+            subject_id=uid,
+            reason=reason,
+            before={"isHost": True, "agencyId": agency},
+            after=after,
+            meta={"agency_id": agency, "application_id": application_id, "activation": "contacts_verified",
+                  "resumed_after_interruption": True, "superseded_applications": superseded},
+        )
+    return _result(uid, None, after, audit_id, superseded_applications=superseded,
+                   resumed=True, roster_repaired=roster_repaired)
+
+
+#: FX-12 — what a superseded application says, to the person and to /kyc.
+SUPERSEDED_REASON = (
+    "Closed: this person became a Host through another application ({by}), so this "
+    "one was not decided on its merits. Nothing else changed."
+)
+
+
+async def activate_host_if_verified(uid: str, actor: dict) -> list[dict]:
+    """Decision 15 (RC) — start a Host role the Owner approved while contacts were pending.
+
+    Each of this person's applications in `awaiting_verification` is started
+    once their account holds BOTH a verified phone and a verified email, read
+    from the authoritative sources (never from the caller). The application is
+    taken with the same decision lease every decision uses, so two concurrent
+    calls grant the role once; the grant itself is `grant_host`, audited, with
+    the role table and the agency re-checked as at any grant.
+    """
+    from app.services import contact_verification  # local: keeps the import graph acyclic
+
+    uid = str(uid or "").strip()
+    out: list[dict] = []
+    if not uid:
+        return out
+    col = firebase.firestore_client().collection(HOST_APPLICATIONS)
+    snaps = await _fs(lambda: list(col.where(filter=FieldFilter("applicantUid", "==", uid)).stream()))
+    waiting = [sn for sn in snaps if str((sn.to_dict() or {}).get("status") or "") == "awaiting_verification"]
+    if not waiting:
+        return out
+    verification = await asyncio.to_thread(contact_verification.status, uid)
+    trigger = str(actor.get("triggered_by") or "").strip()
+    started_reason = "Both contacts verified; the Host role approved earlier has started." + (
+        f" Checked at the request of account {trigger}." if trigger else ""
+    )
+    for snap in waiting:
+        app = snap.to_dict() or {}
+        if not verification.complete:
+            out.append({"application_id": snap.id, "activated": False,
+                        "refusal": contact_verification.refusal_detail(
+                            verification, "The Host role starts once both contacts are verified.")})
+            continue
+        app_ref = _host_application_ref(snap.id)
+        try:
+            lease = await _fs(
+                firebase.claim_decision, app_ref,
+                expected_status="awaiting_verification", actor_uid=str(actor.get("uid", "")),
+                default_status="pending",
+            )
+        except firebase.DecisionConflict as exc:
+            out.append({"application_id": snap.id, "activated": False, "busy": True,
+                        **({"detail": str(exc)} if exc.reason in ("contended", "unknown") else {})})
+            continue
+        resumed = False
+        try:
+            # The restriction, the role table and the agency are re-checked by
+            # `restore`-grade rules inside `grant_host`; a refusal there leaves
+            # THIS application waiting and is reported for it alone — one
+            # application that cannot start must not stop the others.
+            prior = None
+            try:
+                prior = await _load_user(uid)
+            except UserNotFound:
+                prior = None
+            if prior is not None and restriction_of(prior):
+                raise UserError(
+                    "This account is suspended or banned, so the approved Host role "
+                    "cannot start until that is lifted."
+                )
+            if await _host_granted_for_application(uid, snap.id, prior):
+                # HT-2: an earlier run granted the role from this application
+                # and stopped before the application was recorded. Finish it;
+                # never grant twice.
+                account = await _resume_host_grant(uid, prior, app, snap.id, started_reason, actor)
+                resumed = True
+            else:
+                account = await grant_host(
+                    uid, str(app.get("agencyId") or ""),
+                    started_reason,
+                    actor, meta={"application_id": snap.id, "activation": "contacts_verified"},
+                )
+        except UserError as exc:
+            await _fs(firebase.release_decision, app_ref, lease)
+            out.append({"application_id": snap.id, "activated": False, "refusal": str(exc)})
+            continue
+        except Exception:
+            await _fs(firebase.release_decision, app_ref, lease)
+            raise
+        # ── The role has started. Now the application must say so ─────────────
+        #
+        # HT-2: `complete_decision_retry_once` recognises a stamp it already wrote
+        # (an answer lost after the commit) and tries a stamp it could not
+        # confirm once more under the same lease. The approval is audited only
+        # when the application IS recorded as approved — it used to be audited
+        # even when the stamp came back False, and a failed stamp used to escape
+        # as an error with the lease held and the application stuck.
+        now = datetime.now(timezone.utc)
+        try:
+            stamped = await _fs(
+                firebase.complete_decision_retry_once, app_ref, lease,
+                {"status": "approved", "kycStatus": "approved", "isActivated": True,
+                 "activatedByUid": uid, "activatedAt": now, "activationStartedAt": now,
+                 "activationPending": fb_firestore.DELETE_FIELD, "updatedAt": now},
+                expected_status="awaiting_verification", default_status="pending",
+            )
+        except firebase.DecisionNotRecorded as exc:
+            released = await _fs(firebase.release_decision, app_ref, lease)
+            log.error(
+                "Host role of %s started from application %s, but the application could not be "
+                "recorded as approved (%s); lease %s. The next activation check finishes it.",
+                uid, snap.id, exc.outcome, released,
+            )
+            out.append({"application_id": snap.id, "activated": True, "recorded": False,
+                        "pending_completion": True, "outcome": exc.outcome,
+                        "lease_released": released == "released",
+                        "detail": ACTIVATION_NOT_RECORDED, "account": account})
+            continue
+        if not stamped:
+            log.error(
+                "Host role of %s started from application %s, but another decision took the "
+                "application over before it was recorded", uid, snap.id,
+            )
+            out.append({"application_id": snap.id, "activated": True, "recorded": False,
+                        "conflict": True, "detail": ACTIVATION_SUPERSEDED, "account": account})
+            continue
+        await audit.record(
+            actor=actor,
+            action=audit.Action.HOST_APPLICATION_APPROVED,
+            subject_type="host_application",
+            subject_id=snap.id,
+            reason=started_reason,
+            before={"status": "awaiting_verification"},
+            after={"status": "approved", "kycStatus": "approved"},
+            meta={"agency_id": str(app.get("agencyId") or ""), "uid": uid,
+                  "activation": "contacts_verified",
+                  "host_grant_audit_id": (account or {}).get("audit_id", ""),
+                  **({"resumed_after_interruption": True} if resumed else {})},
+        )
+        await asyncio.to_thread(contact_verification.record_phone, uid, verification.phone)
+        out.append({"application_id": snap.id, "activated": True, "recorded": True, "account": account,
+                    **({"resumed": True} if resumed else {})})
+    return out
+
+
+async def supersede_other_host_applications(uid: str, keep_application_id: str, actor: dict) -> list[str]:
+    """FX-12 — close the person's other OPEN host applications; release their locks.
+
+    "Open" is a self-application of this account (`applicantUid == uid`) still
+    pending and never redeemed. An agency's invitation names no account until it
+    is redeemed, so it is never matched here — /kyc flags it as the same person
+    instead. Each one is stamped as a refusal (both status fields, through
+    `_host_decision_fields`, so no screen can read it as pending) plus
+    `supersededBy` / `supersededAt`, and its B32 lock is given back.
+
+    Best effort, after the grant: the grant has happened, and a failure here
+    leaves an application a reviewer can still refuse — which FX-01 makes safe.
+    Returns the ids it closed.
+    """
+    uid = str(uid or "").strip()
+    keep = str(keep_application_id or "").strip()
+    if not uid:
+        return []
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    col = firebase.firestore_client().collection("hostApplications")
+    try:
+        snaps = await _fs(lambda: list(col.where(filter=FieldFilter("applicantUid", "==", uid)).stream()))
+    except Exception:  # noqa: BLE001
+        log.exception("Could not read the other host applications of %s", uid)
+        return []
+    now = datetime.now(timezone.utc)
+    note = SUPERSEDED_REASON.format(by=keep or "a direct grant")
+    closed: list[str] = []
+    for snap in snaps:
+        if snap.id == keep:
+            continue
+        data = snap.to_dict() or {}
+        # Decision 15 (RC): an application the Owner approved that is still
+        # WAITING for verified contacts is open too — once the person holds the
+        # role through another application it can never start (`grant_host`
+        # refuses a second grant), so leaving it would wait forever.
+        if (str(data.get("status") or "pending") not in ("pending", "awaiting_verification")
+                or data.get("isActivated") is True):
+            continue
+        try:
+            await _fs(
+                col.document(snap.id).update,
+                {**_host_decision_fields(False, note, actor, now),
+                 "supersededBy": keep, "supersededAt": now,
+                 "activationPending": fb_firestore.DELETE_FIELD},
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Could not close superseded host application %s", snap.id)
+            continue
+        closed.append(snap.id)
+        await apps.release_host_application_lock(uid, snap.id)
+    return closed
 
 
 async def revoke_host(
-    uid: str, reason: str, actor: dict, meta: dict | None = None
+    uid: str, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Remove host status.
 
@@ -1275,17 +2478,51 @@ async def revoke_host(
     history that has already been paid on. Re-granting to a different agency
     overwrites it.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="revoke host from")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
 
     if not user.get("isHost", False):
         raise UserError("This account is not a host.")
 
+    # UGP-B: ONE active role → suspend the account, never a separate revoke.
+    # Counted from the authoritative records (Mongo `partners` + this flag), so
+    # the rule holds whatever a client offered.
+    from app.services import user_roles  # local: user_roles reads this module's peers
+
+    if await user_roles.held_count(uid, db=get_db()) < 2:
+        raise UserError(user_roles.SINGLE_ROLE_REFUSAL.format(label="Host"))
+
     before = {"isHost": True, "agencyId": user.get("agencyId", "")}
 
     patch: dict = {"isHost": False, "hostRemovedAt": datetime.now(timezone.utc)}
     patch.update(_stamp(actor, "hostRevoked"))
-    await _patch_user(uid, patch)
+    # B34 / C1: the reason travels with the revocation, so the person's own
+    # applications list and the eligibility answer can say why — not only the
+    # audit log and a notice that scrolls away.
+    patch["hostRevokedReason"] = reason
+    # RC (confirmed): the revoked Host's pending earnings are frozen for the
+    # Owner's review, first; the beans stop in the same write as the revocation.
+    patch.update(money_freeze.hold_fields("the Host role's revocation"))
+    await money_freeze.freeze_user(uid, cause="host_revoked", label="the Host role's revocation",
+                                   reason=reason, actor=actor, include_partners=False, db=get_db())
+    # FX-10 (RF-15): the roster row is marked INACTIVE in the same write as the
+    # account. It used to stay exactly as it was, so the weekly payout report,
+    # the agency's app screen and the revoke-with-dependents cascade — which
+    # all read the roster and nothing else — went on counting a revoked Host.
+    # Marked, not deleted: the row is the history of who was on the roster,
+    # and `restore_host` re-activates the same row.
+    roster_ref = _roster_ref(before["agencyId"], uid)
+    roster_snap = await _fs(roster_ref.get) if roster_ref is not None else None
+    if roster_snap is not None and roster_snap.exists:
+        batch = firebase.firestore_client().batch()
+        batch.update(_user_ref(uid), patch)
+        batch.update(roster_ref, roster_removal_fields("revoked", patch["hostRemovedAt"]))
+        await _fs(batch.commit)
+    else:
+        await _patch_user(uid, patch)
 
     after = {"isHost": False, "agencyId": before["agencyId"]}
     audit_id = await audit.record(
@@ -1298,7 +2535,179 @@ async def revoke_host(
         after=after,
         meta={"agency_id": before["agencyId"], **(meta or {})},
     )
+    # Tell the person. The audit row and the account patch are committed;
+    # this is delivery, best effort, and last.
+    from app.services import notices
+
+    await notices.host_revoked(uid, reason)
     return _result(uid, before, after, audit_id)
+
+
+async def restore_host(
+    uid: str, reason: str, actor: dict,
+    *,
+    enforce_target_policy: bool = True,
+) -> dict:
+    """Restore a REVOKED Host role from the person's existing records (UGP-B).
+
+    "Restoration restores the existing role and records, no duplicates": the
+    approved application the person joined on is re-used, the agency roster row
+    is re-written onto the same agency, and the verification record is kept as
+    it is — a host verified before the revocation is still verified, and one
+    who was not still has to capture. No new application, no new record.
+
+    Refused when there is nothing to restore (never a host, or no approved
+    application), when the account is restricted (lift that first), when the
+    host's agency is no longer an approved, active agency (the roster would
+    point at nobody — FLOW-MAP D15), or when the role table no longer allows a
+    Host alongside what the person holds now.
+
+    C2: turning a revoked role back is the Owner's decision — directly here,
+    or through a decided reinstatement request (`services/role_appeals`),
+    which calls this with the Owner as actor. Anyone else is refused with
+    `OwnerOnly` (403).
+
+    B33: the role table is applied the way the Host was held — first. A Host
+    under a main agency who went on to hold a Sub-agency (a permitted order)
+    may have the Host role back; see `partner_applications.recheck_host_restore`.
+    """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="restore host to")
+
+    reason = _require_reason(reason)
+    user = await _load_user(uid)
+
+    if user.get("isHost", False):
+        raise UserError("This account is already a host.")
+    revoked_at = user.get("hostRevokedAt") or user.get("hostRemovedAt")
+    if not revoked_at:
+        raise UserError("This account has no revoked Host role to restore.")
+    if not _actor_is_owner(actor):
+        raise OwnerOnly(OWNER_ONLY_RESTORE)
+    if restriction_of(user):
+        raise UserError(
+            "This account is restricted. Lift the suspension or ban before "
+            "restoring a role."
+        )
+
+    from app.services import user_roles  # local: keeps the import graph acyclic
+
+    apps_on_file = await asyncio.to_thread(user_roles._host_applications_for, uid)
+    approved = [a for a in apps_on_file if str(a.get("status") or "") == "approved"]
+    if not approved:
+        raise UserError(
+            "There is no approved Host application to restore from. The person "
+            "has to apply again."
+        )
+    # The LATEST approved application, not whichever the query returned first
+    # (UGP review): a person can have been approved twice over the years. The
+    # roles view (`user_roles.role_inventory`) names the same one.
+    app = user_roles.latest_application(approved) or approved[0]
+    app_id = str(app.get("id") or "")
+    agency_id = str(user.get("agencyId") or app.get("agencyId") or "").strip()
+    if not agency_id or not await user_roles._partner_live(agency_id, db=get_db()):
+        raise UserError(
+            "The agency this Host worked under is not an approved, active agency "
+            "any more, so the role cannot be restored onto it."
+        )
+
+    from app.services import partner_applications as apps  # local: apps imports this module
+
+    try:
+        await apps.recheck_host_restore(uid, exclude_host_application_id=app_id)
+    except apps.ApplicationError as exc:
+        raise UserError(str(exc)) from exc
+
+    # Decision 15 (RC): restoring the role STARTS it again, so the account must
+    # hold both verified contacts, as at a first approval. Not even the Owner
+    # restores around it; the person verifies first (the app does both).
+    from app.services import contact_verification  # local: keeps the import graph acyclic
+
+    verification = await asyncio.to_thread(contact_verification.status, uid)
+    if not verification.complete:
+        raise HostContactVerificationRequired(
+            verification,
+            "Restoring the Host role needs BOTH a verified phone number and a verified "
+            f"email address on the account (missing: {', '.join(verification.missing)}). "
+            "Nothing was restored.",
+        )
+
+    now = datetime.now(timezone.utc)
+    before = {"isHost": False, "agencyId": user.get("agencyId", "")}
+    patch: dict = {"isHost": True, "hostRestoredAt": now, "agencyId": agency_id}
+    patch.update(_stamp(actor, "hostRestored"))
+
+    # The roster row, re-written onto the SAME agency (merge: a surviving row is
+    # repaired, never duplicated).
+    roster: dict = {
+        "uid": uid,
+        "name": str(app.get("hostName") or user.get("name") or ""),
+        "agencyId": agency_id,
+        "applicationId": app_id,
+        "restoredAt": now,
+        # FX-10: the SAME row, current again — `revoke_host` marked it inactive.
+        **roster_current_fields(),
+    }
+    if user.get("callRateBeans"):
+        roster["callRateBeans"] = user.get("callRateBeans")
+
+    # The account, the roster row and — only if it went missing — the
+    # verification record, in ONE batch, for the reason `grant_host` gives. An
+    # existing verification record is kept exactly as it is: its status,
+    # attempts and reviewer history are history. The roster row is in the
+    # batch too (UGP review): written after it, a failure left a Host with no
+    # roster row and no way to run the restore again ("already a host").
+    batch = firebase.firestore_client().batch()
+    batch.update(_user_ref(uid), patch)
+    batch.set(
+        firebase.firestore_client()
+        .collection("agencies")
+        .document(agency_id)
+        .collection("agencyHosts")
+        .document(uid),
+        roster,
+        merge=True,
+    )
+    existing_ver = await _fs(_host_verification_ref(uid).get)
+    if not existing_ver.exists:
+        batch.set(
+            _host_verification_ref(uid),
+            host_verification_seed(
+                uid,
+                agency_id=agency_id,
+                application_id=app_id,
+                host_name=str(app.get("hostName") or user.get("name") or ""),
+                agency_photo_url=str(app.get("photoUrl") or ""),
+            ),
+        )
+    await _fs(batch.commit)
+
+    after = {"isHost": True, "agencyId": agency_id}
+    audit_id = await audit.record(
+        actor=actor,
+        action=audit.Action.HOST_RESTORED,
+        subject_type="user",
+        subject_id=uid,
+        reason=reason,
+        before=before,
+        after=after,
+        meta={"agency_id": agency_id, "application_id": app_id,
+              "verified": bool(user.get("isVerifiedHost"))},
+    )
+
+    from app.services import notices
+
+    try:
+        epoch = int(revoked_at.timestamp())  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — a legacy string stamp still keys a notice
+        epoch = 0
+    await notices.host_restored(uid, app_id, epoch)
+    # FX-13 (RF-20): a reinstatement request left open beside this restore is
+    # closed (one being decided right now is left to its own decision).
+    from app.services import role_appeals  # local: role_appeals imports this module
+
+    closed = await role_appeals.close_after_direct_restore(uid, "host", actor)
+    return _result(uid, before, after, audit_id, closed_requests=closed)
 
 
 # ── The host application decision — one writer, both status fields ────────────
@@ -1438,7 +2847,45 @@ async def decide_host_application(
         raise UserNotFound("No host application with that id.")
     app = snap.to_dict() or {}
 
-    uid = str(app.get("activatedByUid") or "").strip()
+    # UGP-B: a decision is made ONCE. Refusing an application that is already
+    # approved was a second, unguarded way to revoke a Host — it skipped the
+    # one-role rule and stamped the application "rejected" over a decision a
+    # reviewer had already made. Revoking is `revoke_host`; restoring is
+    # `restore_host`. Approving again stays possible only as the documented
+    # repair of a half-finished approval (the account never became a host).
+    current = str(app.get("status") or "pending")
+    if current == "approved" and not approve:
+        raise UserError(
+            "This application is already approved. To take the Host role away use "
+            "Revoke host (or suspend the account if Host is their only role)."
+        )
+    if current == "rejected" and not approve:
+        raise UserError("This application has already been refused.")
+    if current == "approved" and approve:
+        holder_uid = str(app.get("activatedByUid") or app.get("applicantUid") or "").strip()
+        holder = None
+        if holder_uid:
+            try:
+                holder = await _load_user(holder_uid)
+            except UserNotFound:
+                holder = None
+        if holder is None or holder.get("isHost") or holder.get("hostRevokedAt"):
+            raise UserError(
+                "This application is already approved."
+                + (" To bring back a revoked Host use Restore host."
+                   if holder is not None and holder.get("hostRevokedAt") else "")
+            )
+
+    # Two ways an application can name its human:
+    #   * `activatedByUid` — an agency-filed invitation whose code the person
+    #     has already redeemed in the app;
+    #   * `applicantUid`   — a SELF-application, filed from the app by the
+    #     signed-in user, who is therefore known from the moment it exists.
+    # Either way, if a uid is known, approval grants the role directly; the
+    # referral-code redemption step exists only for invitations addressed to
+    # somebody who has not signed in yet.
+    uid = str(app.get("activatedByUid") or app.get("applicantUid") or "").strip()
+    applicant_uid = str(app.get("applicantUid") or "").strip()
     agency_id = str(app.get("agencyId") or "").strip()
     host_name = str(app.get("hostName") or app.get("name") or "").strip()
 
@@ -1447,15 +2894,104 @@ async def decide_host_application(
         "kycStatus": app.get("kycStatus", ""),
     }
 
+    # ── B17: the decision is taken against the status just read ─────────────
+    #
+    # A lease on the application, compare-and-set in a transaction, BEFORE the
+    # account is touched: a second reviewer deciding the same application at
+    # the same moment is refused here rather than granting or revoking a Host
+    # alongside this decision. Released if anything below fails, and the final
+    # stamp is conditional on still holding it.
+    app_ref = _host_application_ref(application_id)
+    try:
+        lease = await _fs(
+            firebase.claim_decision, app_ref,
+            expected_status=current, actor_uid=str(actor.get("uid", "")),
+            default_status="pending",
+        )
+    except firebase.DecisionConflict as exc:
+        raise UserError(str(exc)) from exc
+    try:
+        return await _decide_host_application_under_lease(
+            application_id, app, app_ref, lease, current, approve, reason, actor,
+            uid, applicant_uid, agency_id, host_name, before,
+        )
+    except Exception:
+        await _fs(firebase.release_decision, app_ref, lease)
+        raise
+
+
+async def _decide_host_application_under_lease(
+    application_id: str, app: dict, app_ref, lease: str, current: str,
+    approve: bool, reason: str, actor: dict,
+    uid: str, applicant_uid: str, agency_id: str, host_name: str, before: dict,
+) -> dict:
+    """`decide_host_application`, from the moment its lease is held."""
     # ── 1. The account. Audited by grant_host / revoke_host in their own right ──
     account: dict | None = None
     account_note = ""
+    awaiting_verification = None
     if approve and uid:
-        # Already redeemed — grant now, so an invitation approved under the old
-        # order is not left marked approved with no host behind it.
-        account = await grant_host(
-            uid, agency_id, reason, actor, meta={"application_id": application_id}
-        )
+        # UGP review: approving an application of somebody whose Host role was
+        # REVOKED gives the role back — a restoration by another door — so it
+        # takes restoration's rule: not onto a banned or suspended account
+        # (`restore_host` refuses the same). A first-time applicant is
+        # unaffected; what a restriction means for a fresh approval is listed
+        # for decision in the report.
+        try:
+            prior_holder = await _load_user(uid)
+        except UserNotFound:
+            prior_holder = None
+        if (prior_holder is not None
+                and (prior_holder.get("hostRevokedAt") or prior_holder.get("hostRemovedAt"))
+                and not prior_holder.get("isHost")
+                and restriction_of(prior_holder)):
+            raise UserError(
+                "This person's Host role was revoked and their account is restricted. "
+                "Lift the suspension or ban before giving the role back. Nothing was changed."
+            )
+        if (
+            prior_holder is not None
+            and prior_holder.get("isHost")
+            and str(prior_holder.get("agencyId") or "").strip() == agency_id
+        ):
+            # B22: the grant already happened — a half-finished approval being
+            # retried, or a Host of this agency whose application is decided
+            # late. Granting again would be refused ("already a Host") and the
+            # application could never be stamped; the decision is recorded and
+            # nothing about the account changes.
+            account_note = (
+                "This person is already a Host of this agency, so only the "
+                "decision was recorded."
+            )
+        else:
+            # ── Decision 15 (RC): approval is not activation ────────────────
+            # The Host role starts only when the person's login holds BOTH a
+            # verified phone and a verified email. Without both, only the
+            # Owner may approve, and the application WAITS — approved,
+            # granting nothing — until `activate_host_if_verified` grants it.
+            from app.services import contact_verification  # local: acyclic
+
+            verification = await asyncio.to_thread(contact_verification.status, uid)
+            if not verification.complete:
+                if not _actor_is_owner(actor):
+                    raise HostContactVerificationRequired(
+                        verification,
+                        "The Host role can start only once the applicant's account has BOTH a "
+                        "verified phone number and a verified email address (missing: "
+                        f"{', '.join(verification.missing)}). The Owner can approve it now, and "
+                        "it will start by itself as soon as both are verified. Nothing was approved.",
+                    )
+                awaiting_verification = verification
+                account_note = (
+                    "Approved by the Owner. The Host role starts as soon as both the phone "
+                    "number and the email address are verified on the account."
+                )
+            else:
+                # Already redeemed — grant now, so an invitation approved under the
+                # old order is not left marked approved with no host behind it.
+                account = await grant_host(
+                    uid, agency_id, reason, actor, meta={"application_id": application_id}
+                )
     elif approve:
         # Not redeemed yet, which is the normal case: the decision is recorded
         # on the application and `activateHost` grants the account when the
@@ -1480,16 +3016,59 @@ async def decide_host_application(
         except UserNotFound:
             holder = None
 
+        # ── FX-01: ONLY THE ROLE THIS APPLICATION GRANTED ───────────────────
+        #
+        # The person behind this application may be a Host through ANOTHER
+        # one — an agency invitation they redeemed, or a duplicate filed before
+        # the one-pending lock existed. Refusing this leftover used to call
+        # `revoke_host` all the same, so a reviewer clearing a duplicate from
+        # /kyc silently took away a live role (RF-04). The role came from this
+        # application only if it is the one that was redeemed for this person:
+        # `isActivated` with `activatedByUid` naming them (the legacy order,
+        # where a code was redeemed before the decision).
+        granted_here = (
+            app.get("isActivated") is True
+            and str(app.get("activatedByUid") or "").strip() == uid
+        ) or (
+            # HT-2: an approval whose grant landed but whose stamp could not be
+            # recorded (DecisionNotRecordedError, or an activation left
+            # `pending_completion`) never wrote `isActivated`. The grant's own
+            # trace — `isHost` plus this application on the verification record,
+            # one batch — says the role came from HERE, so refusing the
+            # application takes back the role it granted.
+            await _host_granted_for_application(uid, application_id, holder)
+        )
+
         if holder is None:
             account_note = (
                 f"The account this application was redeemed by ({uid}) no longer "
                 "exists, so there was no host status to revoke. The application "
                 "is refused and the referral code will not work."
             )
-        elif holder.get("isHost", False):
-            account = await revoke_host(
-                uid, reason, actor, meta={"application_id": application_id}
+        elif holder.get("isHost", False) and not granted_here:
+            account_note = (
+                "The applicant is already a Host through another application, so "
+                "their Host role was not touched. Only this application is refused. "
+                "To take the role away, revoke it on the account (or suspend it)."
             )
+        elif holder.get("isHost", False):
+            try:
+                account = await revoke_host(
+                    uid, reason, actor, meta={"application_id": application_id}
+                )
+            except UserError as exc:
+                # UGP review: the one-role rule. Refusing the APPLICATION still
+                # has to be possible — otherwise it sits pending forever — but
+                # it no longer takes a person's only role away with it.
+                from app.services import user_roles  # local: keeps the import graph acyclic
+
+                if user_roles.SINGLE_ROLE_REFUSAL.format(label="Host") not in str(exc):
+                    raise
+                account_note = (
+                    "The applicant is already a Host and it is their only role, so the "
+                    "role was kept — suspend the account to take it away. The "
+                    "application is refused."
+                )
         else:
             account_note = (
                 "The applicant's account is not a host, so nothing was revoked. "
@@ -1504,7 +3083,48 @@ async def decide_host_application(
     # ── 2. The application. Both status fields, together, with the audit fields ─
     now = datetime.now(timezone.utc)
     after = _host_decision_fields(approve, reason, actor, now)
-    await _fs(_host_application_ref(application_id).update, after)
+    if awaiting_verification is not None:
+        # Decision 15: the documents are approved; the ROLE waits. Its own
+        # status, so no reader takes it for an approved, activated Host and
+        # `activateHost`'s "approved" gate never opens the code for it.
+        after.update({
+            "status": "awaiting_verification",
+            "activationPending": awaiting_verification.missing,
+        })
+    elif approve and uid and not app.get("isActivated"):
+        # C5 / B08: approving for a KNOWN person is the activation — the role
+        # is granted here, not by a referral code redeemed later. Left at
+        # `isActivated: false`, the CRM listed the same human twice: once as
+        # an active Host and once as an application awaiting activation.
+        after.update({"isActivated": True, "activatedByUid": uid, "activatedAt": now})
+    # HT-2: a stamp whose answer was lost is recognised (it used to come back
+    # False — "changed while it was being decided" — for a decision that WAS
+    # recorded, skipping the lock release, the audit and the notice), and a
+    # stamp that could not be confirmed is tried once more under the lease.
+    try:
+        stamped = await _fs(
+            firebase.complete_decision_retry_once, app_ref, lease, after,
+            expected_status=current, default_status="pending",
+        )
+    except firebase.DecisionNotRecorded as exc:
+        raise DecisionNotRecordedError(
+            "This application's decision was carried out" + (
+                " (the account was updated)" if account is not None else ""
+            ) + ", but the application could not be recorded as decided: the database "
+            + ("was busy." if exc.outcome == "not_applied" else "did not confirm it.")
+            + " Decide it again to record it — nothing is granted or revoked twice.",
+            outcome=exc.outcome,
+        ) from exc
+    if not stamped:
+        raise UserError(
+            "This application changed while it was being decided. Reload it and "
+            "check what it says now."
+        )
+    if applicant_uid:
+        # B32: the one-pending-application lock goes with the decision.
+        from app.services import partner_applications as apps  # local: apps imports this module
+
+        await apps.release_host_application_lock(applicant_uid, application_id)
 
     audit_id = await audit.record(
         actor=actor,
@@ -1530,6 +3150,22 @@ async def decide_host_application(
         },
     )
 
+    # ── 3. Tell the applicant. LAST; never a reason for the decision to fail.
+    #
+    # The person is told on the account that will see it: the applicant's own
+    # uid for a self-application, or the account that redeemed the code for an
+    # invitation. An invitation nobody has redeemed yet has nobody to tell —
+    # they learn the outcome when they enter the code, as before.
+    from app.services import notices
+
+    notify_uid = applicant_uid or uid
+    notified = False
+    if notify_uid:
+        if approve:
+            notified = await notices.host_application_approved(notify_uid, application_id)
+        else:
+            notified = await notices.host_application_rejected(notify_uid, application_id, reason)
+
     return {
         "application_id": application_id,
         "uid": uid,
@@ -1538,6 +3174,7 @@ async def decide_host_application(
         "audit_id": audit_id,
         "account": account,
         "note": account_note,
+        "notified": notified,
     }
 
 
@@ -1745,9 +3382,14 @@ async def decide_host_pending_changes(
 
 
 async def set_seller_flag(
-    uid: str, is_seller: bool, reason: str, actor: dict, meta: dict | None = None
+    uid: str, is_seller: bool, reason: str, actor: dict, meta: dict | None = None,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Grant or remove seller status."""
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="change the seller flag on")
+
     reason = _require_reason(reason)
     user = await _load_user(uid)
 
@@ -1756,6 +3398,22 @@ async def set_seller_flag(
         raise UserError(
             f"This account is already {'a seller' if current else 'not a seller'}."
         )
+
+    if not is_seller:
+        # UGP review: clearing the flag is CLEANUP — a badge left behind by a
+        # record that is gone. While the person holds an approved Coin Seller
+        # record the flag follows that record, and clearing it was a side door
+        # round the one-role rule (the older CRM's "Remove seller"). Taking the
+        # role away is Suspend or Revoke on the record.
+        from app.services import user_roles  # local: keeps the import graph acyclic
+
+        inventory = await user_roles.role_inventory(uid, user=user, db=get_db())
+        if any(r.get("role") == "seller" and r.get("status") == "approved" for r in inventory["roles"]):
+            raise UserError(
+                "This person holds an approved Coin Seller record, and the shop flag "
+                "follows it. To take the role away, suspend or revoke the seller record "
+                "(or suspend the account if it is their only role). Nothing was changed."
+            )
 
     now = datetime.now(timezone.utc)
     patch: dict = {"isSeller": bool(is_seller)}
@@ -1813,6 +3471,8 @@ async def request_balance_change(
     amount: int,
     reason: str,
     actor: dict,
+    *,
+    enforce_target_policy: bool = True,
 ) -> dict:
     """Ask for a user's balance to be changed. Moves nothing.
 
@@ -1821,6 +3481,9 @@ async def request_balance_change(
     are how balances and the ledger drifted apart; there is no direct path here
     by design. The money moves in `execute_balance_card`, after an owner signs.
     """
+    if enforce_target_policy:
+        await ensure_ordinary_target(uid, actor, action="adjust the balance of")
+
     reason = _require_reason(reason)
 
     if amount == 0:
@@ -1905,9 +3568,18 @@ async def execute_balance_card(card_id: str, actor: dict) -> dict:
         )
 
     payload = card.get("payload") or {}
-    uid = payload.get("uid") or (card.get("subject") or {}).get("id", "")
+    subject = card.get("subject") or {}
+    uid = payload.get("uid") or subject.get("id", "")
     if not uid:
         raise UserError("This card does not name a user.")
+    # UGP review: the money moves on the account the signer was SHOWN. The
+    # signature checks ("this card pays you") read `subject`; a payload naming a
+    # different account would move a balance nobody approved. Refused before
+    # anything moves; the card stays as it is for a person to look at.
+    if subject.get("id") and str(subject.get("id")) != str(uid):
+        raise UserError(
+            "This card's subject and the account it would move do not match. Nothing was moved."
+        )
 
     amount = int(card.get("amount", 0))
     if amount == 0:
@@ -1925,6 +3597,19 @@ async def execute_balance_card(card_id: str, actor: dict) -> dict:
     action = (
         audit.Action.BALANCE_CREDIT if amount > 0 else audit.Action.BALANCE_DEBIT
     )
+
+    # UGP-D: a DEBIT is taken from the LIVE balance — the number the app shows
+    # and spends — inside a Firestore transaction that re-reads it, takes the
+    # whole amount or refuses, and writes the app-visible history row; only then
+    # is the Mongo ledger written, with `replica_applied_by_caller`. The credit
+    # path below is unchanged.
+    #
+    # It used to guard the Mongo tally (which never sees gifts, calls or
+    # purchases) and then push an unguarded `Increment(-n)` to Firestore, so a
+    # signed debit could drive a live balance negative, and a beans debit left
+    # `beansAvailable` — what a payout reads — untouched.
+    if amount < 0:
+        return await _execute_debit_on_live_balance(card, card_id, uid, currency, -amount, action, actor)
 
     try:
         movement = await apply_movement(
@@ -1986,6 +3671,145 @@ async def execute_balance_card(card_id: str, actor: dict) -> dict:
         },
         succeeded=True,
     )
+
+
+async def _execute_debit_on_live_balance(
+    card: dict, card_id: str, uid: str, currency: Currency, amount: int,
+    action: str, actor: dict,
+) -> dict:
+    """Debit a signed balance card from the live Firestore balance, then ledger it.
+
+    UGP review — ORDER AND THE POINT OF NO RETURN. The live debit comes first
+    (it is the one that can refuse), the ledger second. So the card is CLAIMED
+    before the live step (`cards.claim_execution`): from then on it cannot be
+    rejected, and a crash between the two steps leaves an approved, claimed
+    card whose execution is simply run again — the live step replays on its
+    history id and the ledger on the card id, so nothing is taken twice.
+    """
+    reason = card.get("reason", "Balance adjustment")
+    history_id = f"card_{card_id}"
+    try:
+        await cards.claim_execution(card_id, actor)
+    except CardError as exc:
+        raise UserError(str(exc)) from exc
+    try:
+        if currency == Currency.DIAMONDS:
+            live = await asyncio.to_thread(
+                firebase.clawback_user_diamonds, uid, amount,
+                reason=reason, history_id=history_id, require_full=True,
+            )
+            live_before = int(live.get("available_before") or 0)
+            # Whole or nothing — `require_full` refuses a short or missing
+            # wallet; anything else taken here is a bug, not a partial debit.
+            if int(live.get("taken") or 0) != amount:
+                raise firebase.LiveBalanceShort(uid, int(live.get("taken") or 0), amount)
+        else:
+            live = await asyncio.to_thread(
+                firebase.debit_host_beans, uid, amount, None,
+                {"id": history_id, "reason": reason},
+            )
+            live_before = int(live.get("beans_available_before") or 0)
+    except (firebase.TransactionNotApplied, firebase.TransactionOutcomeUnknown) as exc:
+        # HT-2: the live step's history row was read again and is not there. The
+        # card stays approved and claimed — "run again" is the recovery this path
+        # was built for (it replays on the history id and the card id) — so say
+        # that, instead of a bare 500.
+        raise LiveStepNotConfirmed(
+            f"{exc} The card is still approved: execute it again — it cannot take twice.",
+            outcome=exc.outcome,
+        ) from exc
+    except (firebase.LiveBalanceShort, firebase.HostBeansUnavailable) as exc:
+        available = int(getattr(exc, "available", 0) or 0)
+        await _close_card(
+            card_id,
+            actor,
+            {
+                "error": "insufficient_live_balance",
+                "message": (
+                    f"The account holds {available:,} "
+                    f"{'released beans' if currency != Currency.DIAMONDS else 'diamonds'}; "
+                    f"{amount:,} cannot be taken."
+                ),
+                "available": available,
+                "requested": amount,
+                "uid": uid,
+                "currency": str(currency),
+            },
+            succeeded=False,
+        )
+        await _mark_warning_deduction(card, "failed")
+        raise UserError(
+            f"The live balance ({available:,}) does not cover {amount:,} {currency}. "
+            "Nothing was taken and the card has been marked failed."
+        ) from exc
+
+    try:
+        movement = await apply_movement(
+            Movement(
+                holder_type=HolderType.USER,
+                holder_id=uid,
+                currency=currency,
+                amount=-amount,
+                action=action,
+                reason=reason,
+                actor=actor,
+                card_id=card_id,
+                idempotency_key=card_id,
+                # The live balance already moved and already refused to go
+                # below zero; the Mongo tally is only the CRM's own history and
+                # may legitimately not cover it (see `firebase.py`).
+                allow_negative=True,
+                replica_applied_by_caller=True,
+                meta={"card_type": card.get("type"), "live_history_id": history_id,
+                      "source": (card.get("payload") or {}).get("source", "")},
+            )
+        )
+    except DuplicateMovement:
+        log.warning("Balance card %s was already applied to the ledger", card_id)
+        await _mark_warning_deduction(card, "executed")
+        await _close_card(
+            card_id,
+            actor,
+            {"note": "Already applied — ledger entry exists for this card.",
+             "uid": uid, "currency": str(currency), "amount": -amount},
+            succeeded=True,
+        )
+        raise UserError("This card was already executed. The card has been closed.")
+
+    await _mark_warning_deduction(card, "executed")
+    return await _close_card(
+        card_id,
+        actor,
+        {
+            "uid": uid,
+            "currency": str(currency),
+            "amount": -amount,
+            "ledger_id": movement.ledger_id,
+            "live_balance_before": live_before,
+            "live_balance_after": live_before - amount,
+            "live_replayed": bool(live.get("replayed")),
+            "history_id": history_id,
+            "replica_synced": True,
+        },
+        succeeded=True,
+    )
+
+
+async def _mark_warning_deduction(card: dict, status: str) -> None:
+    """Best effort: show on the warning whether its deduction was taken."""
+    payload = card.get("payload") or {}
+    if payload.get("source") != "warning" or not payload.get("warning_id"):
+        return
+    try:
+        await _fs(
+            _user_ref(str(payload.get("uid") or ""))
+            .collection(WARNINGS)
+            .document(str(payload["warning_id"]))
+            .update,
+            {"deduction.status": status, "deduction.cardId": str(card.get("_id") or card.get("id") or "")},
+        )
+    except Exception:  # noqa: BLE001 — the card and the ledger are the record
+        log.warning("warning %s: deduction status not written", payload.get("warning_id"))
 
 
 async def _close_card(
@@ -2321,6 +4145,30 @@ async def ban_device(
             f"Expected one of: {', '.join(str(d) for d in DeviceType)}."
         ) from exc
 
+    # An Ops ban (`manual`) must not bar a ZIPPER staff member's handset: a
+    # device ban locks every account on it out of the app through
+    # `resolveIdentity`, which is a side door around the staff protection that
+    # covers ban/suspend/warn. Checked against the accounts named AND every
+    # account whose profile records this device. A cascade from `ban_user`
+    # already passed `ensure_ordinary_target` for its account.
+    if manual:
+        named = _string_list(user_uids)
+
+        def _on_device() -> list[str]:
+            q = (firebase.firestore_client().collection("users")
+                 .where(filter=FieldFilter("deviceId", "==", device_id)).limit(50))
+            return [d.id for d in q.stream()]
+
+        on_device = await _fs(_on_device)
+        for uid in dict.fromkeys(named + on_device):
+            row = await protected_staff_row(uid)
+            if row is not None:
+                raise ProtectedTarget(
+                    f"This device is used by {row.get('email') or uid}, an internal "
+                    f"{row.get('role', 'staff')} account. Staff devices cannot be barred "
+                    "through user management."
+                )
+
     ref = _device_ref(device_id)
     snap = await _fs(ref.get)
     before = snap.to_dict() if snap.exists else None
@@ -2648,3 +4496,139 @@ async def action_report(
         "outcome": outcome,
         "audit_id": audit_id,
     }
+
+
+# ── Buyer lookup for a seller filing a sale ─────────────────────────────────
+
+def _mask_email(email: str) -> str:
+    local, _, domain = (email or "").partition("@")
+    if not domain:
+        return ""
+    return (local[:2] + "•••") + "@" + domain
+
+
+def _mask_phone(phone: str) -> str:
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    return f"•••••{digits[-4:]}" if len(digits) >= 4 else ""
+
+
+async def lookup_buyers(term: str, *, limit: int = 5) -> list[dict]:
+    """Find app accounts by an EXACT uid, email address or phone number.
+
+    For a coin seller filing a sale: the CRM cannot list `users` (the rules
+    keep that to staff, correctly — it is everyone's contact details), so the
+    seller names the buyer and the API resolves exactly that person. No browse,
+    no partial match; contact details come back masked, enough to confirm the
+    right person, not enough to harvest anyone. Deleted accounts are skipped.
+    """
+    from app.services import crm_directory as crm
+
+    q = (term or "").strip()
+    if len(q) < 3:
+        return []
+
+    def _run() -> list[tuple[str, dict]]:
+        col = firebase.firestore_client().collection("users")
+        found: dict[str, dict] = {}
+        snap = col.document(q).get() if "/" not in q else None
+        if snap is not None and snap.exists:
+            found[snap.id] = snap.to_dict() or {}
+        if "@" in q:
+            for value in {q, q.lower()}:
+                for d in col.where(filter=FieldFilter("email", "==", value)).limit(limit).stream():
+                    found[d.id] = d.to_dict() or {}
+        else:
+            e164 = crm.to_e164(q)
+            key = crm._phone_key(e164) if e164 else ""
+            if key:
+                for d in col.where(filter=FieldFilter("phoneKey", "==", key)).limit(limit).stream():
+                    found[d.id] = d.to_dict() or {}
+            if e164:
+                for d in col.where(filter=FieldFilter("phoneNumber", "==", e164)).limit(limit).stream():
+                    found[d.id] = d.to_dict() or {}
+        return list(found.items())[:limit]
+
+    rows = await _fs(_run)
+    out = []
+    for uid, d in rows:
+        if d.get("isDeleted") or d.get("accountState") in ("deleted", "purged"):
+            continue
+        out.append({
+            "uid": uid,
+            "name": str(d.get("name") or d.get("displayName") or "Unnamed"),
+            "email": _mask_email(str(d.get("email") or "")),
+            "phone": _mask_phone(str(d.get("phoneNumber") or d.get("phone") or "")),
+        })
+    return out
+
+
+# ── "Is this email / phone already registered for a role?" ─────────────────
+
+#: Statuses that no longer hold an address: a refused or withdrawn application
+#: must not stop the same person applying again.
+_RELEASED_PARTNER_STATUSES = frozenset({"rejected", "revoked"})
+
+_ROLE_SOURCES = (
+    # (kind, collection, email field, phone field)
+    ("agency", "agencies", "ownerEmail", "ownerPhone"),
+    ("seller", "sellers", "email", "phone"),
+)
+
+
+def _phone_variants(raw: str) -> list[str]:
+    """The spellings a stored phone may have: E.164, and the bare national
+    number for an Indian one (older forms stored it without a code)."""
+    from app.services import crm_directory as crm
+
+    e164 = crm.to_e164(raw)
+    out = {e164} if e164 else set()
+    if e164.startswith("+91"):
+        out.add(e164[3:])
+        out.add("+91 " + e164[3:])
+    return [v for v in out if v]
+
+
+async def registration_availability(email: str, phone: str, kind: str = "") -> dict:
+    """Which partner role, if any, already holds this email / phone. Read-only.
+
+    Answers the signup form field by field, so an applicant is told the moment
+    they type an address that is already registered — not after filling in
+    four pages and pressing Submit. Exact matches only; names and ids are never
+    returned, only the role it is registered for. Refused and revoked records
+    do not count.
+    """
+    email = (email or "").strip().lower()
+    phone = (phone or "").strip()
+    # UGP-G (I-5): `kind` narrows the question to ONE role. The public seller
+    # signup needs "is there already a Coin Seller on this address?" — and
+    # cannot ask Firestore itself, because `sellers` is not listable outside
+    # staff — while an Agency on the same address is allowed (Agency + Seller).
+    # Without it the first match (an agency) answered for both.
+    only = (kind or "").strip()
+    sources = tuple(s for s in _ROLE_SOURCES if not only or s[0] == only)
+
+    def _run() -> dict:
+        col = firebase.firestore_client().collection
+        result = {"email": None, "phone": None}
+        for kind, coll, email_field, phone_field in sources:
+            if email and result["email"] is None:
+                for d in col(coll).where(filter=FieldFilter(email_field, "==", email)).limit(5).stream():
+                    if str((d.to_dict() or {}).get("status") or "") not in _RELEASED_PARTNER_STATUSES:
+                        result["email"] = kind
+                        break
+            if phone and result["phone"] is None:
+                for variant in _phone_variants(phone):
+                    hit = False
+                    for d in col(coll).where(filter=FieldFilter(phone_field, "==", variant)).limit(5).stream():
+                        if str((d.to_dict() or {}).get("status") or "") not in _RELEASED_PARTNER_STATUSES:
+                            hit = True
+                            break
+                    if hit:
+                        result["phone"] = kind
+                        break
+        return result
+
+    if not email and not phone:
+        return {"email": None, "phone": None}
+    return await _fs(_run)
+

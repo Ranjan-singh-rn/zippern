@@ -596,8 +596,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             }
             const raw  = snap.data() as Omit<CrmUser, 'uid'> & { role: string }
             const data = { ...raw, role: normalizeCrmRole(raw.role) } as Omit<CrmUser, 'uid'>
-            // Deactivated — force sign-out without waiting for next login
-            if (data.isActive === false) {
+            // Deactivated — force sign-out without waiting for next login.
+            // GOV C4: likewise a login whose app account is suspended or
+            // banned; /login then gives the API's reason (`resolveCrmUser`).
+            if (data.isActive === false || data.accountRestricted === true) {
               crmSignOut().catch(console.error)
               return
             }

@@ -20,6 +20,9 @@ import {
 import api, { ApiError, type Card, type Stage } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
+import { IdentityBlock } from '@/components/ui/Identity'
+import { subjectTarget } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 
 const MIN_REASON = 3
 
@@ -477,7 +480,7 @@ function CardPanel({
             <span className="text-slate-500">({card.requested_by.role})</span>
             {iRaisedIt && <span className="ml-2 text-pink-400 text-xs">you</span>}
           </Field>
-          <Field label="Subject">{card.subject.type} · {card.subject.id}</Field>
+          <Field label="Subject"><CardSubject type={card.subject.type} id={card.subject.id} /></Field>
           <Field label="Team">{card.team}</Field>
 
           {/* Whose balance this is, in front of the person about to move it.
@@ -762,6 +765,23 @@ function CardPanel({
       </div>
     </div>
   )
+}
+
+/**
+ * B1: who a card is about. A person (uid) or a partner record is named; any
+ * other subject keeps its `type · id`. No contact details here — the board is
+ * about money, and a name is all the reviewer needs to recognise the subject.
+ */
+function CardSubject({ type, id }: { type: string; id: string }) {
+  const target = subjectTarget(type)
+  const who = useIdentities({
+    enabled: target !== null,
+    people: target?.lookup === 'person' ? [id] : [],
+    partners: target?.lookup === 'partner' ? [id] : [],
+  })
+  if (!target) return <>{type} · {id}</>
+  const facts = target.lookup === 'person' ? who.people.get(id) : who.partners.get(id)
+  return <IdentityBlock facts={facts} id={id} kind={target.kind} state={who.state} />
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

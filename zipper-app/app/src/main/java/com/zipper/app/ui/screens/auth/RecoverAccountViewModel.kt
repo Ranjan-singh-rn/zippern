@@ -18,12 +18,25 @@ data class RecoverAccountUiState(
     val busy: Boolean = false,
     val recovered: Boolean = false,
     /**
+     * C7: recovered, but the profile was never finished — profile setup, not
+     * Home. Set together with [recovered].
+     */
+    val needsSetup: Boolean = false,
+    /**
      * The account has been purged — by "Create a new account instead" or by
      * "Delete it for good". One flag for both, because the server does the same
      * thing either way and the screen goes to the same place; what differs is
      * only what the person chooses to do once they are back at Login.
      */
     val purged: Boolean = false,
+    /**
+     * Back to Login with no account to enter: the recovery window had already
+     * closed (C8, `RECOVERY_EXPIRED`), or the session could not be kept. The
+     * reason travels to the login screen through `ForcedSignOut`. Without this
+     * the person would be left on a screen with no way back, holding a button
+     * that could never work.
+     */
+    val signedOut: Boolean = false,
     val error: String? = null,
 )
 
@@ -53,15 +66,41 @@ class RecoverAccountViewModel @Inject constructor(
         }
     }
 
-    fun recover() {
+    /**
+     * Keep the account — and, since B02, sign into it properly.
+     *
+     * `recoverAccount` now opens the session the original sign-in skipped
+     * (session, quick login, roles) and routes by profile completeness, so the
+     * answer can be either of the two sign-in results as well as a refusal.
+     *
+     * @param deviceId this handset, as on every other sign-in path.
+     */
+    fun recover(deviceId: String = "") {
         if (_state.value.busy) return
         _state.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
-            when (val res = repo.recoverAccount()) {
+            when (val res = repo.recoverAccount(deviceId)) {
                 is AuthResult.Success ->
                     _state.update { it.copy(busy = false, recovered = true) }
+                is AuthResult.ProfileIncomplete ->
+                    _state.update { it.copy(busy = false, recovered = true, needsSetup = true) }
+                // C8: the window had closed. Already signed out by the repository.
+                is AuthResult.AccountDeleted -> {
+                    ForcedSignOut.raise(res.message)
+                    _state.update { it.copy(busy = false, signedOut = true) }
+                }
                 is AuthResult.Error ->
-                    _state.update { it.copy(busy = false, error = res.message) }
+                    if (repo.isSignedIn()) {
+                        _state.update { it.copy(busy = false, error = res.message) }
+                    } else {
+                        // The session went with the failure (a session that
+                        // could not be claimed signs out). There is nothing to
+                        // retry from here, so Login, with the reason.
+                        ForcedSignOut.raise(res.message)
+                        _state.update { it.copy(busy = false, signedOut = true) }
+                    }
+                is AuthResult.Banned ->
+                    _state.update { it.copy(busy = false, error = res.reason) }
                 else -> _state.update { it.copy(busy = false, error = UNEXPECTED) }
             }
         }
@@ -99,14 +138,13 @@ class RecoverAccountViewModel @Inject constructor(
         /*
          * ── WHY THE `else` BRANCHES SAY SOMETHING ────────────────────────────
          *
-         * `AuthResult` is a sealed class with nine subtypes, and it grows: the
-         * last three (`ObserverDenied`, `DeletedRecoverable`,
-         * `NeedsContactDetails`) arrived after this screen was written. Only
-         * `Success` and `Error` can come out of `recoverAccount` or
-         * `deleteAccountNow` today, so the `else` arms are unreachable — but
-         * they are what keeps this file compiling when a tenth subtype lands,
-         * and a `when` without one would break the build in a screen nobody
-         * changed.
+         * `AuthResult` is a sealed class with nine subtypes, and it changes:
+         * `ObserverDenied` and `DeletedRecoverable` arrived after this screen
+         * was written, and `NeedsContactDetails` has since been replaced by
+         * `AccountDeleted` (C7, C8). `recoverAccount` can now answer like a
+         * sign-in, so its `when` names those results; the `else` arms remain
+         * what keeps this file compiling when another subtype lands, and a
+         * `when` without one would break the build in a screen nobody changed.
          *
          * They used to clear `busy` and say nothing. That turned any future
          * result this screen does not understand into a dead button: the

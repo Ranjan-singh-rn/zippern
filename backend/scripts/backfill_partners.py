@@ -153,8 +153,11 @@ async def run() -> int:
                 continue
 
             try:
+                # A MIRROR, not a creation: represent what exists, duplicates
+                # included, so they can be seen and corrected. This is the one
+                # caller allowed to switch the rule off.
                 _, made, warnings = await ops.ensure_partner_record(
-                    doc_id, ACTOR, REASON
+                    doc_id, ACTOR, REASON, enforce_role_family=False
                 )
             except ops.PartnerOpsError as exc:
                 refused.append((doc_id, str(exc)))

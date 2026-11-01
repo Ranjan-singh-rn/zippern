@@ -47,6 +47,8 @@ def _fail(exc: VerificationError) -> HTTPException:
         if isinstance(exc, VerificationNotFound)
         else status.HTTP_400_BAD_REQUEST
     )
+    # HT-2: `VerificationNotApplied` carries 409 / 503; every other refusal is as before.
+    code = getattr(exc, "status_code", None) or code
     return HTTPException(status_code=code, detail=str(exc))
 
 

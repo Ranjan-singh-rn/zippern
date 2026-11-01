@@ -12,7 +12,8 @@
  * every subsequent call carries.
  */
 
-import { getAuth } from 'firebase/auth'
+import { getAuth, signInWithCustomToken } from 'firebase/auth'
+import type { UserRoles } from './userRoleActions'
 
 // In production the API is served from the same origin via a Hosting rewrite,
 // so a relative path avoids CORS entirely. Locally it runs on its own port.
@@ -336,6 +337,12 @@ async function request<T>(
     // 401 on a call that carried no session is a **sign-in** failure and says
     // nothing about a session that may still be perfectly good.
     if (response.status === 401 && auth) reportUnauthorized({ message, path })
+    // P1-A3: an Owner session that has not passed two-step sign-in. Not a
+    // lost session — send the Owner to the step instead of an error screen.
+    if (response.status === 403 && response.headers.get('X-Zipper-MFA-Required') === '1'
+        && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+      window.location.assign('/login?mfa=1')
+    }
     throw new ApiError(message, response.status, detail)
   }
 
@@ -436,20 +443,54 @@ export interface AuditEntry {
 export type DeviceType = 'android_id' | 'imei'
 export type ReportAction = 'warn' | 'suspend' | 'ban' | 'deduct' | 'dismiss'
 
-export type AppealStatus = 'pending' | 'upheld' | 'overturned'
-/** A verdict is never `pending` — that is the state, not a decision. */
+/**
+ * Where an appeal ended up.
+ *
+ * `resolved` is not a verdict and nobody chose it. It is what the server writes
+ * when an admin lifts the ban or suspension directly — through the user screen,
+ * not through this queue — while an appeal about it is still waiting. The
+ * restriction is gone, so there is nothing left to decide, but no reviewer ever
+ * read the statement and the appeal was neither accepted nor refused.
+ *
+ * See `AppealStatus` in `backend/app/services/appeals.py`, and
+ * `lib/appealStatus.ts` for how each one is shown.
+ */
+export type AppealStatus = 'pending' | 'upheld' | 'overturned' | 'resolved'
+/**
+ * What a reviewer may choose. A strict subset of `AppealStatus`, and that is
+ * the point: `pending` is a state rather than a decision, and `resolved` is
+ * something the system records rather than something anybody decides. Keeping
+ * this type narrow is what makes both unselectable in the decide modal without
+ * a runtime check that somebody could forget.
+ */
 export type AppealVerdict = 'upheld' | 'overturned'
 export type AppealKind = 'ban' | 'report'
 
 /** One appeal, as the raiser wrote it and the reviewer left it. */
+/** UGP-F: one attachment of an appeal, as a short-lived signed link. */
+export interface AppealEvidenceLink {
+  url: string | null
+  error: string
+  kind: 'image' | 'video' | string
+  contentType: string
+  size: number
+}
+
 export interface Appeal {
   id: string
+  /** `public_web` for an appeal filed on the public page (UGP-F). */
+  source?: string
+  /** The reference the appellant was given, on a public-web appeal. */
+  reference?: string
+  /** Private attachments (paths, not URLs) — read through `appealEvidence`. */
+  evidence?: { path: string; contentType: string; kind: string; size: number }[]
   subjectUid: string
   subjectName?: string
   raisedByUid: string
   raisedByName?: string
-  /** `self` when the account speaks for itself, `agency` when its agency does. */
-  raisedByRole?: 'self' | 'agency'
+  /** `self` when the account speaks for itself, `agency` when its agency does,
+   *  `public` when it came through the public appeal page (UGP-F). */
+  raisedByRole?: 'self' | 'agency' | 'public'
   agencyId?: string
   kind: AppealKind
   /** Set when a specific report decision is being contested. */
@@ -459,8 +500,21 @@ export interface Appeal {
   status: AppealStatus
   createdAt?: string | { seconds: number } | null
   decisionReason?: string
+  /**
+   * The reviewer who decided it. Present only on `upheld` and `overturned` —
+   * the server deliberately leaves it unset on `resolved`, because inventing a
+   * reviewer for an administrative removal would also satisfy the four-eyes
+   * check the next time anybody looked. Never fall back to a generic
+   * "a reviewer" for a status that had none; ask `isReviewerDecision()` first.
+   */
   decidedByName?: string
   decidedAt?: string | { seconds: number } | null
+  /** Who removed the restriction, on a `resolved` appeal. Not a reviewer. */
+  resolvedByName?: string
+  resolvedAt?: string | { seconds: number } | null
+  /** Which admin action closed it — `unban` or `resume`. */
+  resolvedTrigger?: string
+  autoResolved?: boolean
   /** What an overturn actually changed. */
   reversed?: string[]
   /** What it could not change, and needs a separate act. */
@@ -469,7 +523,13 @@ export interface Appeal {
 
 export interface AppealOutcome {
   appeal_id: string
-  status: AppealStatus
+  /**
+   * A verdict, not any status: this is the response to `decideAppeal`, and that
+   * endpoint rejects anything outside `VERDICTS`. It can never come back
+   * `pending` or `resolved`, so the banner that renders "Appeal {status}." is
+   * typed to say so.
+   */
+  status: AppealVerdict
   subject_uid: string
   /**
    * What was reversed, and what was not.
@@ -496,6 +556,24 @@ export interface ModerationResult {
   audit_id: string
   warning_id?: string
 }
+
+/** UGP-D: what `POST /users/{uid}/warn` answers. */
+export interface WarnResult extends ModerationResult {
+  /** True when this was a retry of a request the server had already done. */
+  replayed?: boolean
+  deduction?: {
+    currency: UserCurrency
+    amount: number
+    card_id: string
+    card_stage: string
+    /** Always false: a deduction is a card an owner signs. */
+    moved: boolean
+    note: string
+  } | null
+}
+
+/** UGP-B: `GET /users/{uid}/roles`. The shape lives in `lib/userRoleActions.ts`. */
+export type UserRolesResponse = UserRoles
 
 /**
  * What deciding a host application returns.
@@ -609,6 +687,14 @@ export interface ReportOutcome {
   audit_id: string
 }
 
+/** P1-B3 — the staff state. Access is decided by `is_active`; `status` names which kind of inactive. */
+export type StaffStatus = 'active' | 'suspended' | 'deactivated'
+
+export function staffStatus(m: Pick<StaffMember, 'is_active' | 'status'>): StaffStatus {
+  if (m.is_active) return 'active'
+  return m.status === 'suspended' ? 'suspended' : 'deactivated'
+}
+
 export interface StaffMember {
   uid: string
   email: string
@@ -619,6 +705,9 @@ export interface StaffMember {
   field_charge?: string | null
   reports_to?: string
   is_active: boolean
+  /** P1-B3: `active` | `suspended` | `deactivated`. Older rows may lack it — read via `staffStatus()`. */
+  status?: StaffStatus
+  status_reason?: string
   created_at?: string
   // ── The business fields ─────────────────────────────────────────────────────
   //
@@ -648,6 +737,90 @@ export interface EmploymentChange {
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
+
+/** P1-A3 — where an Owner stands on two-step sign-in. Never a secret. */
+export interface OwnerMfaStatus {
+  required: boolean
+  enrolled: boolean | null
+  verified: boolean
+  configured?: boolean
+  locked_until?: string | null
+  recovery_codes_left?: number
+  /** P1-A3b — whether Firestore/Storage Owner authority was unlocked for this sign-in. */
+  firestore_binding?: FirestoreBinding
+}
+
+/**
+ * P1-A3b — the outcome of binding this browser's Firebase sign-in to the
+ * MFA-verified API session. Only `bound` unlocks Owner access in Firestore and
+ * Storage; anything else leaves those locked and must be shown, not hidden.
+ */
+export interface FirestoreBinding {
+  state: 'bound' | 'minted' | 'missing_token' | 'failed' | 'not_bound'
+  reason?: string
+  expires_at?: string | null
+  /** Only on a fresh mint; consumed by `redeemOwnerBinding` and never kept. */
+  custom_token?: string
+}
+
+/**
+ * P1-A3b — redeem a freshly minted Owner binding:
+ *   1. sign this browser's Firebase auth in with the custom token (same uid;
+ *      it REPLACES the password / Google session and carries `mfa_sid`);
+ *   2. confirm it with the new session's ID token.
+ * Only `bound` unlocks Owner access in Firestore and Storage. Any failure is
+ * returned as `failed` with a reason, never thrown and never assumed away.
+ * The custom token is a credential: it is used once and not stored or logged.
+ */
+async function redeemOwnerBinding(b: FirestoreBinding | undefined): Promise<FirestoreBinding> {
+  if (!b) return { state: 'not_bound' }
+  if (b.state !== 'minted' || !b.custom_token) {
+    const { custom_token: _drop, ...rest } = b
+    return rest
+  }
+  try {
+    await signInWithCustomToken(getAuth(), b.custom_token)
+  } catch {
+    return { state: 'failed', reason: 'This browser could not switch to the secure sign-in. Retry unlock.' }
+  }
+  try {
+    const firebase_id_token = await currentFirebaseIdToken()
+    return await post<FirestoreBinding>('/auth/mfa/bind/confirm', { firebase_id_token })
+  } catch (e) {
+    return { state: 'failed', reason: e instanceof Error ? e.message : 'Could not confirm the secure sign-in.' }
+  }
+}
+
+/** Replace the minted binding on a session's user block with the redeemed result. */
+async function settleBinding(user: ApiUser): Promise<ApiUser> {
+  const holder = user as unknown as { mfa?: OwnerMfaStatus }
+  if (!holder.mfa?.firestore_binding) return user
+  const settled = await redeemOwnerBinding(holder.mfa.firestore_binding)
+  holder.mfa = { ...holder.mfa, firestore_binding: settled }
+  return user
+}
+
+/** The current Firebase ID token, or '' (sign-in only via the API, e.g. the observer). */
+async function currentFirebaseIdToken(): Promise<string> {
+  try {
+    return (await getAuth().currentUser?.getIdToken()) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** Read the binding result off a session's user block. */
+export function firestoreBindingOf(user: ApiUser): FirestoreBinding | undefined {
+  return (user as unknown as { mfa?: OwnerMfaStatus }).mfa?.firestore_binding
+}
+
+export interface OwnerMfaEnrolment {
+  secret: string
+  otpauth_uri: string
+  expires_at: string
+  digits: number
+  period: number
+}
 
 /** What every session endpoint returns. `renew_at` is when to come back. */
 interface SessionResponse {
@@ -681,7 +854,24 @@ export const auth = {
     const fbUser = getAuth().currentUser
     if (!fbUser) throw new ApiError('Sign in with Firebase first', 401)
 
-    const idToken = await fbUser.getIdToken()
+    // ── FORCED REFRESH, AND IT IS NOT AN OPTIMISATION ──────────────────────
+    //
+    // `storage.rules` authorises on `request.auth.token.role`, a custom claim
+    // set outside the browser — by the API for staff
+    // (`services/storage_claims.py`) and by the `syncStorageRoleClaim`
+    // trigger for agencies and sellers. A claim written after the token in
+    // hand was minted is simply not in it, and Firebase will not notice for
+    // up to an hour.
+    //
+    // Without `true` here, the people most affected are exactly the ones who
+    // cannot work around it: a newly invited reviewer signs in, opens the KYC
+    // queue and is refused every document in it, with nothing on screen
+    // explaining why and nothing they can do but wait. Same for an agency the
+    // moment it is created, and for anyone whose role just changed.
+    //
+    // The cost is one network round-trip on sign-in only. `getIdToken()`
+    // elsewhere in this file stays cached.
+    const idToken = await fbUser.getIdToken(true)
     return adopt(await post<SessionResponse>('/auth/signin', { id_token: idToken }, false))
   },
 
@@ -723,6 +913,39 @@ export const auth = {
     }
   },
 
+  /**
+   * Decision 16 (RC): why the API refuses the CURRENT Firebase login — asked
+   * only by the CRM door for a partner login it already refuses as inactive,
+   * so a rejected applicant sees the API's reason ("This application was not
+   * approved: … You may apply again") instead of "deactivated" (lib/crmDoor).
+   *
+   * Never adopts a session. Should the API unexpectedly issue one, it is
+   * revoked on the spot with its own token and nothing is stored. Returns ''
+   * when the API cannot be asked or gave no refusal.
+   */
+  async refusalForCurrentLogin(): Promise<string> {
+    const fbUser = getAuth().currentUser
+    if (!fbUser) return ''
+    let idToken: string
+    try {
+      idToken = await fbUser.getIdToken()
+    } catch {
+      return ''
+    }
+    try {
+      const issued = await post<SessionResponse>('/auth/signin', { id_token: idToken }, false)
+      await request('/auth/signout', {
+        method: 'POST',
+        body: '{}',
+        auth: false,
+        headers: { Authorization: `Bearer ${issued.token}` },
+      }).catch(() => undefined)
+      return ''
+    } catch (err) {
+      return err instanceof ApiError && (err.status === 401 || err.status === 403) ? err.message : ''
+    }
+  },
+
   /** Observer: ask for a one-time code. It is emailed, never returned. */
   requestObserverCode: () =>
     post<{ message: string; sent_to: string; expires_in_minutes: number }>(
@@ -736,6 +959,54 @@ export const auth = {
   },
 
   me: fetchMe,
+
+  // ── P1-A3: Owner two-step sign-in ──────────────────────────────────────────
+  // An Owner's session from `/auth/signin` is limited to these routes (plus
+  // `me` and sign-out) until a code is verified; the server answers any other
+  // Owner route with 403 + `X-Zipper-MFA-Required`. Verify and confirm return a
+  // NEW session, adopted here, and the pending one is revoked server-side.
+
+  mfaStatus: () => get<OwnerMfaStatus>('/auth/mfa/status'),
+
+  /** A new authenticator secret, shown once. Refused once MFA is set up. */
+  mfaEnrolStart: () => post<OwnerMfaEnrolment>('/auth/mfa/enrol/start', {}),
+
+  /** First code from the app → recovery codes (shown once) + a full session. */
+  async mfaEnrolConfirm(code: string): Promise<{ user: ApiUser; recoveryCodes: string[] }> {
+    // P1-A3b: the current Firebase sign-in is sent so Firestore/Storage can be
+    // unlocked for THIS sign-in; the server verifies it before binding.
+    const firebase_id_token = await currentFirebaseIdToken()
+    const res = await post<{ recovery_codes: string[]; session: SessionResponse }>(
+      '/auth/mfa/enrol/confirm', { code, firebase_id_token, client: 'crm' })
+    return { user: await settleBinding(adopt(res.session)), recoveryCodes: res.recovery_codes }
+  },
+
+  /** A code from the authenticator, or one recovery code. */
+  async mfaVerify(input: { code?: string; recoveryCode?: string }): Promise<ApiUser> {
+    const firebase_id_token = await currentFirebaseIdToken()
+    return settleBinding(adopt(await post<SessionResponse>('/auth/mfa/verify',
+      { code: input.code ?? '', recovery_code: input.recoveryCode ?? '', firebase_id_token, client: 'crm' })))
+  },
+
+  /** P1-A3b — retry unlocking Firestore/Storage for this verified session. */
+  async mfaBind(): Promise<FirestoreBinding> {
+    const firebase_id_token = await currentFirebaseIdToken()
+    if (!firebase_id_token) return { state: 'missing_token', reason: 'Not signed in to Firebase in this browser.' }
+    try {
+      return await redeemOwnerBinding(await post<FirestoreBinding>('/auth/mfa/bind', { firebase_id_token, client: 'crm' }))
+    } catch (e) {
+      return { state: 'failed', reason: e instanceof Error ? e.message : 'Could not unlock Firestore. Try again.' }
+    }
+  },
+
+  /** New recovery codes; the old ones stop working. Needs a fresh code. */
+  mfaNewRecoveryCodes: (code: string) =>
+    post<{ recovery_codes: string[] }>('/auth/mfa/recovery-codes', { code }),
+
+  /** Observer only: remove an Owner's authenticator and end their sessions. */
+  mfaResetOwner: (ownerUid: string, reason: string) =>
+    post<{ uid: string; was_enrolled: boolean; sessions_revoked: boolean; notified: boolean }>(
+      `/auth/mfa/owners/${encodeURIComponent(ownerUid)}/reset`, { reason }),
 
   async signOut(): Promise<void> {
     try {
@@ -843,6 +1114,20 @@ export const staff = {
   deactivate: (uid: string, reason: string) =>
     post<StaffMember>(`/staff/${uid}/deactivate`, { reason }),
 
+  /** P1-B3 — pause access (reversible). The personal app account is untouched. */
+  suspend: (uid: string, reason: string) =>
+    post<StaffMember>(`/staff/${uid}/suspend`, { reason }),
+
+  /** P1-B2 — restore a suspended or deactivated member. Old sessions stay revoked. */
+  reactivate: (uid: string, reason: string) =>
+    post<StaffMember>(`/staff/${uid}/reactivate`, { reason }),
+
+  /** Observer only — the owner variants. */
+  suspendOwner: (uid: string, reason: string) =>
+    post<StaffMember>(`/staff/owners/${uid}/suspend`, { reason }),
+  reactivateOwner: (uid: string, reason: string) =>
+    post<StaffMember>(`/staff/owners/${uid}/reactivate`, { reason }),
+
   /**
    * Set the business facts on somebody's record — salary, employment id,
    * joining date, field charge. The API refuses a team admin who names anyone
@@ -892,8 +1177,38 @@ export const users = {
   resume: (uid: string, reason: string) =>
     post<ModerationResult>(`/users/${uid}/resume`, { reason }),
 
-  warn: (uid: string, reason: string) =>
-    post<ModerationResult>(`/users/${uid}/warn`, { reason }),
+  /**
+   * A formal warning — optionally with a deduction (UGP-D).
+   *
+   * `requestId` is generated once per open dialog and reused on a retry, so a
+   * timed-out request that is pressed again is the SAME warning on the server
+   * (no second warning, count, card or notice). A deduction never moves money
+   * here: it raises a `balance_debit` card linked to the warning, which an owner
+   * signs on the money board. The server checks the currency against the
+   * person's roles, the amount against the live balance, and asks for
+   * `can_adjust_balance`.
+   */
+  warn: (
+    uid: string,
+    reason: string,
+    opts: { requestId?: string; deduction?: { currency: UserCurrency; amount: number } } = {},
+  ) =>
+    post<WarnResult>(`/users/${uid}/warn`, {
+      reason,
+      ...(opts.requestId ? { request_id: opts.requestId } : {}),
+      ...(opts.deduction ? { deduction: opts.deduction } : {}),
+    }),
+
+  /**
+   * What this person holds, from the authoritative records, with the ROLE
+   * actions the server allows on each (UGP-B). The user page renders Revoke /
+   * Restore from this and from nothing else.
+   */
+  roles: (uid: string) => get<UserRolesResponse>(`/users/${encodeURIComponent(uid)}/roles`),
+
+  /** Restore a revoked Host role from the person's existing records (UGP-B). */
+  restoreHost: (uid: string, reason: string) =>
+    post<ModerationResult>(`/users/${uid}/restore-host`, { reason }),
 
   grantHost: (uid: string, reason: string, agencyId = '') =>
     post<ModerationResult>(`/users/${uid}/grant-host`, {
@@ -1051,6 +1366,13 @@ export const users = {
   decideAppeal: (appealId: string, verdict: AppealVerdict, reason: string) =>
     post<AppealOutcome>(`/users/appeals/${appealId}/decide`, { verdict, reason }),
 
+  /**
+   * UGP-F: fifteen-minute signed links to an appeal's PRIVATE attachments
+   * (public-web appeals store object paths, never download URLs).
+   */
+  appealEvidence: (appealId: string) =>
+    get<{ evidence: AppealEvidenceLink[] }>(`/users/appeals/${encodeURIComponent(appealId)}/evidence`),
+
   // Reports queue.
   reports: (status?: ReportStatus, limit = 200) => {
     const q = new URLSearchParams({ limit: String(limit) })
@@ -1164,6 +1486,78 @@ export interface VerificationVerdict {
    * cases they should not.
    */
   beansHeldNotLost: boolean
+}
+
+/** One document behind a short-lived signed URL. */
+export interface SignedDocument {
+  /** Which document on the record: `doc1`..`doc3`, `photo`, `proof`, `qr`. */
+  slot: string
+  label: string
+  /** A 15-minute signed URL, or `null` when it could not be signed. */
+  url: string | null
+  /** Why it could not be signed. Empty when `url` is set. */
+  error: string
+}
+
+export interface SignedDocumentBatch {
+  /** Keyed `"{kind}:{id}"`. A record the caller may not see is absent. */
+  documents: Record<string, SignedDocument[]>
+  expires_in_seconds: number
+}
+
+export interface SignedDocumentSet {
+  kind: DocumentKind
+  id: string
+  documents: SignedDocument[]
+  expires_in_seconds: number
+}
+
+export type DocumentKind = 'agency' | 'seller' | 'host' | 'coin_purchase'
+
+/**
+ * KYC and identity documents, behind short-lived signed URLs.
+ *
+ * ── WHY THIS EXISTS RATHER THAN RENDERING THE STORED URL ───────────────────
+ *
+ * Every KYC document was stored as the string `getDownloadURL()` returned —
+ * `.../o/<object>?alt=media&token=<uuid>`. That is a permanent bearer
+ * credential: Storage Security Rules are not consulted when one is used, so
+ * whoever holds the string reads the file, forever, unauthenticated, from
+ * anywhere. Tightening `storage.rules` does not touch it, because a download
+ * URL does not take the SDK path.
+ *
+ * The API authorises the caller and mints a fifteen-minute URL instead. The
+ * permanent string never reaches a browser.
+ *
+ * Fetch when the reviewer opens the record and throw the result away when
+ * they close it — same contract as `hostVerification.get`.
+ */
+export const documents = {
+  forRecord: (kind: DocumentKind, recordId: string) =>
+    get<SignedDocumentSet>(`/documents/${kind}/${encodeURIComponent(recordId)}`),
+
+  /**
+   * Many records, one request. Keys are `"{kind}:{id}"`.
+   *
+   * For list views. Through `forRecord` a fifty-row host list would be fifty
+   * HTTP requests to draw one page, which is why those lists were still
+   * rendering the permanent stored URL — the secure path was too expensive to
+   * adopt. This is the version that is not.
+   *
+   * `slots` narrows what gets signed. A list showing one reference photograph
+   * per row passes `['photo']` so the server does not also sign three KYC
+   * documents per row that the row will never render.
+   *
+   * A record the caller may not see is simply absent from the result, and the
+   * call still succeeds — so a list containing one unreachable row renders the
+   * other forty-nine.
+   */
+  batch: (refs: { kind: DocumentKind; id: string }[], slots: string[] = []) => {
+    const q = new URLSearchParams()
+    for (const r of refs) if (r.id) q.append('ref', `${r.kind}:${r.id}`)
+    for (const s of slots) q.append('slot', s)
+    return get<SignedDocumentBatch>(`/documents/batch?${q.toString()}`)
+  },
 }
 
 export const hostVerification = {
@@ -1376,6 +1770,57 @@ export interface SubAgencyPayout {
   updated_at: string
 }
 
+// ── UGP-F: the public appeal (no session) ──────────────────────────────────
+
+export interface PublicAppealLookup {
+  state: 'appealable' | 'appeal_pending' | 'not_found'
+  /** Masked ("G**** y****"). Nothing else about the account is ever returned
+   *  without a session — not ban versus suspension, not a pending appeal's
+   *  reference (UGP review). */
+  name_hint?: string
+  message?: string
+}
+
+export const publicAppeals = {
+  /** Which account these details name, masked — or "not found" (also for an unrestricted one). */
+  lookup: (accountId: string, displayName: string) =>
+    post<PublicAppealLookup>(
+      '/public/appeals/lookup',
+      { account_id: accountId, display_name: displayName },
+      false,
+    ),
+
+  /** File the appeal. Multipart, because of the attachments. Never signed in. */
+  submit: async (form: {
+    accountId: string
+    displayName: string
+    statement: string
+    files: File[]
+  }): Promise<{ reference: string; status: string }> => {
+    const fd = new FormData()
+    fd.append('account_id', form.accountId)
+    fd.append('display_name', form.displayName)
+    fd.append('statement', form.statement)
+    for (const f of form.files) fd.append('files', f)
+    let response: Response
+    try {
+      response = await fetch(`${API_BASE}/api/public/appeals`, { method: 'POST', body: fd })
+    } catch (err) {
+      throw new ApiError('Could not reach the server. Check your connection and try again.', 0, err)
+    }
+    const text = await response.text()
+    let body: unknown = null
+    if (text) {
+      try { body = JSON.parse(text) } catch { body = text }
+    }
+    if (!response.ok) {
+      const detail = (body as { detail?: unknown })?.detail ?? body ?? response.statusText
+      throw new ApiError(typeof detail === 'string' ? detail : 'The appeal could not be sent.', response.status, detail)
+    }
+    return body as { reference: string; status: string }
+  },
+}
+
 export const partnerOps = {
   list: (params: { kind?: PartnerKind; status?: PartnerStatus; limit?: number } = {}) => {
     const q = new URLSearchParams()
@@ -1459,6 +1904,27 @@ export const partnerOps = {
    * Scoped by the server: staff see everything, a seller account sees only its
    * own rows regardless of what `seller_id` says.
    */
+  /**
+   * PUBLIC. Which partner role (if any) already holds this email / phone —
+   * `{ email: 'agency' | 'seller' | null, phone: … }`. For the signup forms to
+   * flag a registered address as soon as it is typed.
+   */
+  registrationAvailability: (email: string, phone: string, kind: '' | 'agency' | 'seller' = '') =>
+    request<{ email: 'agency' | 'seller' | null; phone: 'agency' | 'seller' | null }>(
+      `/partner-ops/registration/availability?email=${encodeURIComponent(email)}&phone=${encodeURIComponent(phone)}`
+        + (kind ? `&kind=${kind}` : ''),
+      { auth: false },
+    ),
+
+  /**
+   * Find a buyer by EXACT uid, email or phone — the CRM cannot list `users`.
+   * Contact details come back masked. `GET /partner-ops/buyers/lookup`.
+   */
+  lookupBuyers: (q: string) =>
+    get<{ uid: string; name: string; email: string; phone: string }[]>(
+      `/partner-ops/buyers/lookup?q=${encodeURIComponent(q)}`,
+    ),
+
   listSales: (params: { seller_id?: string; status?: SaleStatus; limit?: number } = {}) => {
     const q = new URLSearchParams()
     Object.entries(params).forEach(([k, v]) => v !== undefined && q.set(k, String(v)))
@@ -1512,7 +1978,16 @@ export const partnerOps = {
    * names no agency so the payout will bill no commission — which is advisory,
    * not a refusal, and is worth showing before anybody signs.
    */
-  requestHostWithdrawal: (hostUid: string, body: { beans: number; reason: string }) =>
+  requestHostWithdrawal: (
+    hostUid: string,
+    body: {
+      beans: number
+      reason: string
+      /** P0-7: the queued request this card pays; executing it marks that request paid. */
+      request_collection?: 'withdrawalRequests' | 'salaryRequests'
+      request_id?: string
+    },
+  ) =>
     post<Card & { warnings?: string[] }>(
       `/partner-ops/hosts/${encodeURIComponent(hostUid)}/withdrawals`,
       body,
@@ -1702,13 +2177,62 @@ export const reports = {
   },
 }
 
+// ── Tickets (P1-D) ────────────────────────────────────────────────────────────
+//
+// The only writer of `techTickets`, `feedbackTickets` and `supportTickets`.
+// Firestore rules refuse client writes to them; reads stay on Firestore. The
+// server takes "who did this" from the session and the staff record, so none
+// of these calls sends a name. Routing, closing, reopening and dependency
+// changes need a `reason`; a 400 carries a message worth showing as-is.
+
+export type TicketQueue = 'team' | 'feedback' | 'support'
+
+export interface TicketResult {
+  id: string
+  audit_id?: string
+  replayed?: boolean
+  notified?: Record<string, boolean>
+  [field: string]: unknown
+}
+
+export interface NewTeamTicket {
+  title: string
+  description?: string
+  category?: string
+  priority?: string
+  assignedTeam: string
+  assignedTo?: string
+}
+
+/** A fresh id per user action: a retried request then changes nothing twice. */
+export function newRequestId(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto
+  return c?.randomUUID ? c.randomUUID().replace(/-/g, '') : `${Date.now()}${Math.random().toString(36).slice(2)}`
+}
+
+export const tickets = {
+  createTeam: (body: NewTeamTicket, requestId: string = newRequestId()) =>
+    post<TicketResult>('/tickets/team', { ...body, request_id: requestId }),
+
+  update: (queue: TicketQueue, id: string, changes: Record<string, unknown>,
+           reason = '', requestId: string = newRequestId()) =>
+    post<TicketResult>(`/tickets/${queue}/${encodeURIComponent(id)}/update`,
+      { changes, reason, request_id: requestId }),
+
+  routeSupport: (id: string, team: string, note: string, assignTo = '',
+                 requestId: string = newRequestId()) =>
+    post<{ support_ticket_id: string; team_ticket: TicketResult }>(
+      `/tickets/support/${encodeURIComponent(id)}/route`,
+      { team, note, assign_to: assignTo, request_id: requestId }),
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 export const health = () =>
   request<{ status: string; environment: string }>('/health', { auth: false })
 
 const api = {
-  auth, cards, audit, staff, users, hostVerification, partners, partnerOps,
-  reports, health,
+  auth, cards, audit, staff, users, hostVerification, documents, partners,
+  partnerOps, reports, tickets, health,
 }
 export default api

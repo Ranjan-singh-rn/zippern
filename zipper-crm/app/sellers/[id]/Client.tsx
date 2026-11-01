@@ -35,6 +35,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
+import SecureDocuments from '@/components/SecureDocuments'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import {
@@ -47,7 +48,10 @@ import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/Sta
 import { useAuth } from '@/components/AuthProvider'
 import { SellerHistoryPanel } from '@/components/SellerHistoryPanel'
 import { canAccess } from '@/lib/auth'
-import { ApiError } from '@/lib/api'
+import api, { ApiError } from '@/lib/api'
+import { roleButtons, type UserRoles } from '@/lib/userRoleActions'
+import { restoreGate } from '@/lib/governanceRequests'
+import { awaitingLabel } from '@/lib/contactVerification'
 import { getSeller, type Seller } from '@/lib/sellers'
 import {
   board, inventory, lending, partnerOps, statements,
@@ -118,7 +122,7 @@ function ageOf(iso: string | null | undefined) {
   return `${Math.floor(hrs / 24)}d ago`
 }
 
-type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate' | 'grant_agency'
+type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate' | 'grant_agency' | 'revoke'
 
 const DECISION_COPY: Record<
   Decision,
@@ -143,10 +147,22 @@ const DECISION_COPY: Record<
     tone: 'bg-amber-600 hover:bg-amber-500',
   },
   reactivate: {
-    title: 'Lift this suspension',
-    hint: 'They can trade again. Nothing about the outstanding credit changes.',
-    verb: 'Reactivate',
+    title: 'Restore this Coin Seller role',
+    hint:
+      'The SAME record is re-activated — no new application — after the role table is ' +
+      're-checked. They can trade again. Nothing about the outstanding credit changes.',
+    verb: 'Restore',
     tone: 'bg-green-600 hover:bg-green-500',
+  },
+  revoke: {
+    title: 'Revoke this Coin Seller role',
+    hint:
+      'The ROLE ends; the person does not. Their account stays active, any Agency or Sub-agency ' +
+      'they hold stays active, every transaction and every rupee of history stays, and they may ' +
+      'apply again later. They stop appearing to buyers at once. Different from Suspend, which ' +
+      'is temporary and keeps their place.',
+    verb: 'Revoke role',
+    tone: 'bg-red-700 hover:bg-red-600',
   },
   grant_agency: {
     title: 'Also make them an agency',
@@ -202,6 +218,10 @@ export default function SellerDetail() {
   const [cards, setCards] = useState<PartnerCard[]>([])
   const [cardsTruncated, setCardsTruncated] = useState(false)
   const [profile, setProfile] = useState<Seller | null>(null)
+  /** UGP-B: what the OWNER holds — Revoke is offered only beside a second role. */
+  const [ownerRoles, setOwnerRoles] = useState<UserRoles | null>(null)
+  /** The roles request failed — so no revoke is offered, and the page says why. */
+  const [ownerRolesFailed, setOwnerRolesFailed] = useState(false)
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -218,6 +238,16 @@ export default function SellerDetail() {
       setPartner(p)
       setGate(p.can_take_inventory ?? null)
       setLoading(false)
+
+      if (p.owner_crm_uid) {
+        setOwnerRolesFailed(false)
+        api.users.roles(p.owner_crm_uid)
+          .then((r) => { setOwnerRoles(r); setOwnerRolesFailed(false) })
+          .catch(() => { setOwnerRoles(null); setOwnerRolesFailed(true) })
+      } else {
+        setOwnerRoles(null)
+        setOwnerRolesFailed(false)
+      }
 
       // Additive: one panel failing must not blank the record.
       statements.seller(id).then(setStatement).catch(() => setStatement(null))
@@ -303,9 +333,12 @@ export default function SellerDetail() {
           </h1>
           <div className="flex flex-wrap items-center gap-2 mt-2">
             <span className={`text-xs px-2 py-1 rounded ${STATUS_TONE[partner.status] ?? 'bg-slate-700 text-slate-300'}`}>
-              {partner.status}
+              {partner.status === 'awaiting_verification' ? 'approved · waiting for verified contacts' : partner.status}
               {partner.status === 'approved' && !partner.is_active ? ' · inactive' : ''}
             </span>
+            {partner.status === 'awaiting_verification' && (
+              <span className="text-sky-300 text-xs">{awaitingLabel(partner.activation?.missing ?? [])}</span>
+            )}
             <span className={`text-xs px-2 py-1 rounded ${STANDING_TONE[standing]}`}>
               credit: {STANDING_LABEL[standing]}
             </span>
@@ -325,7 +358,30 @@ export default function SellerDetail() {
           >
             <RefreshCw size={14} /> Refresh
           </button>
-          {partner.status !== 'approved' && (
+          {/* UGP-B: Approve decides an application; Reject only a PENDING one;
+              Restore re-activates a suspended or revoked record; Revoke only
+              beside a second role. The API refuses every other combination. */}
+          {/* Decision 15 (RC): approved, NOT started — the role waits for BOTH
+              verified contacts on the login and starts by itself; "Check and
+              start" asks the API to re-read them now. Never bypasses them. */}
+          {partner.status === 'awaiting_verification' && (
+            <button
+              onClick={async () => {
+                try {
+                  const out = await partnerOps.activate(id)
+                  setNotice(out.activated ? 'Both contacts are verified — the role has started.'
+                    : out.already_active ? 'This role had already started.' : 'Checked.')
+                } catch (err) {
+                  setNotice(err instanceof Error ? err.message : 'Could not check just now.')
+                }
+                load()
+              }}
+              className="flex items-center gap-2 bg-sky-600/80 hover:bg-sky-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
+            >
+              <CheckCircle2 size={15} /> Check and start
+            </button>
+          )}
+          {(partner.status === 'pending' || partner.status === 'rejected') && (
             <button
               onClick={() => setDecision('approve')}
               className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
@@ -333,7 +389,7 @@ export default function SellerDetail() {
               <CheckCircle2 size={15} /> Approve
             </button>
           )}
-          {partner.status !== 'rejected' && (
+          {partner.status === 'pending' && (
             <button
               onClick={() => setDecision('reject')}
               className="flex items-center gap-2 bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
@@ -352,20 +408,58 @@ export default function SellerDetail() {
               <Building2 size={15} /> Also an agency
             </button>
           )}
-          {partner.is_active ? (
+          {partner.status === 'approved' && partner.is_active && (
             <button
               onClick={() => setDecision('deactivate')}
               className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
             >
               Suspend
             </button>
-          ) : (
+          )}
+          {/* GOV C2: restoring a REVOKED record is the Owner's decision (the
+              server answers anybody else with 403). Lifting a role-level
+              suspension keeps its current permission. */}
+          {(partner.status === 'suspended' || partner.status === 'revoked') && (() => {
+            const gate = restoreGate(partner.status, isOwner)
+            return (
+              <>
+                <button
+                  onClick={() => { if (gate.allowed) setDecision('reactivate') }}
+                  disabled={!gate.allowed}
+                  title={gate.hint || undefined}
+                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Restore
+                </button>
+                {!gate.allowed && (
+                  <Link href="/role-appeals" className="text-slate-500 hover:text-pink-300 text-xs max-w-[16rem]">
+                    {gate.hint}
+                  </Link>
+                )}
+              </>
+            )
+          })()}
+          {(partner.status === 'approved' || partner.status === 'suspended') &&
+            roleButtons(ownerRoles).some((b) => b.kind === 'revoke' && b.targetId === partner.id) && (
             <button
-              onClick={() => setDecision('reactivate')}
-              className="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
+              onClick={() => setDecision('revoke')}
+              className="bg-red-900/30 hover:bg-red-900/50 border border-red-900/50 text-red-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
+              title="End the role. The person, their other roles and their history stay."
             >
-              Reactivate
+              Revoke role
             </button>
+          )}
+          {(partner.status === 'approved' || partner.status === 'suspended') &&
+            !roleButtons(ownerRoles).some((b) => b.kind === 'revoke' && b.targetId === partner.id) && (
+            ownerRolesFailed ? (
+              <span className="text-amber-400/80 text-xs" title="Revoke is offered only once the owner's roles are known (UGP-B)">
+                The owner's roles could not be read, so Revoke is not offered — reload to try again
+              </span>
+            ) : (
+              <span className="text-slate-500 text-xs" title="One role → suspend only (UGP-B)">
+                Only role — suspend rather than revoke
+              </span>
+            )
           )}
         </div>
       </div>
@@ -685,9 +779,20 @@ export default function SellerDetail() {
           }
           onClose={() => setDecision(null)}
           onConfirm={async (reason) => {
-            if (decision === 'approve') await partnerOps.approve(id, reason)
+            if (decision === 'approve') {
+              const out = await partnerOps.approve(id, reason)
+              // Decision 15 (RC): the Owner's approval of a login without both
+              // verified contacts leaves the role WAITING — say so plainly.
+              if (out?.awaiting_verification) {
+                setDecision(null)
+                setNotice(awaitingLabel(out.missing ?? []))
+                load()
+                return
+              }
+            }
             else if (decision === 'reject') await partnerOps.reject(id, reason)
             else if (decision === 'deactivate') await partnerOps.deactivate(id, reason)
+            else if (decision === 'revoke') await partnerOps.revoke(id, reason)
             else if (decision === 'grant_agency') {
               await partnerOps.grantCapability(id, {
                 kind: 'agency',
@@ -1074,9 +1179,6 @@ function SellerCardRow({
 function ProfilePanel({ partner, profile }: { partner: Partner; profile: Seller | null }) {
   const [zoom, setZoom] = useState('')
 
-  const docs = profile?.idDocUrls ?? []
-  const proof = profile?.registrationProofUrl ?? ''
-
   return (
     <div className="space-y-4">
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
@@ -1097,6 +1199,47 @@ function ProfilePanel({ partner, profile }: { partner: Partner; profile: Seller 
         )}
       </div>
 
+      {/* Where buyers pay this seller. Reviewed here, behind the page's role
+          gate, like the identity documents below. Only the UPI id, the UPI
+          QR and the Binance UID reach the public directory the app reads;
+          the bank account never does. */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 className="text-white font-semibold flex items-center gap-2 mb-4">
+          <Landmark size={15} className="text-slate-500" /> Where buyers pay them
+        </h2>
+        {profile?.payment && Object.values(profile.payment).some(Boolean) ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {profile.payment.upiId && <Info icon={<Hash size={13} />} label="UPI id" value={profile.payment.upiId} mono />}
+            {profile.payment.binanceUid && <Info icon={<Hash size={13} />} label="Binance UID" value={profile.payment.binanceUid} mono />}
+            {profile.payment.accountHolderName && <Info icon={<User size={13} />} label="Account holder" value={profile.payment.accountHolderName} />}
+            {profile.payment.accountNumber && (
+              <Info icon={<Landmark size={13} />} label="Account number"
+                value={`•••• ${profile.payment.accountNumber.slice(-4)}`} mono />
+            )}
+            {profile.payment.ifscCode && <Info icon={<Hash size={13} />} label="IFSC" value={profile.payment.ifscCode} mono />}
+            {profile.payment.bankName && <Info icon={<Landmark size={13} />} label="Bank" value={`${profile.payment.bankName}${profile.payment.branch ? ` · ${profile.payment.branch}` : ''}`} />}
+            {profile.payment.internationalMethod && (
+              <Info icon={<Hash size={13} />} label="International"
+                value={`${profile.payment.internationalMethod}${profile.payment.internationalDetails ? ` · ${profile.payment.internationalDetails}` : ''}`} />
+            )}
+            {(profile.payment.upiQrUrl || profile.qrCodeUrl) && (
+              <div className="sm:col-span-2">
+                <p className="text-slate-500 text-xs mb-1.5">UPI QR</p>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={profile.payment.upiQrUrl || profile.qrCodeUrl} alt="UPI QR"
+                  className="w-32 h-32 rounded-lg border border-slate-700 object-contain bg-white cursor-zoom-in"
+                  onClick={() => setZoom(profile.payment?.upiQrUrl || profile.qrCodeUrl)} />
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="text-slate-500 text-sm">
+            No settlement details on file. A seller who applied before this field existed can add
+            them from their dashboard; buyers see only a QR until then.
+          </p>
+        )}
+      </div>
+
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
         <h2 className="text-white font-semibold flex items-center gap-2 mb-1">
           <FileText size={15} className="text-slate-500" /> Documents
@@ -1104,27 +1247,15 @@ function ProfilePanel({ partner, profile }: { partner: Partner; profile: Seller 
         <p className="text-slate-500 text-sm mb-4">
           Shown inline. Click one to enlarge — verification means looking at it.
         </p>
-        {docs.length === 0 && !proof ? (
-          <p className="text-slate-600 text-sm">No documents were uploaded.</p>
-        ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {docs.map((d, i) => (
-              <DocThumb
-                key={i}
-                url={d.url}
-                label={d.label || `Document ${i + 1}`}
-                onZoom={() => setZoom(d.url)}
-              />
-            ))}
-            {proof && (
-              <DocThumb
-                url={proof}
-                label="Registration proof"
-                onZoom={() => setZoom(proof)}
-              />
-            )}
-          </div>
-        )}
+        {/* Through the API — see the note on the agency screen and
+            components/SecureDocuments.tsx. The server collects `idDocUrls`
+            and `registrationProofUrl` into one list, so the two shapes this
+            screen used to join by hand are joined once, server-side. */}
+        <SecureDocuments
+          kind="seller"
+          recordId={partner.id}
+          emptyHint="No documents were uploaded."
+        />
       </div>
 
       {zoom && <Lightbox url={zoom} onClose={() => setZoom('')} />}

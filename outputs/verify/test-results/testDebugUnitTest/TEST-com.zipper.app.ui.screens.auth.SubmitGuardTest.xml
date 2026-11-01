@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.auth.SubmitGuardTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.051Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="the view model refuses a second SMS, sign-in or save" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="login shows busy from the first tap, before its 500 ms delay" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="nothing starts while something is in flight" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="profile setup shows busy from the first tap, before its 300 ms delay" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="a phone bind links once and cannot be unlinked mid-bind" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="an auto-filled code is used once" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <testcase name="the keyboard Done on the code is gated like the Verify button" classname="com.zipper.app.ui.screens.auth.SubmitGuardTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

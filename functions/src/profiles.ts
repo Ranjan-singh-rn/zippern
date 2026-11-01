@@ -1,6 +1,7 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 import { normaliseCrmRole, OWNER_ROLE } from './crmRoles'
+import { ownerMfaVerified, type OwnerMfaToken } from './ownerMfa'
 
 const db = admin.firestore()
 
@@ -96,7 +97,11 @@ export function project(
     level: Number(u.level ?? 0),
     hostLevel: Number(u.hostLevel ?? 0),
     isHost: u.isHost === true,
-    isVerifiedHost: u.isVerifiedHost === true,
+    // FX-10 (RF-15): "verified Host" only while they ARE a Host. `revoke_host`
+    // clears `isHost` and leaves `isVerifiedHost` (the verification record is
+    // history, not a badge), so the public card kept showing a revoked or
+    // purged Host as verified.
+    isVerifiedHost: u.isHost === true && u.isVerifiedHost === true,
     isOfficial: u.isOfficial === true,
     isLive: liveFromRoom,
     isOnline: u.isOnline === true,
@@ -191,6 +196,14 @@ export const syncPublicProfile = functions
     const before = change.before.exists
       ? (change.before.data() as Record<string, any>)
       : null
+
+    // RC (confirmed): a PERMANENTLY deleted account has no public profile. The
+    // purge deletes the projection and then writes the user document — which
+    // fired this trigger and re-created it from the purged fields.
+    if (String(after.accountState ?? '') === 'permanently_deactivated') {
+      await publicRef.delete().catch(() => undefined)
+      return null
+    }
 
     // Every gift, every call tick and every diamond purchase writes the user
     // document. Reprojecting on all of them would roughly double the write cost
@@ -301,6 +314,12 @@ export const backfillPublicProfiles = functions
     const crmSnap = await db.collection('crmUsers').doc(uid).get()
     if (normaliseCrmRole(crmSnap.get('role')) !== OWNER_ROLE) {
       throw new functions.https.HttpsError('permission-denied', 'Owners only.')
+    }
+    // P1-A3b: the role alone is true for a password-only sign-in. The Owner's
+    // CURRENT Firebase sign-in must be bound to an MFA-verified API session.
+    if (!(await ownerMfaVerified(db, uid, context.auth?.token as OwnerMfaToken | undefined))) {
+      throw new functions.https.HttpsError('permission-denied',
+        'Finish two-step sign-in in the CRM first, then try again.')
     }
 
     let written = 0

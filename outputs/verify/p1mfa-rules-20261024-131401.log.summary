@@ -1,0 +1,27 @@
+All 136 storage-rule checks passed.
+storage exit=0
+P1MFA-STORAGE-RESULT checks=35 failures=0
+All 35 storage owner-MFA checks passed.
+p1mfa:storage exit=0
+All 114 firestore-rule checks passed.
+firestore exit=0
+All 255 Phase 1A rule checks passed.
+phase1a exit=0
+All 22 UGP rule checks passed.
+UGP-RESULT checks=22 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+ugp exit=0
+All 95 P1 governance rule checks passed.
+P1GOV-RESULT checks=95 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+p1gov exit=0
+All 115 P1 owner-MFA rule checks passed.
+P1MFA-RESULT checks=115 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+p1mfa exit=0
+All 60 FX rule checks passed.
+FX-RESULT checks=60 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+fx exit=0
+All 74 GOV rule checks passed.
+GOV-RESULT checks=74 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+gov exit=0
+All 58 RC rule checks passed.
+RC-RESULT checks=58 failures=0 ok_denied=0 ok_error=0 no_allowed=0 no_error=0 aborted=0 rules_sha256=414c404fa0dacd113b334157b04afccb93aa4717dcc13f58c354cfc25e2c12a2
+rc exit=0

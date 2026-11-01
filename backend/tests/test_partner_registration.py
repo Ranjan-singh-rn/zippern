@@ -202,6 +202,12 @@ AGENCY_STAFF_REGISTERED = {
 #: sub-agency slab table and routes the payout through the parent.
 AGENCY_STAFF_REGISTERED_SUB = {
     **AGENCY_STAFF_REGISTERED,
+    # A DIFFERENT human. Spreading the parent's fixture inherited its
+    # `crmUid`, which made this a main agency and a sub-agency held by one
+    # person — the combination `partner_roles` now refuses. A sub-agency is a
+    # separate partner one level below an agency, never a second record for
+    # the same login, so the fixture gets its own.
+    "crmUid": "crm-uid-sub-owner",
     "crmId": "D4E5F6G7",
     "agencyName": "Northstar South",
     "type": "sub",
@@ -355,6 +361,34 @@ def fake_second_role_state(*args) -> bool:
 
 ops.get_db = lambda: db
 partner_svc.get_db = lambda: db
+# `partner_ops.create` now claims the human's role family before it writes
+# (one Agency per Firebase identity), and `partner_roles` reads Mongo
+# through its own import, so it needs the same fake db.
+from app.services import partner_roles as _partner_roles  # noqa: E402
+_partner_roles.get_db = lambda: db  # type: ignore[assignment]
+# Approval re-checks the role table (partner_applications) and staff identity
+# (users), so both read the same fake Mongo.
+from app.services import partner_applications as _apps  # noqa: E402
+
+# Phase 1A (AUTH-002): these fixtures are verified people; the guest refusal
+# is covered by tests/test_phase1a_identity.py.
+_apps.is_unverified_guest = lambda uid: False
+from app.services import users as _users_mod  # noqa: E402
+_apps.get_db = lambda: db  # type: ignore[assignment]
+_users_mod.get_db = lambda: db  # type: ignore[assignment]
+# …and the role table reads the person's app profile (Host or not) from
+# Firestore. An empty fake: nobody in this file is a Host or staff.
+from app.db import firebase as _firebase_mod  # noqa: E402
+from tests import harness as _rc_harness  # noqa: E402
+
+# Decision 15 (RC): every login in these fixtures holds BOTH verified contacts
+# (an SMS-linked phone and a code-verified email) — the subject of this module
+# is not the contact rule, which tests/test_rc_contact_verification.py runs with
+# per-uid records, verified and not.
+_firebase_mod.get_user = _rc_harness.verified_auth  # type: ignore[assignment]
+from tests.fakes import FakeFirestore as _FakeFirestore  # noqa: E402
+_role_fs = _FakeFirestore()
+_firebase_mod.firestore_client = lambda: _role_fs  # type: ignore[assignment]
 audit_mod.record = fake_audit_record
 ops.audit.record = fake_audit_record
 ops._read_firestore_partner = fake_read_firestore
@@ -385,8 +419,8 @@ def stored(partner_id: str) -> dict:
 cred = security.PARTNER_REGISTRATION
 
 check("the credential's id", cred.id, "partner-registration")
-check("its allowlist is exactly one operation",
-      sorted(cred.operations), ["partner.register"])
+check("its allowlist is the three onboarding operations",
+      sorted(cred.operations), ["partner.apply", "partner.register", "recharge.request"])
 check("…which is a name the system knows",
       security.Op.PARTNER_REGISTER in security.KNOWN_OPERATIONS, True)
 check("it reads its key from its own environment variable",
@@ -510,6 +544,14 @@ for doc_id, screen, _collection, _document in PATHS:
 
     ok(f"{screen}: nothing exists before registration", doc_id not in db["partners"].docs)
 
+    # Fixture bookkeeping: a sub-agency may be registered only under an
+    # APPROVED, ACTIVE parent — a pending one is refused. In production the
+    # agency was approved long before it created any sub-agency. Set back to
+    # pending after § 2, because § 7 approves it through the real path.
+    if kind == "sub_agency" and parent:
+        stored(parent)["status"] = "approved"
+        stored(parent)["is_active"] = True
+
     result = asyncio.run(ops.create_partner(doc_id, REASON, SERVICE_ACTOR))
     registered[doc_id] = result
 
@@ -560,6 +602,33 @@ subs = [
 ]
 check("every sub-agency hangs off its parent", sorted(subs),
       ["agency-dashboard-sub", "agency-dashboard-sub-2", "agency-staff-sub"])
+
+# The parent was validated on each of them — a sub-agency under a parent that
+# is pending, or that is itself a sub-agency, is refused outright.
+stored("agency-self-signup")["status"] = "pending"
+stored("agency-self-signup")["is_active"] = False
+FIRESTORE["sub-under-pending"] = ("agencies", {
+    **SUB_AGENCY_FROM_DASHBOARD, "agencyName": "Under A Pending Parent",
+})
+pending_msg = refuses(
+    "a sub-agency under a PENDING parent is refused",
+    lambda: ops.create_partner("sub-under-pending", REASON, SERVICE_ACTOR),
+)
+ok("…and the refusal says the parent is pending", "pending" in pending_msg.lower())
+FIRESTORE["sub-under-sub"] = ("agencies", {
+    **SUB_AGENCY_FROM_DASHBOARD, "agencyName": "Sub Under Sub",
+    "parentAgencyId": "agency-staff-sub",
+})
+stored("agency-staff-sub")["status"] = "approved"
+stored("agency-staff-sub")["is_active"] = True
+nested_msg = refuses(
+    "a sub-agency under a SUB-agency is refused — no sub-sub-agency",
+    lambda: ops.create_partner("sub-under-sub", REASON, SERVICE_ACTOR),
+)
+ok("…and the refusal explains the one-level rule", "itself a sub-agency" in nested_msg)
+ok("…and nothing was written", "sub-under-sub" not in db["partners"].docs)
+stored("agency-staff-sub")["status"] = "pending"
+stored("agency-staff-sub")["is_active"] = False
 
 # Every record is audited, under the machine, with the reason it was given.
 for doc_id in EXPECTED:
@@ -708,7 +777,9 @@ backfill_actor = {
 }
 backfilled, made, _ = asyncio.run(
     ops.ensure_partner_record("agency-backfilled", backfill_actor,
-                              "Backfill — created at zero, pending approval.")
+                              "Backfill — created at zero, pending approval.",
+                              # What the script passes: a mirror does not enforce.
+                              enforce_role_family=False)
 )
 check("the backfill created it", made, True)
 stored("agency-backfilled")["status"] = str(PartnerStatus.APPROVED)
@@ -747,6 +818,33 @@ check("…and still only one insert has happened",
 # permanently, for that applicant. So the trigger skips them, and this is the
 # behaviour that makes the skip necessary rather than tidy.
 
+# The backfilled record above belongs to the SAME human (crm-uid-1) and is
+# live. Approval now re-checks the one-agency-family rule against what the
+# person holds today, so approving a second agency for them is refused — the
+# B3 fix — until the duplicate is dealt with.
+try:
+    asyncio.run(ops.approve_partner("agency-self-signup", "Approved after KYC review.",
+                                    {"uid": "staff-1", "name": "Ops Admin",
+                                     "role": "ops_admin", "team": "ops"}))
+    dup_refused = False
+except ops.PartnerOpsError as exc:
+    dup_refused = "agency" in str(exc).lower()
+check("approving a second live agency for one human is refused at approval", dup_refused, True)
+stored("agency-backfilled")["status"] = str(PartnerStatus.REVOKED)
+stored("agency-backfilled")["is_active"] = False
+# C1: a REVOKED agency still counts — revoking the duplicate does not make room
+# for a second one; the way back for a revoked role is a reinstatement request.
+message = refuses(
+    "a revoked duplicate still blocks approving a second agency (C1)",
+    lambda: ops.approve_partner("agency-self-signup", "Approved after KYC review.",
+                                {"uid": "staff-1", "name": "Ops Admin",
+                                 "role": "ops_admin", "team": "ops"}),
+)
+ok("…with the reinstatement sentence", "Request reinstatement" in message)
+# The duplicate is retired as what it should have been — an application that
+# was never granted — which releases the place.
+stored("agency-backfilled")["status"] = str(PartnerStatus.REJECTED)
+
 held = asyncio.run(
     ops.approve_partner("agency-self-signup", "Approved after KYC review.",
                         {"uid": "staff-1", "name": "Ops Admin",
@@ -776,6 +874,13 @@ FIRESTORE["seller-second-role-2"] = ("sellers", {
 FIRESTORE["agency-staff-main"] = (
     "agencies", {**AGENCY_STAFF_REGISTERED, "crmUid": "crm-uid-3"}
 )
+# FX-09: approval resolves the record's login (B07: Mongo `owner_crm_uid`, else
+# the Firestore document's `crmUid`) and refuses a record that names none. In
+# production the register screen's back-link puts `crmUid` on the document the
+# resolver reads; the same document, here, in the fake the resolver reads.
+_role_fs.collection("agencies").docs["agency-staff-main"] = {
+    **AGENCY_STAFF_REGISTERED, "crmUid": "crm-uid-3",
+}
 asyncio.run(ops.approve_partner("agency-staff-main", "Approved after review.",
                                 {"uid": "staff-1", "name": "Ops Admin",
                                  "role": "ops_admin", "team": "ops"}))
@@ -830,8 +935,12 @@ refuses(
 # renamed here would not fail here — it would fail as a blank line on a document
 # nobody reads.
 
+# Its own human: the trigger path is held to the one-agency-per-human rule
+# now, so a fixture that borrows another agency's login is refused — correctly.
 FIRESTORE["agency-shape"] = ("agencies", {
     **AGENCY_SELF_SIGNUP, "crmId": "J0K1L2M3", "agencyName": "Shape Check Media",
+    "crmUid": "crm-uid-shape", "ownerUid": "crm-uid-shape",
+    "ownerEmail": "shape@example.com",
 })
 shape = asyncio.run(ops.create_partner("agency-shape", REASON, SERVICE_ACTOR))
 for field, reader in (
@@ -963,6 +1072,7 @@ left, created_by_backfill, _ = asyncio.run(
     ops.ensure_partner_record(
         "seller-left-behind", backfill_actor,
         "Backfill — this partner existed in Firestore with no business record.",
+        enforce_role_family=False,   # the backfill mirrors; it does not enforce
     )
 )
 check("the backfill creates the missing record", created_by_backfill, True)

@@ -23,8 +23,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { doc, serverTimestamp, updateDoc, Timestamp } from 'firebase/firestore'
-import { db } from '@/lib/firebase'
+import { Timestamp } from 'firebase/firestore'
+import { tickets as apiTickets } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
 import { getFeedbackTickets } from '@/lib/operations'
@@ -267,16 +267,9 @@ export default function OpsFeedbackPage() {
   }, [tickets])
 
   async function writeStatus(ticket: Ticket, next: Status, reason: string) {
-    // updateFeedbackStatus() in lib/operations writes the status and nothing
-    // else. A status change with no reason beside it is the hole this page is
-    // closing, so both land in one write.
-    await updateDoc(doc(db, 'feedbackTickets', ticket.id), {
-      status: next,                       // canonical — this is the migration
-      statusNote: reason,
-      statusChangedAt: serverTimestamp(),
-      statusChangedByName: actorName,
-      ...(TERMINAL.includes(next) ? { resolvedAt: serverTimestamp() } : {}),
-    })
+    // P1-D: the API writes the status (canonical — this is the migration) with
+    // the reason as its note, audits it, and names the actor from the session.
+    await apiTickets.update('feedback', ticket.id, { status: next }, reason)
     const updated: Ticket = {
       ...ticket,
       status: next,

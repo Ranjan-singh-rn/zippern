@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -59,6 +60,30 @@ class VerificationError(Exception):
 
 class VerificationNotFound(VerificationError):
     pass
+
+
+class VerificationNotApplied(VerificationError):
+    """HT-2 — the decision's transaction failed and the decision is not visible.
+
+    409 when the database aborted it, 503 when its outcome could not be
+    established (it may still land). Deciding again is safe: a decision that
+    landed makes the record no longer reviewable, so it cannot be applied twice.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+REVIEW_NOT_APPLIED = (
+    "The database was busy and did not record this decision: the verification is still "
+    "waiting for one. Decide it again — it cannot be applied twice."
+)
+REVIEW_UNKNOWN = (
+    "The database did not confirm this decision, and it is not recorded yet — but it may "
+    "still complete. Reload the verification before deciding again; deciding again is "
+    "safe, it cannot be applied twice."
+)
 
 
 async def _fs(fn, *args, **kwargs):
@@ -274,6 +299,65 @@ async def get_for_review(uid: str) -> dict[str, Any]:
 # ── The decision ──────────────────────────────────────────────────────────────
 
 
+def _apply_review(uid: str, expected_status: str, patch: dict, approved: bool) -> bool:
+    """Blocking — the verdict and `isVerifiedHost`, together, or nothing (B37).
+
+    Returns False, writing nothing, when the record's status is no longer the
+    one the reviewer was shown.
+
+    HT-2: with a `reviewId` in the patch (`review` always sends one), a decision
+    whose answer was lost is recognised — the record carries this review's id
+    and verdict — and reported as applied. It used to come back False ("changed
+    while you were reviewing"), leaving a host verified or rejected with no
+    audit entry and no notice, and a re-review refused. After a Firestore error
+    the record is read again: this review there → True; status moved → False;
+    still waiting → `firebase.TransactionNotApplied` / `TransactionOutcomeUnknown`.
+    """
+    from firebase_admin import firestore
+
+    client = firebase.firestore_client()
+    ver_ref = _ref(uid)
+    user_ref = client.collection(USERS).document(uid.strip())
+    review_id = str(patch.get("reviewId") or "")
+    decided = str(patch.get("status") or "")
+
+    def _ours(data: dict) -> bool:
+        return bool(review_id) and data.get("reviewId") == review_id and str(data.get("status") or "") == decided
+
+    @firestore.transactional
+    def _apply(transaction) -> bool:
+        snap = ver_ref.get(transaction=transaction)
+        if not getattr(snap, "exists", False):
+            return False
+        data = snap.to_dict() or {}
+        if _ours(data):
+            return True  # HT-2: an earlier attempt of this review committed
+        if str(data.get("status") or "") != expected_status:
+            return False
+        transaction.update(ver_ref, patch)
+        transaction.update(user_ref, {"isVerifiedHost": approved})
+        return True
+
+    try:
+        return bool(_apply(client.transaction()))
+    except Exception as exc:
+        kind = firebase.transaction_error_kind(exc)
+        if kind is None or not review_id:
+            raise
+        log.warning("verification decision for %s failed in Firestore (%s); reading it again", uid, exc)
+        try:
+            snap = ver_ref.get()
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("verification decision for %s: the record could not be read again", uid)
+            raise firebase.TransactionOutcomeUnknown(REVIEW_UNKNOWN) from exc
+        data = (snap.to_dict() or {}) if getattr(snap, "exists", False) else None
+        if data is not None and _ours(data):
+            return True
+        if data is None or str(data.get("status") or "") != expected_status:
+            return False
+        raise firebase.unresolved(kind, REVIEW_NOT_APPLIED, REVIEW_UNKNOWN) from exc
+
+
 async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, Any]:
     """Approve or reject a host's identity.
 
@@ -291,6 +375,15 @@ async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, 
 
     if d.get("status") == "verified" and verdict == "verified":
         raise VerificationError("That host is already verified.")
+    # B37: a decision is made on a SUBMITTED capture — the state the review
+    # queue lists — and on nothing else. Deciding a record still waiting for
+    # the host's capture, or one already decided, used to be accepted and
+    # simply overwrote it.
+    if str(d.get("status") or "") not in REVIEWABLE:
+        raise VerificationError(
+            "There is no submitted capture waiting for a decision on this host "
+            f"(the record is '{d.get('status') or 'unknown'}'). Reload the queue."
+        )
 
     before = {
         "status": d.get("status", ""),
@@ -302,6 +395,9 @@ async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, 
 
     patch: dict[str, Any] = {
         "status": verdict,
+        # HT-2: this review's id, so a decision that landed can be told from
+        # one that did not (the record is written by the server only).
+        "reviewId": secrets.token_urlsafe(12),
         "manualReviewedBy": actor.get("uid", ""),
         "manualReviewedByName": actor.get("name", ""),
         "manualReviewedByRole": str(actor.get("role", "")),
@@ -315,16 +411,20 @@ async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, 
     else:
         patch["lastRejectedAt"] = now
 
-    await _fs(_ref(uid).update, patch)
-
-    # Second write, deliberately not batched with the first. If this one fails,
-    # the verification record still shows the verdict and a retry is obvious;
-    # the reverse — a payable flag with no record of who set it — is the state
-    # worth avoiding.
-    await _fs(
-        firebase.firestore_client().collection(USERS).document(uid.strip()).update,
-        {"isVerifiedHost": approved},
-    )
+    # B37: both writes in ONE transaction, conditional on the status that was
+    # read. Two reviewers deciding the same capture used to both write, the
+    # last one winning; and the verdict and the payable flag were two writes,
+    # so a failure between them left the record and the flag disagreeing. Now
+    # either both land, against the capture that was reviewed, or neither does.
+    try:
+        applied = await _fs(_apply_review, uid, str(d.get("status") or ""), patch, approved)
+    except (firebase.TransactionNotApplied, firebase.TransactionOutcomeUnknown) as exc:
+        raise VerificationNotApplied(str(exc), status_code=exc.status_code) from exc
+    if not applied:
+        raise VerificationError(
+            "This verification changed while you were reviewing it. Reload it "
+            "and check what it says now."
+        )
 
     after = {"status": verdict, "isVerifiedHost": approved}
     audit_id = await audit.record(
@@ -351,6 +451,13 @@ async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, 
         },
     )
 
+    # Tell the host. Approval is the moment they become a verified Host;
+    # rejection says so and points at the retry. Delivered last and best
+    # effort — the verdict and its audit row are already committed.
+    from app.services import notices
+
+    notified = await notices.host_verification_decided(uid, approved, reason if not approved else "")
+
     return {
         "uid": uid,
         "before": before,
@@ -359,4 +466,5 @@ async def review(uid: str, verdict: str, reason: str, actor: dict) -> dict[str, 
         # Rejecting does not destroy anything: unreleased weeks are skipped by
         # the payout run, not discarded, so passing later pays all of it.
         "beansHeldNotLost": not approved,
+        "notified": notified,
     }

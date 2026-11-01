@@ -509,3 +509,32 @@ def missing_permissions(role, needed) -> tuple[Permission, ...]:
     """
     wanted = {Permission(str(p)) for p in needed}
     return tuple(p for p in ALL_PERMISSIONS if p in wanted and not has_permission(role, p))
+
+
+# ── What a session may do, said to the client that holds it (mobile parity) ──
+#
+# `GET /api/auth/me` answers with this, so a client — the Android app — decides
+# which screens to OFFER from the server's own table instead of a copy of it.
+# It decides nothing: every route still runs its own dependency, and a screen
+# offered here that a route refuses is answered 403 exactly as before.
+#
+# Only the caller's own facts. A partner's ids are the ones already on their
+# session (and on their sign-in response); an internal session is given none.
+def capability_profile(role_value, partner_ids=None, partner_status=None) -> dict:
+    try:
+        role = Role(str(role_value))
+    except ValueError:
+        role = None
+    internal = role is not None and is_internal(role)
+    external = role is not None and is_external(role)
+    return {
+        "permissions": [str(p) for p in ALL_PERMISSIONS if role is not None and p in PERMISSIONS.get(role, frozenset())],
+        "is_internal": internal,
+        "is_external": external,
+        "is_owner": role == Role.OWNER,
+        "is_observer": role == Role.OBSERVER,
+        "is_team_admin": role is not None and is_team_admin(role),
+        "can_write": internal and can_write(role),
+        "partner_ids": {str(k): str(v) for k, v in dict(partner_ids or {}).items()} if external else {},
+        "partner_status": (str(partner_status) if partner_status is not None else None) if external else None,
+    }

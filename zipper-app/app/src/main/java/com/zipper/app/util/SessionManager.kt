@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import java.util.UUID
 import javax.inject.Inject
@@ -36,21 +37,37 @@ class SessionManager @Inject constructor(
         private val KEY_IS_GUEST = booleanPreferencesKey("session_is_guest")
 
         /**
-         * The address a Firebase email sign-in link was last sent to, while
-         * that link is still out there unopened.
+         * C7 (B01/B02): what the SERVER says this account still owes us — a
+         * phone number, an email, or neither — as `resolveIdentity` answered it
+         * at sign-in.
          *
-         * ── WHY THIS HAS TO BE ON DISK ───────────────────────────────────
+         * Recorded, never routed on. These two used to travel as
+         * `AuthResult.NeedsContactDetails`, which sent a Host, a partner or a
+         * member of staff with a finished profile to profile setup on every
+         * sign-in — a screen that cannot bind a contact — and skipped starting
+         * their session on the way. The verified way to settle either one is
+         * the "Add your phone number / Add your email" row in Settings, which
+         * binds by OTP or by code; the next sign-in re-reads the answer.
+         */
+        /**
+         * FX-21: the uid of this device's GUEST account, remembered when a
+         * guest signs out (see [GuestLinkWarning]). Login reads it to warn
+         * before a phone or Google sign-in opens a separate account.
          *
-         * The link that comes back carries a one-time code and nothing else;
-         * `EmailAuthProvider.getCredentialWithLink` needs the address too. And
-         * the person leaves the app to fetch it — into a mail client, on a
-         * phone that is free to kill this process while they are gone — so a
-         * field on a ViewModel, or on the Activity, is exactly the thing that
-         * will not be there when the link is tapped.
-         *
-         * Cleared by `AuthRepository` the moment the binding succeeds or the
-         * person chooses a different address: this is somebody's email address
-         * and it has no reason to outlive the attempt.
+         * NOT removed by [clear] — it describes the device, not the session,
+         * and the warning exists for the moment after sign-out. It is a hint
+         * for a warning, never a credential: nothing signs in with it.
+         */
+        private val KEY_DEVICE_GUEST_UID = stringPreferencesKey("device_guest_uid")
+
+        private val KEY_REQUIRES_PHONE = booleanPreferencesKey("session_requires_phone")
+        private val KEY_REQUIRES_EMAIL = booleanPreferencesKey("session_requires_email")
+
+        /**
+         * LEGACY (UGP-C): where 1.2.3 kept the address an email sign-in LINK
+         * was sent to. The link flow is gone — binding is a code typed into
+         * the app — so nothing writes this any more. The key is kept only so
+         * [clear] can erase an address an older build left on the device.
          */
         private val KEY_PENDING_EMAIL = stringPreferencesKey("pending_email_link")
 
@@ -59,9 +76,6 @@ class SessionManager @Inject constructor(
 
     val sessionToken: Flow<String> = dataStore.data.map { it[KEY_TOKEN] ?: "" }
     val sessionUid:   Flow<String> = dataStore.data.map { it[KEY_UID]   ?: "" }
-
-    /** The address an unopened email sign-in link went to, or "". */
-    val pendingEmailLink: Flow<String> = dataStore.data.map { it[KEY_PENDING_EMAIL] ?: "" }
 
     /**
      * The server's answer, or **null** when it has never been asked on this
@@ -82,6 +96,26 @@ class SessionManager @Inject constructor(
      */
     val isGuest: Flow<Boolean?> = dataStore.data.map { it[KEY_IS_GUEST] }
 
+    /**
+     * C7: does this account still owe a phone number / an email? False until
+     * the server has said so — the same "ask for nothing until told" default
+     * profile setup uses. See [KEY_REQUIRES_PHONE].
+     */
+    val requiresPhone: Flow<Boolean> = dataStore.data.map { it[KEY_REQUIRES_PHONE] ?: false }
+    val requiresEmail: Flow<Boolean> = dataStore.data.map { it[KEY_REQUIRES_EMAIL] ?: false }
+
+    /**
+     * Phase 1A (SESSION-001): [payload] with this device's active mobile session
+     * id attached as `sessionId`, for every callable. The SERVER decides what it
+     * means (`assertActiveSession`); attaching it is the client half only.
+     * An explicit `sessionId` already in the payload is left alone.
+     */
+    suspend fun withSession(payload: Map<String, Any>): Map<String, Any> {
+        if (payload.containsKey("sessionId")) return payload
+        val sid = try { sessionToken.first() } catch (_: Exception) { "" }
+        return if (sid.isBlank()) payload else payload + ("sessionId" to sid)
+    }
+
     suspend fun save(uid: String, token: String) {
         dataStore.edit { prefs ->
             prefs[KEY_TOKEN] = token
@@ -99,13 +133,27 @@ class SessionManager @Inject constructor(
         dataStore.edit { prefs -> prefs[KEY_IS_GUEST] = isGuest }
     }
 
-    /** See [KEY_PENDING_EMAIL]. Written when the link is sent, not before. */
-    suspend fun setPendingEmailLink(email: String) {
-        dataStore.edit { prefs -> prefs[KEY_PENDING_EMAIL] = email }
+    /** FX-21: this device's remembered guest account, "" when none. See [KEY_DEVICE_GUEST_UID]. */
+    val deviceGuestUid: Flow<String> = dataStore.data.map { it[KEY_DEVICE_GUEST_UID] ?: "" }
+
+    suspend fun setDeviceGuestUid(uid: String) {
+        dataStore.edit { prefs -> prefs[KEY_DEVICE_GUEST_UID] = uid }
     }
 
-    suspend fun clearPendingEmailLink() {
-        dataStore.edit { prefs -> prefs.remove(KEY_PENDING_EMAIL) }
+    suspend fun clearDeviceGuestUid() {
+        dataStore.edit { prefs -> prefs.remove(KEY_DEVICE_GUEST_UID) }
+    }
+
+    /**
+     * Record the server's contact requirement (C7). Written by `gateIdentity`
+     * beside [setGuest], for the same reason it is separate from [save]: it
+     * arrives from `resolveIdentity`, before the session is minted.
+     */
+    suspend fun setContactRequirement(requiresPhone: Boolean, requiresEmail: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[KEY_REQUIRES_PHONE] = requiresPhone
+            prefs[KEY_REQUIRES_EMAIL] = requiresEmail
+        }
     }
 
     suspend fun clear() {
@@ -113,9 +161,12 @@ class SessionManager @Inject constructor(
             prefs.remove(KEY_TOKEN)
             prefs.remove(KEY_UID)
             prefs.remove(KEY_IS_GUEST)
-            // A half-finished binding belongs to the session that started it.
-            // Left behind, it is one person's address waiting to be decoded
-            // against the next person's link on a shared handset.
+            // A requirement belongs to the account that was signed in, not to
+            // the next one on this phone.
+            prefs.remove(KEY_REQUIRES_PHONE)
+            prefs.remove(KEY_REQUIRES_EMAIL)
+            // An address left by an older build's email-link flow (see
+            // KEY_PENDING_EMAIL) — somebody's email has no reason to outlive it.
             prefs.remove(KEY_PENDING_EMAIL)
         }
     }

@@ -123,6 +123,33 @@ ok(
     "assert_secure_configuration(settings)" in main_src,
 )
 
+# ── ENVIRONMENT fails closed ────────────────────────────────────────────────
+import os as _os  # noqa: E402
+
+GOOD = "a" * MIN_SECRET_CHARS
+ok("a misspelled ENVIRONMENT refuses to start",
+   any("ENVIRONMENT" in p for p in secret_problems(Settings(environment="prodution", jwt_secret=GOOD))))
+ok("an empty ENVIRONMENT refuses to start",
+   any("ENVIRONMENT" in p for p in secret_problems(Settings(environment="", jwt_secret=GOOD))))
+ok("'test' is a recognised environment", secret_problems(Settings(environment="test")) == [])
+_prev = _os.environ.get("K_SERVICE")
+_os.environ["K_SERVICE"] = "zipper-api"
+try:
+    ok("on Cloud Run, a development ENVIRONMENT refuses to start",
+       any("Cloud Run" in p for p in secret_problems(Settings(environment="development"))))
+    ok("on Cloud Run, production with a real secret starts",
+       secret_problems(Settings(environment="production", jwt_secret=GOOD)) == [])
+    ok("on Cloud Run, production with the placeholder still refuses",
+       len(secret_problems(Settings(environment="production"))) == 1)
+finally:
+    if _prev is None:
+        _os.environ.pop("K_SERVICE", None)
+    else:
+        _os.environ["K_SERVICE"] = _prev
+
+ok("CORS never pairs a wildcard origin with credentials",
+   "allow_credentials=settings.is_production" in main_src and "allow_credentials=True" not in main_src)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  A2 — account state is checked on EVERY authenticated request
@@ -380,16 +407,41 @@ ok(
 print("\n── A7: capability changes, and the audit ───────────────────────────────")
 
 po_src = (ROOT / "app" / "services" / "partner_ops.py").read_text()
-approve = po_src[po_src.index("async def approve_partner") :][:9000]
+# Decision 15 (RC): approval's body is `_start_role` (shared with the
+# activation of an Owner-approved, verification-pending record), and the
+# Owner's early approval is `_approve_pending_verification`. Both must revoke.
+start_role = po_src[po_src.index("async def _start_role(") :]
+start_role = start_role[: start_role.index("\nasync def ", 10)]
 ok(
     "approving a partner revokes the session that predates the capability",
-    "_revoke_partner_sessions" in approve,
+    "_revoke_partner_sessions" in start_role,
 )
+pending_v = po_src[po_src.index("async def _approve_pending_verification(") :]
+pending_v = pending_v[: pending_v.index("\nasync def ", 10)]
+ok(
+    "…and so does the Owner's approval pending verification (the waiting room must re-route)",
+    "_revoke_partner_sessions" in pending_v,
+)
+# Seven doors now: approve (the role starts), approve pending verification
+# (Decision 15), reject, deactivate, revoke — (B39) restore, the one that
+# hands a capability BACK, which a session minted while it was withdrawn does
+# not carry — and (D17) the hold of a legacy role whose login lacks a verified
+# contact, which withdraws the capability like a deactivation. Each must kill
+# the live token, or the decision starts in up to seven days.
 check(
-    "rejection and deactivation still do too — three doors, three revokes",
+    "rejection, deactivation, revocation, restoration and the D17 hold do too — seven doors, seven revokes",
     po_src.count("await _revoke_partner_sessions("),
-    3,
+    7,
 )
+hold = po_src[po_src.index("async def hold_for_verification(") :]
+hold = hold[: hold.index("\nasync def ", 10)]
+ok("the D17 hold revokes the live session", "await _revoke_partner_sessions(updated)" in hold)
+revoke = po_src[po_src.index("async def revoke_partner") :]
+revoke = revoke[: revoke.index("\n# ═══", 10)]
+ok("revocation revokes the live session", "_revoke_partner_sessions" in revoke)
+# C1 / B04: and it does NOT release the role-family slot — a revoked role still
+# counts, and the way back is a reinstatement request the Owner decides.
+ok("…and KEEPS the role-family slot", "release_role_family(" not in revoke)
 
 audit_src = (ROOT / "app" / "core" / "audit.py").read_text()
 for action in ("SESSION_ENDED", "SESSION_DISPLACED", "USER_FIREBASE_REVOKE_FAILED"):

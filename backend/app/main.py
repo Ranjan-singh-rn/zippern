@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import assert_secure_configuration, settings
+from app.core import isolation
 from app.db import firebase, mongo
 from app.routers import (
     audit,
@@ -22,12 +23,17 @@ from app.routers import (
     capital,
     cards,
     chance,
+    documents,
     expenses,
     notifications,
     partner_ops,
     partners,
+    public_appeals,
     reports,
+    role_appeals,
     staff,
+    tickets,
+    transfer_requests,
     users,
     verification,
 )
@@ -47,6 +53,13 @@ async def lifespan(_: FastAPI):
     # exempt. This raises, which fails the deployment loudly rather than serving
     # traffic signed with a key that is in the repository.
     assert_secure_configuration(settings)
+
+    # Outside production every destination must be on this machine (MongoDB,
+    # the Firebase emulators) and no email is sent; in production off Cloud Run
+    # the run must be confirmed. Checked here so every problem is named at once
+    # — `firebase.init()` and `mongo.connect()` repeat their own half anyway.
+    isolation.assert_local_isolation(settings)
+    log.info("Isolation: %s", isolation.describe(settings))
 
     firebase.init()
     await mongo.connect()
@@ -68,9 +81,13 @@ app.add_middleware(
         "https://zipperlive.web.app",
         "https://zipperlive.firebaseapp.com",
     ],
-    allow_credentials=True,
+    # Bearer tokens only — no cookie auth anywhere — so credentials are never
+    # needed, and a wildcard origin must never be paired with them.
+    allow_credentials=settings.is_production,
     allow_methods=["*"],
     allow_headers=["*"],
+    # P1-A3: lets the CRM tell "finish two-step sign-in" from any other 403.
+    expose_headers=["X-Zipper-MFA-Required"],
 )
 
 app.include_router(auth.router, prefix="/api")
@@ -80,6 +97,12 @@ app.include_router(partners.router, prefix="/api")
 app.include_router(staff.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(partner_ops.router, prefix="/api")
+# C2 — reinstatement of a revoked role: the person asks, a reviewer recommends,
+# the Owner decides. `/api/partner-ops/role-appeals`.
+app.include_router(role_appeals.router, prefix="/api")
+# C3 — transfers between agencies: an admin requests, the Owner decides.
+# `/api/partner-ops/transfers`.
+app.include_router(transfer_requests.router, prefix="/api")
 # Operating expenditure — the other half of the owner's profit definition.
 app.include_router(expenses.router, prefix="/api")
 # The owners' capital account. Money the owners put in and take back is cash
@@ -104,6 +127,22 @@ app.include_router(chance.router, prefix="/api")
 # weekly earnings for withdrawal — so it belongs in the same append-only audit
 # trail as bans, balance cards and payouts.
 app.include_router(verification.router, prefix="/api")
+
+# Short-lived signed links to KYC and identity documents. The CRM used to
+# render the permanent `?alt=media&token=` URL stored at upload — a bearer
+# credential that never expires and that Storage Rules are never consulted
+# for. This route authorises the caller and mints a fifteen-minute URL
+# instead; the stored string never leaves the API.
+app.include_router(documents.router, prefix="/api")
+
+# UGP-F: the PUBLIC appeal — a person locked out of their account files an
+# appeal from a web page, without signing in. Writes the existing `appeals`
+# collection (so the CRM inbox and decision are unchanged) and never lifts a
+# restriction. See `app/services/public_appeals.py`.
+app.include_router(public_appeals.router, prefix="/api")
+# P1-D: ticket workflows — the only writer of techTickets / feedbackTickets /
+# supportTickets; the Firestore rules refuse client mutations of them.
+app.include_router(tickets.router, prefix="/api")
 
 
 @app.get("/api/health")

@@ -107,35 +107,45 @@ sealed class Screen(val route: String) {
     object SecureAccount : Screen("secure_account")
 
     /**
-     * The same thing by email. Reached from Settings, and from the Android
-     * intent that carries the sign-in link back into the app.
-     *
-     * No arguments, for the reason [SecureAccount] has none and one more: the
-     * link itself is a one-time credential in a query string, and a route is a
-     * string the nav library keeps in the back stack. It travels through
-     * `EmailLinkReturn` instead.
+     * The same thing by email — a six-digit code typed into the app (UGP-C).
+     * Reached from Settings only; no intent or deep link leads here any more.
      */
     object SecureEmail : Screen("secure_email")
+
+    /**
+     * Approved contact rule — the SAME two verification screens, opened from the
+     * partner hub or an application form when the server says a verified
+     * contact is required. They differ from the Settings entries in one thing:
+     * Done returns to the hub or the form that opened them (which re-reads the
+     * server's answer on resume), never to Settings.
+     */
+    object SecureAccountForPartner : Screen("secure_account_partner")
+    object SecureEmailForPartner : Screen("secure_email_partner")
 
     object FaceVerification : Screen("face_verification/{gender}") {
         fun createRoute(gender: String) = "face_verification/$gender"
         val navArguments = listOf(navArgument("gender") { type = NavType.StringType })
     }
 
+
     /**
-     * Redeem an agency referral code on an account that already exists.
-     *
-     * The code field used to live on the first-run profile setup form and
-     * nowhere else, so an agency could invite somebody who already had the app
-     * and that person had no way to accept — the code was shown on their profile
-     * as a read-only row, and the Go Live screen told them to "apply with an
-     * agency referral code" with nowhere to type one.
-     *
-     * No arguments: the server reads the identity it matches on from the caller's
-     * own token and user document, and anything this route carried would be a
-     * second, weaker answer to a question already settled server-side.
+     * "Become a partner" — Host, Agency, Sub-agency or Coin Seller, offered or
+     * greyed out according to the server's eligibility table, plus the
+     * applications this person has in flight. Replaces the lone "Join an
+     * agency" row; the referral-code route is still reachable from here.
      */
-    object JoinAgency : Screen("join_agency")
+    object PartnerHub : Screen("partner_hub")
+
+    /** The application form for one role. `kind` is host|agency|sub_agency|seller. */
+    object PartnerApply : Screen("partner_apply/{kind}") {
+        fun createRoute(kind: String) = "partner_apply/$kind"
+    }
+
+    /** "I have paid this seller" — files a recharge request for staff to verify. */
+    object RechargeRequest : Screen("recharge_request/{sellerId}/{sellerName}") {
+        fun createRoute(sellerId: String, sellerName: String) =
+            "recharge_request/$sellerId/${android.net.Uri.encode(sellerName.ifBlank { "-" })}"
+    }
 
     // Main shell
     object Main          : Screen("main")
@@ -255,6 +265,19 @@ sealed class Screen(val route: String) {
         val navArguments = listOf(
             navArgument("callId") { type = NavType.StringType }
         )
+    }
+
+    // ── Work (mobile parity: CRM capabilities for partners and staff) ───────
+    /** The role-aware hub — what the API session may do, grouped. */
+    object Work : Screen("work")
+    /** One declared work screen (`data/work/WorkModules`). `p` pre-fills its first parameter. */
+    object WorkModule : Screen("work/m/{moduleId}?p={p}") {
+        fun createRoute(moduleId: String, param: String = "") =
+            "work/m/$moduleId?p=${android.net.Uri.encode(param)}"
+    }
+    /** The selected row of a work screen (held in `WorkSelection`, not in the route). */
+    object WorkDetail : Screen("work/d/{moduleId}") {
+        fun createRoute(moduleId: String) = "work/d/$moduleId"
     }
 
     // Agency / Seller dashboards

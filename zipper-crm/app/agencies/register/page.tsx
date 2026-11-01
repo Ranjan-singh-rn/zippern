@@ -59,7 +59,7 @@ import { useState, useRef, useEffect } from 'react'
 import { db, storage } from '@/lib/firebase'
 import { addDoc, collection, serverTimestamp, doc, getDoc, updateDoc } from 'firebase/firestore'
 import {
-  createAgencyAccount, createPartnerLogin, generateCrmId, canAccess,
+  createAgencyAccount, createPartnerLoginThen, generateCrmId, canAccess,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
 import {
@@ -86,6 +86,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { submitApproval } from '@/lib/approvals'
+import { isRecordNotWritten, recordNotWrittenMessage } from '@/lib/loginThenRecord'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useAuth } from '@/components/AuthProvider'
@@ -93,6 +94,8 @@ import {
   findPartnersByEmail, normaliseEmail, statusPhrase, loginPhrase,
   duplicateHeadline, type ExistingPartner,
 } from '@/lib/partnerDuplicates'
+import PhoneInput from '@/components/PhoneInput'
+import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
 
 /**
  * What happened to the agency's login, kept separate from "the agency was
@@ -164,6 +167,8 @@ export default function RegisterAgencyPage() {
     password:             '',
     confirmPassword:      '',
   })
+  // Flags an already-registered email / phone while it is being typed.
+  const registered = useRegisteredCheck(form.ownerEmail, form.ownerPhone)
   const [aadhaarUrl, setAadhaarUrl] = useState('')
   const [panUrl, setPanUrl] = useState('')
   const [passbookUrl, setPassbookUrl] = useState('')
@@ -343,13 +348,13 @@ export default function RegisterAgencyPage() {
                   Owner Phone *
                 </span>
               </label>
-              <input
-                type="tel"
+              <PhoneInput
                 className={inputClass}
-                placeholder="e.g. 9876543210"
+                placeholder="Mobile number"
                 value={form.ownerPhone}
-                onChange={(e) => handleFormChange('ownerPhone', e.target.value)}
+                onChange={(v) => handleFormChange('ownerPhone', v)}
               />
+              {registered.phone && <p className="text-xs text-red-400 mt-1">{registered.phone}</p>}
             </div>
 
             <div>
@@ -366,6 +371,7 @@ export default function RegisterAgencyPage() {
                 value={form.ownerEmail}
                 onChange={(e) => handleFormChange('ownerEmail', e.target.value)}
               />
+              {registered.email && <p className="text-xs text-red-400 mt-1">{registered.email}</p>}
             </div>
           </div>
 
@@ -775,15 +781,68 @@ export default function RegisterAgencyPage() {
         // here on the flow carries `crmUid`, which identifies the login and
         // unlocks nothing. `adminMode: true` runs it on a throwaway secondary
         // Firebase app so the staff member's own session survives.
+        //
+        // RC: the record is written INSIDE the login's step (`createPartnerLoginThen`),
+        // so when it fails the login made a moment ago is removed again rather
+        // than left in Auth holding the address with nothing behind it — the
+        // retry this page invites would otherwise be refused on the address.
         let crmUid: string
+        let createdAgencyId = ''
         try {
-          crmUid = await createPartnerLogin({
-            email:     emailLower,
-            password:  form.password,
-            kind:      'agency',
-            adminMode: true,
-          })
+          const created = await createPartnerLoginThen(
+            { email: emailLower, password: form.password, kind: 'agency' },
+            async (uid) => {
+              if (isSuperAdmin) {
+                // ── Superadmin: create directly ─────────────────────────────
+                //
+                // Written WITHOUT `crmUid`. If the two writes below fail, the
+                // record is left with no login attached — which is exactly what
+                // `/agencies` badges, so the state is visible rather than
+                // invisible.
+                const docRef = await addDoc(collection(db, 'agencies'), {
+                  ...agencyPayload,
+                  createdAt:      serverTimestamp(),
+                  kycSubmittedAt: serverTimestamp(),
+                })
+                return docRef.id
+              }
+              // ── Admin / other: submit for superadmin approval ─────────────
+              //
+              // `crmUid` — not a password — is what travels through the queue.
+              // It names the Firebase Auth account created moments ago, and it
+              // is a public identifier: holding it grants nothing, and nobody,
+              // superadmin included, can read the password back out of it.
+              //
+              // `onApprovalApproved` in functions/src/index.ts writes the
+              // `crmUsers` document against that uid when the request is
+              // approved, and does it BEFORE it creates the agency, so a
+              // failure there leaves no agency behind rather than one nobody
+              // can sign in as.
+              await submitApproval({
+                type:             'create_agency',
+                description:      `New agency registration: ${form.agencyName} (${form.ownerName})`,
+                targetLabel:      `Agency: ${form.agencyName}`,
+                targetCollection: 'agencies',
+                targetDocId:      '',   // will be created on approval
+                operation:        'create',
+                payload:          { ...agencyPayload, crmUid: uid },
+                requestedBy: {
+                  uid:  crmUser!.uid,
+                  name: crmUser!.name,
+                  role: crmUser!.role,
+                },
+              })
+              return ''
+            },
+          )
+          crmUid = created.uid
+          createdAgencyId = created.result
         } catch (authErr: unknown) {
+          if (isRecordNotWritten(authErr)) {
+            console.error('Agency record could not be written:', authErr.reason)
+            setError(recordNotWrittenMessage(authErr, emailLower, 'agency'))
+            return
+          }
           setError(
             errorCode(authErr) === 'auth/email-already-in-use'
               ? `A login already exists for ${emailLower}, so nothing was created. `
@@ -797,28 +856,18 @@ export default function RegisterAgencyPage() {
         }
 
         if (isSuperAdmin) {
-          // ── Superadmin: create directly ───────────────────────────────────
-          //
-          // Written WITHOUT `crmUid`. If the two writes below fail, the record
-          // is left with no login attached — which is exactly what `/agencies`
-          // badges, so the state is visible rather than invisible.
-          const docRef = await addDoc(collection(db, 'agencies'), {
-            ...agencyPayload,
-            createdAt:      serverTimestamp(),
-            kycSubmittedAt: serverTimestamp(),
-          })
-          setAgencyId(docRef.id)
+          setAgencyId(createdAgencyId)
 
           try {
             await createAgencyAccount({
               email:     emailLower,
               name:      form.ownerName,
               phone:     form.ownerPhone,
-              agencyId:  docRef.id,
+              agencyId:  createdAgencyId,
               adminMode: true,
               uid:       crmUid,
             })
-            await updateDoc(doc(db, 'agencies', docRef.id), { crmUid })
+            await updateDoc(doc(db, 'agencies', createdAgencyId), { crmUid })
             setLogin({ kind: 'attached', email: emailLower })
           } catch (linkErr: unknown) {
             // The agency record is committed and is a real application, so it
@@ -836,31 +885,6 @@ export default function RegisterAgencyPage() {
           setCreatedReferralCode(referralCode)
           setSubmittedForApproval(false)
         } else {
-          // ── Admin / other: submit for superadmin approval ─────────────────
-          //
-          // `crmUid` — not a password — is what travels through the queue. It
-          // names the Firebase Auth account created moments ago, and it is a
-          // public identifier: holding it grants nothing, and nobody, superadmin
-          // included, can read the password back out of it.
-          //
-          // `onApprovalApproved` in functions/src/index.ts writes the
-          // `crmUsers` document against that uid when the request is approved,
-          // and does it BEFORE it creates the agency, so a failure there leaves
-          // no agency behind rather than one nobody can sign in as.
-          await submitApproval({
-            type:             'create_agency',
-            description:      `New agency registration: ${form.agencyName} (${form.ownerName})`,
-            targetLabel:      `Agency: ${form.agencyName}`,
-            targetCollection: 'agencies',
-            targetDocId:      '',   // will be created on approval
-            operation:        'create',
-            payload:          { ...agencyPayload, crmUid },
-            requestedBy: {
-              uid:  crmUser!.uid,
-              name: crmUser!.name,
-              role: crmUser!.role,
-            },
-          })
           setLogin({ kind: 'attached', email: emailLower })
           setCreatedReferralCode(referralCode)
           setSubmittedForApproval(true)

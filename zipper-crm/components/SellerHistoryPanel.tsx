@@ -49,6 +49,8 @@ import {
 import { Empty, Loading, UnavailablePanel, Warning } from '@/components/ui/States'
 import { DateRangePicker, defaultRange, toParams, type Range } from '@/components/ui/DateRange'
 import { ApiError } from '@/lib/api'
+import { nameOrReference, type IdentityFacts } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import { failureCode, ok, toFailure, type ReadFailure, type ReadResult } from '@/lib/readState'
 import {
   statements, coins as coinText, inrExact, whenExact,
@@ -222,6 +224,12 @@ function HistoryBody({
   they: string
   periodLabel: string
 }) {
+  // B1: a sale's counterparty is the buyer's Firebase uid. Named from the PUBLIC
+  // profile — a name only, never an email or phone — so the same rule holds for
+  // the seller's own portal and the staff view of this panel.
+  const buyers = useIdentities({
+    publicPeople: history.rows.filter((r) => r.kind === 'sale').map((r) => r.counterparty ?? ''),
+  })
   const t = history.totals
   const capped =
     history.sources.cards_capped ||
@@ -348,7 +356,7 @@ function HistoryBody({
               </thead>
               <tbody>
                 {history.rows.map((row, i) => (
-                  <Row key={rowKey(row, i)} row={row} audience={audience} />
+                  <Row key={rowKey(row, i)} row={row} audience={audience} buyer={buyers.publicPeople.get(row.counterparty ?? '')} />
                 ))}
               </tbody>
             </table>
@@ -366,7 +374,7 @@ function rowKey(row: SellerHistoryRow, i: number): string {
   return `${row.source}:${row.card_id ?? row.sale_id ?? ''}:${row.at ?? ''}:${i}`
 }
 
-function Row({ row, audience }: { row: SellerHistoryRow; audience: Audience }) {
+function Row({ row, audience, buyer }: { row: SellerHistoryRow; audience: Audience; buyer?: IdentityFacts }) {
   const Icon = KIND_ICON[row.kind] ?? Coins
   const stage = row.card_stage ?? ''
 
@@ -407,7 +415,7 @@ function Row({ row, audience }: { row: SellerHistoryRow; audience: Audience }) {
 
       <td className="px-3 sm:px-5 py-3 text-xs text-slate-400 hidden sm:table-cell break-all max-w-[10rem]">
         {row.kind === 'sale'
-          ? row.counterparty || 'a buyer'
+          ? row.counterparty ? nameOrReference(buyer, row.counterparty, 'buyer') : 'a buyer'
           : audience === 'owner'
             ? 'Us'
             : 'Zipper'}

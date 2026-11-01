@@ -1,0 +1,49 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/core/deps.py
++++ b/backend/app/core/deps.py
+@@ -317,11 +317,44 @@
+             status_code=status.HTTP_403_FORBIDDEN, detail=exc.message
+         ) from exc
+ 
++    _refuse_owner_without_mfa(request, user)
++
+     # Nothing below this line runs for an internal session: `is_external` is an
+     # allowlist of the two partner roles, so an owner, a team member, the
+     # observer and a machine credential all fall straight through unchanged.
+     _refuse_unreachable_route(request, user)
+     return user
++
++
++#: Returned on an Owner route reached before MFA. The CRM reads this header
++#: (not the message) to show the second-factor step.
++MFA_REQUIRED_HEADER = "X-Zipper-MFA-Required"
++
++
++def _refuse_owner_without_mfa(request: Request | None, user: dict) -> None:
++    """P1-A3 — an Owner session that has not passed MFA reaches the MFA routes,
++    `me` and sign-out, and nothing else.
++
++    Server-side, on every route, because every route depends on
++    `current_user`. The browser gate this replaces could be skipped by anyone
++    holding the password; this cannot, because the API itself refuses.
++    A request whose route cannot be identified is refused, as for partners.
++    """
++    if user.get("role") != R.Role.OWNER or user.get("mfa_verified"):
++        return
++    from app.config import settings
++    from app.services.owner_mfa import MFA_PENDING_ROUTES
++
++    if not settings.owner_mfa_required:
++        return
++    key = _route_key(request)
++    if key is not None and key in MFA_PENDING_ROUTES:
++        return
++    raise HTTPException(
++        status_code=status.HTTP_403_FORBIDDEN,
++        detail="Two-step sign-in required. Enter the code from your authenticator app.",
++        headers={MFA_REQUIRED_HEADER: "1"},
++    )
+ 
+ 
+ # ══════════════════════════════════════════════════════════════════════════════

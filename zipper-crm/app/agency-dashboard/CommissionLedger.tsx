@@ -181,7 +181,7 @@ function LedgerRow({ entry }: { entry: LedgerEntry }) {
             )}
             {hostId && (
               <span className="text-slate-600 text-[11px] font-mono truncate max-w-[9rem]">
-                host {hostId}
+                Host ID: {hostId}
               </span>
             )}
             {paymentRef && (

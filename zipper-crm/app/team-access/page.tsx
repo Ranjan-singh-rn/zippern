@@ -95,7 +95,7 @@ export default function TeamAccess() {
   async function deactivate(m: StaffMember, reason: string) {
     try {
       await api.staff.deactivate(m.uid, reason.trim())
-      setNotice(`${m.name || m.email} no longer has access.`)
+      setNotice(`${m.name || m.email} no longer has staff access. Their personal Zipper app account is not affected; restore access from /team.`)
       setRevoking(null)
       await load()
     } catch (err) {
@@ -306,7 +306,7 @@ function RevokePanel({
 
         <div className="px-6 py-5 space-y-4">
           <p className="text-slate-300 text-sm">
-            {member.name || member.email} will no longer be able to sign in.
+            {member.name || member.email} will lose staff access to the CRM and the API. Their personal Zipper app account is not affected, and access can be restored from /team.
           </p>
           <div>
             <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">

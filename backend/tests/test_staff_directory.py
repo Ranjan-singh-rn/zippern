@@ -405,12 +405,17 @@ check("a second pass leaves it absent by design", again.action, "absent_by_desig
 check("still nothing under its uid", crm_door_open(OBSERVER_UID), None)
 check("and nothing under its address", crm.find_by_email(OBSERVER_EMAIL), [])
 
-# Not even a deactivation writes one.
-asyncio.run(
-    svc.deactivate(OBSERVER_UID, OWNER, "Rotating the observer to a new person.")
-)
+# Phase 1A (STAFF-001): CHANGED EXPECTATION. The observer cannot be
+# deactivated at all — the attempt is refused — and still nothing is written.
+try:
+    asyncio.run(
+        svc.deactivate(OBSERVER_UID, OWNER, "Rotating the observer to a new person.")
+    )
+    check("an owner deactivating the observer is refused", "allowed", "refused")
+except svc.StaffError:
+    check("an owner deactivating the observer is refused", "refused", "refused")
 check(
-    "deactivating the observer writes no document either",
+    "and no document is written for it",
     crm.find_by_email(OBSERVER_EMAIL),
     [],
 )
@@ -486,20 +491,19 @@ promoted = asyncio.run(
     )
 )
 ARJUN = promoted["uid"]
-asyncio.run(svc.change_role(ARJUN, Role.OWNER, OWNER, "Third owner, agreed at the board."))
-check("a promotion to owner writes superadmin", crm_door_open(ARJUN)["role"], "superadmin")
-check("and the API record says owner", api_door_open(ARJUN)["role"], "owner")
-
-asyncio.run(
-    svc.change_role(ARJUN, Role.OBSERVER, OWNER, "Stepping back to a watching role.")
-)
-check(
-    "a change to observer DELETES the document rather than downgrading it",
-    crm_door_open(ARJUN),
-    None,
-)
-check("and leaves none under the address", crm.find_by_email("arjun@example.com"), [])
-check("while the API record says observer", api_door_open(ARJUN)["role"], "observer")
+# Phase 1A (STAFF-001/002): CHANGED EXPECTATION. An Owner can no longer
+# promote anybody to Owner or Observer through `change_role` — Owners are made
+# by the observer, and there is exactly one observer. Both are refused, and
+# neither record moves.
+for target_role, why in ((Role.OWNER, "Third owner, agreed at the board."),
+                         (Role.OBSERVER, "Stepping back to a watching role.")):
+    try:
+        asyncio.run(svc.change_role(ARJUN, target_role, OWNER, why))
+        check(f"a change to {target_role} via change_role is refused", "allowed", "refused")
+    except svc.StaffError:
+        check(f"a change to {target_role} via change_role is refused", "refused", "refused")
+check("the API record is unchanged", api_door_open(ARJUN)["role"], "ops_member")
+check("and so is the CRM document", crm_door_open(ARJUN)["role"], "ops_member")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -684,10 +688,12 @@ for role in sorted(R.MEMBER_ROLES, key=str):
     ok(f"{role} does not hold CAN_MANAGE_TEAM",
        not R.has_permission(role, R.Permission.CAN_MANAGE_TEAM))
 
-# Every staff role plus `owner` — and NOT `observer`, which is a single
-# permanent account rather than a role anyone hands out.
-ok("an owner is offered every staff role and owner",
-   len(svc.assignable_roles(Role.OWNER)) == len(R.STAFF_ROLES) + 1)
+# Phase 1A (STAFF-001): CHANGED EXPECTATION. Every department role and
+# nothing else — not `owner` (the observer provisions owners) and not
+# `observer`, which is a single permanent account.
+ok("an owner is offered every department role and nothing else",
+   sorted(map(str, svc.assignable_roles(Role.OWNER))) == sorted(map(str, R.STAFF_ROLES)))
+ok("and not the owner role", Role.OWNER not in svc.assignable_roles(Role.OWNER))
 ok("but not the observer",
    Role.OBSERVER not in svc.assignable_roles(Role.OWNER))
 check("the observer may provision an owner, and only that",

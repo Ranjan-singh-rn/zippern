@@ -104,6 +104,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import SecureDocuments from '@/components/SecureDocuments'
 import Link from 'next/link'
 import {
   AlertTriangle, ArrowRight, Building2, CheckCircle2, ChevronRight, Clock,
@@ -579,6 +580,7 @@ export default function Kyc() {
                 <ReviewCard
                   key={`${category}-${item.id}`}
                   item={item}
+                  category={category}
                   onZoom={setZoom}
                   mayDecide={mayDecide}
                   onDecide={(action) => setPending({ item, action })}
@@ -715,10 +717,29 @@ function EmptyQueue({
 
 // ── One record under review ───────────────────────────────────────────────────
 
+/**
+ * Which backend document collection each queue's rows live in.
+ *
+ * `reapproval` maps to 'agency' because a re-approval row is a proposed change
+ * to a partner record and `item.id` is that partner's id. A reapproval row for
+ * a host carries `linkage === 'reapproval_host'`, and those propose no new
+ * documents at all — the branch above renders copy rather than this component
+ * — so the mapping is never exercised for one.
+ */
+const DOC_KIND: Record<Category, 'agency' | 'seller' | 'host'> = {
+  main_agency: 'agency',
+  sub_agency:  'agency',
+  coin_seller: 'seller',
+  host:        'host',
+  reapproval:  'agency',
+}
+
 function ReviewCard({
-  item, onZoom, onDecide, mayDecide,
+  item, category, onZoom, onDecide, mayDecide,
 }: {
   item: Item
+  /** Which queue this row came from — decides the document kind below. */
+  category: Category
   onZoom: (url: string) => void
   onDecide: (action: DecisionAction) => void
   /** Holds `can_approve_kyc`. Without it the queue is readable, not actionable. */
@@ -801,6 +822,15 @@ function ReviewCard({
         </p>
       )}
 
+      {/* FX-12: the same human, filed twice (a self-application and an
+          invitation, or a legacy duplicate). Information for the reviewer. */}
+      {item.samePerson && (
+        <p className="flex items-start gap-1.5 bg-sky-500/10 border border-sky-500/30 rounded-lg px-3 py-2 text-sky-200 text-xs mb-3">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+          <span><strong className="font-semibold">Same person</strong> — {item.samePerson}</span>
+        </p>
+      )}
+
       {/* What is actually being decided, when it is a change rather than an
           application. Every field side by side, live value first: the reviewer
           is answering "did they mean to change this, and is the new value
@@ -861,7 +891,16 @@ function ReviewCard({
         <p className="text-slate-500 text-xs mb-2">{item.docsCaption}</p>
       )}
 
-      {/* Documents, inline. Verification means looking at them. */}
+      {/* Documents, inline. Verification means looking at them.
+
+          Through the API behind 15-minute signed URLs. `item.docs` carries the
+          stored `?alt=media&token=` strings, which are permanent bearer
+          credentials Storage Rules are never consulted for — rendering one
+          puts a forever-link to an identity document in the page source.
+          `item.docs.length` is still the right emptiness test: it is read from
+          the record, so it says whether anything was uploaded without
+          dereferencing the URLs. A re-approval row proposes no new documents
+          and keeps its explanatory copy. */}
       {item.docs.length === 0 ? (
         <p className="text-slate-600 text-sm mb-3">
           {reapproval
@@ -872,10 +911,8 @@ function ReviewCard({
               'approving would be a decision made on no evidence.'}
         </p>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
-          {item.docs.map((d, i) => (
-            <DocThumb key={`${d.label}-${i}`} doc={d} onZoom={() => onZoom(d.url)} />
-          ))}
+        <div className="mb-3">
+          <SecureDocuments kind={DOC_KIND[category]} recordId={item.id} />
         </div>
       )}
 
@@ -901,6 +938,16 @@ function ReviewCard({
       {!reapproval && item.status === 'approved' && (
         <p className="text-green-400 text-sm flex items-center gap-1.5 mt-3">
           <CheckCircle2 size={14} /> Approved.
+        </p>
+      )}
+
+      {/* Decision 15 (RC): decided, not started. Nothing is left to approve
+          here; the role starts by itself once the person's login holds both a
+          verified phone and a verified email. */}
+      {!reapproval && item.status === 'awaiting_verification' && (
+        <p className="text-sky-300 text-sm flex items-center gap-1.5 mt-3">
+          <CheckCircle2 size={14} /> Approved — waiting for the person to verify BOTH their phone number and
+          email address. The role starts by itself once both are verified.
         </p>
       )}
 

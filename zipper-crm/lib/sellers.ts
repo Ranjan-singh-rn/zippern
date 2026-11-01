@@ -40,7 +40,7 @@ export interface Seller {
    * `isApproved` alone for a long time and many documents still have no
    * `status` at all, which is why `firestoreStatusOf` on /kyc consults both.
    */
-  status?: 'pending' | 'approved' | 'rejected' | 'suspended'
+  status?: 'pending' | 'approved' | 'rejected' | 'suspended' | 'revoked'
   /**
    * A proposed change to identity details, waiting on a reviewer. Read it with
    * `readPendingChanges` — a browser writes it and the security rules say
@@ -51,6 +51,24 @@ export interface Seller {
   totalCoinsSold: number
   qrCodeUrl: string
   description: string
+  /**
+   * Settlement details the seller gave when applying — where a buyer pays
+   * them. Only `upiId`, `upiQrUrl` and `binanceUid` are copied to the public
+   * directory; the bank fields are reviewed here and nowhere else.
+   */
+  payment?: {
+    accountHolderName?: string
+    accountNumber?: string
+    ifscCode?: string
+    bankName?: string
+    branch?: string
+    upiId?: string
+    upiQrUrl?: string
+    binanceUid?: string
+    internationalMethod?: string
+    internationalDetails?: string
+    currency?: string
+  }
   createdAt: Timestamp
   approvedAt?: Timestamp
   approvedBy?: string
@@ -224,27 +242,11 @@ export async function getSellerRechargeRequests(sellerUid: string): Promise<Rech
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as RechargeRequest))
 }
 
-export async function approveRecharge(reqId: string, approvedByUid: string): Promise<void> {
-  await updateDoc(doc(db, 'rechargeRequests', reqId), {
-    status: 'approved',
-    approvedBy: approvedByUid,
-    approvedAt: serverTimestamp(),
-    rejectedReason: '',
-  })
-}
-
-export async function rejectRecharge(
-  reqId: string,
-  reason: string,
-  approvedByUid: string
-): Promise<void> {
-  await updateDoc(doc(db, 'rechargeRequests', reqId), {
-    status: 'rejected',
-    rejectedReason: reason,
-    approvedBy: approvedByUid,
-    approvedAt: serverTimestamp(),
-  })
-}
+// `approveRecharge` / `rejectRecharge` wrote `status` onto `rechargeRequests`
+// from the browser. Nothing called them, and `firestore.rules` now refuses
+// every client write to that collection: a recharge is decided by Zipper staff
+// through the API (`lib/apiPartners.ts` → `recharges.approve / reject`), which
+// credits through the ledger exactly once. Removed rather than left to fail.
 
 // ── Update seller fields ───────────────────────────────────────────────────────
 export async function updateSeller(

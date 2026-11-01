@@ -94,6 +94,22 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # ── Their own session and identity ────────────────────────────────────
         ("GET", "/api/auth/me"),
         ("POST", "/api/auth/signout"),
+        # ── Decision 15 (RC): verifying their own contacts ────────────────────
+        # A role approved by the Owner waits until the login holds BOTH a
+        # verified phone and a verified email. These three are how the
+        # person, signed in to the waiting room with no partner ids at all,
+        # sees what is missing, starts the role once both are verified, and
+        # reports a contact that turned out to belong to another account.
+        # Each acts on the session's OWN uid only (`own_session_uid(user)`),
+        # takes no id from the request — no path parameter, and no id field in
+        # the body — and re-reads the verification from Firebase Auth and the
+        # server's ledger, so nothing is started on the caller's word. The two
+        # POSTs are the only self-scoped writes on this list;
+        # `tests/test_partner_session.py` reads the router source and fails if
+        # either one grows an id.
+        ("GET", "/api/partner-ops/me/verification"),
+        ("POST", "/api/partner-ops/me/verification/check"),
+        ("POST", "/api/partner-ops/me/verification/conflict"),
         # ── Their own money — 4.1.9 / 0.2.2–0.2.4 / 0.4.2 ─────────────────────
         # Each scoped by `own_partner_id_or_403(user, id, kind=…)`; the `kind`
         # is what stops a dual-role login reading its seller record through an
@@ -121,6 +137,10 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/partners/agencies/{agency_id}/host-reports"),
         ("GET", "/api/partners/agencies/{agency_id}/appeals"),
         ("GET", "/api/partners/sellers/{seller_id}/statement"),
+        # A coin seller filing a sale names the buyer; this resolves exactly
+        # that person (exact uid / email / phone, contact details masked). The
+        # route itself refuses any partner without a Coin Seller role.
+        ("GET", "/api/partner-ops/buyers/lookup"),
         # Their whole record in one list — purchases with the rupees and the
         # UTR, lending, repayments, recoveries, write-offs and the sales they
         # filed. Scoped by the same `own_partner_id_or_403(…, kind="seller")`
@@ -134,6 +154,29 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/partners/sellers/{seller_id}/history"),
         # 4.3.12 — whether they may take new inventory, and why not.
         ("GET", "/api/partners/sellers/{seller_id}/can-take-inventory"),
+        # ── Their own KYC documents, behind a short-lived signed URL ──────────
+        #
+        # A partner has always been able to SEE its own documents — the agency
+        # dashboard renders them — but it was doing so from the permanent
+        # `?alt=media&token=` download URL stored at upload. That URL is a
+        # bearer credential Storage Rules are never consulted for, so it had to
+        # stop being handed to a browser; this route is what replaces it.
+        #
+        # Reachable rather than internal-only for that reason: refusing a
+        # partner here would not close anything, it would just leave the
+        # dashboard on the permanent URL it is being taken off.
+        #
+        # Scoped by `partner_ids_of(user, kind)` in `services/documents`, the
+        # same session-derived authority the statement routes above use —
+        # deliberately NOT by matching `ownerUid`/`crmUid` on the record, which
+        # are client-written during signup. `kind='host'` has no external
+        # branch at all, so a host application is staff-only by omission.
+        ("GET", "/api/documents/{kind}/{record_id}"),
+        # The batch form of the same route, for list views. Each ref inside it
+        # is authorised individually by `_may_see`, and one the caller may not
+        # see is omitted — so batching grants nothing the single route does
+        # not. A partner reaches only its own records through either.
+        ("GET", "/api/documents/batch"),
         # ── Their own record, and their own sales ─────────────────────────────
         # `list_partners` answers an external caller from `partner_ids_of` and
         # ignores the filters; `get_partner` is `own_partner_id_or_403` with no
@@ -143,6 +186,10 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # 4.3.8 — the sales they filed. `list_sales` pins an external caller to
         # their own *seller* id and answers an agency-only login with nothing.
         ("GET", "/api/partner-ops/sales"),
+        # A seller's own recharge queue — the buyer-filed requests staff are
+        # verifying — scoped to its own partner id inside the route.
+        ("GET", "/api/partner-ops/recharges"),
+        ("GET", "/api/partner-ops/recharges/{recharge_id}"),
         # ── Where their own request has got to — 5.2 / 4.3.6 ─────────────────
         # A seller who has paid us can otherwise see nothing between "raised"
         # and "the coins appeared", and `approved` is not `executed`. Scoped in
@@ -163,13 +210,18 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # cannot see which half it is in. Scoped in the route to payouts where
         # the caller is the parent or the sub.
         ("GET", "/api/partner-ops/subagency-payouts/open"),
-        # ══ Writes ═══════════════════════════════════════════════════════════
+        # ══ Writes that name a partner record ════════════════════════════════
         #
-        # Two, and only two. Both are the *start* of a flow the spec puts in the
+        # Three. (The other two writes on this list are the Decision 15
+        # self-scoped verification POSTs above, which name no record at all.)
+        #
+        # The first two are the *start* of a flow the spec puts in the
         # partner's hands, both raise a request that moves nothing, and both are
         # scoped by `own_partner_id_or_403(…, kind="seller")` inside the route
         # against the id in the URL or the body. Both carry a mandatory reason
-        # and both are audited, exactly as they were for staff.
+        # and both are audited, exactly as they were for staff. The third
+        # (Decision 16) is scoped the same way with `kind="agency"` and files a
+        # pending application that holds nothing.
         #
         # 4.3.5 — "Seller buys inventory." The card is verified, signed and only
         # then executed by an owner (4.3.6): nothing here credits a coin.
@@ -178,6 +230,12 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # sale." Filing leaves the sale at `pending`; approval is owner-only and
         # debits the seller's inventory first (4.3.9).
         ("POST", "/api/partner-ops/sales"),
+        # Decision 16 (RC) — a parent agency files a FRESH Sub-agency
+        # application for a person whose earlier one was rejected (their login
+        # already exists, so the dashboard's own create cannot). Scoped by
+        # `own_partner_id_or_403(…, kind="agency")` on the URL's agency id;
+        # files a pending record that holds nothing, decided by staff.
+        ("POST", "/api/partner-ops/agencies/{agency_id}/sub-agencies/reapply"),
     }
 )
 
@@ -259,11 +317,44 @@ async def current_user(
             status_code=status.HTTP_403_FORBIDDEN, detail=exc.message
         ) from exc
 
+    _refuse_owner_without_mfa(request, user)
+
     # Nothing below this line runs for an internal session: `is_external` is an
     # allowlist of the two partner roles, so an owner, a team member, the
     # observer and a machine credential all fall straight through unchanged.
     _refuse_unreachable_route(request, user)
     return user
+
+
+#: Returned on an Owner route reached before MFA. The CRM reads this header
+#: (not the message) to show the second-factor step.
+MFA_REQUIRED_HEADER = "X-Zipper-MFA-Required"
+
+
+def _refuse_owner_without_mfa(request: Request | None, user: dict) -> None:
+    """P1-A3 — an Owner session that has not passed MFA reaches the MFA routes,
+    `me` and sign-out, and nothing else.
+
+    Server-side, on every route, because every route depends on
+    `current_user`. The browser gate this replaces could be skipped by anyone
+    holding the password; this cannot, because the API itself refuses.
+    A request whose route cannot be identified is refused, as for partners.
+    """
+    if user.get("role") != R.Role.OWNER or user.get("mfa_verified"):
+        return
+    from app.config import settings
+    from app.services.owner_mfa import MFA_PENDING_ROUTES
+
+    if not settings.owner_mfa_required:
+        return
+    key = _route_key(request)
+    if key is not None and key in MFA_PENDING_ROUTES:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Two-step sign-in required. Enter the code from your authenticator app.",
+        headers={MFA_REQUIRED_HEADER: "1"},
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,6 +433,30 @@ def own_partner_id_or_403(
     return requested
 
 
+def own_session_uid(user: dict) -> str:
+    """The subject of a self-scoped route: this session's own uid, and nothing else.
+
+    For a route that takes NO id from the request — no path parameter, and no
+    id field in its body — because what it acts on is the signed-in person
+    themselves (Decision 15: "show me what is verified on my login", "start my
+    approved role now that both contacts are verified"). An applicant whose
+    role is waiting has no partner ids on the session at all, which is why
+    `own_partner_id_or_403` cannot be the scope here: it would refuse exactly
+    the person the route exists for.
+
+    `tests/test_partner_session.py` holds a route that calls this to having no
+    path parameter and no id field in its body, so it cannot become a way to
+    name somebody else.
+    """
+    uid = str((user or {}).get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This session names no account.",
+        )
+    return uid
+
+
 async def require_write(user: dict = Depends(current_user)) -> dict:
     """A write. The observer never does one, and neither does a partner.
 
@@ -378,9 +493,14 @@ async def require_write(user: dict = Depends(current_user)) -> dict:
 async def require_write_or_partner(user: dict = Depends(current_user)) -> dict:
     """A write that the spec puts in a partner's own hands, or a staff write.
 
-    Two routes use this and no others: `POST /partner-ops/sellers/{id}/
-    coin-purchases` (4.3.5) and `POST /partner-ops/sales` (4.3.8). Both raise a
-    request that moves nothing; both are executed or approved by an owner.
+    Five routes use this and no others. Three name a partner record:
+    `POST /partner-ops/sellers/{id}/coin-purchases` (4.3.5) and
+    `POST /partner-ops/sales` (4.3.8) — both raise a request that moves
+    nothing, executed or approved by an owner — and Decision 16's
+    `POST /partner-ops/agencies/{id}/sub-agencies/reapply`, which files a
+    pending application staff decide. Two name nothing at all:
+    `POST /partner-ops/me/verification/check` and `/conflict` (Decision 15),
+    which act on `own_session_uid(user)` and take no id from the request.
 
     **This dependency does not scope anything, and a route that uses it without
     scoping is a hole.** It answers "may this caller write at all", which for a
@@ -888,6 +1008,17 @@ internal_or_email_events_service = _person_or_service(
 #: team admin as before.
 team_admin_or_partner_registration_service = _person_or_service(
     Op.PARTNER_REGISTER, require_team_admin
+)
+
+#: The app's "Join as …" callables, or a team admin filing on somebody's
+#: behalf. Same key as registration; see `Op.PARTNER_APPLY`.
+team_admin_or_partner_apply_service = _person_or_service(
+    Op.PARTNER_APPLY, require_team_admin
+)
+
+#: The app's recharge-request callable, or a team admin. See `Op.RECHARGE_REQUEST`.
+team_admin_or_recharge_request_service = _person_or_service(
+    Op.RECHARGE_REQUEST, require_team_admin
 )
 
 

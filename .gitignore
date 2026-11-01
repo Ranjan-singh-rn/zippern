@@ -94,6 +94,11 @@ backend/__pycache__/
 # Firestore exports — may contain personal data
 backend/backups/
 
+# P0-10 (OPS-D): reset plans and post-checks name production records
+# (uids, document ids). Kept on the operator's disk, never committed.
+backend/reset-plan*.json
+backend/reset-postcheck*.json
+
 # Build output — never commit.
 # zipper-crm/out held a stale bundle containing a removed superadmin bootstrap
 # and real bank details long after both were deleted from source. A single
@@ -113,3 +118,6 @@ functions/lib/
 # whenever a folder was opened in Finder. They are untracked by the baseline
 # commit (the files stay on disk; Finder simply rewrites them).
 .DS_Store
+
+# local validation output (never committed)
+validation-logs/

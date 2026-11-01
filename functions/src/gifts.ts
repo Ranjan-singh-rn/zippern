@@ -89,7 +89,7 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
     }
     // Auth-only guard. See functions/src/mobileSession.ts: refuses when the
     // caller presents a session id that is not the account's active one.
-    await assertActiveSession(senderUid, data, 'settleGift')
+    await assertActiveSession(senderUid, data, 'settleGift', context.auth?.token)
 
     const { giftId, receiverUid, quantity, context: giftContext, roomId, idempotencyKey } = data ?? {}
 

@@ -56,9 +56,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from firebase_admin import firestore
 from google.cloud.firestore_v1.base_query import BaseQuery, FieldFilter
 
 from app.core import audit
@@ -83,6 +85,59 @@ class AppealNotFound(AppealError):
     pass
 
 
+APPEAL_CLAIM_CONTENDED = (
+    "Another change to this appeal was being saved at the same moment, so it was "
+    "not resolved. Nothing was changed — try again."
+)
+
+
+class AppealClaimContended(AppealError):
+    """HT-1 — Firestore gave up on resolving an appeal under contention. Nothing was written.
+
+    The same shape as `partner_ops.HostMoveContended`. `_auto_resolve_one`'s
+    compare-and-set is one transaction; when Firestore aborts it
+    (`firebase.is_transaction_contention`) no attempt committed, so the appeal
+    is read once more: no longer pending → None, the documented "it had moved
+    on" result; still pending → this. Every caller of `auto_resolve_pending`
+    already treats an error as "left pending, logged" and never fails the
+    unban, resume or decision it follows, so it does not reach a response.
+    """
+
+
+APPEAL_CLAIM_UNKNOWN = (
+    "The database did not confirm whether this appeal was resolved. It is not shown "
+    "as resolved here; the next unban or resume looks at it again."
+)
+
+
+class AppealClaimOutcomeUnknown(AppealError):
+    """HT-2 — the claim's outcome could not be established, and it is not visible.
+
+    A Firestore error other than ABORTED, after which the appeal was read again:
+    not resolved by this claim, still pending. A commit can still land after the
+    client stopped waiting, so this is not "nothing happened". Like
+    `AppealClaimContended` it never reaches a response — the callers of
+    `auto_resolve_pending` log it — and the next unban or resume claims again,
+    recognising the claim if it did land.
+    """
+
+
+class AppealDecisionNotRecorded(AppealError):
+    """HT-2 — the appeal's effects are committed, but the verdict is not recorded.
+
+    The ban or suspension was lifted (or the report dismissed) under the
+    decision lease, and the verdict's stamp could not be confirmed, twice. The
+    lease is given back, so the appeal can be decided again at once — and
+    safely: a restriction already lifted is found lifted and nothing is lifted
+    twice. 409 ("not_applied") or 503 ("unknown").
+    """
+
+    def __init__(self, message: str, *, outcome: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.status_code = 503 if outcome == "unknown" else 409
+
+
 class AppealKind(StrEnum):
     #: The account is banned or suspended and says it should not be.
     BAN = "ban"
@@ -96,6 +151,24 @@ class AppealStatus(StrEnum):
     UPHELD = "upheld"
     #: Reviewed, and the original decision was wrong.
     OVERTURNED = "overturned"
+    #: The restriction was removed administratively, and nobody decided this
+    #: appeal. NOT a verdict — see `VERDICTS` and `decide_appeal` below.
+    #:
+    #: It exists because the alternative was writing `overturned`, which asserts
+    #: "a reviewer found the original decision wrong". An admin lifting a
+    #: suspension early for unrelated reasons has found nothing of the sort, and
+    #: a moderation record that says otherwise is the same class of untruth as a
+    #: report marked actioned that banned nobody.
+    RESOLVED = "resolved"
+
+
+#: The two a reviewer may actually choose. `PENDING` is the starting state and
+#: `RESOLVED` is written by the system, so neither is selectable — and both are
+#: refused by `decide_appeal` rather than being absent from a type, because the
+#: endpoint takes a string off the wire and the refusal has to be explicit.
+VERDICTS: frozenset[AppealStatus] = frozenset(
+    {AppealStatus.UPHELD, AppealStatus.OVERTURNED}
+)
 
 
 class Action:
@@ -103,6 +176,11 @@ class Action:
 
     APPEAL_UPHELD = "appeal.upheld"
     APPEAL_OVERTURNED = "appeal.overturned"
+    #: Deliberately NOT `appeal.overturned`. That name means a reviewer judged
+    #: the original decision wrong; this one means nobody judged anything and
+    #: the restriction simply went away. Conflating them in the audit log would
+    #: make the two indistinguishable to whoever reads it next.
+    APPEAL_AUTO_RESOLVED = "appeal.auto_resolved"
 
 
 async def _fs(fn: Callable, *args, **kwargs):
@@ -245,11 +323,22 @@ async def decide_appeal(
     """
     reason = _require_reason(reason)
 
+    # ── Only the two real verdicts, and the refusal is explicit ──────────────
+    #
+    # `AppealStatus` now has four members, and two of them are not choices a
+    # reviewer gets to make: `pending` is where an appeal starts and `resolved`
+    # is written by the system when a restriction is lifted administratively.
+    #
+    # Checked against `VERDICTS` rather than by excluding `PENDING` one value at
+    # a time. The old form was `if verdict_enum is AppealStatus.PENDING`, which
+    # was exhaustive when there were three members and silently stopped being so
+    # the moment a fourth arrived — `resolved` would have parsed, passed, and
+    # let a reviewer write it as though they had decided something.
     try:
         verdict_enum = AppealStatus(verdict)
     except ValueError as exc:
         raise AppealError("A verdict must be 'upheld' or 'overturned'.") from exc
-    if verdict_enum is AppealStatus.PENDING:
+    if verdict_enum not in VERDICTS:
         raise AppealError("A verdict must be 'upheld' or 'overturned'.")
 
     ref = _ref(appeal_id)
@@ -270,16 +359,89 @@ async def decide_appeal(
     # whether it was right — an appeal reviewed by its own author is a formality
     # with a paper trail, which is worse than no appeal process at all because
     # it looks like one.
-    original_actor = str(appeal.get("originalDecidedBy") or "").strip()
-    if original_actor and original_actor == str(actor.get("uid", "")):
+    #
+    # B29: the original decider is read from the RECORD of the decision, not
+    # only from `originalDecidedBy` — a field no writer fills, so the check
+    # compared against a blank and the moderator who banned could decide the
+    # appeal. The account carries who restricted it (`bannedBy` /
+    # `suspendedBy`, stamped by `users._stamp`), and a contested report
+    # carries who decided it (`reviewedBy`).
+    if str(actor.get("uid", "")).strip() in await _original_deciders(appeal, subject_uid):
         raise AppealError(
             "You made the decision being appealed, so you cannot decide the "
             "appeal. Someone else has to look at it."
         )
 
+    # B40: claim the decision against the status read above BEFORE anything
+    # is reversed — a lease taken in a transaction, so two reviewers deciding
+    # at once cannot both act, and an overturn racing an uphold cannot lift a
+    # ban the record then says was upheld. Released if the decision fails.
+    try:
+        lease = await _fs(
+            firebase.claim_decision, ref,
+            expected_status=str(AppealStatus.PENDING), actor_uid=str(actor.get("uid", "")),
+            default_status=str(AppealStatus.PENDING),
+        )
+    except firebase.DecisionConflict as exc:
+        raise AppealError(str(exc)) from exc
+    try:
+        return await _decide_under_lease(
+            appeal_id, ref, lease, appeal, verdict_enum, status_before, subject_uid,
+            reason, actor,
+        )
+    except Exception:
+        await _fs(firebase.release_decision, ref, lease)
+        raise
+
+
+async def _original_deciders(appeal: dict, subject_uid: str) -> set[str]:
+    """B29 — every uid that made the decision this appeal contests."""
+    found = {str(appeal.get("originalDecidedBy") or "").strip()}
+    try:
+        user = await users_svc.load_user(subject_uid)
+    except users_svc.UserNotFound:
+        user = {}
+    restriction = users_svc.restriction_of(user) if user else ""
+    if restriction == str(users_svc.AccountState.BANNED):
+        found.add(str(user.get("bannedBy") or "").strip())
+    elif restriction == str(users_svc.AccountState.SUSPENDED):
+        found.add(str(user.get("suspendedBy") or "").strip())
+    report_id = str(appeal.get("reportId") or "").strip()
+    if report_id:
+        snap = await _fs(firebase.firestore_client().collection(REPORTS).document(report_id).get)
+        if getattr(snap, "exists", False):
+            found.add(str((snap.to_dict() or {}).get("reviewedBy") or "").strip())
+    found.discard("")
+    return found
+
+
+async def _decide_under_lease(
+    appeal_id: str, ref, lease: str, appeal: dict, verdict_enum: AppealStatus,
+    status_before: str, subject_uid: str, reason: str, actor: dict,
+) -> dict[str, Any]:
+    """`decide_appeal`, from the moment its lease is held."""
     reversed_acts: list[str] = []
     outstanding: list[str] = []
     outcome_audit_id: str | None = None
+    lifted = False
+
+    # HT-2: an overturn of THIS appeal whose reversal was carried out but whose
+    # verdict could not be recorded (`AppealDecisionNotRecorded`) left the
+    # appeal pending over a lifted restriction. Its unban / resume is audited
+    # with this appeal's id. Upholding now would record the opposite of what
+    # happened; deciding it again as overturned records it — and counts the
+    # restriction as lifted, so the person's other pending appeals are closed.
+    lifted_earlier = [
+        e for e in await audit.history_for("user", subject_uid)
+        if e.get("action") in (audit.Action.USER_UNBANNED, audit.Action.USER_RESUMED)
+        and str((e.get("meta") or {}).get("appeal_id") or "") == appeal_id
+    ] if subject_uid else []
+    if lifted_earlier and verdict_enum is AppealStatus.UPHELD:
+        raise AppealError(
+            "An earlier decision on this appeal already lifted the restriction, but the "
+            "verdict was not recorded. Decide it as overturned to record what happened — "
+            "upholding it now would contradict the account. Nothing was changed."
+        )
 
     if verdict_enum is AppealStatus.OVERTURNED:
         link = {"appeal_id": appeal_id, "appeal_kind": str(appeal.get("kind", ""))}
@@ -306,19 +468,37 @@ async def decide_appeal(
                 "The account no longer exists, so nothing could be restored to it."
             )
 
+        # ── `enforce_target_policy=False` on both restorations below ────────
+        #
+        # Overturning an appeal is RESTORATIVE: it lifts a restriction that
+        # already exists. The target-protection guard refuses internal
+        # identities and self-targeting, which is the right answer for somebody
+        # pressing Ban in user management and the wrong one here — leaving it
+        # on would mean a restriction that should never have been applied also
+        # could never be lifted, trapping the account permanently.
+        #
+        # The reviewer's authority is checked by `decide_appeal` above (four
+        # eyes, `CAN_APPROVE_KYC`), so this is not an unguarded path; it is a
+        # guarded path whose guard is a different and more specific one.
         restriction = users_svc.restriction_of(user) if user else ""
         if restriction == str(users_svc.AccountState.SUSPENDED):
             resumed = await users_svc.resume_user(
-                subject_uid, reason, actor, meta=link
+                subject_uid, reason, actor, meta=link,
+                enforce_target_policy=False,
             )
             outcome_audit_id = resumed.get("audit_id")
+            lifted = True
             reversed_acts.append(
                 "The suspension was lifted and the account resumed. No device "
                 "ban was touched — a suspension never placed one."
             )
         elif restriction == str(users_svc.AccountState.BANNED):
-            unban = await users_svc.unban_user(subject_uid, reason, actor, meta=link)
+            unban = await users_svc.unban_user(
+                subject_uid, reason, actor, meta=link,
+                enforce_target_policy=False,
+            )
             outcome_audit_id = unban.get("audit_id")
+            lifted = True
             reversed_acts.append("The account was unbanned.")
             for kept in unban.get("device_bans_kept") or []:
                 # A ban lifted while a handset stays barred is exactly the case
@@ -333,6 +513,12 @@ async def decide_appeal(
                     f"{len(unban['devices_released'])} handset(s) barred by that "
                     "ban were released with it."
                 )
+        elif user and lifted_earlier:
+            lifted = True
+            reversed_acts.append(
+                "The restriction was already lifted by an earlier decision on this appeal "
+                "that could not be recorded; nothing was lifted twice."
+            )
         elif user:
             reversed_acts.append(
                 "The account was under no restriction, so nothing was lifted."
@@ -390,7 +576,30 @@ async def decide_appeal(
         "reversed": reversed_acts,
         "outstanding": outstanding,
     }
-    await _fs(ref.update, patch)
+    # B40: stamped only while this decision's lease still holds and the appeal
+    # is still pending — never over a verdict or a resolution made meanwhile.
+    # HT-2: a verdict whose answer was lost is recognised (it used to come back
+    # False, and the audit was skipped for a verdict that WAS recorded), and one
+    # that could not be confirmed is stamped once more under the lease.
+    try:
+        stamped = await _fs(
+            firebase.complete_decision_retry_once, ref, lease, patch,
+            expected_status=str(AppealStatus.PENDING), default_status=str(AppealStatus.PENDING),
+        )
+    except firebase.DecisionNotRecorded as exc:
+        raise AppealDecisionNotRecorded(
+            "The appeal's decision was carried out"
+            + (" (" + "; ".join(reversed_acts) + ")" if reversed_acts else "")
+            + ", but the verdict could not be recorded: the database "
+            + ("was busy." if exc.outcome == "not_applied" else "did not confirm it.")
+            + " Decide it again to record it — nothing is lifted twice.",
+            outcome=exc.outcome,
+        ) from exc
+    if not stamped:
+        raise AppealError(
+            "This appeal was decided or closed while it was being decided. Reload "
+            "it and check what it says now."
+        )
 
     audit_id = await audit.record(
         actor=actor,
@@ -416,11 +625,249 @@ async def decide_appeal(
         },
     )
 
+    # UGP review: an appeal from the public web form does not block the owner's
+    # own, so a second appeal can be pending for this account. This overturn
+    # has just lifted the restriction it was about; leaving the other pending
+    # would have it decided later against a restriction that no longer exists.
+    # It is closed the way an administrator's unban closes one — `resolved`,
+    # no reviewer invented — with its own trigger and its own reason. The
+    # appeal decided HERE is no longer pending, so it is not touched.
+    also_resolved: list[str] = []
+    if lifted:
+        try:
+            other = await auto_resolve_pending(
+                subject_uid, actor, trigger="appeal_overturned",
+                reason=OVERTURN_RESOLVE_REASON,
+            )
+        except Exception:  # noqa: BLE001 — the decision itself is made and recorded
+            log.exception("appeal %s: other pending appeals not resolved", appeal_id)
+            other = None
+        if other:
+            also_resolved = [other["appeal_id"], *other.get("also_resolved", [])]
+
     return {
         "appeal_id": appeal_id,
         "status": str(verdict_enum),
         "subject_uid": subject_uid,
         "reversed": reversed_acts,
         "outstanding": outstanding,
+        "audit_id": audit_id,
+        **({"also_resolved": also_resolved} if also_resolved else {}),
+    }
+
+
+# ── A restriction lifted by hand, with an appeal still waiting ───────────────
+
+#: Written as the reason. The person reads this, so it says what happened
+#: rather than what a reviewer thought, because no reviewer thought anything.
+AUTO_RESOLVE_REASON = "Restriction manually removed by administrator."
+#: The same, when the restriction was lifted by ANOTHER appeal being accepted.
+OVERTURN_RESOLVE_REASON = "The restriction was lifted when another appeal for this account was accepted."
+
+
+async def auto_resolve_pending(
+    subject_uid: str, actor: dict, *, trigger: str, reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Close a pending appeal because its restriction was lifted by an admin.
+
+    Returns the resolution, or `None` when there was nothing pending — which is
+    the ordinary case and is not an error.
+
+    ── WHY THIS IS CALLED FROM THE ROUTER AND NOT FROM `unban_user` ──────────
+
+    `unban_user` and `resume_user` have exactly three callers, and only one of
+    them is an administrator acting by hand:
+
+        routers/users.py   POST /{uid}/unban, /{uid}/resume   ← this one
+        services/users.py  lift_expired_suspensions sweep     ← must NOT resolve
+        services/appeals   decide_appeal's own reversal       ← must NOT resolve
+                           (UGP review: AFTER an overturn has lifted the
+                           restriction, `decide_appeal` calls this for any
+                           OTHER appeal still pending — trigger
+                           "appeal_overturned", its own reason. The appeal it
+                           decided is no longer pending and is not touched.)
+
+    Hooking the service would therefore need a runtime guard on `meta` to tell
+    the three apart, and — decisively — `services/users` cannot import
+    `services/appeals`, because `services/appeals` already imports
+    `services/users`. That cycle is not worth a deferred import to dodge.
+
+    Calling from the router instead makes the distinction STRUCTURAL rather
+    than conditional: the sweep and the appeal path do not go through an HTTP
+    endpoint, so they cannot reach this however it is later edited. The
+    `meta.appeal_id` marker `decide_appeal` passes stays exactly as it was and
+    is still what labels the audit entry; it simply is not load-bearing here.
+
+    `trigger` is required and recorded. A future second admin path must name
+    itself, which is the point — opting in is explicit, and nothing acquires
+    this behaviour by accident.
+
+    ── WHAT IT DELIBERATELY DOES NOT WRITE ──────────────────────────────────
+
+    No `decidedBy`, no `decidedByName`, no `decidedByRole`. Those fields mean
+    "a person reviewed this", and populating them with the admin who lifted the
+    restriction would manufacture a reviewer who never read the appeal — and
+    would quietly satisfy the four-eyes check the next time anybody looked.
+    `resolvedBy` is a separate field for exactly that reason: it records who
+    lifted the RESTRICTION, which is a different act.
+    """
+    uid = (subject_uid or "").strip()
+    if not uid:
+        return None
+
+    client = firebase.firestore_client()
+    # Same predicate as the duplicate-appeal rule: subjectUid + pending, with no
+    # `kind` filter. Deliberately unchanged — a suspension appeal and a ban
+    # appeal both carry kind 'ban', so a kind filter would separate nothing.
+    #
+    # UGP review: EVERY pending appeal, not the first. An appeal from the public
+    # web form does not block the owner's own (anybody can file one naming the
+    # account), so two can be pending together — and one left behind after the
+    # restriction is lifted would wait forever, then be "decided" against a
+    # restriction that no longer exists.
+    query = (
+        client.collection(APPEALS)
+        .where(filter=FieldFilter("subjectUid", "==", uid))
+        .where(filter=FieldFilter("status", "==", str(AppealStatus.PENDING)))
+        .limit(10)
+    )
+    docs = await _fs(lambda: list(query.stream()))
+    if not docs:
+        # Nothing waiting. The overwhelmingly common case: most restrictions are
+        # lifted without anybody having appealed.
+        return None
+
+    resolutions: list[dict[str, Any]] = []
+    for snap in docs:
+        one = await _auto_resolve_one(client, snap, uid, actor, trigger, reason or AUTO_RESOLVE_REASON)
+        if one is not None:
+            resolutions.append(one)
+    if not resolutions:
+        return None
+    first = dict(resolutions[0])
+    if len(resolutions) > 1:
+        first["also_resolved"] = [r["appeal_id"] for r in resolutions[1:]]
+    return first
+
+
+async def _auto_resolve_one(
+    client, snap, uid: str, actor: dict, trigger: str, reason: str,
+) -> dict[str, Any] | None:
+    """Resolve ONE pending appeal, compare-and-set. `None` when it had moved on.
+
+    HT-1 / HT-2: the claim carries its own id (`resolvedClaimId`), and the
+    transaction recognises it first, so a claim whose answer was lost is
+    reported as the resolution it is — it used to come back None, with no audit
+    entry for an appeal it HAD resolved. After a Firestore error the appeal is
+    read again: resolved by this claim → resolved; resolved or decided by
+    somebody else → None; still pending → `AppealClaimContended` (aborted) or
+    `AppealClaimOutcomeUnknown`. An error of the transaction's own code is
+    re-raised unchanged.
+    """
+    appeal = snap.to_dict() or {}
+
+    now = datetime.now(timezone.utc)
+    claim_id = secrets.token_urlsafe(12)
+    patch = {
+        "status": str(AppealStatus.RESOLVED),
+        "decisionReason": reason,
+        # Who lifted the restriction — NOT who decided the appeal.
+        "resolvedBy": actor.get("uid", ""),
+        "resolvedByName": actor.get("name", ""),
+        "resolvedByRole": str(actor.get("role", "")),
+        "resolvedAt": now,
+        "resolvedTrigger": trigger,
+        "autoResolved": True,
+        # HT-2: this claim's id, so a claim that landed can be told from one
+        # that did not (appeals are written by the server only).
+        "resolvedClaimId": claim_id,
+    }
+
+    # ── Idempotent, and that is a correctness requirement, not a nicety ──────
+    #
+    # Unban is repeatable from the CRM. Without the guard, a second press would
+    # overwrite `resolvedAt`, write a second audit entry, and make one event
+    # look like two in the record. The compare-and-set makes the second call a
+    # no-op: the transaction re-reads inside the lock and bails if anything has
+    # already moved the status off `pending`.
+    #
+    # This also closes the race between two admins pressing Unban at once, and
+    # the narrower one between this and a reviewer deciding the same appeal in
+    # the CRM at the same moment — whichever transaction commits first wins, and
+    # the loser writes nothing.
+    # Same shape as `firebase.debit_host_beans`: the decorator is the
+    # module-level `firestore.transactional`, and the transaction object is
+    # passed in from `client.transaction()`.
+    ref = snap.reference
+
+    def _state(fresh) -> str:
+        if not getattr(fresh, "exists", False):
+            return "gone"
+        data = fresh.to_dict() or {}
+        if data.get("resolvedClaimId") == claim_id and data.get("status") == str(AppealStatus.RESOLVED):
+            return "ours"
+        return "pending" if data.get("status") == str(AppealStatus.PENDING) else "moved"
+
+    @firestore.transactional
+    def _claim(transaction) -> bool:
+        state = _state(ref.get(transaction=transaction))
+        if state == "ours":
+            return True  # HT-2: an earlier attempt of this claim committed
+        if state != "pending":
+            return False
+        transaction.update(ref, patch)
+        return True
+
+    try:
+        claimed = await _fs(lambda: _claim(client.transaction()))
+    except Exception as exc:
+        kind = firebase.transaction_error_kind(exc)
+        if kind is None:
+            raise
+        # HT-1 / HT-2: which documented result applies? The error does not say.
+        log.warning("appeal %s: the claim failed (%s); reading it again", snap.id, exc)
+        try:
+            state = _state(await _fs(ref.get))
+        except Exception:  # noqa: BLE001 — what is known is reported below
+            log.exception("appeal %s: could not re-read it after the failed claim", snap.id)
+            raise AppealClaimOutcomeUnknown(APPEAL_CLAIM_UNKNOWN) from exc
+        if state in ("moved", "gone"):
+            return None  # somebody else resolved or decided it: the compare-and-set result
+        if state == "pending":
+            if kind == "contended":
+                raise AppealClaimContended(APPEAL_CLAIM_CONTENDED) from exc
+            raise AppealClaimOutcomeUnknown(APPEAL_CLAIM_UNKNOWN) from exc
+        claimed = True  # "ours": the claim landed; its answer was lost
+    if not claimed:
+        return None
+
+    audit_id = await audit.record(
+        actor=actor,
+        action=Action.APPEAL_AUTO_RESOLVED,
+        subject_type="appeal",
+        subject_id=snap.id,
+        reason=reason,
+        before={"status": str(AppealStatus.PENDING)},
+        after={"status": str(AppealStatus.RESOLVED)},
+        meta={
+            "appeal_id": snap.id,
+            "subject_uid": uid,
+            "kind": str(appeal.get("kind", "")),
+            "trigger": trigger,
+            "raised_by": appeal.get("raisedByUid"),
+            "source": str(appeal.get("source", "") or "app"),
+            # Stated so the log cannot be misread as a verdict.
+            "reviewed": False,
+        },
+    )
+
+    log.info(
+        "appeal %s auto-resolved for %s by %s (%s)",
+        snap.id, uid, actor.get("uid", ""), trigger,
+    )
+    return {
+        "appeal_id": snap.id,
+        "status": str(AppealStatus.RESOLVED),
+        "subject_uid": uid,
         "audit_id": audit_id,
     }

@@ -2,6 +2,7 @@ package com.zipper.app.data.repository
 
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
+import com.zipper.app.util.ServerRefusals
 import kotlinx.coroutines.tasks.await
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -33,6 +34,8 @@ sealed interface AgoraTokenResult {
 @Singleton
 class AgoraTokenRepository @Inject constructor(
     private val functions: FirebaseFunctions,
+    /** Phase 1A (SESSION-001): the active session id travels with the token request. */
+    private val sessionManager: com.zipper.app.util.SessionManager,
 ) {
     /**
      * Ask for a token for [channelId].
@@ -43,12 +46,14 @@ class AgoraTokenRepository @Inject constructor(
         return try {
             val result = functions
                 .getHttpsCallable("generateAgoraToken")
-                .call(mapOf("channelName" to channelId, "uid" to uid))
+                .call(sessionManager.withSession(mapOf("channelName" to channelId, "uid" to uid)))
                 .await()
             @Suppress("UNCHECKED_CAST")
             val data = result.getData() as? Map<String, Any>
             AgoraTokenResult.Granted(data?.get("token") as? String)
         } catch (e: FirebaseFunctionsException) {
+            // P0-1: a session refusal also signs this device out (SessionViewModel).
+            ServerRefusals.report(e)
             when (e.code) {
                 FirebaseFunctionsException.Code.PERMISSION_DENIED -> AgoraTokenResult.Denied
                 FirebaseFunctionsException.Code.FAILED_PRECONDITION -> AgoraTokenResult.Ended

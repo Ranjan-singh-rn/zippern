@@ -21,6 +21,7 @@ import com.zipper.app.ui.components.ButtonStyle
 import com.zipper.app.ui.components.ZipperButton
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.DeletionWindow
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -36,7 +37,7 @@ import java.util.Locale
  * discovery with no way to clear the flag. They would not know why nobody could
  * find them.
  *
- * Deletion is a thirty-day pause now, and this is the door back. It is shown
+ * Deletion is a sixty-day pause now, and this is the door back. It is shown
  * once, on the next sign-in after the request, and it makes the person choose —
  * because the one thing worse than deleting an account by accident is silently
  * resurrecting one somebody meant to delete.
@@ -92,12 +93,30 @@ import java.util.Locale
 fun RecoverAccountScreen(
     onRecovered: () -> Unit,
     onDeletedForGood: () -> Unit,
+    /**
+     * C7: recovered, with a profile that was never finished. Profile setup, as
+     * any other sign-in with an unfinished profile would go. Defaults to
+     * [onRecovered] for a caller that has nowhere else to send it.
+     */
+    onRecoveredNeedsSetup: () -> Unit = onRecovered,
     viewModel: RecoverAccountViewModel = hiltViewModel(),
 ) {
     // No way back past this. The choice has to be made.
     BackHandler(enabled = true) { }
     val c = ZipperTheme.colors
     val state by viewModel.state.collectAsStateWithLifecycle()
+
+    /*
+     * B02: keeping the account now signs into it properly — the session, the
+     * quick-login credential and the roles the original sign-in never got to —
+     * and those are recorded against this handset, as on every other path.
+     */
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val deviceId = remember {
+        android.provider.Settings.Secure.getString(
+            context.contentResolver, android.provider.Settings.Secure.ANDROID_ID,
+        ) ?: ""
+    }
 
     /*
      * Which ending is waiting to be confirmed, or null while the three options
@@ -111,11 +130,18 @@ fun RecoverAccountScreen(
      */
     var confirming by remember { mutableStateOf<Ending?>(null) }
 
-    LaunchedEffect(state.recovered) { if (state.recovered) onRecovered() }
+    LaunchedEffect(state.recovered) {
+        if (state.recovered) {
+            if (state.needsSetup) onRecoveredNeedsSetup() else onRecovered()
+        }
+    }
     // Both endings land here: the account is gone and the session with it, so
     // there is nowhere to go but Login — where "create a new account" finishes
     // by signing up again, and "delete for good" finishes by walking away.
-    LaunchedEffect(state.purged) { if (state.purged) onDeletedForGood() }
+    // C8: and so does a recovery refused because the window had closed.
+    LaunchedEffect(state.purged, state.signedOut) {
+        if (state.purged || state.signedOut) onDeletedForGood()
+    }
 
     val dueText = remember(state.dueAtMillis) {
         if (state.dueAtMillis <= 0L) null
@@ -199,7 +225,7 @@ fun RecoverAccountScreen(
                  */
                 ZipperButton(
                     "Keep my account",
-                    onClick = viewModel::recover,
+                    onClick = { viewModel.recover(deviceId) },
                     gradient = true,
                     fullWidth = true,
                     enabled = !state.busy,
@@ -241,10 +267,13 @@ fun RecoverAccountScreen(
                 )
                 Spacer(Modifier.height(Space.sm))
                 Text(
+                    // C8 (B28): the server's own due date when it could be read,
+                    // otherwise the window it actually keeps — sixty days, not
+                    // the thirty this used to promise.
                     if (dueText != null) {
                         "Finish it today instead of waiting until $dueText."
                     } else {
-                        "Finish it today instead of waiting out the thirty days."
+                        "Finish it today instead of waiting out the ${DeletionWindow.GRACE_DAYS} days."
                     },
                     style = ZipperTheme.type.caption, color = c.textMuted,
                     textAlign = TextAlign.Center,

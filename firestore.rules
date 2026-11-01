@@ -40,8 +40,48 @@ service cloud.firestore {
     }
 
     // Read the role field from crmUsers (called only when isCrmUser() is already true)
+    //
+    // P1-A3b — OWNER MFA BOUNDARY. An Owner's authority here holds only for a
+    // Firebase sign-in the backend has bound to an API session that passed MFA
+    // (`ownerMfaOk()` below). Until then the Owner's role reads as
+    // 'superadmin_mfa_pending', which no helper accepts — so every grant that
+    // trusts `superadmin` (isSuperAdmin, isAdmin, the department helpers,
+    // isStaff, hasPerm, canDecideCoinOps) refuses a password-only Owner without
+    // any individual grant being edited. Self-access by uid (`isOwner(uid)`)
+    // does not go through this, so the MFA login screen can still read the
+    // Owner's own crmUsers document. Non-owners never evaluate ownerMfaOk().
     function crmRole() {
-      return get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('role', '');
+      let r = get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('role', '');
+      return (r != 'superadmin' || ownerMfaOk()) ? r : 'superadmin_mfa_pending';
+    }
+
+    // P1-A3b — which Owner sign-ins passed MFA. After MFA the backend mints a
+    // Firebase custom token carrying the developer claim `mfa_sid` for ONE new
+    // Firebase session (CRM: replaces its sign-in; Android: a separate
+    // `ownerWork` app) and, once that session's ID token is presented back,
+    // marks ownerMfaSessions/{uid}.bindings[mfa_sid] ACTIVE with that token's
+    // auth_time. Written only by the backend (Admin SDK).
+    //
+    // Accepted only when ALL hold: the token carries a non-empty `mfa_sid`
+    // (only server-signed custom tokens can put it there), the session was
+    // made from a custom token, the binding exists, is 'active' (minted-but-
+    // unconfirmed grants nothing), its authTime equals THIS token's auth_time
+    // (a second redemption of the same custom token fails), and it has not
+    // expired. A password/Google/phone sign-in — the same second or not — and
+    // every other custom token (e.g. quick login) carry no mfa_sid.
+    function ownerMfaOk() {
+      let sid = request.auth.token.get('mfa_sid', '');
+      let p = /databases/$(database)/documents/ownerMfaSessions/$(request.auth.uid);
+      return sid is string && sid != ''
+          && request.auth.token.get('firebase', {}).get('sign_in_provider', '') == 'custom'
+          && exists(p)
+          && ownerMfaBindingLive(get(p).data.get('bindings', {}).get(sid, {}));
+    }
+
+    function ownerMfaBindingLive(b) {
+      return b.get('state', '') == 'active'
+          && b.get('authTime', -1) == request.auth.token.get('auth_time', -2)
+          && b.get('expiresAt', timestamp.value(0)) > request.time;
     }
 
     // CRM user holding the AGENCY capability — the agency portal login.
@@ -68,7 +108,123 @@ service cloud.firestore {
       return isCrmUser()
           && (crmRole() == 'agency'
               || 'agency' in get(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
-                               .data.get('roles', []));
+                               .data.get('roles', []))
+          && agencyRoleLive();
+    }
+
+    // SECURITY-005 (Phase 1A): the AGENCY role's own status, not the login's.
+    //
+    // A login holding Agency + Seller stays `isActive` and `status: approved`
+    // while its Seller is live, so `isCrmUser()` alone let a REVOKED or
+    // SUSPENDED agency keep reading host KYC/bank data and editing its agency
+    // record. `roleStatus.agency` is written by the backend on every decision
+    // (`partner_ops._mirror_login_status`). Pending stays allowed — a pending
+    // agency must still upload its own KYC — and an absent map reads as live,
+    // because single-role logins are switched off through `isActive` instead.
+    function agencyRoleLive() {
+      return !(get(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+                 .data.get('roleStatus', {}).get('agency', '')
+               in ['revoked', 'suspended', 'rejected'])
+          // Phase 1A (gap closure): an ALLOWLIST, matching storageClaims.ts and
+          // lib/partnerRouting.ts — any explicit per-role status other than
+          // approved/pending (or none, for a legacy login) is a refusal.
+          && get(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+               .data.get('roleStatus', {}).get('agency', '') in ['', 'approved', 'pending'];
+    }
+
+    // Phase 1A (role-specific revocation): the SELLER capability's own status,
+    // for the seller clauses that act (not the ones that read history).
+    function sellerRoleLive() {
+      return get(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+               .data.get('roleStatus', {}).get('seller', '') in ['', 'approved', 'pending'];
+    }
+    // …and the seller RECORD's: a revoked or suspended seller files nothing new.
+    function sellerRecordNotWithdrawn(sellerId) {
+      return !exists(/databases/$(database)/documents/sellers/$(sellerId))
+          || !(get(/databases/$(database)/documents/sellers/$(sellerId))
+                 .data.get('status', '') in ['revoked', 'suspended', 'rejected']);
+    }
+
+    // ── Decision 15 (RC): a role that has STARTED ─────────────────────────────
+    //
+    // `agencyRoleLive()` / `sellerRoleLive()` above admit a PENDING role, on
+    // purpose: an applicant must still complete its own application (KYC,
+    // bank details). An Owner-approved role WAITING for both verified
+    // contacts (`awaiting_verification`) is outside their allowlists already,
+    // so it holds no partner authority at all.
+    //
+    // These answer the stricter question the protected partner ACTIONS need —
+    // inviting a Host, raising a salary request, creating a sub-agency,
+    // contesting for a host, filing a coin purchase — "has this role been
+    // approved AND started?". Neither a pending nor a waiting role may take
+    // them. A legacy single-capability login with no `roleStatus` falls back
+    // to the login's own `status`, which the backend writes for it.
+    function agencyRoleApproved() {
+      let c = get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data;
+      let rs = c.get('roleStatus', {}).get('agency', '');
+      return rs == 'approved'
+          || (rs == '' && c.get('role', '') == 'agency' && c.get('status', '') == 'approved');
+    }
+    function sellerRoleApproved() {
+      let c = get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data;
+      let rs = c.get('roleStatus', {}).get('seller', '');
+      return rs == 'approved'
+          || (rs == '' && c.get('role', '') == 'seller' && c.get('status', '') == 'approved');
+    }
+    // …and the seller RECORD has started: approved (legacy records carry only
+    // `isApproved`). An app-only seller has no login document to ask.
+    function sellerRecordApproved(sellerId) {
+      return sellerId is string && sellerId != ''
+          && exists(/databases/$(database)/documents/sellers/$(sellerId))
+          && (get(/databases/$(database)/documents/sellers/$(sellerId)).data.get('status', '') == 'approved'
+              || (get(/databases/$(database)/documents/sellers/$(sellerId)).data.get('status', '') == ''
+                  && get(/databases/$(database)/documents/sellers/$(sellerId)).data.get('isApproved', false) == true));
+    }
+    // RC: an APP seller's own STARTED record, for the writes the app makes
+    // with `sellerUid = auth.uid` (BuyCoinScreen). The legacy record is keyed
+    // by the uid; since FX-05 an app application gets an automatic id, which
+    // the login document names (`crmUsers.sellerId`). Either must be approved
+    // (Decision 15), and the named one must name the caller back — the login
+    // can only point at its own record anyway (crmUsers rules), this re-checks.
+    function appSellerRecordStarted() {
+      return sellerRecordApproved(request.auth.uid)
+          || (exists(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+              && sellerRoleApproved()
+              && appSellerOwnsNamedRecord(
+                   get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('sellerId', '')));
+    }
+    function appSellerOwnsNamedRecord(sellerId) {
+      return sellerRecordApproved(sellerId)
+          && (get(/databases/$(database)/documents/sellers/$(sellerId)).data.get('crmUid', '') == request.auth.uid
+              || get(/databases/$(database)/documents/sellers/$(sellerId)).data.get('ownerUid', '') == request.auth.uid);
+    }
+
+    // GOV C4 (B06): the person's APP account is suspended or banned.
+    //
+    // `isActive` and `roleStatus` above speak for the login and for each role;
+    // neither moves when the HUMAN behind them is suspended or banned in the
+    // app, so a suspended agency owner kept writing their agency record, their
+    // invitations and their salary requests from a browser. `services/users.py`
+    // now sets `crmUsers/{uid}.accountRestricted = true` on suspend and ban and
+    // `false` on resume and unban (Admin SDK). Absent reads as unrestricted —
+    // every login written before the field existed.
+    //
+    // Required by every partner-owned WRITE that relies on a crmUsers login
+    // (the agency arms through `isAgencyCrmWriter()`, the seller and
+    // second-capability arms by name). Reads are not narrowed here: the API
+    // refuses the restricted account's CRM session itself (C4 session checks).
+    // Staff are unaffected — a protected internal identity cannot be
+    // restricted in the first place.
+    function crmLoginUnrestricted() {
+      return get(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+               .data.get('accountRestricted', false) != true;
+    }
+
+    // The agency capability, for a WRITE: live (`isAgencyCrmUser`) and the
+    // human behind the login not suspended or banned (`crmLoginUnrestricted`).
+    // Same document as every other check here, so no extra billed read.
+    function isAgencyCrmWriter() {
+      return isAgencyCrmUser() && crmLoginUnrestricted();
     }
 
     // NOTE — THERE IS DELIBERATELY NO isSellerCrmUser().
@@ -189,8 +345,14 @@ service cloud.firestore {
     // owner document written before that table existed may carry an empty
     // `permissions`, and "the owner is locked out of the money screens" is not a
     // failure this file should be able to cause. Owner authority is positional.
+    //
+    // P1-A3b: a pending Owner's `permissions` array lists every capability, so
+    // the array is not consulted for one — `crmRole()` already reads
+    // 'superadmin_mfa_pending' for them, and that is refused explicitly here.
     function hasPerm(p) {
-      return isCrmUser() && (crmRole() == 'superadmin' || p in crmPermissions());
+      return isCrmUser()
+          && crmRole() != 'superadmin_mfa_pending'
+          && (crmRole() == 'superadmin' || p in crmPermissions());
     }
 
     // ── Deciding, as distinct from doing ────────────────────────────────────
@@ -329,6 +491,84 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    // AUTH-002 (Phase 1A): a signed-in account that carries a real contact
+    // identity on its TOKEN — not a guest. Anonymous sessions have neither
+    // claim; a guest restored by quick login (custom token) has neither until
+    // it links one. Typed profile fields never reach the token.
+    function hasContactIdentity() {
+      return request.auth != null
+          && (request.auth.token.get('phone_number', '') != ''
+              || tokenEmailVerified());
+    }
+
+    // P0-5 (AUTHN-2): the token's email counts only once Firebase has seen it
+    // CONFIRMED. CRM email/password sign-up is open, so an unverified token
+    // can carry any address that has no account yet. Every rule that matches
+    // a document to the caller by email requires this.
+    function tokenEmailVerified() {
+      return request.auth != null
+          && request.auth.token.get('email_verified', false) == true
+          && request.auth.token.get('email', '') != '';
+    }
+
+    // SECURITY-003 (Phase 1A): what any client-side partner create must look
+    // like. Pending and inactive, and no field may name a human other than the
+    // caller. Approval, activation and owner linking happen server-side.
+    function namesOnlyCaller(field) {
+      return request.resource.data.get(field, '') == ''
+          || (request.auth != null && request.resource.data.get(field, '') == request.auth.uid);
+    }
+    // SECURITY-012 / SECURITY-004 (Phase 1A): a staff browser edit of a partner
+    // record may not move who owns it, nor its lifecycle. Approve, reject,
+    // suspend, reactivate, revoke and attach-login are backend operations
+    // (Admin SDK, audited) and are unaffected by this. The first `crmUid` link
+    // on a record that has none stays allowed (register screens write it).
+    //
+    // GOV-4 (Phase 1A.2, B4): nor its governance. `parentAgencyId` and `type`
+    // decide which commission table a partner is paid from
+    // (`partner_ops._derive_kind`) and who may read its record; re-parenting
+    // is the audited transfer in `partner_ops` (Mongo first, then mirrored
+    // here). `kycStatus` is written by the server's decisions and by applying
+    // or declining a proposal. `commissionRate` has no browser caller. No CRM
+    // screen writes any of the four on an agency or seller.
+    function adminPartnerEditSafe() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['ownerUid', 'secondRoleOwnerUid', 'status', 'isActive',
+                         'isApproved', 'approvedBy', 'approvedAt',
+                         'referralCode', 'coinBalance', 'totalCoinsSold',
+                         'parentAgencyId', 'type', 'kycStatus', 'commissionRate',
+                         'createdByUid'])
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['crmUid'])
+              || resource.data.get('crmUid', '') == '');
+    }
+    // GOV-4 (Phase 1A.2, B4): where a partner is paid, and where buyers pay a
+    // seller, is changed from a staff browser by the Owner only — the rule
+    // `hostApplications` already applies to a host's bank details. Any `*_admin`
+    // and finance members could rewrite these, and a payout is a human reading
+    // them off the record.
+    //
+    // `payoutFields()` is how agencies store them. A seller filed through the
+    // app keeps them in the `payment` map instead (partner_applications.py),
+    // with its UPI QR mirrored to `qrCodeUrl`; `syncPublicSeller` publishes
+    // `payment.upiId`, `payment.upiQrUrl || qrCodeUrl` and `payment.binanceUid`
+    // to buyers. `affectedKeys()` sees only top-level keys, so the map is named
+    // as a whole. No CRM screen writes any of these as staff.
+    function staffPaymentEditAllowed() {
+      return !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(payoutFields().concat(['payment', 'qrCodeUrl']))
+          || isSuperAdmin();
+    }
+    function partnerCreateSafe() {
+      return request.resource.data.get('status', 'pending') == 'pending'
+          && request.resource.data.get('isActive', false) == false
+          && request.resource.data.get('isApproved', false) == false
+          && namesOnlyCaller('ownerUid')
+          && namesOnlyCaller('crmUid')
+          && namesOnlyCaller('secondRoleOwnerUid')
+          // P0-5: who made the record — see subAgencyMadeByItsParent().
+          && namesOnlyCaller('createdByUid');
+    }
+
     // ── A ban that actually bans ─────────────────────────────────────────────
     //
     // `isBanned` was consulted in exactly ONE clause in this whole file —
@@ -350,10 +590,17 @@ service cloud.firestore {
     // and NOT to reads, to the appeal itself, or to anything on the user's own
     // document. A banned person must still be able to appeal, and must still be
     // able to read what was decided about them.
+    // Phase 1A (SESSION-003): "not banned" now means "not restricted" — a
+    // suspension, a pending deletion and a permanent deactivation stop
+    // protected writes too, not only a ban.
     function notBanned() {
+      let u = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
       return request.auth != null
-             && get(/databases/$(database)/documents/users/$(request.auth.uid))
-                  .data.get('isBanned', false) != true;
+             && u.get('isBanned', false) != true
+             && u.get('isSuspended', false) != true
+             && u.get('isDeleted', false) != true
+             && !(u.get('accountState', 'active')
+                    in ['suspended', 'banned', 'recovery_pending', 'permanently_deactivated']);
     }
 
     // ── The displaced device ─────────────────────────────────────────────────
@@ -411,6 +658,11 @@ service cloud.firestore {
       return request.auth != null && request.auth.uid == uid;
     }
 
+    // P1-E: the caller's department, from their own crmUsers document.
+    function callerDept() {
+      return get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('dept', '');
+    }
+
     // ── Partner self-registration ────────────────────────────────────────────
     //
     // An agency or coin seller signing up creates their OWN crmUsers document,
@@ -435,19 +687,76 @@ service cloud.firestore {
     // created from its dashboard ('agency_created'). Anything else — including
     // an agency record a stranger fabricated with some other source string —
     // does not qualify.
+    //
+    // P0-5 (AUTHN-2): a public application binds on a VERIFIED address only
+    // (`/agency-signup` confirms it before anything is filed). A sub-agency
+    // login is made by its parent with a brand-new password account, which is
+    // unverified by definition, so it binds instead on who CREATED the record:
+    // `createdByUid` is pinned to the creator at create
+    // (`partnerCreateSafe`), cannot be edited afterwards, and must be a login
+    // of the parent agency the record names. A stranger can fabricate neither.
     function agencyNamesCaller(agencyId) {
       return exists(/databases/$(database)/documents/agencies/$(agencyId))
           && get(/databases/$(database)/documents/agencies/$(agencyId))
                .data.get('ownerEmail', '') == request.auth.token.email
-          && get(/databases/$(database)/documents/agencies/$(agencyId))
-               .data.get('source', '') in ['self_signup', 'agency_created'];
+          && ((get(/databases/$(database)/documents/agencies/$(agencyId))
+                 .data.get('source', '') == 'self_signup'
+               && tokenEmailVerified())
+              || (get(/databases/$(database)/documents/agencies/$(agencyId))
+                    .data.get('source', '') == 'agency_created'
+                  && subAgencyMadeByItsParent(agencyId)));
+    }
+
+    // The creator must be a LIVE login of the parent agency the record names:
+    // active, holding the agency capability, that capability not withdrawn.
+    // `parentAgencyId` must be a real id — an explicit null would otherwise
+    // equal a creator document whose `agencyId` is null.
+    function subAgencyMadeByItsParent(agencyId) {
+      let a = get(/databases/$(database)/documents/agencies/$(agencyId)).data;
+      let c = get(/databases/$(database)/documents/crmUsers/$(a.get('createdByUid', 'none'))).data;
+      return a.get('type', '') == 'sub'
+          && a.get('parentAgencyId', null) is string
+          && a.get('parentAgencyId', '') != ''
+          && a.get('createdByUid', '') != ''
+          && c.get('agencyId', '') == a.get('parentAgencyId', '')
+          && c.get('isActive', true) != false
+          && (c.get('role', '') == 'agency' || 'agency' in c.get('roles', []))
+          // Decision 15 (RC): the parent's agency role has STARTED — approved,
+          // not pending review and not waiting for verified contacts.
+          && (c.get('roleStatus', {}).get('agency', '') == 'approved'
+              || (c.get('roleStatus', {}).get('agency', '') == ''
+                  && c.get('role', '') == 'agency' && c.get('status', '') == 'approved'));
+    }
+
+    // UGP-G: sub-agencies are ONE level. The agency login creating a sub-agency
+    // must itself belong to a MAIN agency: not typed 'sub', and no parent link.
+    // Main agencies are stored with an explicit `parentAgencyId: null` by the
+    // signup forms and the API, older ones with '' or no field at all — all
+    // three mean "no parent". A missing agency document fails the `get`, which
+    // denies.
+    function ownAgencyIsMain() {
+      let own = get(/databases/$(database)/documents/agencies/$(crmUserAgencyId())).data;
+      let parent = own.get('parentAgencyId', null);
+      // Compared the way the API reads it (`_derive_kind` lower-cases and
+      // trims), so a stored 'SUB' is a sub here too.
+      return own.get('type', 'main').trim().lower() != 'sub'
+          && (parent == null || parent == '');
+    }
+
+    // UGP-G: the record being created is a MAIN agency: `type` absent or
+    // exactly 'main' — the only value the signup forms write — and no parent.
+    function createsMainAgency() {
+      let parent = request.resource.data.get('parentAgencyId', null);
+      return request.resource.data.get('type', 'main') == 'main'
+          && (parent == null || parent == '');
     }
 
     // The binding half, for a coin seller.
     function sellerNamesCaller(sellerId) {
       return exists(/databases/$(database)/documents/sellers/$(sellerId))
           && get(/databases/$(database)/documents/sellers/$(sellerId))
-               .data.get('email', '') == request.auth.token.email;
+               .data.get('email', '') == request.auth.token.email
+          && tokenEmailVerified();
     }
 
     // ── The second capability ────────────────────────────────────────────────
@@ -511,7 +820,19 @@ service cloud.firestore {
        */
       allow get:   if true;
       allow list:  if isOps();
-      allow write: if isOps();
+      /*
+       * GOV C6 (B30): SERVER-ONLY. This was `isOps()`, so any ops login —
+       * `ops_member` included — could bar or free any handset from a browser
+       * console, with no reason, no audit entry and no named actor, and could
+       * delete a `manualBan` that only `POST /users/devices/bans/{id}/unban`
+       * is meant to lift. Every legitimate writer runs through the Admin SDK,
+       * which these rules do not govern: the ban cascade in
+       * `services/users.ban_user`, `barDevice` in functions/src/identity.ts,
+       * and the CRM's manual ban/unban, which calls
+       * `POST /users/devices/bans` and `POST /users/devices/bans/{id}/unban`
+       * (zipper-crm/lib/operations.ts, app/operations/bans).
+       */
+      allow write: if false;
     }
 
     /*
@@ -563,6 +884,18 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // UGP-C: email binding by one-time code (functions/src/emailOtp.ts). The
+    // challenge holds a salted HMAC of the code and its attempt counter; the
+    // rate rows hold send counts. Written and read ONLY by the Admin SDK — a
+    // client that could read the challenge could brute-force the digest
+    // offline, and one that could write it could reset its own attempts.
+    match /emailOtpChallenges/{uid} {
+      allow read, write: if false;
+    }
+    match /emailOtpRate/{key} {
+      allow read, write: if false;
+    }
+
     match /authEvents/{eventId} {
       allow read:  if isStaff();
       allow write: if false;
@@ -584,6 +917,10 @@ service cloud.firestore {
      * already shows the device side of it.
      */
     match /guestDeviceBindings/{deviceId} {
+      allow read, write: if false;
+    }
+    // AUTH-001 (Phase 1A): reverse index uid → device. Server-only, like above.
+    match /guestUidBindings/{uid} {
       allow read, write: if false;
     }
 
@@ -618,12 +955,52 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════════════════════════════
     // CRM TEAM ACCOUNTS
     // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    // CONTACT VERIFICATIONS — Decision 15 (RC), server-written only
+    // ══════════════════════════════════════════════════════════════════════════
+    // `contactVerifications/{uid}` records the verifications OUR flows
+    // completed for that login: the 6-digit email code (`verifyEmailBindCode`,
+    // `verifyLoginEmailCode`) and the SMS-linked phone the API found bound. It
+    // is half of the answer to "may this approved partner role start?", so no
+    // client may write it — a browser that could would verify itself. The
+    // person may read their own; staff may read any (support). The Admin SDK
+    // writes it and is not governed by these rules.
+    // P1-E: names, roles and departments of staff — no contact details. Every
+    // member of staff may read it (assignee pickers, routing). Written only by
+    // the backend's Admin SDK (`crm_directory.write_roster`).
+    // P1-A3b: Owner MFA bindings. Server-only — no client, Owners included, may
+    // read or write them (a readable binding would tell an attacker which
+    // sign-in to imitate; a writable one would be the bypass itself).
+    match /ownerMfaSessions/{uid} {
+      allow read, write: if false;
+    }
+
+    match /staffRoster/{uid} {
+      allow read:  if isStaff();
+      allow write: if false;
+    }
+
+    match /contactVerifications/{uid} {
+      allow read: if request.auth != null && (request.auth.uid == uid || isStaff());
+      allow write: if false;
+    }
+
     match /crmUsers/{uid} {
-      // Staff read the team list. Agencies and sellers hold crmUsers documents too
-      // (role 'agency' / 'seller'), so isCrmUser() here would have handed every
-      // external partner the name, email and phone of every member of staff. They
-      // get their own record and nothing else.
-      allow read:   if isStaff() || isOwner(uid);
+      // P1-E (decision 8, least privilege): a crmUsers document carries phone,
+      // personal email and address. It is read by its holder, by an Owner, and
+      // by a department admin for a MEMBER of their own department — the same
+      // set `GET /api/staff` returns (services/staff.list_staff). Every other
+      // member of staff reads names only, from `staffRoster` (above).
+      //
+      // This used to be `isStaff() || isOwner(uid)`: every staff member could
+      // read every colleague's — and every agency's and seller's — contact
+      // details. Agencies and sellers still get their own record and nothing else.
+      allow read:   if isOwner(uid)
+                    || isSuperAdmin()
+                    || (isAdmin()
+                        && resource.data.get('dept', '') != ''
+                        && resource.data.get('dept', '') == callerDept()
+                        && resource.data.get('role', '').matches('.*_member'));
 
       // NOTE — nothing in the browser creates a staff account any more.
       //   /team used to, through `createCrmUser` in zipper-crm/lib/auth.ts, and
@@ -666,21 +1043,77 @@ service cloud.firestore {
       //   Role is pinned to 'agency' or 'seller' and status to 'pending'. Neither
       //   path can mint staff, and neither account does anything until it is
       //   approved.
-      allow create: if isSuperAdmin()
+      /*
+       * Phase 1A (STAFF-001/002/003, SECURITY-004). An Owner's browser is no
+       * longer an unconditional writer of this collection:
+       *
+       *   * it cannot CREATE an Owner (`superadmin`) or any internal role —
+       *     only the Observer provisions Owners, through POST /staff/owners;
+       *     staff and department roles are made by POST /staff;
+       *   * it cannot touch another Owner's document at all, nor change its
+       *     own role;
+       *   * it cannot write role, roles, roleStatus, permissions, isActive or
+       *     the partner links on anybody — authority changes are API calls
+       *     (change_role / deactivate / partner-ops), audited, with the
+       *     last-Owner guard and session revocation;
+       *   * it never deletes one (deactivation keeps history attributable).
+       *
+       * What remains is the admin-mode partner LOGIN creation in
+       * lib/auth.ts (role agency/seller, for a uid that has no document yet —
+       * so never a staff account) and cosmetic edits on non-Owner documents.
+       */
+      allow create: if (isSuperAdmin()
+                        && uid != request.auth.uid
+                        && request.resource.data.get('role', '') in ['agency', 'seller']
+                        && !('superadmin' in request.resource.data.get('roles', []))
+                        // Decision 15 (RC): an Owner's browser creates a
+                        // partner LOGIN, never a decided one. Approval — and
+                        // the start of the role once both contacts are
+                        // verified — is the API's (`roleStatus`, `roles` and
+                        // any status but `pending` are the server's to write;
+                        // lib/auth.ts writes exactly `status: 'pending'`).
+                        && request.resource.data.get('status', 'pending') == 'pending'
+                        && !request.resource.data.keys().hasAny(['roles', 'roleStatus']))
+                    // P0-5 review: a self-registered login holds exactly the ONE
+                    // capability its binding proved. `roles`, `roleStatus` and
+                    // the other capability's link are written only by the API
+                    // and the second-role arms below — at create they let a
+                    // seller applicant name `roles: ['seller','agency']` and any
+                    // agency's id, and `isAgencyCrmUser()` honours `roles`.
                     || (partnerSelfRegistration(uid)
                         && request.resource.data.role == 'agency'
                         && request.resource.data.get('createdBy', '')
                              in ['self_signup', 'agency_created']
+                        && !request.resource.data.keys().hasAny(['roles', 'roleStatus', 'secondRoleOwnerUid'])
+                        && unlinked(request.resource.data.get('sellerId', ''))
                         && agencyNamesCaller(request.resource.data.agencyId))
                     || (partnerSelfRegistration(uid)
                         && request.resource.data.role == 'seller'
                         && request.resource.data.get('createdBy', '') == 'self_signup'
+                        && !request.resource.data.keys().hasAny(['roles', 'roleStatus', 'secondRoleOwnerUid'])
+                        && unlinked(request.resource.data.get('agencyId', ''))
                         && sellerNamesCaller(request.resource.data.sellerId));
 
-      allow update: if isSuperAdmin()
+      // GOV C4: `accountRestricted` is the server's record that the human
+      // behind this login is suspended or banned in the app. It is written by
+      // `services/users.py` alone (Admin SDK) — clearing it from a browser
+      // would lift the restriction with no resume, no unban and no audit.
+      allow update: if (isSuperAdmin()
+                        && uid != request.auth.uid
+                        && resource.data.get('role', '') != 'superadmin'
+                        && !request.resource.data.diff(resource.data).affectedKeys()
+                              .hasAny(['role', 'roles', 'roleStatus', 'permissions',
+                                       'isActive', 'status', 'agencyId', 'sellerId',
+                                       'dept', 'team', 'uid', 'email',
+                                       'accountRestricted', 'gateAnswers']))
                     || (isCrmUser() && request.auth.uid == uid
                         && request.resource.data.diff(resource.data)
                              .affectedKeys().hasOnly(['lastLoginAt']))
+                    // P1-A3: the Owner FIRST-LOGIN gate arm (own `gateAnswers`,
+                    // once) is REMOVED with the gate itself. Owners now pass
+                    // server-enforced TOTP (backend `services/owner_mfa.py`), and
+                    // `gateAnswers` is written by no client at all — it is in
+                    // the refused list of the superadmin arm above.
                     // ── Your own contact details, and nothing else ────────────
                     //
                     // /profile lets every person in the CRM — staff, agency and
@@ -727,11 +1160,13 @@ service cloud.firestore {
                         && request.resource.data.diff(resource.data).affectedKeys()
                              .hasOnly(['displayName', 'phone', 'personalEmail',
                                        'address', 'photoUrl']))
-                    // Admin can approve/reject agency or seller accounts (status field only)
-                    || (isAdmin()
-                        && resource.data.role in ['agency', 'seller']
-                        && request.resource.data.diff(resource.data)
-                             .affectedKeys().hasOnly(['status']))
+                    // REMOVED (Phase 1A, SECURITY-004 / RESTORE-006): an admin
+                    // arm that let any department admin set a partner login's
+                    // `status` from a browser. Approval, revocation and
+                    // reactivation are backend operations (audited, Admin SDK);
+                    // a browser write here could re-open a revoked login. The
+                    // only callers (`approveAgencyAccount`/`approveSellerAccount`
+                    // in zipper-crm/lib/auth.ts) were dead and are removed.
                     // ── Applying for the second capability ──────────────────
                     //
                     // An approved agency asking to also sell coins, or a coin
@@ -758,21 +1193,32 @@ service cloud.firestore {
                     //   * the record it points at must name this caller in
                     //     `secondRoleOwnerUid` — see the two binding functions
                     //     at the top of this file.
+                    // GOV C4: neither second-capability arm is open to a login
+                    // whose app account is suspended or banned.
                     || (isOwner(uid)
+                        && resource.data.get('accountRestricted', false) != true
                         && request.resource.data.diff(resource.data).affectedKeys()
                              .hasOnly(['roles', 'roleStatus', 'sellerId'])
                         && request.resource.data.get('roles', []).hasOnly(['agency', 'seller'])
                         && request.resource.data.get('roleStatus', {}).get('seller', '') == 'pending'
+                        // SECURITY-005 (Phase 1A): ONLY the new capability's
+                        // entry may move. Writing the whole map let a revoked
+                        // agency set its own `roleStatus.agency` back.
+                        && request.resource.data.get('roleStatus', {})
+                             .diff(resource.data.get('roleStatus', {})).affectedKeys().hasOnly(['seller'])
                         && unlinked(resource.data.get('sellerId', ''))
                         && sellerSecondRoleNamesCaller(request.resource.data.get('sellerId', '')))
                     || (isOwner(uid)
+                        && resource.data.get('accountRestricted', false) != true
                         && request.resource.data.diff(resource.data).affectedKeys()
                              .hasOnly(['roles', 'roleStatus', 'agencyId'])
                         && request.resource.data.get('roles', []).hasOnly(['agency', 'seller'])
                         && request.resource.data.get('roleStatus', {}).get('agency', '') == 'pending'
+                        && request.resource.data.get('roleStatus', {})
+                             .diff(resource.data.get('roleStatus', {})).affectedKeys().hasOnly(['agency'])
                         && unlinked(resource.data.get('agencyId', ''))
                         && agencySecondRoleNamesCaller(request.resource.data.get('agencyId', '')));
-      allow delete: if isSuperAdmin();
+      allow delete: if false;   // Phase 1A: deactivation via the API, never deletion from a browser.
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -811,20 +1257,90 @@ service cloud.firestore {
                   // signup has no uid on the record — it is written before the
                   // account exists — so without this the applicant could not
                   // read back the application they just filed.
-                  || (request.auth != null
+                  // P0-5 (AUTHN-2): VERIFIED — an unverified token could
+                  // otherwise read the bank and KYC details of any application
+                  // filed under an address that has no account yet.
+                  || (tokenEmailVerified()
                       && resource.data.get('ownerEmail', '') == request.auth.token.email);
 
       // CRM admin registers on behalf, OR authenticated app user self-registers,
       // OR CRM agency user creates a sub-agency,
       // OR unauthenticated user submits via the public signup form
-      allow create: if isCrmUser()
-                    || (isAppUser()
-                        && request.resource.data.kycStatus == 'pending'
-                        && request.resource.data.isActive == false)
-                    || (request.auth == null
-                        && request.resource.data.kycStatus == 'pending'
-                        && request.resource.data.isActive == false
-                        && request.resource.data.source == 'self_signup');
+      //
+      // The app-user arm binds `ownerUid` to the caller. The registration
+      // trigger reads that field as the record's human and the API enforces
+      // one agency-family record per human on it — so a client that could
+      // write somebody else's uid could claim that person's slot, or hang a
+      // record on them. The app itself no longer creates agencies here (it
+      // applies through a callable that sets `ownerUid` server-side); this arm
+      // remains for the signed-in CRM signup form and is held to the same
+      // binding `sellers` has always had.
+      // SECURITY-003 / AUTH-002 (Phase 1A). Every arm now creates only a
+      // PENDING, INACTIVE record that names no human other than the caller
+      // (`partnerCreateSafe`). Before this, any CRM login — a coin seller
+      // included — could create an agency with any `status` and any
+      // `ownerUid`, and an unauthenticated caller could name a victim's uid,
+      // which the backend then treated as that person's agency (claiming
+      // their one agency slot and later attaching the record's phone to their
+      // login). Guests (no verified email/phone on the token) may not apply.
+      // FX-06 / approved contact rule: `source: 'self_app'` marks an
+      // application the API wrote and registered itself; the registration
+      // trigger skips it. Only the Admin SDK may write it — a client that
+      // could would create a record no server check ever sees. Decision 16
+      // (RC): `reapply` (a fresh Sub-agency application after a rejection,
+      // written by the API) is the Admin SDK's alone for the same reason.
+      allow create: if partnerCreateSafe()
+                    && !(request.resource.data.get('source', '') in ['self_app', 'reapply'])
+                    && (isStaff()
+                        || (isAgencyCrmWriter()
+                            // Decision 15 (RC): only a STARTED agency role
+                            // creates a sub-agency.
+                            && agencyRoleApproved()
+                            && request.resource.data.get('type', '') == 'sub'
+                            && request.resource.data.get('parentAgencyId', '') == crmUserAgencyId()
+                            // UGP-G: one level only. The creating login's OWN
+                            // agency must be a main agency — a sub-agency may
+                            // not create a sub-agency. The API already refused
+                            // to register such a record (`_validate_parent_
+                            // agency`), but the document was still written and
+                            // left behind as `partnerRecordFailed` with a
+                            // pending login. `type` or a parent link marks a
+                            // sub, exactly as `_derive_kind` reads it.
+                            && ownAgencyIsMain())
+                        // GOV B35: the second-capability arm, mirrored on the
+                        // seller one (`sellers` create). It was
+                        // `isCrmUser() && source == 'second_role'` and nothing
+                        // else, so ANY CRM login — a sub-agency's included —
+                        // could create a `type: 'sub'` record naming any
+                        // parent, around the one-level rule above. The record
+                        // must name the caller in both links, and a second
+                        // capability is a MAIN agency (lib/partnerRoles.ts
+                        // writes `type: 'main'`, `parentAgencyId: null`).
+                        || (isCrmUser()
+                            && crmLoginUnrestricted()
+                            && request.resource.data.get('source', '') == 'second_role'
+                            && request.resource.data.get('secondRoleOwnerUid', '') == request.auth.uid
+                            && request.resource.data.get('crmUid', '') == request.auth.uid
+                            && createsMainAgency())
+                        // UGP-G: the two signup arms create MAIN agencies only.
+                        // A sub-agency is created by its parent's login (above)
+                        // or by staff; through these arms a `type: 'sub'` record
+                        // could name any parent, which the API then refused and
+                        // left behind as a failed record.
+                        // Approved contact rule: the signed-in public signup
+                        // (`/agency-signup`). Pinned to `self_signup`, the source
+                        // the registration path holds to the full application
+                        // eligibility (`ensure_partner_record` →
+                        // `refuse_client_created_registration`), so a direct
+                        // create cannot step around it.
+                        || (hasContactIdentity()
+                            && request.resource.data.kycStatus == 'pending'
+                            && request.resource.data.get('source', '') == 'self_signup'
+                            && createsMainAgency()));
+                        // FX-09: the UNAUTHENTICATED create arm is gone. The
+                        // public forms sign in first; an unauthenticated
+                        // document could name no owner, so approval applied no
+                        // per-person or contact rule to it at all.
 
       // Owner can update their own doc (KYC, bank details) — both app user and CRM agency role
       // Admin approves/rejects
@@ -836,29 +1352,133 @@ service cloud.firestore {
       // A record still awaiting its first decision is exempt: there is no
       // approved bank account to protect yet, and forcing a proposal flow
       // before anyone has ever looked would just add a step.
-      allow update: if isAdmin()
-                    || (isAgencyCrmUser() && crmUserAgencyId() == agencyId
+      //
+      // ── `crmUid` AND `ownerUid` ARE EXCLUDED FROM BOTH SELF-EDIT CLAUSES ──
+      //
+      // These are the two fields that say WHICH HUMAN a record belongs to.
+      // Neither may be rewritten by the partner: `crmUid` is the CRM login
+      // (write-once, granted by the last arm below), and `ownerUid` is the
+      // app-side owner, written at create and never again — no code in any of
+      // the four codebases updates it afterwards. Letting either move is
+      // handing the business to somebody else from a browser, unaudited.
+      //
+      // Rules are a PERMISSIVE UNION: one `allow` anywhere wins, and a more
+      // specific arm does not override a general one. The write-once guard
+      // lives on the last arm below, and these two re-granted exactly what it
+      // removed:
+      //
+      //   · the agency-CRM arm excluded only status/approvedBy/approvedAt/
+      //     isActive, and `crmUid` is in neither `payoutFields()` nor
+      //     `identityFields()` — so `touchesNoSensitiveField()` was TRUE for a
+      //     crmUid-only write and an agency could re-point its own record at
+      //     any status, approved included;
+      //   · the app-user-owner arm excluded the same three keys, so whoever
+      //     was on `ownerUid` could rewrite `crmUid` on a pending record as
+      //     often as they liked.
+      //
+      // All of it was confirmed by `tests/firestore.rules.test.mjs`: §6 failed
+      // on four assertions until 'crmUid' was added to both lists, and §8 then
+      // failed on two more until 'ownerUid' joined it. The equivalent SELLER
+      // clause has always listed BOTH by name —
+      //
+      //     hasAny([… 'isActive', 'status', 'ownerUid', 'crmUid', …])
+      //
+      // — which is exactly why /sellers was closed and /agencies was not.
+      // The two collections now say the same thing.
+      //
+      // The FIRST link is unaffected: it is granted by the last arm, which
+      // requires `crmUid == ''`. Only rewriting is refused here. `ownerUid` is
+      // set at create and has no update path to lose.
+      // SECURITY-012 (Phase 1A): the staff arm used to be a bare `isAdmin()`,
+      // so any department admin could rewrite `ownerUid`/`crmUid` (hand the
+      // business to another human) or flip `status`/`isActive` (approve or
+      // restore a revoked agency) straight from a browser, unaudited.
+      // GOV-4 (Phase 1A.2, B4): staff may not move governance or, unless they
+      // are the Owner, bank details (`adminPartnerEditSafe`,
+      // `staffPaymentEditAllowed`); and the agency itself may not move its own
+      // parent, type or commission rate — the pending-record exemption below
+      // covers its KYC and bank details, never which table it is paid from.
+      // GOV C4: both agency-login arms are WRITES, so `isAgencyCrmWriter()`.
+      allow update: if (isAdmin() && adminPartnerEditSafe() && staffPaymentEditAllowed())
+                    || (isAgencyCrmWriter() && crmUserAgencyId() == agencyId
                         && !request.resource.data.diff(resource.data)
-                              .affectedKeys().hasAny(['status', 'approvedBy', 'approvedAt', 'isActive'])
+                              .affectedKeys().hasAny(['status', 'approvedBy', 'approvedAt', 'isActive', 'crmUid', 'ownerUid',
+                                                      'parentAgencyId', 'type', 'commissionRate',
+                                                      'createdByUid'])
                         && (touchesNoSensitiveField()
                             || resource.data.get('status', '') == 'pending'))
-                    || (isAgencyCrmUser() && crmUserAgencyId() == agencyId
+                    || (isAgencyCrmWriter() && crmUserAgencyId() == agencyId
                         && proposesChangeOnly())
                     || (isAppUser()
                         && resource.data.get('ownerUid', '') == request.auth.uid
                         && resource.data.get('status', '') == 'pending'
                         && !request.resource.data.diff(resource.data)
-                              .affectedKeys().hasAny(['status', 'approvedBy', 'approvedAt']))
+                              .affectedKeys().hasAny(['status', 'approvedBy', 'approvedAt', 'crmUid', 'ownerUid',
+                                                      'parentAgencyId', 'type', 'commissionRate',
+                                                      'createdByUid']))
                     // The applicant writing the `crmUid` back-link immediately
                     // after their account is created. Matched on the verified
                     // email because the record predates the account, and pinned
                     // to that one field so it cannot become an edit of anything
                     // else.
-                    || (request.auth != null
+                    //
+                    // WRITE-ONCE. `crmUid` must have been EMPTY. Without that
+                    // clause this permitted re-pointing an agency that already
+                    // had an owner at a different login — a handover, done
+                    // from a browser, with nothing recording it. The identical
+                    // clause on /sellers has always carried this condition
+                    // (search `crmUid`, '' there); agencies was the one that
+                    // did not, which is the collection the duplicate-agency
+                    // incident happened in.
+                    //
+                    // This is a floor, not the enforcement. Rules cannot
+                    // answer "does another document already name this human" —
+                    // that needs a collection query and rules cannot query —
+                    // so one human holding one agency is enforced in the API,
+                    // against Mongo, by `services/partner_roles`. What this
+                    // does is stop a link being MOVED without anybody seeing
+                    // it; `POST /partner-ops/partners/{id}/attach-login` is
+                    // the audited route, and it refuses a second agency.
+                    // P0-5 (AUTHN-2): on a VERIFIED address only.
+                    || (tokenEmailVerified()
                         && resource.data.get('ownerEmail', '') == request.auth.token.email
                         && resource.data.get('status', '') == 'pending'
+                        && resource.data.get('crmUid', '') == ''
                         && request.resource.data.diff(resource.data)
-                              .affectedKeys().hasOnly(['crmUid']));
+                              .affectedKeys().hasOnly(['crmUid']))
+                    // GOV B07: the SUB-AGENCY's own new login writing the same
+                    // back-link, once, straight after `createSubAgencyAccount`
+                    // (zipper-crm/lib/auth.ts) made it and its crmUsers
+                    // document. Nothing else could: the parent's login may name
+                    // only itself at create (`partnerCreateSafe`), and a brand-
+                    // new password login is unverified, so the arm above refuses
+                    // it — the record stayed owned by nobody and the API's
+                    // per-person rules could not see who held it. Bound exactly
+                    // like that login's crmUsers create (`agencyNamesCaller`,
+                    // source 'agency_created'): a pending sub-agency made by a
+                    // live login of its parent, naming the caller's address,
+                    // with no link yet — and the caller's own crmUsers document,
+                    // which only that create could have written, names THIS
+                    // agency. Write-once, one field, and only the caller's uid.
+                    // The login must also be ACTIVE (`isCrmUser()`, which the
+                    // bare `exists()` this first used did not ask) and, like
+                    // every partner write that relies on a crmUsers login, not
+                    // a restricted human's (GOV C4, `crmLoginUnrestricted`).
+                    // All three read the caller's crmUsers document, already
+                    // read above, so this adds no distinct document.
+                    || (request.auth != null
+                        && resource.data.get('source', '') == 'agency_created'
+                        && resource.data.get('status', '') == 'pending'
+                        && resource.data.get('crmUid', '') == ''
+                        && resource.data.get('ownerEmail', '') != ''
+                        && resource.data.get('ownerEmail', '') == request.auth.token.get('email', '')
+                        && request.resource.data.diff(resource.data)
+                              .affectedKeys().hasOnly(['crmUid'])
+                        && request.resource.data.get('crmUid', '') == request.auth.uid
+                        && isCrmUser()
+                        && crmUserAgencyId() == agencyId
+                        && crmLoginUnrestricted()
+                        && subAgencyMadeByItsParent(agencyId));
 
       allow delete: if isSuperAdmin();
 
@@ -930,7 +1550,62 @@ service cloud.firestore {
                     || (request.auth != null
                         && resource.data.get('activatedByUid', '') == request.auth.uid);
       // CRM (admin/agency) creates invitations; app users activate them
-      allow create: if isCrmUser() || isAppUser();
+      /*
+       * CREATE — an agency INVITATION from the CRM, nothing else.
+       *
+       * It was `isCrmUser() || isAppUser()`: any signed-in app user could write
+       * a host application naming themselves (`applicantUid`) and skip the
+       * role table entirely — Host + Agency through the side door. A
+       * SELF-application is filed by the API (`submit_host_application`, Admin
+       * SDK), which checks eligibility; the app never writes this collection.
+       *
+       * What a client may still create is an agency's invitation for a person
+       * who has not signed in: staff, or an agency login for its OWN agency,
+       * pending, unredeemed, naming no applicant. Redemption (`activateHost`)
+       * and approval (the API) are server-side and re-check the role table.
+       */
+      /*
+       * Phase 1A (SECURITY-002): the server's decision fields. Only
+       * `decide_host_application` (Admin SDK) writes them, and `activateHost`
+       * refuses an application whose `decidedByUid` is empty — so no browser,
+       * staff or applicant, can manufacture an approval by writing `status`.
+       * `agencyId` and `referralCode` are here too: re-pointing an approved
+       * invitation at another agency, or forging the code, is the same act.
+       */
+      function hostDecisionFields() {
+        return ['status', 'kycStatus', 'decidedAt', 'decidedBy', 'decidedByUid',
+                'decidedByRole', 'decisionReason', 'rejectionReason',
+                'isActivated', 'activatedByUid', 'activatedAt', 'applicantUid',
+                'agencyId', 'referralCode', 'source'];
+      }
+      function hostAppDecisionUntouched() {
+        return !request.resource.data.diff(resource.data).affectedKeys()
+                  .hasAny(hostDecisionFields());
+      }
+      // The invitation's code must be its agency's real code.
+      function hostAppCodeIsAgencys() {
+        let agencyId = request.resource.data.get('agencyId', '');
+        return agencyId is string && agencyId != ''
+            && exists(/databases/$(database)/documents/agencies/$(agencyId))
+            && request.resource.data.get('referralCode', '') ==
+                 get(/databases/$(database)/documents/agencies/$(agencyId))
+                   .data.get('referralCode', '').upper()
+            && request.resource.data.get('referralCode', '') != '';
+      }
+      allow create: if (isStaff()
+                        // GOV C4: a restricted agency login files no invitation.
+                        // Decision 15 (RC): nor a pending or waiting one.
+                        || (isAgencyCrmWriter()
+                            && agencyRoleApproved()
+                            && request.resource.data.get('agencyId', '') == crmUserAgencyId()))
+                    && hostAppCodeIsAgencys()
+                    && !request.resource.data.keys().hasAny([
+                         'applicantUid', 'activatedByUid', 'activatedAt',
+                         'decidedAt', 'decidedBy', 'decidedByUid', 'decidedByRole',
+                         'decisionReason'])
+                    && request.resource.data.get('isActivated', false) == false
+                    && request.resource.data.get('status', 'pending') == 'pending'
+                    && request.resource.data.get('kycStatus', 'submitted') in ['submitted', 'pending'];
       // A host's bank account is changed by STAFF here, not by the host — they
       // have no CRM dashboard of their own — so the control that fits is
       // four-eyes rather than a partner-facing proposal flow. An admin may
@@ -941,16 +1616,23 @@ service cloud.firestore {
       //
       // Everything that is not a re-approval field — call rate, notes, the
       // status fields — is unchanged and still admin-writable.
-      allow update: if (isAdmin() && (touchesNoSensitiveField() || isSuperAdmin()))
+      /*
+       * Phase 1A (SECURITY-002): the applicant arm is GONE. It let the
+       * applicant write `status: 'approved'`, a forged `referralCode`, a
+       * different `agencyId` and a new `photoUrl` onto their own application
+       * — self-approval. The app never writes this collection (see
+       * HostFunctions.kt); a self-application is filed and edited by the API.
+       *
+       * The admin arms keep their edit rights for notes, call rate and so on,
+       * but never the decision fields: deciding goes through
+       * POST /users/host-applications/{id}/decision.
+       */
+      allow update: if (isAdmin() && hostAppDecisionUntouched()
+                        && (touchesNoSensitiveField() || isSuperAdmin()))
                     || (isAdmin() && proposesChangeOnly())
-                    || (isAgencyCrmUser()
+                    || (isAgencyCrmWriter()
                         && resource.data.get('agencyId', '') == crmUserAgencyId()
-                        && proposesChangeOnly())
-                    || (isAppUser()
-                        && resource.data.applicantUid == request.auth.uid
-                        && !request.resource.data.diff(resource.data)
-                              .affectedKeys().hasAny(['isActivated', 'activatedByUid'])
-                        && touchesNoSensitiveField());
+                        && proposesChangeOnly());
                     /*
                      * ── REMOVED: the client-side activation clause ───────────
                      *
@@ -994,11 +1676,23 @@ service cloud.firestore {
       // Bounded to their own agency, still pending, and never activated: an
       // invitation the host has already redeemed is a record of something that
       // happened and is not the agency's to erase.
+      //
+      // RC: and an INVITATION — something the agency itself filed. A person's
+      // self-filed Host application under this agency (`applicantUid`,
+      // `source: 'self_app'`) is the applicant's, and staff decide it
+      // (`decide_host_application` excludes every partner on purpose: "the
+      // agency files the invitation, staff decide it"). Deleting it was a
+      // decision with no record. Withdrawal also removes the invitation's KYC
+      // uploads now (`onHostInvitationWithdrawn`), which must never reach an
+      // applicant's own documents.
       allow delete: if isAdmin()
-                    || (isAgencyCrmUser()
+                    || (isAgencyCrmWriter()
                         && resource.data.get('agencyId', '') == crmUserAgencyId()
                         && resource.data.get('status', '') == 'pending'
-                        && resource.data.get('isActivated', false) != true);
+                        && resource.data.get('isActivated', false) != true
+                        && resource.data.get('activatedByUid', '') == ''
+                        && resource.data.get('applicantUid', '') == ''
+                        && resource.data.get('source', '') != 'self_app');
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1070,20 +1764,73 @@ service cloud.firestore {
        */
       allow get:    if request.auth != null;
       allow list:   if isStaff();
-      allow delete: if isOwner(uid) || isAdmin();
+      /*
+       * ── DELETE (Phase 1A, IDENTITY-002) ─────────────────────────────────────
+       *
+       * Was `isOwner(uid) || isAdmin()`. Every protection on this document is
+       * an UPDATE rule, and delete-then-create walks around all of them: a
+       * banned or suspended account deleted its own document and created a
+       * clean one — no `isBanned`, no `accountState`, no `crmRole`, no
+       * `credentialsValidAfter`. A staff browser could do the same to anyone.
+       *
+       * Now:
+       *   * a real deletion goes through `requestAccountDeletion` and the purge
+       *     (Admin SDK), which these rules do not govern;
+       *   * the owner may delete only a HALF-MADE signup — the Back button on
+       *     profile setup (`abandonSignup`) — and only while it carries no
+       *     moderation, deletion, CRM or money state and no `crmUsers` row;
+       *   * no browser, staff included, deletes a user document.
+       */
+      function abandonableSignup() {
+        let d = resource.data;
+        return d.get('isProfileComplete', false) != true
+            && d.get('isBanned', false) != true
+            && d.get('isSuspended', false) != true
+            && d.get('accountState', 'active') in ['active', '']
+            && d.get('crmRole', '') == ''
+            && d.get('isHost', false) != true
+            && d.get('isSeller', false) != true
+            && d.get('diamonds', 0) == 0
+            && d.get('beans', 0) == 0
+            && d.get('coinBalance', 0) == 0
+            && !exists(/databases/$(database)/documents/crmUsers/$(uid));
+      }
+      allow delete: if isOwner(uid) && abandonableSignup();
 
-      // Registration writes the profile, not a balance. Without this a new
-      // account could be created holding any number of diamonds — the update
-      // rule below would then be irrelevant, because the money is already
-      // there before the first update ever happens.
-      allow create: if isAdmin()
-          || (isOwner(uid)
-              && !request.resource.data.keys().hasAny([
-                   'diamonds', 'beans', 'beansAvailable', 'totalBeansEarned',
-                   'totalGemsSpent', 'coinBalance', 'videoCards', 'totalXp',
-                   'level', 'hostLevel', 'isVerifiedHost', 'payoutHold',
-                   'isBanned', 'isHost', 'isSeller', 'agencyId', 'role',
-                 ]));
+      /*
+       * ── CREATE: AN ALLOWLIST (Phase 1A, IDENTITY-002 / CONTACT-001) ─────────
+       *
+       * This was a denylist of twenty money and role fields, so everything
+       * not on it — `accountState`, `isSuspended`, `crmRole`, `isOfficial`,
+       * `credentialsValidAfter`, `activeMobileSession`, `deviceId`, `phoneKey`
+       * — could be set at birth, where no update rule ever looks.
+       *
+       * The list below is exactly what the app writes when a document does
+       * not yet exist: `createUserDocument` and `saveUserProfile`'s
+       * `set(merge)` (AuthRepository.kt). Server-maintained fields arrive
+       * later through the Admin SDK.
+       *
+       * Contact fields are accepted only as the VERIFIED values on the
+       * caller's own token, or empty. A typed address or number never lands
+       * on a user document from a client.
+       */
+      function userCreateFields() {
+        return ['uid', 'name', 'photoUrl', 'phoneNumber', 'email',
+                'isProfileComplete', 'createdAt', 'lastSeen',
+                'gender', 'dob', 'age', 'city', 'country', 'languages', 'bio',
+                'isOnline', 'coverPhotoUrl', 'theme', 'appLanguage'];
+      }
+      function contactIsVerified(data) {
+        return (data.get('email', '') == ''
+                || (tokenEmailVerified()
+                    && string(data.get('email', '')).lower() == request.auth.token.get('email', '').lower()))
+            && (data.get('phoneNumber', '') == ''
+                || data.get('phoneNumber', '') == request.auth.token.get('phone_number', ''));
+      }
+      allow create: if isOwner(uid)
+          && request.resource.data.keys().hasOnly(userCreateFields())
+          && request.resource.data.get('uid', uid) == uid
+          && contactIsVerified(request.resource.data);
 
       // ── Balance writes: nobody writes money from a client ───────────────────
       //
@@ -1125,7 +1872,7 @@ service cloud.firestore {
           // Trust and status. A user must not be able to verify themselves,
           // lift their own payout hold, unban themselves, or become a host.
           'isVerifiedHost', 'payoutHold', 'isBanned', 'isHost', 'isSeller',
-          'agencyId', 'role',
+          'agencyId', 'ownAgencyId', 'role',
           // The price of a minute of this host's time. See the note below the
           // list: the ceiling depends on the host's level, a rule cannot read
           // the level ladder, and setCallRate can.
@@ -1215,7 +1962,78 @@ service cloud.firestore {
           'suspendedBy', 'suspendedByName', 'suspendedByRole', 'suspendedAt',
           'resumedBy', 'resumedByName', 'resumedByRole', 'resumedAt',
           'previousBanReason', 'warningCount',
+          /*
+           * Phase 1A (CONTACT-001 / IDENTITY-002). Contact identity is moved
+           * only by `bindVerifiedIdentity` and the server-side bind paths.
+           * `email` and `phoneNumber` are NOT in this list, because the
+           * update rule below lets the owner write them when — and only when
+           * — the new value is the verified one on their own token; see
+           * `ownerContactWriteOk()`. `phone` is a legacy spelling with no
+           * verified source, so it is simply closed.
+           */
+          'phone', 'isDeleted', 'uid',
+          // Session and credential state.
+          'activeSessionId', 'sessionStartedAt', 'credentialsRevokedAt',
+          // Staff/official/verification flags not listed above.
+          'isStaff', 'staffRole', 'roles', 'isVerified', 'verificationStatus',
+          'isGuest', 'guestDeviceId', 'createdVia',
+          /*
+           * FX-02 (RF-06). The Host lifecycle stamps — written only by the
+           * server (`grant_host`, `revoke_host`, `restore_host`, `_move_host`,
+           * `activateHost`, all Admin SDK) and READ as the decision itself:
+           * `hostEligibility.ts` (HOST_REVOKED_STAMPS / HOST_REINSTATED_STAMPS),
+           * `partner_applications` (a revoked Host may not apply again),
+           * `user_roles` and `role_appeals`. While they were writable a revoked
+           * Host could delete `hostRevokedAt` (or write `hostRestoredAt`), apply
+           * again and be approved — the Owner-only reinstatement, skipped. No
+           * client writes any of them.
+           */
+          'hostAddedAt', 'hostGrantedAt', 'hostGrantedBy', 'hostGrantedByName',
+          'hostGrantedByRole',
+          'hostRemovedAt', 'hostRevokedAt', 'hostRevokedBy', 'hostRevokedByName',
+          'hostRevokedByRole', 'hostRevokedReason',
+          'hostRestoredAt', 'hostRestoredBy', 'hostRestoredByName', 'hostRestoredByRole',
+          'hostActivatedAt',
+          'agencyTransferredAt', 'agencyTransferredFrom',
         ];
+      }
+
+      /*
+       * The owner may change `email` / `phoneNumber` only to the verified
+       * value on their own ID token (or clear nothing — removal is not a
+       * client action either). Typed contact details never reach this
+       * document from a client. Contact CHANGE as a product feature is
+       * CONTACT-003 and deliberately not implemented.
+       *
+       * P0-5: the email must be VERIFIED on the token (AUTHN-2), and a contact
+       * already on the document is never REPLACED from a client (AUTHN-3,
+       * interim, until D1/D2 decide the change workflow). Writing the same
+       * value again is fine, and so is respelling the same phone number — a
+       * legacy bare `9876543210` becoming the token's `+919876543210`.
+       */
+      function ownerContactWriteOk() {
+        let ch = changed();
+        let oldEmail = resource.data.get('email', '');
+        let newEmail = string(request.resource.data.get('email', '')).lower();
+        let oldPhone = resource.data.get('phoneNumber', '');
+        let oldDigits = string(oldPhone).replace('[^0-9]', '');
+        let newDigits = string(request.resource.data.get('phoneNumber', '')).replace('[^0-9]', '');
+        return (!ch.hasAny(['email'])
+                || (request.resource.data.get('email', '') != ''
+                    && tokenEmailVerified()
+                    && newEmail == request.auth.token.get('email', '').lower()
+                    && (oldEmail == null || oldEmail == ''
+                        || string(oldEmail).lower() == newEmail)))
+            && (!ch.hasAny(['phoneNumber'])
+                || (request.resource.data.get('phoneNumber', '') != ''
+                    && request.resource.data.get('phoneNumber', '')
+                         == request.auth.token.get('phone_number', '')
+                    && (oldPhone == null || oldDigits == '' || oldDigits == newDigits
+                        // a BARE legacy number gaining its country code — never
+                        // one full international number becoming another
+                        || (oldDigits.size() >= 6
+                            && !string(oldPhone).matches('[+].*')
+                            && newDigits.matches('[0-9]{1,3}' + oldDigits)))));
       }
 
       /*
@@ -1282,7 +2100,7 @@ service cloud.firestore {
 
           // Role and badge. Written by `syncMyRoles` and `_attach_app_identity`,
           // both Admin SDK. No client has ever needed to write these.
-          'crmRole', 'isOfficial', 'isAgent',
+          'crmRole', 'isOfficial', 'isAgent', 'ownAgencyId',
 
           // Moderation state and its audit trail. The ONLY path is
           // POST /users/{uid}/{ban,suspend,resume,unban}, which authorises the
@@ -1308,7 +2126,25 @@ service cloud.firestore {
 
           // Identity keys. Moving one of these between accounts is the takeover
           // that `bindVerifiedIdentity`'s three-case rule exists to refuse.
-          'phoneKey', 'phoneNumber', 'email',
+          'phoneKey', 'phoneNumber', 'email', 'phone', 'uid',
+
+          /*
+           * Phase 1A (SECURITY-004 / ROLE-001). Partner and level state.
+           *
+           * The comment above says staff legitimately write `isHost`,
+           * `isSeller`, `agencyId` and `level` from the CRM browser. They no
+           * longer do: `makeHost` / `removeHost` were removed from
+           * lib/firestore.ts and the hosts page calls the API
+           * (`grant_host` / `revoke_host`), which checks the eligibility
+           * matrix, writes the agency roster and the audit entry. A direct
+           * browser write did none of that and could make a staff member, a
+           * guest or an Owner a host.
+           */
+          'isHost', 'isSeller', 'agencyId', 'callRateBeans', 'level',
+          'hostLevel', 'role', 'wealthLevel', 'hostActivatedAt',
+          'isStaff', 'staffRole', 'roles', 'isVerified', 'verificationStatus',
+          'activeSessionId', 'sessionStartedAt', 'credentialsRevokedAt',
+          'warningCount',
 
           // Trust and payout gates.
           'isVerifiedHost', 'payoutHold',
@@ -1317,6 +2153,17 @@ service cloud.firestore {
           // rule cannot.
           'equippedFrame', 'equippedChatBubble', 'equippedProfileCard',
           'equippedIdFrame', 'equippedEntrance',
+
+          // FX-02 (RF-06): the Host lifecycle stamps (`hostActivatedAt` is
+          // above). A staff browser erasing `hostRevokedAt` is the same
+          // reinstatement-without-the-Owner as the owner doing it; the API
+          // (`restore_host`, the appeal decision) is the only path.
+          'hostAddedAt', 'hostGrantedAt', 'hostGrantedBy', 'hostGrantedByName',
+          'hostGrantedByRole',
+          'hostRemovedAt', 'hostRevokedAt', 'hostRevokedBy', 'hostRevokedByName',
+          'hostRevokedByRole', 'hostRevokedReason',
+          'hostRestoredAt', 'hostRestoredBy', 'hostRestoredByName', 'hostRestoredByRole',
+          'agencyTransferredAt', 'agencyTransferredFrom',
         ];
       }
 
@@ -1347,9 +2194,29 @@ service cloud.firestore {
       // reads the same ladder `getHostHome` draws the slider from, clamps to the
       // host's own rung, and writes with the Admin SDK — which is why this can
       // now say the true thing: no client sets its own price.
+      // GOV B42: the owner arm also requires `notBanned()` — a suspended,
+      // banned, deleting or deactivated account no longer edits its own
+      // profile (bio, name, photo, presence) from a client. Deliberately NOT
+      // `isActiveAppUser()`: `sessionCurrent()` would refuse profile setup on a
+      // device whose token predates the session stamp, and that is not what
+      // this closes. `notBanned()` is one `get()` of this same document — one
+      // document access per owner write, well inside the per-request limit.
+      //
+      // GOV B42 — the one owner write a restricted account still makes: on
+      // sign-out, `PushNotifications.clearToken` REMOVES the legacy
+      // `fcmToken` field. `functions/src/push.ts` falls back to that field
+      // whenever `fcmTokens/` is empty, so if the removal were refused a
+      // banned, suspended or deleting account that signed out of its only
+      // phone would keep ringing that phone. Removal only: the field must
+      // exist before, be absent after, and be the only key that moves.
       allow update: if
           (isStaff() && !changed().hasAny(staffProtectedFields()))
-          || (isOwner(uid) && !changed().hasAny(ownerProtectedFields()));
+          || (isOwner(uid) && notBanned() && !changed().hasAny(ownerProtectedFields())
+              && ownerContactWriteOk())
+          || (isOwner(uid)
+              && changed().hasOnly(['fcmToken'])
+              && resource.data.keys().hasAny(['fcmToken'])
+              && !request.resource.data.keys().hasAny(['fcmToken']));
 
       // PUBLIC, anonymous — gift and count only. No uid, no timestamp, nothing
       // that could identify who sent or received it.
@@ -1382,7 +2249,12 @@ service cloud.firestore {
 
       match /blocked/{targetUid}      { allow read, write: if isOwner(uid) || isAdmin(); }
       match /liked/{targetUid}        { allow read, write: if isOwner(uid) || isAdmin(); }
-      match /likedBy/{likerUid}       { allow read: if isOwner(uid) || isAdmin(); allow write: if request.auth != null; }
+      // B3 (RULES-4): written ONLY by the `toggleLike` callable (Admin SDK),
+      // which keeps `totalLikesReceived` / `totalLikesGiven` in step with it.
+      // `write: if request.auth != null` let any account plant a "who liked me"
+      // entry on anybody — any name, any photo — or delete somebody's real
+      // like, without either counter moving. The app only reads this list.
+      match /likedBy/{likerUid}       { allow read: if isOwner(uid) || isAdmin(); allow write: if false; }
 
       // ── Subcollections that previously had NO rule ──────────────────────────
       // Without a match block these fell through to the catch-all `if false`.
@@ -1510,7 +2382,11 @@ service cloud.firestore {
     match /kycSubmissions/{docId} {
       allow read:   if isAdmin() || isSupport()
                     || (isAppUser() && resource.data.uid == request.auth.uid);
-      allow create: if request.auth != null;
+      // B3 (RULES-3): a submission names its own author. `create: if
+      // request.auth != null` let any account file one in somebody else's
+      // name (or in nobody's) straight into the review queue.
+      allow create: if request.auth != null
+                    && request.resource.data.get('uid', '') == request.auth.uid;
       allow update: if isAdmin();
       allow delete: if isAdmin();
     }
@@ -1525,10 +2401,13 @@ service cloud.firestore {
                   || (request.auth != null
                       && get(/databases/$(database)/documents/users/$(hostUid)).data.agencyId
                          != null);
-      allow write: if isAdmin()
-                   || (request.auth != null
-                       && get(/databases/$(database)/documents/users/$(hostUid)).data.agencyId
-                          != null);
+      // B3 (RULES-1, writes): staff admins only. The second arm admitted ANY
+      // signed-in account — guests included — whenever the host's user
+      // document had an `agencyId`, because it never checked that the caller
+      // WAS that agency. No app, CRM, Functions or backend code writes this
+      // collection. The read arm above has the same flaw; B3 changes writes
+      // only, so it is deliberately left as it was and tracked separately.
+      allow write: if isAdmin();
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1643,9 +2522,18 @@ service cloud.firestore {
     // Also written by Support routing an app-user ticket (routeSupportTicketToTeam).
     // ══════════════════════════════════════════════════════════════════════════
     match /techTickets/{ticketId} {
-      allow read:   if isCrmUser();
-      allow create: if isCrmUser();
-      allow update: if isCrmUser();
+      // P1-A1: STAFF only. This was `isCrmUser()`, which is also true for agency
+      // and coin-seller logins (they hold crmUsers documents) — so a partner
+      // could read every internal ticket, including the app users' support
+      // messages that Support routing copies here, and edit them. The comment
+      // above always said "any CRM staff member"; the rule now says so too.
+      //
+      // P1-D: written ONLY by the backend (`/api/tickets/...`, Admin SDK), which
+      // takes the reporter / actor from the session, audits before writing and
+      // notifies the people affected. A browser write could set any reporter
+      // name, skip the audit and bypass the close/route reason rules.
+      allow read:   if isStaff();
+      allow create, update: if false;
       allow delete: if isSuperAdmin();
     }
 
@@ -1662,15 +2550,22 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════════════════════════════
     // FINANCE — PLATFORM REVENUE + STATS
     // ══════════════════════════════════════════════════════════════════════════
+    // B3 (RULES-2): no client writes. `platformRevenue` is written only by Cloud
+    // Functions — `settleGift`, the call settlement (`settleAndClose`) and
+    // `dailyPlatformStatsAggregator` — through the Admin SDK, which these rules
+    // do not govern; nothing in the current code writes `platformStats` at all.
+    // A client create planted revenue and call-time rows straight into the
+    // CRM's reports and the nightly reconciliation. Reads are unchanged.
     match /platformRevenue/{docId} {
-      allow create:         if request.auth != null;
+      allow create:         if false;
       allow read:           if isFinance() || isAdmin();
       allow update, delete: if false;
     }
 
     match /platformStats/{docId} {
-      allow read, create, update: if request.auth != null;
-      allow delete:               if isAdmin();
+      allow read:           if request.auth != null;
+      allow create, update: if false;
+      allow delete:         if isAdmin();
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1804,20 +2699,28 @@ service cloud.firestore {
       // purchase card for the opening load, which is verified, signed and then
       // executed by the backend through the Admin SDK. NOBODY opens a balance
       // from a browser.
-      allow create: if (
+      // SECURITY-003 / AUTH-002 (Phase 1A): `partnerCreateSafe()` — pending,
+      // inactive, unapproved, naming nobody but the caller — wraps every arm,
+      // and the app-user arm now requires a real contact identity (no guests).
+      // FX-06 / approved contact rule: `self_app` is the Admin SDK's alone
+      // (see the agencies create rule), and so is Decision 16's `reapply`.
+      // FX-09: no unauthenticated arm.
+      allow create: if partnerCreateSafe()
+                    && !(request.resource.data.get('source', '') in ['self_app', 'reapply'])
+                    && (
                          (
                            request.resource.data.get('coinBalance', 0) == 0
                         && request.resource.data.get('totalCoinsSold', 0) == 0
                         && (
                              isStaff()
-                          || (isAppUser()
+                          // The signed-in public signup (`/seller-signup`),
+                          // pinned to `self_signup` so the registration path
+                          // applies the full application eligibility to it.
+                          || (hasContactIdentity()
                               && request.resource.data.ownerUid == request.auth.uid
+                              && request.resource.data.get('source', '') == 'self_signup'
                               && request.resource.data.isApproved == false
                               && request.resource.data.isActive == false)
-                          || (request.auth == null
-                              && request.resource.data.isApproved == false
-                              && request.resource.data.isActive == false
-                              && request.resource.data.source == 'self_signup')
                           // An existing partner applying for the coin-seller
                           // capability on the login they already have. Note
                           // where this sits: INSIDE the zero-balance wrapper, so
@@ -1831,6 +2734,8 @@ service cloud.firestore {
                           // creator here and nobody else. It is written once,
                           // at creation, and no update clause below can touch it.
                           || (isCrmUser()
+                              // GOV C4: not from a restricted login.
+                              && crmLoginUnrestricted()
                               && request.resource.data.get('source', '') == 'second_role'
                               && request.resource.data.get('secondRoleOwnerUid', '') == request.auth.uid
                               && request.resource.data.get('crmUid', '') == request.auth.uid
@@ -1855,14 +2760,39 @@ service cloud.firestore {
       // are raised, verified by a second person, signed by an owner and executed
       // by the backend with the Admin SDK, which bypasses these rules. Leaving
       // finance a direct write meant the entire approval chain was optional.
+      //
+      // FIN-7 (Phase 1A.2, B4): every arm in which the seller edits its OWN
+      // record — online status, city, description, QR code, a pending edit, a
+      // proposal — needs a live seller capability on the login
+      // (`sellerRoleLive`) and a record that is not revoked, suspended or
+      // rejected (`sellerRecordNotWithdrawn`), the same pair the coin-purchase
+      // clause uses. Both, because each is mirrored best-effort by the backend
+      // and either can lag the other. A dual-role login stays active while its
+      // agency is live, so before this a revoked seller could still swap the
+      // payment QR buyers are shown.
       allow update: if (
                         (isSuperAdmin() || isFinance() || isAdmin())
                         && !request.resource.data.diff(resource.data).affectedKeys()
-                              .hasAny(['coinBalance', 'totalCoinsSold']))
+                              .hasAny(['coinBalance', 'totalCoinsSold'])
+                        // SECURITY-012 (Phase 1A): no owner-link or lifecycle
+                        // moves from a staff browser either.
+                        && adminPartnerEditSafe()
+                        // GOV-4 (B4): payment details, Owner only.
+                        && staffPaymentEditAllowed())
+                    // The app owner's online toggle (`SellerDashboardScreen`).
+                    // An app-only seller has no crmUsers document, and
+                    // `sellerRoleLive()` reads it, so it is asked only when the
+                    // document exists.
                     || (request.auth != null
                         && resource.data.get('ownerUid', '') == request.auth.uid
                         && request.resource.data.diff(resource.data)
-                              .affectedKeys().hasOnly(['isOnline', 'lastSeen']))
+                              .affectedKeys().hasOnly(['isOnline', 'lastSeen'])
+                        && sellerRecordNotWithdrawn(sellerId)
+                        // Decision 15 (RC): a seller goes online only once its
+                        // role has started.
+                        && sellerRecordApproved(sellerId)
+                        && (!exists(/databases/$(database)/documents/crmUsers/$(request.auth.uid))
+                            || (sellerRoleLive() && crmLoginUnrestricted())))
                     // CRM seller updating their own seller doc. Allow-list, not a
                     // deny-list: a deny-list still permits writing ownerUid,
                     // crmUid, commissionRate or any newly added field.
@@ -1872,16 +2802,31 @@ service cloud.firestore {
                     // off on, and an approved seller could rewrite all four
                     // without anyone looking again. They are proposed through
                     // the clause below instead.
+                    // GOV C4: each of the three CRM-seller arms below also
+                    // needs `crmLoginUnrestricted()` — the human behind the
+                    // login is not suspended or banned in the app.
                     || (isCrmUser()
                         && resource.data.get('crmUid', '') == request.auth.uid
                         && request.resource.data.diff(resource.data).affectedKeys()
                               .hasOnly(['city', 'description', 'qrCodeUrl',
-                                        'isOnline', 'lastSeen']))
+                                        'isOnline', 'lastSeen'])
+                        && sellerRoleLive()
+                        && crmLoginUnrestricted()
+                        && sellerRecordNotWithdrawn(sellerId)
+                        // Decision 15 (RC): going ONLINE is a partner action —
+                        // only once the seller role and the record have
+                        // started. A pending or waiting seller still edits its
+                        // details and may always go offline.
+                        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['isOnline'])
+                            || request.resource.data.get('isOnline', false) == false
+                            || (sellerRoleApproved() && sellerRecordApproved(sellerId))))
                     // A seller nobody has decided on yet edits directly, the
                     // same exemption agencies get. There is no verified account
                     // to protect before the first decision, and without this a
                     // brand-new seller filling in their own details would be
                     // proposing changes to a record no reviewer has ever seen.
+                    // (A pending record is never withdrawn, so only the login's
+                    // seller capability needs asking here.)
                     || (isCrmUser()
                         && resource.data.get('crmUid', '') == request.auth.uid
                         && resource.data.get('isApproved', false) != true
@@ -1889,12 +2834,19 @@ service cloud.firestore {
                         && !request.resource.data.diff(resource.data).affectedKeys()
                               .hasAny(['coinBalance', 'totalCoinsSold', 'isApproved',
                                        'isActive', 'status', 'ownerUid', 'crmUid',
-                                       'commissionRate']))
+                                       'commissionRate',
+                                       // Decision 15 (RC): not online before the role starts.
+                                       'isOnline'])
+                        && sellerRoleLive()
+                        && crmLoginUnrestricted())
                     // A seller proposing a change to identity or payout details.
                     // The live fields do not move until a reviewer applies them.
                     || (isCrmUser()
                         && resource.data.get('crmUid', '') == request.auth.uid
-                        && proposesChangeOnly())
+                        && proposesChangeOnly()
+                        && sellerRoleLive()
+                        && crmLoginUnrestricted()
+                        && sellerRecordNotWithdrawn(sellerId))
                     // The applicant writing the `crmUid` back-link straight after
                     // signup. The seller record is created before the account
                     // exists, so it carries no uid to match on — the verified
@@ -1902,12 +2854,15 @@ service cloud.firestore {
                     // field. Without this, seller signup completes the account
                     // and then fails on the link, leaving a login that no rule
                     // can associate with its seller.
-                    || (request.auth != null
+                    // P0-5 (AUTHN-2): on a VERIFIED address only.
+                    || (tokenEmailVerified()
                         && resource.data.get('email', '') == request.auth.token.email
                         && resource.data.get('crmUid', '') == ''
                         && request.resource.data.diff(resource.data)
                               .affectedKeys().hasOnly(['crmUid']));
-      allow delete: if isAdmin();
+      // SECURITY-012 (Phase 1A): deleting a seller record frees the human's
+      // role slot and erases the ownership trail; Owner only.
+      allow delete: if isSuperAdmin();
 
       // Recharge history — coin load records for this seller.
       //
@@ -1953,58 +2908,48 @@ service cloud.firestore {
       }
     }
 
-    // Recharge requests (user pays seller → seller approves → coins transfer)
-    // Also used when CRM seller initiates a diamond send to a host or agency
+    // ══════════════════════════════════════════════════════════════════════════
+    // RECHARGE REQUESTS — a buyer paid a Coin Seller; Zipper verifies and credits
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // READ-ONLY TO EVERY CLIENT. Writes come from the API alone, through the
+    // Admin SDK (which these rules do not govern): `services/recharges.py`
+    // creates the document when the buyer files through the
+    // `submitRechargeRequest` callable, and moves it through
+    // pending → approved | rejected → refund_pending → refunded | reversed under
+    // a compare-and-set in Mongo, mirroring each state here.
+    //
+    // ── WHY THERE IS NO CLIENT WRITE CLAUSE AT ALL ──────────────────────────
+    //
+    // This document used to be the money path itself. A seller (or any
+    // `.*_admin`, later narrowed to finance) flipping `status` to 'approved'
+    // fired `onRechargeApproved`, which minted diamonds on that word alone —
+    // no proof, no verification, not idempotent, and the update had no field
+    // allow-list, so `diamondPackage` could be edited on the way through. The
+    // trigger now reverts a client approval, but a rule that permits a write
+    // the server must then undo is not a rule. Every field here — status,
+    // reviewer, timestamps, credited and refunded amounts, the ledger marker
+    // `creditedByLedger` — is server-authoritative, so no client clause can be
+    // written that is narrower than "none".
+    //
+    // Nothing in the app or the CRM writes this collection any more: the app
+    // files through the callable, the seller dashboard is read-only, and the
+    // CRM decides through the `/partner-ops/recharges` routes.
+    //
+    // Reads are unchanged: finance and admins, the buyer, and the seller whose
+    // request it is (by app uid or by their CRM login).
     match /rechargeRequests/{reqId} {
       allow read: if isAdmin() || isFinance()
                   || (request.auth != null
                       && (resource.data.buyerUid == request.auth.uid
                           || resource.data.sellerUid == request.auth.uid))
-                  // CRM seller reads their own recharge requests
                   || (isCrmUser()
                       && get(/databases/$(database)/documents/sellers/$(resource.data.sellerUid))
                            .data.get('crmUid', '') == request.auth.uid);
-      // App user buys from seller (buyer = themselves), OR
-      // CRM seller initiates a diamond send to a host/agency (sellerUid = their seller doc)
-      allow create: if (isAppUser() && request.resource.data.buyerUid == request.auth.uid)
-                    || (isCrmUser()
-                        && get(/databases/$(database)/documents/sellers/$(request.resource.data.sellerUid))
-                             .data.get('crmUid', '') == request.auth.uid);
-      // Self-dealing guard: approving a request where buyer and seller are the
-      // same identity mints diamonds for free via onRechargeApproved. A genuine
-      // sale always has a distinct buyer.
-      //
-      // ── THE STAFF CLAUSE WAS `isAdmin()`, AND THIS IS THE LIVE MONEY PATH ───
-      //
-      // Flipping `status` to 'approved' here fires `onRechargeApproved`, which
-      // runs a transaction that debits the seller's `coinBalance` and credits the
-      // buyer's diamonds. It is the one write in this file that mints currency as
-      // a side effect. `isAdmin()` matches `.*_admin`, so marketing_admin,
-      // support_admin, app_admin and ops_admin could all fire it — none of whom
-      // holds `can_coin_operations` in `roles.PERMISSIONS`, which is the system's
-      // own statement that coins are not theirs to move.
-      //
-      // Finance at admin tier, or the owner. `lib/sellers.ts` still exports
-      // `approveRecharge`/`rejectRecharge` but nothing in the CRM calls them, so
-      // this is a break-glass path rather than a screen — which is a reason to
-      // narrow it, not a reason to leave it wide.
-      //
-      // The seller clauses below are untouched: the seller approving their own
-      // sale is the normal path, and the buyer-is-not-seller test beside each one
-      // is the self-dealing guard that stops a single identity minting for free.
-      allow update: if canDecideCoinOps()
-                    || (request.auth != null
-                        && resource.data.get('sellerUid', '') == request.auth.uid
-                        && resource.data.get('buyerUid', '') != request.auth.uid)
-                    // CRM seller approves/rejects recharge
-                    || (isCrmUser()
-                        && resource.data.get('buyerUid', '') != request.auth.uid
-                        && get(/databases/$(database)/documents/sellers/$(resource.data.sellerUid))
-                             .data.get('crmUid', '') == request.auth.uid);
-      // Owner only. Deleting a settled recharge destroys the record of a payment
-      // a buyer made in cash, and it is the document `onRechargeApproved` read to
-      // decide what to mint. No department needs this; Finance rejects instead.
-      allow delete: if isSuperAdmin();
+      allow create, update: if false;
+      // A recharge is a record of a payment somebody made. It is never deleted
+      // from a client — not even by an owner; a mistaken one is rejected.
+      allow delete: if false;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -2090,17 +3035,23 @@ service cloud.firestore {
     // CRM reads from supportTickets. Give identical rules to both.
     // ══════════════════════════════════════════════════════════════════════════
     match /feedbackTickets/{ticketId} {
+      // App users file their own. P1-D: every later change goes through the
+      // backend (`/api/tickets/...`), which audits it and names the actor from
+      // the session — so no client may update or delete these.
       allow create: if isAppUser() && request.resource.data.userId == request.auth.uid;
       allow read:   if (isAppUser() && resource.data.userId == request.auth.uid)
                     || isOps() || isAdmin() || isSupport();
-      allow update, delete: if isOps() || isAdmin() || isSupport();
+      allow update, delete: if false;
     }
 
     match /supportTickets/{ticketId} {
+      // App users file their own. P1-D: every later change goes through the
+      // backend (`/api/tickets/...`), which audits it and names the actor from
+      // the session — so no client may update or delete these.
       allow create: if isAppUser() && request.resource.data.userId == request.auth.uid;
       allow read:   if (isAppUser() && resource.data.userId == request.auth.uid)
                     || isOps() || isAdmin() || isSupport();
-      allow update, delete: if isOps() || isAdmin() || isSupport();
+      allow update, delete: if false;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -2146,7 +3097,11 @@ service cloud.firestore {
         return isAppUser()
             && liveHost().isHost == true
             && liveHost().isVerifiedHost == true
-            && liveHost().get('isBanned', false) != true;
+            && liveHost().get('isBanned', false) != true
+            // RF-27: every restriction, in every spelling — `accountState`
+            // suspended/banned/deleting and `isSuspended`/`isDeleted` — not
+            // `isBanned` alone. Same document, so no extra read.
+            && notBanned();
       }
       function isLiveHost() {
         return isAppUser() && resource.data.hostUid == request.auth.uid;
@@ -2195,8 +3150,10 @@ service cloud.firestore {
       match /gifts/{giftId} {
         allow read:           if request.auth != null;
         // Written by settleGift on the server. A client create here would be a
-        // gift nobody paid for.
-        allow create:         if request.auth != null;
+        // gift nobody paid for — on the ticker and on the room's leaderboard,
+        // which sums these rows. B3 (RULES-5): so it is refused; the comment
+        // said this and the rule still let any signed-in account do it.
+        allow create:         if false;
         allow update, delete: if isAdmin();
       }
       match /viewers/{uid} {
@@ -2463,13 +3420,72 @@ service cloud.firestore {
             && request.resource.data.kind in ['ban', 'report'];
       }
 
+      // UGP-F: an agency login must actually HAVE an agency id to read by it.
+      // Appeals filed by the account itself — in the app or on the public web
+      // page — carry `agencyId: ''`, so a login whose own link is empty (a
+      // seller login holding the agency capability before its record exists,
+      // say) would otherwise match every one of them.
+      function agencyLinkSet() {
+        return crmUserAgencyId() is string && crmUserAgencyId() != '';
+      }
+
+      // ── RC (confirmed): pinned ids, and another appeal after a decision ──
+      //
+      // FX-13's deterministic ids are the ONLY ids a client may file at: a
+      // self-appeal is `self_{uid}_{restriction}[_{n}]`, an agency's contest
+      // of a report `contest_{agencyId}_{reportId}[_{n}]`. Slot n ≥ 2 is an
+      // appeal filed after the earlier slot was DECIDED, and "another appeal
+      // after a decision only with new evidence or a valid reason": it must
+      // carry at least one evidence file, or a statement that is not the
+      // decided one's. Restriction keys and Firestore ids hold no '_', so the
+      // slot is the last '_' segment.
+      // A slot number is canonical — 2, 3, … with no leading zero — so each
+      // slot has exactly one id (`_02`, `_0`, `_1` would otherwise all point
+      // back at slot 1 and let several re-appeals wait at once).
+      function selfAppealIdOk() {
+        return appealId.matches('^self_' + request.auth.uid + '_[A-Za-z0-9-]+(_([2-9]|[1-9][0-9]+))?$');
+      }
+      function contestIdOk() {
+        return appealId.matches('^contest_' + request.resource.data.agencyId + '_'
+                                + request.resource.data.reportId + '(_([2-9]|[1-9][0-9]+))?$');
+      }
+      function slotted() {
+        return appealId.matches('^(self|contest)_.+_([2-9]|[1-9][0-9]+)$');
+      }
+      function previousSlotId() {
+        let parts = appealId.split('_');
+        let n = int(parts[parts.size() - 1]);
+        let base = appealId.replace('_[0-9]+$', '');
+        return n <= 2 ? base : base + '_' + string(n - 1);
+      }
+      function reappealOk() {
+        return !slotted()
+            || (exists(/databases/$(database)/documents/appeals/$(previousSlotId()))
+                && get(/databases/$(database)/documents/appeals/$(previousSlotId())).data
+                     .get('status', 'pending') != 'pending'
+                && (request.resource.data.get('evidenceUrls', []).size() > 0
+                    || request.resource.data.statement.trim().lower()
+                         != get(/databases/$(database)/documents/appeals/$(previousSlotId())).data
+                              .get('statement', '').trim().lower()));
+      }
+
       allow create: if wellFormedAppeal()
+                    // RC (confirmed): another appeal after a decision needs
+                    // new evidence or a statement that is not the decided one's.
+                    && reappealOk()
                     && (
-                      // The account speaking for itself.
-                      (isAppUser() && request.resource.data.subjectUid == request.auth.uid)
-                      // Or its agency, on its own agencyId.
-                      || (isAgencyCrmUser()
-                          && request.resource.data.agencyId == crmUserAgencyId())
+                      // The account speaking for itself — at its pinned id.
+                      (isAppUser() && request.resource.data.subjectUid == request.auth.uid
+                       && selfAppealIdOk())
+                      // Or its agency, on its own agencyId — unless the
+                      // agency's own login is restricted (GOV C4).
+                      // Decision 15 (RC): a started agency role only.
+                      || (isAgencyCrmWriter()
+                          && agencyRoleApproved()
+                          && agencyLinkSet()
+                          && request.resource.data.agencyId == crmUserAgencyId()
+                          // A contest of a report sits at its pinned id.
+                          && (request.resource.data.kind != 'report' || contestIdOk()))
                     );
 
       allow read:   if isStaff()
@@ -2478,6 +3494,7 @@ service cloud.firestore {
                     || (request.auth != null
                         && resource.data.raisedByUid == request.auth.uid)
                     || (isAgencyCrmUser()
+                        && agencyLinkSet()
                         && resource.data.get('agencyId', '') == crmUserAgencyId());
 
       // Decided on the server, through the API, or not at all.
@@ -2501,10 +3518,12 @@ service cloud.firestore {
         return request.auth != null && request.auth.uid in resource.data.participants;
       }
       allow read:   if isParticipant() || isOps();
-      allow create: if request.auth != null
+      // Phase 1A (SESSION-001/003): a displaced, suspended, banned or
+      // deletion-pending account cannot open or touch a conversation.
+      allow create: if isActiveAppUser()
                     && request.auth.uid in request.resource.data.participants
                     && request.resource.data.participants.size() == 2;
-      allow update: if (request.auth != null
+      allow update: if (isActiveAppUser()
                         && request.auth.uid in request.resource.data.participants)
                     || isOps();
       allow delete: if isOps();
@@ -2543,7 +3562,10 @@ service cloud.firestore {
         }
 
         allow read:   if inThisConversation() || isOps();
-        allow write:  if (inThisConversation() && notBanned() && notBlockedByPeer())
+        // Phase 1A (SESSION-001/003): `sessionCurrent()` added — a displaced
+        // device could still send chat with its old token.
+        allow write:  if (inThisConversation() && notBanned() && sessionCurrent()
+                          && notBlockedByPeer())
                       || isOps();
       }
     }
@@ -2578,7 +3600,8 @@ service cloud.firestore {
                  && (call.callerId == request.auth.uid || call.receiverId == request.auth.uid);
         }
         allow read:   if isParty() || isAdmin();
-        allow create: if isParty() && request.resource.data.senderUid == request.auth.uid;
+        allow create: if isParty() && isActiveAppUser()   // Phase 1A (SESSION-001/003)
+                      && request.resource.data.senderUid == request.auth.uid;
         allow update, delete: if isAdmin();
       }
     }
@@ -2696,13 +3719,39 @@ service cloud.firestore {
       // stop them filing their own already marked `approved` or `paid` — the
       // update clause below is finance-only, so the state could not be changed
       // afterwards, but it could be chosen at birth.
-      allow create: if (isFinance() || isSuperAdmin())
-                    || (request.auth != null
-                        && request.resource.data.get('hostUid', '') == request.auth.uid
-                        && request.resource.data.get('status', '') == 'pending');
+      // P0-7: Finance files one as `pending` too — a request born `paid` is
+      // a payout recorded with nothing moved.
+      //
+      // GOV B41: and the host must BE one. A revoked Host (`isHost: false`)
+      // or a suspended or banned account could still file a request for
+      // itself — `notBanned()` is the file's single "not restricted" test
+      // (suspended, banned, deleting, deactivated). Same document both reads.
+      function callerIsLiveHost() {
+        return get(/databases/$(database)/documents/users/$(request.auth.uid))
+                 .data.get('isHost', false) == true
+            && notBanned();
+      }
+      allow create: if request.resource.data.get('status', '') == 'pending'
+                    && ((isFinance() || isSuperAdmin())
+                        || (request.auth != null
+                            && request.resource.data.get('hostUid', '') == request.auth.uid
+                            && callerIsLiveHost()));
       // Deciding a withdrawal is Finance's, for the same reason as above:
       // `isAdmin()` let every department admin approve one.
-      allow update: if isFinance() || isSuperAdmin();
+      //
+      // P0-7 (FIN-5): deciding is ALL a browser may do — approve a pending
+      // request, or reject one not yet paid, touching only the decision
+      // fields. `paid` is written only by the backend, in the same Firestore
+      // transaction that debits the host's beans when the host-withdrawal card
+      // raised for this request is executed (`execute_host_withdrawal`).
+      // "Mark paid" from a browser recorded a payout the ledger never saw.
+      allow update: if (isFinance() || isSuperAdmin())
+                    && ((resource.data.get('status', '') == 'pending'
+                         && request.resource.data.get('status', '') == 'approved')
+                        || (resource.data.get('status', '') in ['pending', 'approved']
+                            && request.resource.data.get('status', '') == 'rejected'))
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'processedAt', 'processedBy', 'notes', 'rejectionReason']);
       allow delete: if isSuperAdmin();
     }
 
@@ -2740,10 +3789,13 @@ service cloud.firestore {
 
       // Pinned to the caller's own agency, and pinned to `pending` — a request
       // cannot be born approved or paid.
+      // GOV C4: the agency arms here are writes — `isAgencyCrmWriter()`.
       allow create: if request.resource.data.get('status', '') == 'pending'
                     && (
                          isFinance() || isAdmin()
-                      || (isAgencyCrmUser()
+                      // Decision 15 (RC): a started agency role only.
+                      || (isAgencyCrmWriter()
+                          && agencyRoleApproved()
                           && crmUserAgencyId() == request.resource.data.get('agencyId', ''))
                     );
 
@@ -2756,9 +3808,23 @@ service cloud.firestore {
       // Finance or the owner. `isAdmin()` matched `.*_admin`, so marketing_admin
       // and support_admin could mark a host payout approved and paid from a
       // browser — an authority `CAN_PROCESS_PAYOUT` gives to Finance alone.
-      allow update: if isFinance() || isSuperAdmin()
-                    || (isAgencyCrmUser()
+      //
+      // P0-7 (FIN-5): a salary request is a host's beans paid out through
+      // their agency, so it is paid exactly like a host withdrawal — by
+      // executing the host-withdrawal card raised for it, which marks it
+      // `paid` in the same transaction as the debit. From a browser, Finance
+      // may only approve or reject it; the agency may mark a PAID one
+      // distributed.
+      allow update: if ((isFinance() || isSuperAdmin())
+                        && ((resource.data.get('status', '') == 'pending'
+                             && request.resource.data.get('status', '') == 'approved')
+                            || (resource.data.get('status', '') in ['pending', 'approved']
+                                && request.resource.data.get('status', '') == 'rejected'))
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(['status', 'approvedAt', 'rejectedAt', 'notes', 'rejectionReason']))
+                    || (isAgencyCrmWriter()
                         && crmUserAgencyId() == resource.data.agencyId
+                        && resource.data.get('status', '') == 'paid'
                         && request.resource.data.diff(resource.data)
                              .affectedKeys().hasOnly(['status', 'distributedAt'])
                         && request.resource.data.get('status', '') == 'distributed');
@@ -2778,48 +3844,82 @@ service cloud.firestore {
       // owners' approval queue — including, before the Cloud Function was
       // stripped, requests that credited diamonds.
       //
-      // This queue is legacy. Money never travels through it any more (see
-      // functions/src/index.ts::handleCustomApproval); anything that moves a
-      // balance must be raised as a card on the money board, where it gets a
-      // separate verifier and an owner signature.
+      // This queue is legacy. Money never travels through it any more; anything
+      // that moves a balance must be raised as a card on the money board, where
+      // it gets a separate verifier and an owner signature.
       //
-      // THE ONE EXCEPTION: an agency inviting a host.
+      // ── GOV-1 (Phase 1A.2, B5): only what the CRM files, decided by another ─
       //
-      // The agency dashboard's "Invite Host" flow writes a `hostApplications`
-      // document and then files an `add_host` request here for the superadmin
-      // to approve. Locking this rule to isStaff() blocked the second write
-      // while the first had already succeeded, so every attempt failed with
-      // "missing or insufficient permissions" AND left an orphaned pending
-      // application behind — one more on every retry.
+      // An approved request is applied by `onApprovalApproved` through the Admin
+      // SDK. The browser that filed it used to choose the operation, collection,
+      // document id and payload, so one approval could overwrite or delete any
+      // document — an Owner's `crmUsers` record included — and an Owner could
+      // approve their own. The function now applies only the shapes below and
+      // re-checks the approver; these rules refuse anything else at filing time,
+      // so nothing misleading ever reaches the Owner's screen.
       //
-      // So agencies may file, but only this one shape: type `add_host`,
-      // targeting `hostApplications`, an update whose entire payload is
-      // `status: approved`, and only against an application belonging to THEIR
-      // OWN agency. That last check is the one that matters — without it an
-      // agency could queue an approval against another agency's host.
+      // The four shapes the current CRM files:
+      //   update_config → appConfig/economy  economy/config     (finance_admin)
+      //   update_config → appConfig/control  tech/appcontrol    (tech_admin, tech_member)
+      //   create_agency → agencies, new id   agencies/register  (app_admin)
+      //   create_seller → sellers,  new id   sellers/register   (app_admin, ops_*)
       //
-      // Nothing here can move a balance. The payload is pinned to a single
-      // field with a single value, and money has not travelled through this
-      // queue since handleCustomApproval was stripped; anything that moves a
-      // balance is a card on the money board with its own verifier and an
-      // owner signature.
-      function agencyInvitingOwnHost() {
-        return isAgencyCrmUser()
-            && request.resource.data.type == 'add_host'
-            && request.resource.data.targetCollection == 'hostApplications'
-            && request.resource.data.operation == 'update'
-            && request.resource.data.payload.keys().hasOnly(['status'])
-            && request.resource.data.payload.status == 'approved'
-            && get(/databases/$(database)/documents/hostApplications/$(request.resource.data.targetDocId))
-                 .data.get('agencyId', '') == crmUserAgencyId();
+      // REMOVED: the agency `add_host` arm. The Invite Host flow stopped filing
+      // it (app/agency-dashboard/page.tsx — the invitation IS the
+      // `hostApplications` document), the function refuses the type, and the
+      // CRM disables approving it. Partners file nothing here now.
+      function approvalShapeAllowed() {
+        let d = request.resource.data;
+        return (d.type == 'update_config' && d.operation == 'update'
+                && d.targetCollection == 'appConfig' && d.targetDocId in ['control', 'economy'])
+            || (d.type == 'create_agency' && d.operation == 'create'
+                && d.targetCollection == 'agencies' && d.targetDocId == '')
+            || (d.type == 'create_seller' && d.operation == 'create'
+                && d.targetCollection == 'sellers' && d.targetDocId == '');
+      }
+      // A queued registration opens a pending, inactive, unfunded record that
+      // names no owner — `partnerCreateSafe()` and the zero-balance pin, which
+      // the Admin SDK write that applies it never passes through.
+      function approvalPayloadSafe() {
+        let d = request.resource.data;
+        return d.payload is map
+            && (d.operation != 'create'
+                || (d.payload.get('status', 'pending') == 'pending'
+                    && d.payload.get('isActive', false) == false
+                    && d.payload.get('isApproved', false) == false
+                    && d.payload.get('coinBalance', 0) == 0
+                    && d.payload.get('totalCoinsSold', 0) == 0
+                    && d.payload.get('ownerUid', '') in ['', null]
+                    && d.payload.get('secondRoleOwnerUid', '') in ['', null]
+                    && !d.payload.keys().hasAny(['approvedBy', 'approvedAt'])));
       }
 
-      allow create: if (isStaff() || agencyInvitingOwnHost())
+      // Filing: staff, in their own name, pending, one of the four shapes, and
+      // nothing from the review or the outcome (`reviewedBy`, `appliedAt`,
+      // `applyFailed`, …) — those are written by the decision and the function.
+      allow create: if isStaff()
+                    && request.resource.data.keys().hasOnly([
+                         'type', 'description', 'targetLabel', 'targetCollection', 'targetDocId',
+                         'operation', 'payload', 'requestedBy', 'status', 'requestedAt'])
                     && request.resource.data.requestedBy.uid == request.auth.uid
-                    && request.resource.data.status == 'pending';
-      // Only superadmin can approve/reject (change status)
-      allow update: if isSuperAdmin();
-      allow delete: if isSuperAdmin();
+                    && request.resource.data.status == 'pending'
+                    && approvalShapeAllowed()
+                    && approvalPayloadSafe();
+      // Deciding: an Owner, once, on a pending request, writing only the
+      // decision, signed as themselves — and never approving their own request
+      // (rejecting it, i.e. withdrawing it, stays possible). The payload and the
+      // target cannot be edited on the way through.
+      allow update: if isSuperAdmin()
+                    && resource.data.status == 'pending'
+                    && request.resource.data.status in ['approved', 'rejected']
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                         .hasOnly(['status', 'reviewedBy', 'reviewedAt', 'reviewNotes'])
+                    && request.resource.data.reviewedBy.uid == request.auth.uid
+                    && (request.resource.data.status == 'rejected'
+                        || resource.data.requestedBy.uid != request.auth.uid);
+      // The request is the record of the decision. No CRM screen deletes one;
+      // cleanup scripts use the Admin SDK.
+      allow delete: if false;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -2850,9 +3950,17 @@ service cloud.firestore {
                  || (isCrmUser()
                      && get(/databases/$(database)/documents/sellers/$(resource.data.sellerUid))
                           .data.get('crmUid', '') == request.auth.uid);
-      // List queries (getDocs): resource.data is unavailable, so allow any authenticated CRM user.
-      // Client always queries with where('sellerUid','==',sellerId) — no extra enforcement needed.
-      allow list: if isAdmin() || isFinance() || isCrmUser();
+      // List queries: staff as before; a seller only for queries constrained to
+      // its OWN record (`where('sellerUid', '==', <its sellerId>)`, which is what
+      // the seller dashboard sends). P1-A1: this was `|| isCrmUser()`, so any
+      // agency or seller login could list every seller's purchase requests —
+      // amounts, references and proof links — by leaving the filter off.
+      // The legacy uid-keyed seller record (sellerUid == the login uid) is kept.
+      allow list: if isAdmin() || isFinance()
+                  || (isCrmUser()
+                      && (resource.data.sellerUid == request.auth.uid
+                          || resource.data.sellerUid
+                               == get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('sellerId', '-')));
 
       // ── Who files one ───────────────────────────────────────────────────────
       //
@@ -2875,12 +3983,21 @@ service cloud.firestore {
       // create, so no coins moved — but `/coin-purchases` shows staff a board of
       // these, and a row that arrives pre-approved is a row somebody acts on.
       allow create: if request.resource.data.get('status', '') == 'pending'
+                    && sellerRecordNotWithdrawn(request.resource.data.get('sellerUid', ''))
                     && (
-                      (isCrmUser()
+                      // GOV C4: not from a restricted login.
+                      // Decision 15 (RC): a STARTED seller role and record —
+                      // not pending, not waiting for verified contacts.
+                      (isCrmUser() && sellerRoleApproved() && crmLoginUnrestricted()
+                       && sellerRecordApproved(request.resource.data.get('sellerUid', ''))
                        && get(/databases/$(database)/documents/sellers/$(request.resource.data.sellerUid))
                             .data.get('crmUid', '') == request.auth.uid)
-                      || (request.auth != null
-                          && request.resource.data.get('sellerUid', '') == request.auth.uid)
+                      // Phase 1A (AUTH-002): not a guest — a seller is a person.
+                      // RC: the caller's own started seller record — keyed by
+                      // the uid (legacy) or named by the login (automatic id).
+                      || (hasContactIdentity()
+                          && request.resource.data.get('sellerUid', '') == request.auth.uid
+                          && appSellerRecordStarted())
                     );
 
       // ── Who decides one ─────────────────────────────────────────────────────

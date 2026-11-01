@@ -20,6 +20,28 @@ DESIRED_SITE="zipper"          # want https://zipper.web.app
 API_SERVICE="zipper-api"
 API_REGION="asia-south1"
 
+# ── P0-10 (OPS-B): QUARANTINED ────────────────────────────────────────────────
+# One double-click used to ship EVERYTHING to production: rules, all functions
+# with `--force` (which DELETES every deployed function missing from the local
+# build), the API with its environment and secret lists REPLACED (dropping any
+# variable or secret not named here), and Hosting. A release is a reviewed,
+# step-by-step operation now — see the release report. This refuses to run
+# unless the target project is typed for this one invocation:
+#
+#     ZIPPER_CONFIRM_DEPLOY=setup-email-and-deploy:<project-id> ./setup-email-and-deploy.command
+#
+# and even then it no longer force-deletes functions, and it merges (does not
+# replace) the API's environment variables and secrets.
+if [ "${ZIPPER_CONFIRM_DEPLOY:-}" != "setup-email-and-deploy:${PROJECT_ID}" ]; then
+  echo ""
+  echo "  setup-email-and-deploy: refusing — quarantined (P0-10)."
+  echo "  Use the reviewed release commands. To run this script anyway, for this one"
+  echo "  invocation:  ZIPPER_CONFIRM_DEPLOY=setup-email-and-deploy:<project-id>"
+  echo ""
+  read -r -p "Press Enter to close..." || true
+  exit 2
+fi
+
 bar()  { echo ""; echo "──────────────────────────────────────────────"; echo "$1"; echo "──────────────────────────────────────────────"; }
 ok()   { echo "  ✅ $1"; }
 warn() { echo "  ⚠️  $1"; }
@@ -104,7 +126,8 @@ npm run build
 ok "functions built"
 
 cd "$PROJECT_ROOT"
-firebase deploy --only functions --force --project "$PROJECT_ID"
+# P0-10: no `--force` — a function missing locally is never deleted silently.
+firebase deploy --only functions --project "$PROJECT_ID"
 ok "functions deployed"
 
 # ── Python API ────────────────────────────────────────────────────────────────
@@ -141,8 +164,8 @@ else
       --region "$API_REGION" \
       --allow-unauthenticated \
       --quiet \
-      --set-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=${PROJECT_ID},OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=no-reply@zipper.app,MAIL_FROM_NAME=Zipper" \
-      --set-secrets "MONGO_URI=MONGO_URI:latest,JWT_SECRET=JWT_SECRET:latest,SENDGRID_API_KEY=SENDGRID_API_KEY:latest" \
+      --update-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=${PROJECT_ID},OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=no-reply@zipper.app,MAIL_FROM_NAME=Zipper" \
+      --update-secrets "MONGO_URI=MONGO_URI:latest,JWT_SECRET=JWT_SECRET:latest,SENDGRID_API_KEY=SENDGRID_API_KEY:latest" \
       --min-instances 0 --max-instances 10 --memory 512Mi
     ok "API deployed to ${API_REGION}"
     cd "$PROJECT_ROOT"

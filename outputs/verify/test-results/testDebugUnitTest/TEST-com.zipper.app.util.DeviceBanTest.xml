@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.DeviceBanTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.144Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="both client checks use it" classname="com.zipper.app.util.DeviceBanTest" time="0.0"/>
+  <testcase name="a lifted bar bars nothing" classname="com.zipper.app.util.DeviceBanTest" time="0.0"/>
+  <testcase name="C6 the session refusal for a barred device is recognised and nothing else is" classname="com.zipper.app.util.DeviceBanTest" time="0.001"/>
+  <testcase name="no document bars nothing" classname="com.zipper.app.util.DeviceBanTest" time="0.0"/>
+  <testcase name="a live bar bars, including one written before the field existed" classname="com.zipper.app.util.DeviceBanTest" time="0.0"/>
+  <testcase name="C6 a refused session on a barred device is not reported as a connection problem" classname="com.zipper.app.util.DeviceBanTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

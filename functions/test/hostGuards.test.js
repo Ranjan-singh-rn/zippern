@@ -36,7 +36,11 @@
 const { test, describe } = require('node:test')
 const { expect } = require('./expect')
 
-const { restrictionOn, heldByAnotherAgency } = require('../lib/hostEligibility')
+const {
+  restrictionOn, heldByAnotherAgency,
+  hostRoleRevoked, hostOfSameAgency, activeHostRefusal,
+  HOST_REVOKED_REFUSAL, ROLE_REVOKED, NOT_A_HOST,
+} = require('../lib/hostEligibility')
 
 /** A user document, as `tx.get(userRef)` hands it over. */
 const snap = (fields) => ({ get: (key) => fields[key] })
@@ -77,11 +81,29 @@ describe('restrictionOn — who may not become a host', () => {
     }
   })
 
-  test('a ban outranks a suspension in the message', () => {
-    // Both flags set is a real state — `ban_user` leaves `isSuspended` behind in
-    // some histories — and the stronger one is the true one.
-    const why = restrictionOn(snap({ isBanned: true, isSuspended: true }))
+  test('a SUSPENSION is labelled suspended, in the shape suspend_user writes (C9, B25)', () => {
+    /*
+     * C9 reverses what this asserted ("a ban outranks a suspension"). Both flags
+     * set is exactly what `suspend_user` writes — `isBanned` is the app's one
+     * gate and is true for a suspension too — so reading the ban first told
+     * every suspended person they were banned. Suspension is checked first, as
+     * in the backend's `restriction_of`.
+     */
+    const real = { accountState: 'suspended', isBanned: true, isSuspended: true }
+    expect(restrictionOn(snap(real))).toContain('suspended')
+    expect(restrictionOn(snap(real))).not.toContain('banned')
+    // A document from before `accountState` existed: both flags, no state.
+    expect(restrictionOn(snap({ isBanned: true, isSuspended: true }))).toContain('suspended')
+  })
+
+  test('a BAN with a stale isSuspended left behind is still a ban', () => {
+    // `ban_user` now clears `isSuspended`, but older histories kept it. The
+    // state names the ban, and the state wins.
+    const why = restrictionOn(snap({ accountState: 'banned', isBanned: true, isSuspended: true }))
     expect(why).toContain('banned')
+    // And the shape `ban_user` writes today.
+    expect(restrictionOn(snap({ accountState: 'banned', isBanned: true, isSuspended: false })))
+      .toContain('banned')
   })
 
   test('every refusal is a sentence somebody can act on', () => {
@@ -151,5 +173,97 @@ describe('heldByAnotherAgency — one host, one agency', () => {
     // Same reasoning as `restrictionOn`: a truthy string from a bad write must
     // not block somebody who is not actually a host.
     expect(heldByAnotherAgency(snap({ isHost: 'true', agencyId: 'a' }), 'b')).toBe(false)
+  })
+})
+
+// ── GOV phase: C1 (B04), B09, B41 ────────────────────────────────────────────
+
+/** A Firestore Timestamp, as the Admin SDK hands one over. */
+const at = (ms) => ({ toMillis: () => ms })
+const T1 = 1_800_000_000_000
+
+describe('hostRoleRevoked — a revocation stands until a later restore (C1, B04)', () => {
+  test('never a host, never revoked', () => {
+    expect(hostRoleRevoked(snap({}))).toBe(false)
+    expect(hostRoleRevoked(snap({ isHost: true, hostActivatedAt: at(T1) }))).toBe(false)
+  })
+
+  test('the shape revoke_host writes is revoked', () => {
+    // `isHost: false` + `hostRemovedAt` + the `_stamp(actor, "hostRevoked")` fields.
+    expect(hostRoleRevoked(snap({
+      isHost: false, hostRemovedAt: at(T1), hostRevokedAt: at(T1), hostRevokedBy: 'ops',
+      hostActivatedAt: at(T1 - 86_400_000),
+    }))).toBe(true)
+    // Either stamp alone is enough.
+    expect(hostRoleRevoked(snap({ hostRemovedAt: at(T1) }))).toBe(true)
+    expect(hostRoleRevoked(snap({ hostRevokedAt: at(T1) }))).toBe(true)
+  })
+
+  test('a LATER restore lifts it; restore_host never clears the revocation stamps', () => {
+    expect(hostRoleRevoked(snap({
+      isHost: true, hostRevokedAt: at(T1), hostRemovedAt: at(T1), hostRestoredAt: at(T1 + 1000),
+    }))).toBe(false)
+  })
+
+  test('a restore BEFORE a second revocation does not', () => {
+    expect(hostRoleRevoked(snap({
+      isHost: false, hostRestoredAt: at(T1), hostRevokedAt: at(T1 + 1000), hostRemovedAt: at(T1 + 1000),
+    }))).toBe(true)
+  })
+
+  test('a later grant or activation counts as the role coming back', () => {
+    // The authoritative `isHost: true` from grant_host / activateHost after an
+    // old revocation must not be read as revoked.
+    expect(hostRoleRevoked(snap({ isHost: true, hostRevokedAt: at(T1), hostGrantedAt: at(T1 + 5) }))).toBe(false)
+    expect(hostRoleRevoked(snap({ isHost: true, hostRemovedAt: at(T1), hostActivatedAt: at(T1 + 5) }))).toBe(false)
+  })
+
+  test('Dates and ISO strings are read too; an unreadable restore lifts nothing', () => {
+    expect(hostRoleRevoked(snap({ hostRevokedAt: new Date(T1), hostRestoredAt: new Date(T1 + 1) }))).toBe(false)
+    expect(hostRoleRevoked(snap({ hostRevokedAt: new Date(T1).toISOString() }))).toBe(true)
+    expect(hostRoleRevoked(snap({ hostRevokedAt: at(T1), hostRestoredAt: 'not a date' }))).toBe(true)
+  })
+
+  test('the refusal is C1\'s sentence, word for word', () => {
+    expect(HOST_REVOKED_REFUSAL).toBe('Your Host role was revoked. Request reinstatement instead of applying again.')
+    expect(ROLE_REVOKED).toBe('ROLE_REVOKED')
+  })
+})
+
+describe('hostOfSameAgency — a duplicate invitation is not an activation (B09)', () => {
+  test('a host of this agency', () => {
+    expect(hostOfSameAgency(snap({ isHost: true, agencyId: 'AG1' }), 'AG1')).toBe(true)
+    expect(hostOfSameAgency(snap({ isHost: true, agencyId: ' AG1 ' }), 'AG1')).toBe(true)
+  })
+  test('not a host, another agency, or no agency recorded', () => {
+    expect(hostOfSameAgency(snap({ isHost: false, agencyId: 'AG1' }), 'AG1')).toBe(false)
+    expect(hostOfSameAgency(snap({ isHost: true, agencyId: 'AG2' }), 'AG1')).toBe(false)
+    expect(hostOfSameAgency(snap({ isHost: true, agencyId: '' }), 'AG1')).toBe(false)
+    expect(hostOfSameAgency(snap({ isHost: true, agencyId: '' }), '')).toBe(false)
+    expect(hostOfSameAgency(snap({ isHost: 'true', agencyId: 'AG1' }), 'AG1')).toBe(false)
+  })
+})
+
+describe('activeHostRefusal — only a current, unrestricted Host acts as one (B41)', () => {
+  test('a current host may', () => {
+    expect(activeHostRefusal(snap({ isHost: true, agencyId: 'AG1' }))).toBe(null)
+  })
+  test('a revoked host may not, and is told to request reinstatement', () => {
+    const r = activeHostRefusal(snap({ isHost: false, hostRevokedAt: at(T1), hostRemovedAt: at(T1) }))
+    expect(r.code).toBe(ROLE_REVOKED)
+    expect(r.message).toBe(HOST_REVOKED_REFUSAL)
+  })
+  test('somebody who is not a host may not', () => {
+    expect(activeHostRefusal(snap({})).code).toBe(NOT_A_HOST)
+    expect(activeHostRefusal(snap({ isHost: 'true' })).code).toBe(NOT_A_HOST)
+  })
+  test('a restricted host may not — the real suspension shape and a ban', () => {
+    for (const fields of [
+      { isHost: true, accountState: 'suspended', isBanned: true, isSuspended: true },
+      { isHost: true, accountState: 'banned', isBanned: true },
+      { isHost: true, isDeleted: true },
+    ]) {
+      expect(activeHostRefusal(snap(fields)).code).toBe('ACCOUNT_RESTRICTED')
+    }
   })
 })

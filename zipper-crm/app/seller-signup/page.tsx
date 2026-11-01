@@ -59,9 +59,10 @@ import { useState, useRef } from 'react'
 import { auth, db, storage } from '@/lib/firebase'
 import { addDoc, collection, serverTimestamp, doc, updateDoc } from 'firebase/firestore'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { signupDocName } from '@/lib/signupDocName'
 import {
-  createPartnerLogin, createSellerAccount, discardPartnerLogin, generateCrmId,
-  partnerSignUpWithGoogle,
+  createPartnerLogin, createSellerAccount, discardPartnerLogin, ensurePartnerEmailVerified,
+  generateCrmId, partnerSignUpWithGoogle,
 } from '@/lib/auth'
 import {
   Upload, CheckCircle, ArrowRight, ArrowLeft, User, Phone, Mail,
@@ -69,9 +70,12 @@ import {
   AlertTriangle, XCircle,
 } from 'lucide-react'
 import {
-  findPartnersByEmail, normaliseEmail, statusPhrase,
+  normaliseEmail, statusPhrase,
   type ExistingPartner,
 } from '@/lib/partnerDuplicates'
+import PhoneInput from '@/components/PhoneInput'
+import { registeredMessage, useRegisteredCheck } from '@/lib/useRegisteredCheck'
+import api from '@/lib/api'
 
 /** Whether the login was finished, kept separate from "the form was filed". */
 type LoginOutcome =
@@ -230,6 +234,9 @@ export default function SellerSignupPage() {
     { num: 3, label: 'Done'       },
   ]
 
+  // Flags an already-registered email / phone while it is being typed.
+  const registered = useRegisteredCheck(form.email, form.phone)
+
   // ── Step 1: Basic Info + Password ─────────────────────────────────────────
   function Step1() {
     function next() {
@@ -240,6 +247,10 @@ export default function SellerSignupPage() {
       }
       if (!/^\S+@\S+\.\S+$/.test(form.email)) {
         setError('Please enter a valid email address.')
+        return
+      }
+      if (registered.email || registered.phone) {
+        setError(registered.email || registered.phone)
         return
       }
       /*
@@ -298,8 +309,9 @@ export default function SellerSignupPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <div>
               <label className={labelClass}><span className="flex items-center gap-1.5"><Phone className="w-4 h-4 text-pink-400" />Phone Number *</span></label>
-              <input type="tel" className={inputClass} placeholder="e.g. 98765 43210 or +1 415 555 0100"
-                value={form.phone} onChange={(e) => set('phone', e.target.value)} />
+              <PhoneInput className={inputClass} placeholder="Mobile number"
+                value={form.phone} onChange={(v) => set('phone', v)} />
+              {registered.phone && <p className="text-xs text-red-400 mt-1">{registered.phone}</p>}
             </div>
             <div>
               <label className={labelClass}><span className="flex items-center gap-1.5"><Mail className="w-4 h-4 text-pink-400" />Email Address *</span></label>
@@ -308,6 +320,7 @@ export default function SellerSignupPage() {
                 placeholder="your@email.com"
                 readOnly={!!googleUid}
                 value={form.email} onChange={(e) => set('email', e.target.value)} />
+              {registered.email && <p className="text-xs text-red-400 mt-1">{registered.email}</p>}
               {googleUid && (
                 <p className="text-xs text-slate-500 mt-1">
                   Verified by Google. Your application is filed against this address.
@@ -477,41 +490,89 @@ export default function SellerSignupPage() {
           }
         }
 
-        // ── 2. Now signed in: has this address already applied? ─────────────
-        const existing = await findPartnersByEmail('seller', emailLower)
-        if (existing.checked && existing.matches.length > 0) {
-          // The login was made purely to run this check and holds nothing, so
-          // it goes back — otherwise this address is locked out for good.
-          //
-          // A Google login goes back too, even though `reusing` is true of it:
-          // `partnerSignUpWithGoogle` only ever hands back an account this form
-          // created, so it is ours to undo. A resumed PASSWORD session is not —
-          // it may be an account the applicant already had, and deleting that
-          // would be far worse than leaving it.
-          if (!reusing || googleUid !== '') {
-            try {
-              await discardPartnerLogin(crmUid)
-              setGoogleUid('')
-            } catch (undoErr: unknown) {
-              setCheckWarning(
-                `A login was created for ${emailLower} while checking and could not `
-                + `be removed again: ${errorMessage(undoErr)}. Contact support — `
-                + 'nothing else was created.',
-              )
-            }
-          }
-          setDuplicates(existing.matches)
+        // ── 1b. A CONFIRMED address, before anything is read or written ─────
+        //
+        // P0-5 (AUTHN-2): the rules that bind this application to its login by
+        // email require Firebase to have seen the address confirmed. See the
+        // same step on /agency-signup.
+        const verified = await ensurePartnerEmailVerified()
+        if (!verified.ok) {
+          setError(verified.message)
           return
         }
+
+        // ── 2. Now signed in: has this address already applied? ─────────────
+        // The login was made purely to run this check and holds nothing, so
+        // it goes back — otherwise this address is locked out for good: the
+        // next attempt gets `auth/email-already-in-use` and the form refuses
+        // it, with no way forward but support.
+        //
+        // A Google login goes back too, even though `reusing` is true of it:
+        // `partnerSignUpWithGoogle` only ever hands back an account this form
+        // created, so it is ours to undo. A resumed PASSWORD session is not —
+        // it may be an account the applicant already had, and deleting that
+        // would be far worse than leaving it.
+        const undoLoginMadeForTheCheck = async () => {
+          if (reusing && googleUid === '') return
+          try {
+            await discardPartnerLogin(crmUid)
+            setGoogleUid('')
+          } catch (undoErr: unknown) {
+            setCheckWarning(
+              `A login was created for ${emailLower} while checking and could not `
+              + `be removed again: ${errorMessage(undoErr)}. Contact support — `
+              + 'nothing else was created.',
+            )
+          }
+        }
+
+        // ── UGP-G (I-5): ASKED OF THE API, NOT OF FIRESTORE ──────────────────
+        //
+        // This was `findPartnersByEmail('seller', …)`: a `sellers where email ==`
+        // list query. `sellers` is listable by STAFF only (firestore.rules), so
+        // for an applicant the query was refused every time, the fail-closed
+        // branch below fired, the new login was discarded — and no public
+        // seller signup could ever complete. The API's public availability
+        // check reads the same records server-side and answers only "is there
+        // already a Coin Seller on this address", nothing else.
+        let existing:
+          | { checked: false; reason: string }
+          | { checked: true; matches: ExistingPartner[]; taken: boolean }
+        try {
+          const r = await api.partnerOps.registrationAvailability(emailLower, '', 'seller')
+          existing = { checked: true, matches: [], taken: r.email === 'seller' }
+        } catch (lookupErr: unknown) {
+          existing = { checked: false, reason: errorMessage(lookupErr) }
+        }
+
+        // ── A LOOKUP THAT DID NOT RUN IS NOT A CLEAN RESULT ─────────────────
+        //
+        // This said "Your application was submitted — if it turns out to be a
+        // second one, our team will see both", which is the same fail-open
+        // `/agency-signup` had, in the same words. The note it carried —
+        // "the uniqueness of the login above is the guard that actually
+        // holds" — is not true of a RESUMED session: `reusing` means the
+        // applicant was already signed in, so no new login was minted and no
+        // uniqueness was tested. That is exactly the path a second record
+        // comes in on.
+        //
+        // One human may hold one Coin Seller, same as one Agency, and the API
+        // now refuses the second in Mongo before anything is written
+        // (`backend/app/services/partner_roles.py`). Stopping here saves a
+        // round trip and gives the applicant a sentence instead of a 400.
         if (!existing.checked) {
-          // Said out loud rather than swallowed. The uniqueness of the login
-          // above is the guard that actually holds; this one adds cover for a
-          // record that has no login at all, and it did not run.
-          setCheckWarning(
-            'We could not check whether an application already exists under this '
-            + `address (${existing.reason}). Your application was submitted — if it `
-            + 'turns out to be a second one, our team will see both.',
+          await undoLoginMadeForTheCheck()
+          setError(
+            'The check for an existing coin seller under this address could not '
+            + `be run, so nothing was created: ${existing.reason}. Please try `
+            + 'again in a moment.',
           )
+          return
+        }
+        if (existing.taken) {
+          await undoLoginMadeForTheCheck()
+          setError(registeredMessage('email', 'seller'))
+          return
         }
 
         // ── 3. The seller record ────────────────────────────────────────────
@@ -587,7 +648,7 @@ export default function SellerSignupPage() {
           }`}
         >
           <input type="file" accept="image/*,application/pdf" className="hidden" ref={proofRef}
-            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f, `sellerDocs/signup/${Date.now()}_${f.name}`, setProofProgress, setProofUrl, setProofFile) }} />
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f, `sellerDocs/signup/${signupDocName('proof')}`, setProofProgress, setProofUrl, setProofFile) }} />
 
           {done ? (
             <div className="space-y-3">

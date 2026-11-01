@@ -2062,12 +2062,17 @@ def _record_blocking(doc: dict) -> Any:
     """
     global _sync_client
 
+    from app.core import isolation
     from app.db.mongo import C
     from pymongo import MongoClient
     from pymongo.errors import DuplicateKeyError, PyMongoError
 
     try:
         if _sync_client is None:
+            # This client bypasses `mongo.connect()`, so it carries the same
+            # refusal: outside production, a MongoDB on this machine only. A
+            # refusal surfaces as DeliveryNotRecorded — no record, no send.
+            isolation.assert_mongo_allowed(settings)
             _sync_client = MongoClient(
                 settings.mongo_uri,
                 tz_aware=True,

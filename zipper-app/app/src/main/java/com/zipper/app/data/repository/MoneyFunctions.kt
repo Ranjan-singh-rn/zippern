@@ -1,8 +1,13 @@
 package com.zipper.app.data.repository
 
+import android.content.Context
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.tasks.await
+import com.zipper.app.util.AppBuild
+import com.zipper.app.util.ServerRefusals
+import com.zipper.app.util.SessionManager
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -27,7 +32,18 @@ import javax.inject.Singleton
 @Singleton
 class MoneyFunctions @Inject constructor(
     private val functions: FirebaseFunctions,
+    /**
+     * Phase 1A (SESSION-001): the one active mobile session's id, sent on every
+     * callable so the server can refuse a displaced device on protected
+     * operations (`assertActiveSession`). Read at call time, never cached.
+     */
+    private val sessionManager: SessionManager,
+    /** D18: only to read the installed versionCode for the sign-in gate. */
+    @ApplicationContext private val appContext: Context,
 ) {
+
+    /** D18: the installed build, read once per process (an update restarts the process). */
+    private val appVersionCode: Int by lazy { AppBuild.installedVersionCode(appContext) }
 
     sealed interface Result<out T> {
         data class Ok<T>(val value: T) : Result<T>
@@ -562,7 +578,15 @@ class MoneyFunctions @Inject constructor(
      * is never told about a device cannot report one missing.
      */
     suspend fun resolveIdentity(deviceId: String = ""): Result<Identity> =
-        call("resolveIdentity", mapOf("deviceId" to deviceId)) { m ->
+        // D18: the installed build rides along, so the server can count how
+        // many accounts run a build that pins appeal ids. 0 is not sent.
+        call(
+            "resolveIdentity",
+            buildMap {
+                put("deviceId", deviceId)
+                if (appVersionCode > 0) put("appVersionCode", appVersionCode)
+            },
+        ) { m ->
             Identity(
                 decision          = m["decision"] as? String ?: "allow",
                 uid               = m["uid"] as? String ?: "",
@@ -618,14 +642,85 @@ class MoneyFunctions @Inject constructor(
         }
 
     /** Bind a phone or email the caller has just verified. See the three cases in identity.ts. */
-    suspend fun bindVerifiedIdentity(phone: String, email: String): Result<List<String>> =
+    /**
+     * What a bind answered. [customToken] is set only when this session began
+     * ANONYMOUSLY: a token for the SAME uid, so the session stops reading as a
+     * guest to checks that look at how it began (UGP D21 — see
+     * `AuthRepository.adoptSameUidSession`).
+     */
+    data class Bound(val releasedFrom: List<String>, val customToken: String)
+
+    suspend fun bindVerifiedIdentity(phone: String, email: String): Result<Bound> =
         call("bindVerifiedIdentity", buildMap {
             if (phone.isNotBlank()) put("phone", phone)
             if (email.isNotBlank()) put("email", email)
         }) { m ->
-            (m["releasedFrom"] as? List<*>).orEmpty().mapNotNull { it as? String }
+            Bound(
+                releasedFrom = (m["releasedFrom"] as? List<*>).orEmpty().mapNotNull { it as? String },
+                customToken = m["customToken"] as? String ?: "",
+            )
         }
 
+    // ── Email by one-time code (UGP-C; functions/src/emailOtp.ts) ───────────
+
+    data class EmailCodeSent(
+        /** "sent", or "already_bound" when this verified address is already on the account. */
+        val status: String,
+        /** Masked by the server ("s****@g****.com") — the app never echoes more. */
+        val maskedEmail: String,
+        val resendInSec: Int,
+        val expiresInSec: Int,
+        /**
+         * With "already_bound" on a session that began anonymously: a token for
+         * the SAME uid, exactly as a fresh bind would have returned (UGP-D21).
+         */
+        val customToken: String = "",
+    )
+
+    suspend fun requestEmailBindCode(email: String): Result<EmailCodeSent> =
+        call("requestEmailBindCode", mapOf("email" to email)) { m ->
+            EmailCodeSent(
+                status = m["status"] as? String ?: "",
+                maskedEmail = m["email"] as? String ?: "",
+                resendInSec = (m["resendInSec"] as? Number)?.toInt() ?: 60,
+                expiresInSec = (m["expiresInSec"] as? Number)?.toInt() ?: 600,
+                customToken = m["customToken"] as? String ?: "",
+            )
+        }
+
+    suspend fun verifyEmailBindCode(email: String, code: String): Result<Bound> =
+        call("verifyEmailBindCode", mapOf("email" to email, "code" to code)) { m ->
+            Bound(
+                releasedFrom = (m["releasedFrom"] as? List<*>).orEmpty().mapNotNull { it as? String },
+                customToken = m["customToken"] as? String ?: "",
+            )
+        }
+
+
+    data class EmailAdoption(
+        /** "adopted" — [customToken] signs into [uid]; "none" — keep the new account. */
+        val status: String,
+        val uid: String,
+        val customToken: String,
+        /** With `none`: why (`no_holder`, `caller_not_fresh`, …). See [GoogleAdoption.next]. */
+        val reason: String = "",
+    )
+
+    /**
+     * After a Google sign-in that CREATED a uid: does this verified email already
+     * belong to exactly one other account (e.g. a guest that bound it)? If so the
+     * server removes the new empty uid, links Google onto that account and returns
+     * a token for it. See functions/src/emailAdoption.ts.
+     */
+    suspend fun adoptEmailAccount(): Result<EmailAdoption> =
+        call("adoptEmailAccount", emptyMap()) { m ->
+            EmailAdoption(
+                status      = m["status"] as? String ?: "",
+                uid         = m["uid"] as? String ?: "",
+                customToken = m["customToken"] as? String ?: "",
+                reason      = m["reason"] as? String ?: "",
+            )
+        }
 
     // ── Payout ───────────────────────────────────────────────────────────────
 
@@ -719,11 +814,13 @@ class MoneyFunctions @Inject constructor(
         payload: Map<String, Any>,
         parse: (Map<String, Any?>) -> T,
     ): Result<T> = try {
-        val res = functions.getHttpsCallable(name).call(payload).await()
+        val res = functions.getHttpsCallable(name).call(sessionManager.withSession(payload)).await()
         val map = res.data as? Map<String, Any?>
             ?: return Result.Failed("internal", "Unexpected response from the server.")
         Result.Ok(parse(map))
     } catch (e: FirebaseFunctionsException) {
+        // P0-1: a session refusal also signs this device out (SessionViewModel).
+        ServerRefusals.report(e)
         // The server writes these messages for a person to read. Passing them
         // through beats inventing a generic one that hides the actual reason —
         // "you need 900 diamonds, you have 420" is the whole answer.

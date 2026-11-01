@@ -307,16 +307,27 @@ ok("nor require_team_admin, which the observer is not",
 #  5. Owners can still create owners
 # ══════════════════════════════════════════════════════════════════════════════
 
-ok("an owner may still assign the owner role",
-   Role.OWNER in svc.assignable_roles(Role.OWNER))
+# Phase 1A (STAFF-001): CHANGED EXPECTATION. Only the observer creates Owners.
+ok("an owner may NOT assign the owner role",
+   Role.OWNER not in svc.assignable_roles(Role.OWNER))
+try:
+    run(svc.invite(
+        Invitation(email="another.owner@example.com", name="Another", role=Role.OWNER),
+        OWNER,
+    ))
+    ok("an owner inviting an owner is refused", False)
+except StaffError:
+    ok("an owner inviting an owner is refused", True)
 
+# The observer can provision a second owner: several owners remain possible.
 second = run(
     svc.invite(
         Invitation(email="another.owner@example.com", name="Another", role=Role.OWNER),
-        OWNER,
+        OBSERVER,
+        reason="Second owner.",
     )
 )
-check("and the account is created", second["role"], str(Role.OWNER))
+check("and the account is created by the observer", second["role"], str(Role.OWNER))
 ok("multiple owners are allowed", second["uid"] != created["uid"])
 
 # An owner still reaches every department, which the observer does not.

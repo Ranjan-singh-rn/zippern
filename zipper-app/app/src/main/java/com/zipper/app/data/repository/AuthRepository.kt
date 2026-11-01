@@ -1,9 +1,6 @@
 package com.zipper.app.data.repository
 
 import android.net.Uri
-import com.google.firebase.FirebaseApp
-import com.google.firebase.auth.ActionCodeSettings
-import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.GoogleAuthProvider
@@ -12,10 +9,10 @@ import com.google.firebase.auth.PhoneAuthOptions
 import com.google.firebase.auth.PhoneAuthProvider
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.storage.FirebaseStorage
-import com.zipper.app.BuildConfig
 import com.zipper.app.data.model.User
 import com.zipper.app.util.DeviceKey
 import com.zipper.app.util.DeviceSecretStore
+import com.zipper.app.util.GuestLinkWarning
 import com.zipper.app.util.QuickLoginStore
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.UserLanguage
@@ -25,6 +22,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -83,20 +81,29 @@ sealed class AuthResult {
         val dueAtMs: Long,
     ) : AuthResult()
 
-    /**
-     * Signed in, but the role needs something the sign-in method could not
-     * supply — a host or a staff member who arrived by Google and has no phone
-     * on file, or by phone and has no email.
+    /*
+     * ── REMOVED: NeedsContactDetails (C7 — B01, B02) ─────────────────────────
      *
-     * An ordinary user is NEVER returned this. That is the whole point: the app
-     * used to demand an email of every phone user and a phone of every Google
-     * user, whoever they were.
+     * "Signed in, but the role needs a phone or an email the sign-in method
+     * could not supply." Returned BEFORE the session was started and before
+     * `isProfileComplete` was read, and mapped to profile setup — so a Host, a
+     * partner or a member of staff with a finished profile was sent to setup on
+     * every sign-in, by a screen that cannot bind a contact, and never held a
+     * mobile session. The requirement is now stored in SessionManager by
+     * `gateIdentity` and the sign-in carries on; the route is decided by
+     * `SignInRouting` from `isProfileComplete` alone.
      */
-    data class NeedsContactDetails(
-        val requiresPhone: Boolean,
-        val requiresEmail: Boolean,
-        val crmRole: String,
-    ) : AuthResult()
+
+    /**
+     * C8 (B27): this account was deleted and its recovery window is over —
+     * `resolveIdentity` answered `deleted_permanent`, or `recoverAccount`
+     * refused with `RECOVERY_EXPIRED`.
+     *
+     * Not an entry, and not a new start on the same uid. The session has
+     * already been signed out by the time this is returned; [message] is what
+     * the person is told.
+     */
+    data class AccountDeleted(val message: String) : AuthResult()
 }
 
 /** Which of the three refusals this is. See [AuthResult.Banned]. */
@@ -144,6 +151,17 @@ class AuthRepository @Inject constructor(
 ) {
     val currentFirebaseUser get() = auth.currentUser
 
+    /**
+     * B11: how many sign-ins have STARTED on this process.
+     *
+     * Bumped at the top of every sign-in path and read by [signOut], which may
+     * finish — clear SessionManager, drop the push token, sign out of
+     * Firebase — only if no sign-in has started since it began. The uid alone
+     * cannot say that: the quick re-sign-in that used to be wiped by the tail
+     * of a logout is usually into the SAME account. See [SignOutGuard].
+     */
+    private val signInSerial = java.util.concurrent.atomic.AtomicLong(0L)
+
     // ── Phone OTP ─────────────────────────────────────────────────────────────
 
     fun sendOtp(
@@ -174,12 +192,18 @@ class AuthRepository @Inject constructor(
     // ── Device ban ────────────────────────────────────────────────────────────
 
     /** Returns the ban reason if this device is banned, null otherwise.
-     *  Returns null on any error (PERMISSION_DENIED, network, etc.) — safe to ignore. */
+     *  Returns null on any error (PERMISSION_DENIED, network, etc.) — safe to ignore.
+     *
+     *  B44: a bar with `isActive: false` has been LIFTED and is kept only for
+     *  the record — the server has always read it that way, and so does this
+     *  now. See [com.zipper.app.util.DeviceBan]. */
     suspend fun getDeviceBanReason(deviceId: String): String? {
         if (deviceId.isBlank()) return null
         return try {
             val snap = firestore.collection("bannedDevices").document(deviceId).get().await()
-            if (snap.exists()) snap.getString("reason") ?: "This device has been banned." else null
+            if (com.zipper.app.util.DeviceBan.applies(snap.exists(), snap.getBoolean("isActive"))) {
+                snap.getString("reason") ?: "This device has been banned."
+            } else null
         } catch (_: Exception) {
             null
         }
@@ -220,31 +244,74 @@ class AuthRepository @Inject constructor(
      * server-only in the rules. The previous phone is watching the same
      * document and loses within a second.
      */
-    private suspend fun generateSession(uid: String, deviceId: String = "") {
-        when (val res = money.startMobileSession(
-            deviceId = deviceId,
-            /*
-             * "Samsung SM-A546E", not "SM-A546E".
-             *
-             * This string is shown to the person being signed out — "your
-             * account was opened on a …" — so it has to be something they can
-             * recognise as a handset they own. A bare model code is not.
-             */
-            deviceName = listOfNotNull(
-                android.os.Build.MANUFACTURER?.takeIf { it.isNotBlank() }
-                    ?.replaceFirstChar { c -> c.uppercase() },
-                android.os.Build.MODEL?.takeIf { it.isNotBlank() },
-            ).joinToString(" ").take(64),
-        )) {
-            is MoneyFunctions.Result.Ok -> sessionManager.save(uid, res.value.sessionId)
+    private suspend fun generateSession(uid: String, deviceId: String = ""): AuthResult? {
+        /*
+         * "Samsung SM-A546E", not "SM-A546E".
+         *
+         * This string is shown to the person being signed out — "your
+         * account was opened on a …" — so it has to be something they can
+         * recognise as a handset they own. A bare model code is not.
+         */
+        val deviceName = listOfNotNull(
+            android.os.Build.MANUFACTURER?.takeIf { it.isNotBlank() }
+                ?.replaceFirstChar { c -> c.uppercase() },
+            android.os.Build.MODEL?.takeIf { it.isNotBlank() },
+        ).joinToString(" ").take(64)
+
+        var res = money.startMobileSession(deviceId = deviceId, deviceName = deviceName)
+        if (res is MoneyFunctions.Result.Failed) {
+            delay(700)
+            res = money.startMobileSession(deviceId = deviceId, deviceName = deviceName)
+        }
+        return when (res) {
+            is MoneyFunctions.Result.Ok -> {
+                sessionManager.save(uid, res.value.sessionId)
+                null
+            }
             is MoneyFunctions.Result.Failed -> {
                 /*
-                 * A session that could not be claimed is not a sign-in that
-                 * should fail. The person is authenticated; refusing them the
-                 * app because one write did not land would be worse than
-                 * letting two devices coexist until the next launch, which the
-                 * splash check catches.
+                 * P0-1 (SESS-4): a session that could not be claimed now FAILS
+                 * the sign-in.
+                 *
+                 * It used to be let through, on the reasoning that two devices
+                 * coexisting until the next launch was the lesser harm. But a
+                 * device with no session cannot be displaced, the cut-off this
+                 * sign-in should have stamped was never written, and every
+                 * protected callable now refuses a token the account has not
+                 * caught up with — so "signed in" here was a phone that could
+                 * not do anything. Same cleanup as `gateIdentity`'s refusal: a
+                 * guest keeps a way back in, anyone else is signed out cleanly.
                  */
+                if (auth.currentUser?.isAnonymous == true) {
+                    mintQuickLoginCredential(deviceId)
+                } else {
+                    try { auth.signOut() } catch (_: Exception) {}
+                    sessionManager.clear()
+                }
+                /*
+                 * C6 (B31): `DEVICE_BARRED` is about this handset, not the
+                 * connection. A barred one gets the device screen with the
+                 * server's reason, as `gateIdentity` shows `device_banned`; one
+                 * that sent no id is told so in the server's own sentence.
+                 */
+                if (com.zipper.app.util.DeviceBan.isDeviceBarred(res.detail)) {
+                    if (deviceId.isBlank()) AuthResult.Error(res.userMessage)
+                    else AuthResult.Banned(res.userMessage, RestrictionKind.Device)
+                } else if (com.zipper.app.util.ServerRefusals.classify(res.detail) ==
+                    com.zipper.app.util.ServerRefusals.Kind.Restricted
+                ) {
+                    // RF-27: the account is restricted — say so in the server's
+                    // own sentence, never "check your connection". (The gate now
+                    // reads restrictions in the same order as this refusal, so
+                    // this is the race where it changed between the two calls;
+                    // the next sign-in or cold start shows the proper screen.)
+                    AuthResult.Error(res.userMessage)
+                } else {
+                    AuthResult.Error(
+                        "Could not start your session on this device. " +
+                        "Check your connection and try again."
+                    )
+                }
             }
         }
     }
@@ -334,7 +401,24 @@ class AuthRepository @Inject constructor(
      * their own balance, and the app minted them a new account instead. That is
      * the duplicate-document bug at its root.
      */
-    suspend fun signInWithQuickLogin(deviceId: String): AuthResult {
+    suspend fun signInWithQuickLogin(
+        deviceId: String,
+        /**
+         * FX-15: asked with the recovered uid AFTER the credential is redeemed
+         * and BEFORE anything is started for the account — no gate, no
+         * document, no mobile session. A non-null answer is returned as the
+         * result and the redeemed sign-in is closed again, starting nothing.
+         * The guest button checks the device binding here: it used to check it
+         * only after `startMobileSession` had already displaced the saved
+         * account's other phone and revoked that phone's quick-login
+         * credential (RF-29).
+         */
+        beforeSession: (suspend (uid: String) -> AuthResult?)? = null,
+    ): AuthResult {
+        // UGP-F: whatever the outcome, an id learned by an EARLIER attempt is
+        // not this attempt's to show.
+        com.zipper.app.util.PublicAppeal.forgetRestrictedUid()
+        signInSerial.incrementAndGet()   // B11 — see signOut
         val saved = quickLogin.load() ?: return AuthResult.Error("Nothing saved on this device.")
 
         getDeviceBanReason(deviceId)?.let { return AuthResult.Banned(it, RestrictionKind.Device) }
@@ -418,13 +502,24 @@ class AuthRepository @Inject constructor(
              * Returned as `Banned` with the right `kind` so the nav graph sends
              * each to its own screen — the suspension one with its end date —
              * rather than to a toast that loses the distinction.
+             *
+             * C9 (B25): the outcome → screen mapping is `AppealRoute.kindOfOutcome`,
+             * one total function shared with its test, so a suspension can never
+             * be shown the ban screen by a comparison drifting here. Only the two
+             * payload outcomes stop here; a device bar arrives as an error.
              */
-            if (value.outcome == "suspended" || value.outcome == "banned") {
+            val restriction = com.zipper.app.util.AppealRoute.kindOfOutcome(value.outcome)
+                ?.takeIf { it == RestrictionKind.Suspension || it == RestrictionKind.Account }
+            if (restriction != null) {
+                // UGP-F: the restriction screen shows this account's ID for the
+                // public web appeal — the device has just proved itself, and it
+                // is the person's own account. In memory only.
+                com.zipper.app.util.PublicAppeal.lastRestrictedUid = value.uid
                 return AuthResult.Banned(
                     reason = value.reason.ifBlank { value.message },
-                    kind = if (value.outcome == "suspended") RestrictionKind.Suspension
-                           else RestrictionKind.Account,
-                    untilMillis = value.suspendedUntilMs ?: 0L,
+                    kind = restriction,
+                    // An end date belongs to a suspension only; a ban has none.
+                    untilMillis = if (restriction == RestrictionKind.Suspension) value.suspendedUntilMs ?: 0L else 0L,
                 )
             }
 
@@ -451,10 +546,23 @@ class AuthRepository @Inject constructor(
             opened = true
             val uid = auth.currentUser?.uid ?: return AuthResult.Error("No user ID")
 
+            if (beforeSession != null) {
+                val refusal = beforeSession(uid)
+                if (refusal != null) {
+                    // Nothing was started for this account, so there is nothing
+                    // to end; the rotated credential is already saved above, so
+                    // the saved-account button still works.
+                    try { auth.signOut() } catch (_: Exception) {}
+                    sessionManager.clear()
+                    opened = false
+                    return refusal
+                }
+            }
+
             gateIdentity(deviceId)?.let { return it }
 
             ensureUserDocument(uid)
-            generateSession(uid, deviceId)
+            generateSession(uid, deviceId)?.let { return it }
             /*
              * Mint again, now that there is a session.
              *
@@ -468,7 +576,8 @@ class AuthRepository @Inject constructor(
             mintQuickLoginCredential(deviceId)
             syncRoles()
 
-            if (value.isProfileComplete) AuthResult.Success else AuthResult.ProfileIncomplete
+            // C7: by profile completeness alone — see routeSignIn.
+            routeSignIn(value.isProfileComplete)
         } catch (e: Exception) {
             /*
              * An error here must not leave the account open.
@@ -542,6 +651,11 @@ class AuthRepository @Inject constructor(
                  * session-less appeal is proved with.
                  */
                 "banned" -> AuthResult.Banned(res.userMessage, RestrictionKind.Account)
+
+                // C9 (B25): the same for a suspension, should a server send it
+                // as an error — the suspension screen, never the ban one, and
+                // the credential kept for the appeal.
+                "suspended" -> AuthResult.Banned(res.userMessage, RestrictionKind.Suspension)
 
                 "rate_limited" -> AuthResult.Error(res.userMessage)
 
@@ -620,12 +734,17 @@ class AuthRepository @Inject constructor(
      *   a DELETED account holds it   → released and bound, its history left
      *                                  exactly where it is
      *
-     * An account inside its 30-day recovery window counts as live: it can still
+     * An account inside its 60-day recovery window counts as live: it can still
      * be restored in one tap, and giving its number away would break that.
      */
     suspend fun bindVerifiedIdentity(phone: String = "", email: String = ""): AuthResult =
         when (val res = money.bindVerifiedIdentity(phone, email)) {
-            is MoneyFunctions.Result.Ok -> AuthResult.Success
+            is MoneyFunctions.Result.Ok -> {
+                // UGP (D21): an anonymous session is continued from a same-uid
+                // token so it stops reading as a guest. See adoptSameUidSession.
+                if (res.value.customToken.isNotBlank()) adoptSameUidSession(res.value.customToken)
+                AuthResult.Success
+            }
             /*
              * `already-exists` is the one refusal that is not a failure.
              *
@@ -950,326 +1069,156 @@ class AuthRepository @Inject constructor(
         )
     }
 
-    // ── Email link ───────────────────────────────────────────────────────────
+    // ── Email, by a one-time code (UGP-C) ───────────────────────────────────
     //
-    // ── WHY A LINK AND NOT A PASSWORD ────────────────────────────────────────
+    // Replaces the Firebase passwordless email LINK. The server mails a six-digit
+    // code (`requestEmailBindCode`), the person types it back here, and the
+    // server (`verifyEmailBindCode`, functions/src/emailOtp.ts) binds the address
+    // to THIS uid through the same rules as a phone number and marks it verified
+    // on the Firebase Auth record. Nothing is linked on the device, so there is
+    // no dangling provider to undo, no address to remember across a process
+    // death, and no link that some other account could spend later.
     //
-    // The whole of this section attaches an EMAIL to a guest account, and it
-    // does it with Firebase's passwordless email link. There is no password
-    // field here and there must never be one: a password is a second secret for
-    // the person to lose, a second thing to phish, and a second recovery flow to
-    // build — and it buys nothing the link does not already give, because what
-    // the server actually wants is proof that this person reads that mailbox.
-    //
-    // `signInWithEmailAndPassword` and `createUserWithEmailAndPassword` appear
-    // NOWHERE in this app, deliberately. If either ever does, this comment is
-    // the one that was ignored.
-    //
-    // ── "password" IS THE PROVIDER ID, NOT A PASSWORD ────────────────────────
-    //
-    // `EmailAuthProvider.PROVIDER_ID` is the string "password", and an email
-    // link credential attaches under exactly that id — Firebase has one email
-    // provider with two sign-in methods on it. So `providerData` gains a
-    // "password" entry for an account that has no password at all. That is the
-    // id to test and the id to unlink, and it is why every use of it below says
-    // so: somebody reading `PROVIDER_ID` and deleting it as dead
-    // password-login code would delete the email binding with it.
+    // Still no password anywhere: `signInWithEmailAndPassword` and
+    // `createUserWithEmailAndPassword` appear NOWHERE in this app, deliberately.
 
-    /**
-     * Where the link in the email comes back to.
-     *
-     * Built from the project id rather than typed out, so a project rename or a
-     * second Firebase project cannot leave a dead domain compiled into the app.
-     * `<project>.firebaseapp.com` is the default authorised domain every
-     * Firebase project has, and the link must be on an authorised domain or the
-     * send is refused server-side.
-     *
-     * The path is ours and is matched by the App Link intent filter in
-     * AndroidManifest.xml. It has to be a real path on a real domain — the
-     * action handler redirects to it — so a custom scheme (`com.zipper.app://…`,
-     * which is what the reCAPTCHA return uses) is not an option here.
-     */
-    private fun emailLinkSettings(): ActionCodeSettings {
-        // `FirebaseApp.getInstance()` rather than `auth.app`: the default app is
-        // the one this `FirebaseAuth` was built from (see the Hilt module), it is
-        // initialised in `ZipperApp.onCreate` long before any of this can be
-        // reached, and it is the accessor that is unambiguously public API.
-        val projectId = FirebaseApp.getInstance().options.projectId.orEmpty()
-            .ifBlank { "zipper-83816" }
-        return ActionCodeSettings.newBuilder()
-            .setUrl("https://$projectId.firebaseapp.com$EMAIL_LINK_RETURN_PATH")
-            // False would mean "open the web action handler and finish there",
-            // which signs somebody in ON THE WEB and leaves the app's account
-            // exactly as unbound as it was.
-            .setHandleCodeInApp(true)
-            .setAndroidPackageName(BuildConfig.APPLICATION_ID, true, null)
-            .build()
+    /** Is anybody signed in on this device right now? */
+    fun isSignedIn(): Boolean = auth.currentUser != null
+
+    /** What asking for a code came to. */
+    sealed class EmailCodeSend {
+        /** Mailed. [maskedEmail] is the server's own masked form of the address. */
+        data class Sent(val maskedEmail: String, val resendInSec: Int, val expiresInSec: Int) : EmailCodeSend()
+        /** This verified address is already on the account — nothing to do. */
+        object AlreadyBound : EmailCodeSend()
+        /** Too soon, or too many: the message says how long. */
+        data class Wait(val message: String) : EmailCodeSend()
+        /** Not retryable as typed: a malformed address, a contact already on the account. */
+        data class Refused(val message: String) : EmailCodeSend()
+        /** Worth retrying: no connection, mail could not be sent. */
+        data class Failed(val message: String) : EmailCodeSend()
     }
 
-    /**
-     * Send the sign-in link, and remember the address it went to.
-     *
-     * The address MUST be stored. The link that comes back carries a one-time
-     * code and nothing else — `EmailAuthProvider.getCredentialWithLink` needs
-     * the address as well, and by the time the link is tapped the person has
-     * been in their mail app and the process may have been killed. Firebase's
-     * own documentation calls this out for the same reason. It goes to
-     * DataStore rather than to a field on a ViewModel precisely because a field
-     * does not survive that.
-     *
-     * Stored lower-cased and trimmed, which is exactly what `emailKey` on the
-     * server does. Sending a differently-cased string would bind an address the
-     * server then fails to match against the token.
-     */
-    suspend fun sendEmailSignInLink(email: String): AuthResult {
+    suspend fun requestEmailCode(email: String): EmailCodeSend {
         val address = email.trim().lowercase()
-        if (address.isBlank()) return AuthResult.Error("Enter your email address.")
-        return try {
-            auth.sendSignInLinkToEmail(address, emailLinkSettings()).await()
-            // After the send, not before: an address we failed to send to is not
-            // one to complete a binding with.
-            sessionManager.setPendingEmailLink(address)
-            AuthResult.Success
-        } catch (e: Exception) {
-            AuthResult.Error(e.message ?: "We could not send that email. Check the address and try again.")
+        if (address.isBlank()) return EmailCodeSend.Refused("Enter your email address.")
+        return when (val res = money.requestEmailBindCode(address)) {
+            is MoneyFunctions.Result.Ok ->
+                if (res.value.status == "already_bound") {
+                    // Typically the verify reply was lost and this is the retry.
+                    // The bind DID happen, so the device catches up exactly as
+                    // it would have then — otherwise Settings keeps offering
+                    // "Add your email" and an anonymous session stays anonymous.
+                    afterEmailBound(res.value.customToken)
+                    EmailCodeSend.AlreadyBound
+                } else {
+                    EmailCodeSend.Sent(res.value.maskedEmail, res.value.resendInSec, res.value.expiresInSec)
+                }
+            is MoneyFunctions.Result.Failed -> when (res.code) {
+                "RESOURCE_EXHAUSTED" -> EmailCodeSend.Wait(res.userMessage)
+                "INVALID_ARGUMENT", "PERMISSION_DENIED", "FAILED_PRECONDITION" ->
+                    EmailCodeSend.Refused(res.userMessage)
+                else -> EmailCodeSend.Failed(res.userMessage)
+            }
         }
     }
 
-    /** The address the last link was sent to, or "" if there is not one. */
-    suspend fun pendingEmailAddress(): String =
-        try { sessionManager.pendingEmailLink.first() } catch (_: Exception) { "" }
+    /** What entering a code came to. */
+    sealed class EmailCodeVerify {
+        /** On this account now — same uid, verified, nothing else changed. */
+        object Bound : EmailCodeVerify()
+        data class WrongCode(val message: String) : EmailCodeVerify()
+        /** Expired, used, locked or never sent: only a new code helps. */
+        data class NeedNewCode(val message: String) : EmailCodeVerify()
+        /** Another account holds the address. Final — see `bindContactCore`. */
+        data class Taken(val message: String) : EmailCodeVerify()
+        /** Refused for this account (a different email is already on it). */
+        data class Refused(val message: String) : EmailCodeVerify()
+        /** Did not finish — entering the SAME code again retries safely. */
+        data class Failed(val message: String) : EmailCodeVerify()
+    }
 
-    /**
-     * Attach an email address to the account that is signed in RIGHT NOW.
-     *
-     * The email twin of [linkPhone], and deliberately the same shape — read that
-     * one first; the reasoning behind every branch is written out there and only
-     * the parts that differ are repeated here.
-     *
-     * @param emailLink the link Firebase sent, as it arrived from the intent.
-     * @param expectedEmail the address it was sent to. See [sendEmailSignInLink]
-     *   for why this has to be carried rather than read out of the link.
-     */
-    suspend fun linkEmail(emailLink: String, expectedEmail: String): AuthResult {
-        val user = auth.currentUser ?: return AuthResult.Error("Not signed in.")
-        val address = expectedEmail.trim().lowercase()
-        if (address.isBlank()) {
-            return AuthResult.Error(
-                "We no longer have the address that link was sent to. " +
-                "Enter it again and we will send a new one.",
-            )
-        }
-        /*
-         * Asked before anything is attempted, because this is the one failure
-         * with a plain cause: the intent that opened the app was not a sign-in
-         * link at all — a stale link from a previous attempt, or any other
-         * https link the filter happened to match.
-         */
-        if (!auth.isSignInWithEmailLink(emailLink)) {
-            return AuthResult.Error(
-                "That link is not a sign-in link, or it has already been used. " +
-                "Send yourself a new one.",
-            )
-        }
-        return try {
-            /*
-             * ── THE LINK STEP IS IDEMPOTENT ──────────────────────────────
-             *
-             * Same reason as `linkPhone`. A "password" provider already on this
-             * account means a previous run linked it and then failed to bind —
-             * the leave-it-in-place branch below. Calling `linkWithCredential`
-             * again throws `provider-already-linked`, which surfaces as a
-             * collision and lands on a terminal "that address is taken" screen
-             * about the person's own address, with no way out of it and the
-             * account wedged: Auth holding an address Firestore does not, and
-             * Settings no longer offering the row that leads back here because
-             * the server computes guest-ness from `providerData`.
-             *
-             * So when it is already attached the link is skipped and the BIND is
-             * retried, which is the half that failed.
-             */
-            val alreadyLinked =
-                user.providerData.any { it.providerId == EmailAuthProvider.PROVIDER_ID }
-
-            val linked = if (alreadyLinked) {
-                try { user.reload().await() } catch (_: Exception) {}
-                auth.currentUser
-            } else {
-                user.linkWithCredential(
-                    EmailAuthProvider.getCredentialWithLink(address, emailLink),
-                ).await().user
+    suspend fun verifyEmailCode(email: String, code: String): EmailCodeVerify {
+        val address = email.trim().lowercase()
+        val digits = code.filter { it.isDigit() }
+        return when (val res = money.verifyEmailBindCode(address, digits)) {
+            is MoneyFunctions.Result.Ok -> {
+                afterEmailBound(res.value.customToken)
+                EmailCodeVerify.Bound
             }
-
-            val bound = linked?.email?.trim()?.lowercase()
-                ?: auth.currentUser?.email?.trim()?.lowercase()
-                ?: ""
-            if (bound.isBlank()) {
-                return undoEmailLink(
-                    AuthResult.Error(
-                        "That address could not be read back from your account. Try again."
-                    )
-                )
+            is MoneyFunctions.Result.Failed -> when {
+                res.code == "ALREADY_EXISTS" -> EmailCodeVerify.Taken(res.userMessage)
+                res.detail == "wrong_code" || res.detail == "invalid_code_format" ->
+                    EmailCodeVerify.WrongCode(res.userMessage)
+                // Only the server's own verdicts mean "this code is finished".
+                // A bare DEADLINE_EXCEEDED is the SDK's client-side timeout: the
+                // bind may have committed, and entering the SAME code again is
+                // the safe retry (the server accepts it for 15 minutes) — so it
+                // falls through to Failed with the code left in the boxes.
+                res.detail in setOf("no_code", "used", "expired", "locked") ->
+                    EmailCodeVerify.NeedNewCode(res.userMessage)
+                // Ten wrong codes today: a new code would not help either.
+                res.detail == "locked_out" -> EmailCodeVerify.Refused(res.userMessage)
+                res.code == "FAILED_PRECONDITION" || res.code == "PERMISSION_DENIED" ||
+                    res.code == "INVALID_ARGUMENT" -> EmailCodeVerify.Refused(res.userMessage)
+                else -> EmailCodeVerify.Failed(res.userMessage)
             }
-
-            /*
-             * ── NEVER BIND AN ADDRESS THEY DID NOT JUST PROVE ────────────
-             *
-             * `alreadyLinked` cannot tell a dangling link from an address that
-             * is attached and already bound, and reusing it is only right when
-             * the retry is for the SAME address. If they moved on to a
-             * different one, skipping the link and binding what is on the
-             * account means they open a link for B and are told the account is
-             * secured — with A on it.
-             */
-            if (alreadyLinked && bound != address) {
-                return AuthResult.Error(
-                    "A different address is still attached to this account. " +
-                    "Choose \"use a different address\" and try again."
-                )
-            }
-
-            /*
-             * ── THE TOKEN HAS TO CARRY THE ADDRESS, AND MAY NOT YET ──────
-             *
-             * `bindVerifiedIdentity` refuses anything the CALLER'S TOKEN does
-             * not already hold (`emailKey(token['email']) === email`), and a
-             * callable sends whatever ID token is cached — up to an hour old.
-             *
-             * On the fresh-link branch the SDK has just been handed new tokens
-             * by the link response, so that one is fine. On the `alreadyLinked`
-             * retry it is NOT: `reload()` refreshes the user record and leaves
-             * the token alone, so the cached token is the one minted before the
-             * link and carries no email at all. The bind would fail
-             * `failed-precondition` for ever, on exactly the retry path the
-             * idempotent link step exists to make work.
-             *
-             * Forced, and best-effort. If the refresh itself fails the cached
-             * token may still be good, so the bind is attempted anyway; the
-             * worst case is the transient branch below, which is retryable.
-             */
-            try { user.getIdToken(true).await() } catch (_: Exception) {}
-
-            val result = bindVerifiedIdentity(email = bound)
-            /*
-             * ── ROLL BACK ONLY ON A DEFINITIVE REFUSAL ────────────────────
-             *
-             * `IdentityTaken` is the server saying no and meaning it, so the
-             * link comes back off. Every other failure is UNKNOWN, and
-             * unlinking on an unknown is the worse bet for the reason set out
-             * at length in `linkPhone` and `undoPhoneLink`: a dropped
-             * connection is reported as `unavailable` while the server's write
-             * may have COMMITTED, and unlinking then leaves the address held in
-             * Firestore by an account that cannot prove it — locking out the
-             * rightful owner. Leaving the link is safe to retry, because the
-             * server filters holders to `d.id !== uid`.
-             */
-            if (result is AuthResult.IdentityTaken) return undoEmailLink(result)
-            if (result !is AuthResult.Success) {
-                return AuthResult.Error(
-                    "That address could not be confirmed just now. Open this " +
-                    "screen again and retry — nothing has been lost."
-                )
-            }
-            syncRoles()
-            // The binding is done; the stored address has no further use and is
-            // a record of somebody's email sitting in DataStore until it does.
-            try { sessionManager.clearPendingEmailLink() } catch (_: Exception) {}
-            /*
-             * No longer a guest, and Settings has to stop offering to fix that.
-             * Swallowed for the same reason as in `linkPhone`: this is a
-             * DataStore write after a bind that has already succeeded, and
-             * letting an IO failure reach the catch below would report a
-             * finished binding as a failure and send them to retry something
-             * that worked.
-             */
-            try { sessionManager.setGuest(false) } catch (_: Exception) {}
-            AuthResult.Success
-        } catch (e: FirebaseAuthUserCollisionException) {
-            /*
-             * Firebase refused the link because the address is on a live
-             * Firebase account. Nothing has changed on either side.
-             */
-            AuthResult.IdentityTaken(
-                "This email is already used by another Zipper account. " +
-                    "Sign in to that account instead.",
-            )
-        } catch (e: Exception) {
-            AuthResult.Error(e.message ?: "Could not add that email address.")
         }
     }
 
     /**
-     * Drop an email provider that was linked but never bound, so another
-     * address can be tried.
-     *
-     * The twin of [discardPendingPhoneLink], and needed for the same reason:
-     * [linkEmail]'s link step is idempotent, so a dangling link is REUSED on the
-     * next attempt — right for retrying the same address, wrong once the person
-     * has chosen a different one.
-     *
-     * The stored address goes too. It is the input to the next
-     * `getCredentialWithLink`, and leaving the old one there is how somebody
-     * opens the link for B and has it decoded against A.
-     *
-     * @return true if there is no email provider left to drop — including the
-     *   case where there was never one, or nobody is signed in.
+     * The device catching up with a bind the server has made: the same steps
+     * whether the bind is fresh (verify) or found already done (a retried
+     * request after a lost reply).
      */
-    suspend fun discardPendingEmailLink(): Boolean {
-        try { sessionManager.clearPendingEmailLink() } catch (_: Exception) {}
-        val user = auth.currentUser ?: return true
-        if (user.providerData.none { it.providerId == EmailAuthProvider.PROVIDER_ID }) return true
-        return try {
-            user.unlink(EmailAuthProvider.PROVIDER_ID).await()
-            try { user.reload().await() } catch (_: Exception) {}
-            true
+    private suspend fun afterEmailBound(customToken: String) {
+        if (customToken.isNotBlank()) adoptSameUidSession(customToken)
+        // The address was written to the Auth record by the server; the
+        // local user and its token learn about it only by asking.
+        try { auth.currentUser?.reload()?.await() } catch (_: Exception) {}
+        try { auth.currentUser?.getIdToken(true)?.await() } catch (_: Exception) {}
+        syncRoles()
+        // Swallowed for the reason given in `linkPhone`: the bind has
+        // already happened, a stale cached flag only leaves a no-op row.
+        try { sessionManager.setGuest(false) } catch (_: Exception) {}
+    }
+
+    /**
+     * UGP (D21): continue THIS account's session from a same-uid custom token.
+     *
+     * Firebase records how a session began and never changes it, so a guest who
+     * started anonymously still reads as `anonymous` after binding a phone or an
+     * email — and Storage (`isNonGuest`) and `guestRefusal` refuse anonymous
+     * sessions outright, which blocked the very next step (a host application's
+     * documents, a host invitation) until the next sign-in. The server mints a
+     * token for the caller's own uid only; this checks that before using it, so
+     * it can never move the device into another account. Best effort: a failure
+     * leaves the current session exactly as it was.
+     */
+    private suspend fun adoptSameUidSession(customToken: String) {
+        val current = auth.currentUser?.uid ?: return
+        if (com.zipper.app.util.CustomTokens.uidOf(customToken) != current) return
+        try {
+            val res = auth.signInWithCustomToken(customToken).await()
+            if (res.user?.uid != current) {
+                // Cannot happen with the check above; if it ever does, say so
+                // rather than carry on in an account nobody chose.
+                android.util.Log.w("AuthRepository", "same-uid session token resolved to another uid")
+            }
         } catch (_: Exception) {
-            false
         }
-    }
-
-    /**
-     * Take the address back off the Firebase account, because the server would
-     * not have it.
-     *
-     * The twin of [undoPhoneLink] — the same two-store divergence, the same
-     * rule that it runs ONLY on a definitive refusal, and the same refusal to
-     * report a failed rollback as a success. Read that one for the whole
-     * argument.
-     *
-     * @param refusal what the server said, returned unchanged once the account
-     *   is genuinely back to how it was.
-     */
-    private suspend fun undoEmailLink(refusal: AuthResult): AuthResult {
-        val user = auth.currentUser
-        val unlinked = if (user == null) false else try {
-            user.unlink(EmailAuthProvider.PROVIDER_ID).await()
-            // So the local `FirebaseUser` stops reporting an `email` the server
-            // has just taken back off it.
-            try { user.reload().await() } catch (_: Exception) {}
-            true
-        } catch (_: Exception) {
-            false
-        }
-
-        if (unlinked) return refusal
-        return AuthResult.Error(
-            "That address could not be added, and we could not put your account " +
-            "back the way it was either. Sign out and sign in again — if the " +
-            "address is still shown on your account after that, contact support.",
-        )
     }
 
     private suspend fun signInWithCredential(
         credential: PhoneAuthCredential,
         deviceId: String = "",
     ): AuthResult {
+        signInSerial.incrementAndGet()   // B11 — see signOut
         return try {
             val result = auth.signInWithCredential(credential).await()
             val uid = result.user?.uid ?: return AuthResult.Error("No user ID")
             val isNew = result.additionalUserInfo?.isNewUser == true
-            if (isNew) {
-                createUserDocument(uid, result.user?.phoneNumber ?: "")
-            } else {
+            if (!isNew) {
                 /*
                  * The ban check used to live HERE, and it was wrong twice over.
                  *
@@ -1295,23 +1244,28 @@ class AuthRepository @Inject constructor(
                  */
             }
             // Asked BEFORE anything is created — observer, deleted account,
-            // CRM role, missing contact details. See `gateIdentity`.
+            // a ban. A missing contact is RECORDED there and no longer stops
+            // the sign-in (C7). See `gateIdentity`.
+            //
+            // FX-07: and now that is true — the new login's document is
+            // written below the gate, not above it, so a refused sign-in
+            // leaves no `users` document behind.
             gateIdentity(deviceId)?.let { return it }
 
             // The document must exist before a session is written to it — see
             // `ensureUserDocument` for the sign-in that was impossible without
             // this.
-            if (!isNew) ensureUserDocument(uid)
-            generateSession(uid, deviceId)
+            if (isNew) createUserDocument(uid, result.user?.phoneNumber ?: "") else ensureUserDocument(uid)
+            generateSession(uid, deviceId)?.let { return it }
             mintQuickLoginCredential(deviceId)
             // Agent / seller / official / CRM role badges, read server-side
             // from `crmUsers/{uid}` — the same document `resolveIdentity`
             // reads, so the two can never disagree.
             syncRoles()
-            if (isNew) AuthResult.ProfileIncomplete
+            if (isNew) routeSignIn(isProfileComplete = false)
             else {
                 val snap = firestore.collection("users").document(uid).get().await()
-                if (snap.getBoolean("isProfileComplete") == true) AuthResult.Success else AuthResult.ProfileIncomplete
+                routeSignIn(snap.getBoolean("isProfileComplete") == true)
             }
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Sign in failed")
@@ -1321,11 +1275,91 @@ class AuthRepository @Inject constructor(
     // ── Google Sign-In ────────────────────────────────────────────────────────
 
     suspend fun signInWithGoogle(idToken: String, deviceId: String = ""): AuthResult {
+        signInSerial.incrementAndGet()   // B11 — see signOut
         return try {
             val credential = GoogleAuthProvider.getCredential(idToken, null)
             val result = auth.signInWithCredential(credential).await()
-            val uid = result.user?.uid ?: return AuthResult.Error("No user ID")
-            val isNew = result.additionalUserInfo?.isNewUser == true
+            var uid = result.user?.uid ?: return AuthResult.Error("No user ID")
+            var isNew = result.additionalUserInfo?.isNewUser == true
+            /*
+             * ── A NEW GOOGLE UID FOR AN EMAIL THAT ALREADY HAS AN ACCOUNT ──────
+             *
+             * The 2026-10-08 bug: a guest bound x@gmail.com with an email link,
+             * signed out, then used Google with that Gmail — and landed in Setup
+             * Profile on a second, empty account. Asked BEFORE any document is
+             * written: if the server finds exactly one existing account holding
+             * this verified address, it removes the new uid, links Google onto
+             * that account and hands back a token for it.
+             *
+             * ── B13: A FAILED CALL IS NOT A "NO MATCH" ──────────────────────────
+             *
+             * The answer used to be `(… as? Ok)?.value`, so a dropped connection
+             * read exactly like the server saying nobody holds the address, and
+             * a permanent duplicate account was written on the spot. Only the
+             * server's own "none" lets a new account be made now; anything else
+             * is retried once and then FAILS CLOSED — signed out, nothing
+             * deleted, nothing created (`GoogleAdoption`).
+             *
+             * Asked for a Google login with no users document yet, too, not only
+             * a brand-new one: after a fail-closed the login Firebase created
+             * still exists, so the next attempt is not `isNewUser` — and it must
+             * get the same question rather than walk past it into a duplicate.
+             * The server's own freshness rule (a Google-only login minutes old,
+             * with nothing on it) keeps this from ever touching an old account.
+             */
+            // FX-08: whether this login already has a users document, and
+            // whether Google is its only provider — together they decide how a
+            // `none / caller_not_fresh` answer is read (see GoogleAdoption.next).
+            val callerHasDocument = !isNew &&
+                firestore.collection("users").document(uid).get().await().exists()
+            val callerGoogleOnly = result.user?.providerData.orEmpty()
+                .map { it.providerId }
+                .filter { it != "firebase" } == listOf("google.com")
+            val askAdoption = isNew || !callerHasDocument
+            if (askAdoption) {
+                var adopted: MoneyFunctions.EmailAdoption? = null
+                var step = GoogleAdoption.Step.Retry
+                var attempt = 0
+                while (step == GoogleAdoption.Step.Retry) {
+                    if (attempt > 0) delay(700)
+                    attempt += 1
+                    adopted = (money.adoptEmailAccount() as? MoneyFunctions.Result.Ok)?.value
+                    step = GoogleAdoption.next(
+                        status = adopted?.status,
+                        hasToken = !adopted?.customToken.isNullOrBlank(),
+                        attempt = attempt,
+                        reason = adopted?.reason.orEmpty(),
+                        callerHasDocument = callerHasDocument,
+                        callerGoogleOnly = callerGoogleOnly,
+                    )
+                }
+                if (step == GoogleAdoption.Step.FailClosed) {
+                    try { auth.signOut() } catch (_: Exception) {}
+                    return AuthResult.Error(GoogleAdoption.COULD_NOT_CHECK)
+                }
+                if (step == GoogleAdoption.Step.Adopt && adopted != null) {
+                    auth.signInWithCustomToken(adopted.customToken).await()
+                    uid = auth.currentUser?.uid ?: return AuthResult.Error("No user ID")
+                    isNew = false
+                }
+            }
+            // The ban check moved into `gateIdentity`, which can tell a
+            // suspension from a ban and bars the device actually in use rather
+            // than the one the account was created on.
+            //
+            // Asked BEFORE anything is created — observer, deleted account,
+            // a ban. A missing contact is RECORDED there and no longer stops
+            // the sign-in (C7). See `gateIdentity`.
+            //
+            // FX-07: and now that is true. The document used to be written
+            // ABOVE this line for a new login, so a sign-in the gate refused
+            // (the observer, whose login it then deletes; a barred device)
+            // left a `users` document behind for an account that was refused.
+            gateIdentity(deviceId)?.let { return it }
+
+            // The document must exist before a session is written to it — see
+            // `ensureUserDocument` for the sign-in that was impossible without
+            // this.
             if (isNew) {
                 createUserDocument(
                     uid = uid,
@@ -1334,29 +1368,18 @@ class AuthRepository @Inject constructor(
                     photoUrl = result.user?.photoUrl?.toString() ?: "",
                 )
             } else {
-                // Same as the phone path above: the ban check moved into
-                // `gateIdentity`, which can tell a suspension from a ban and
-                // bars the device actually in use rather than the one the
-                // account was created on.
+                ensureUserDocument(uid)
             }
-            // Asked BEFORE anything is created — observer, deleted account,
-            // CRM role, missing contact details. See `gateIdentity`.
-            gateIdentity(deviceId)?.let { return it }
-
-            // The document must exist before a session is written to it — see
-            // `ensureUserDocument` for the sign-in that was impossible without
-            // this.
-            if (!isNew) ensureUserDocument(uid)
-            generateSession(uid, deviceId)
+            generateSession(uid, deviceId)?.let { return it }
             mintQuickLoginCredential(deviceId)
             // Agent / seller / official / CRM role badges, read server-side
             // from `crmUsers/{uid}` — the same document `resolveIdentity`
             // reads, so the two can never disagree.
             syncRoles()
-            if (isNew) AuthResult.ProfileIncomplete
+            if (isNew) routeSignIn(isProfileComplete = false)
             else {
                 val snap = firestore.collection("users").document(uid).get().await()
-                if (snap.getBoolean("isProfileComplete") == true) AuthResult.Success else AuthResult.ProfileIncomplete
+                routeSignIn(snap.getBoolean("isProfileComplete") == true)
             }
         } catch (e: FirebaseAuthUserCollisionException) {
             /*
@@ -1396,9 +1419,8 @@ class AuthRepository @Inject constructor(
             try { auth.signOut() } catch (_: Exception) {}
             AuthResult.IdentityTaken(
                 "This email already belongs to a Zipper account that signs in a " +
-                "different way. Sign in with your phone number, or open the CRM " +
-                "and use Settings → Connect Google once — after that, Google " +
-                "works here too."
+                "different way. Sign in with that account's phone number, or " +
+                "contact support to reach it."
             )
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Google sign-in failed")
@@ -1446,6 +1468,7 @@ class AuthRepository @Inject constructor(
      * functions/src/identity.ts.
      */
     suspend fun signInAsGuest(deviceId: String = ""): AuthResult {
+        signInSerial.incrementAndGet()   // B11 — see signOut
         getDeviceBanReason(deviceId)?.let { return AuthResult.Banned(it, RestrictionKind.Device) }
 
         return try {
@@ -1513,97 +1536,70 @@ class AuthRepository @Inject constructor(
              * credentials therefore cost a guest nothing.
              */
             if (existing == null && savedQuickLogin() != null) {
-                val resumed = signInWithQuickLogin(deviceId)
                 /*
-                 * Succeeded — but a quick-login credential proves which ACCOUNT
-                 * was last signed out HERE, and the device's guest slot is a
-                 * separate fact that can disagree with it. So the recovered uid
-                 * is checked against this device's binding before it is accepted.
-                 *
-                 * The disagreement is narrower than it was. Quick login is now
-                 * signature-bound and no longer cloud-backed, so a credential
-                 * cannot arrive from another handset. The DEVICE SECRET still
-                 * can — it is deliberately backed up, because carrying a guest
-                 * account across a device transfer is what it is for — so the
-                 * two can still name different accounts, and this check is what
-                 * decides between them.
+                 * A quick-login credential proves which ACCOUNT was last signed
+                 * out HERE, and the device's guest slot is a separate fact that
+                 * can disagree with it. So the recovered uid is checked against
+                 * this device's binding before it is accepted. The DEVICE SECRET
+                 * can still come from another handset — it is deliberately backed
+                 * up, to carry a guest across a device transfer — so the two can
+                 * name different accounts, and this check decides between them.
                  *
                  * This is also how every guest who already exists acquires a
-                 * binding. They have a quick-login credential and no binding, so
-                 * the check answers `bound` and records the account they already
-                 * have — no migration script, and it happens on their next
-                 * sign-in.
+                 * binding: a quick-login credential and no binding → `bound`, on
+                 * their next sign-in, with no migration script.
+                 *
+                 * FX-15: the check now runs INSIDE quick login, after the
+                 * credential is redeemed and BEFORE any session is started for
+                 * the account (`beforeSession`). It used to run afterwards, so a
+                 * saved Google / email / phone account opened from the GUEST
+                 * button had already displaced its other phone and revoked that
+                 * phone's quick-login credential by the time the check said "not
+                 * a guest" (RF-29). Refused or not-a-guest, nothing is started.
+                 *
+                 * B12: every result that would open the account goes through the
+                 * check — it is asked for every successful redemption, before the
+                 * result is known.
                  */
-                if (resumed is AuthResult.Success || resumed is AuthResult.ProfileIncomplete) {
-                    val recovered = auth.currentUser?.uid.orEmpty()
-                    val check =
-                        if (recovered.isEmpty()) BindingCheck.Agrees
+                var check: BindingCheck = BindingCheck.Agrees
+                val resumed = signInWithQuickLogin(deviceId) { recovered ->
+                    check = if (recovered.isEmpty()) BindingCheck.Agrees
                         else confirmDeviceBinding(deviceId, secret, recovered)
-                    when (check) {
-                        BindingCheck.Agrees -> return resumed
-
-                        /*
-                         * THE SESSION HAS TO GO WITH THE REFUSAL.
-                         *
-                         * By now `signInWithQuickLogin` has done everything:
-                         * signed in, gated, written the document, claimed the
-                         * one-device mobile session and minted a fresh secret.
-                         * Returning a refusal on top of that would be a lie —
-                         * the account IS open, and `SplashScreen` admits any live
-                         * session with a document, so the next cold start walks
-                         * straight into it and never asks again.
-                         *
-                         * `signOut` rather than a bare `auth.signOut()`: the
-                         * mobile session and the push token have to be released
-                         * too. It re-mints the secret on the way out, so the
-                         * saved-account button the refusal points at still works.
-                         */
-                        is BindingCheck.Refuse -> {
-                            signOut(deviceId)
-                            return check.result
-                        }
-
-                        /*
-                         * ── THE SAVED ACCOUNT IS NOT A GUEST ────────────────
-                         *
-                         * Quick login restores whatever was last signed in on
-                         * this handset, and that is often an email or Google
-                         * account. Returning it from the GUEST button was wrong
-                         * twice over: the person asked for a guest session and
-                         * got their real account, and the device's guest slot was
-                         * about to be filled with an account that is not a guest
-                         * — which would have barred that handset from ever having
-                         * one.
-                         *
-                         * So let go of it and carry on below as if there had been
-                         * no saved sign-in at all. `existing` is already null on
-                         * this path, so the server is asked the plain question and
-                         * either hands back this device's real guest or agrees
-                         * that it may have its first.
-                         */
-                        BindingCheck.NotTheDevicesGuest -> signOut(deviceId)
+                    when (val c = check) {
+                        BindingCheck.Agrees -> null
+                        is BindingCheck.Refuse -> c.result
+                        BindingCheck.NotTheDevicesGuest -> AuthResult.Error(NOT_THE_DEVICES_GUEST)
                     }
-                } else {
+                }
+                when (val c = check) {
+                    // Refused before anything was started; the refusal is the answer.
+                    is BindingCheck.Refuse -> return c.result
                     /*
+                     * ── THE SAVED ACCOUNT IS NOT A GUEST ────────────────────
+                     *
+                     * Quick login restores whatever was last signed in on this
+                     * handset, often an email or Google account. The guest
+                     * button must not hand it back, and the device's guest slot
+                     * must not be filled with it. Its sign-in has already been
+                     * closed, with nothing started, so carry on below as if
+                     * there had been no saved sign-in: `existing` is null, so
+                     * the server is asked the plain question.
+                     */
+                    BindingCheck.NotTheDevicesGuest -> Unit
+                    /*
+                     * Agrees — or the resume never got as far as the check.
+                     *
                      * ── A FAILED RESUME IS TERMINAL. IT MUST NOT FALL THROUGH ──
                      *
-                     * This used to continue into the create path on an Error, and
-                     * that is the stranded-balance bug by a longer route. A saved
-                     * sign-in that could not be USED is not evidence that the
-                     * device has no guest — it is evidence of the opposite — and
-                     * the server cannot know better, because for a guest who
-                     * predates the binding this secret was the only record of
-                     * them. Asked with no uid it answers `no_guest`, perfectly
-                     * correctly, and a new account would be minted and bound.
-                     *
-                     * So: say what happened and stop. When the token really is
-                     * dead `signInWithQuickLogin` forgets it, so the next tap
-                     * finds no saved sign-in and takes the create path honestly.
-                     *
-                     * Banned, suspended and awaiting-a-deletion-choice come
-                     * through here too, and all three belong to `gateIdentity`.
+                     * A saved sign-in that could not be USED is not evidence
+                     * that the device has no guest — for a guest who predates
+                     * the binding this secret was the only record of them, and
+                     * asked with no uid the server would answer `no_guest` and a
+                     * new account would be minted. So say what happened and
+                     * stop. When the token really is dead `signInWithQuickLogin`
+                     * forgets it, so the next tap takes the create path honestly.
                      */
-                    return resumed
+                    BindingCheck.Agrees -> return resumed
                 }
             }
 
@@ -1712,8 +1708,12 @@ class AuthRepository @Inject constructor(
             gateIdentity(deviceId)?.let { return it }
 
             createUserDocument(uid, phone = "", name = "")
-            generateSession(uid, deviceId)
+            generateSession(uid, deviceId)?.let { return it }
             mintQuickLoginCredential(deviceId)
+            // C7: the same chain as every other sign-in — session, quick login,
+            // roles — before the route is decided. A guest holds no CRM role,
+            // so this normally confirms none; it is the same call either way.
+            syncRoles()
 
             /*
              * A returning guest whose profile is finished goes Home. The old code
@@ -1731,8 +1731,7 @@ class AuthRepository @Inject constructor(
              * paths never had it.
              */
             val snap = firestore.collection("users").document(uid).get().await()
-            if (snap.getBoolean("isProfileComplete") == true) AuthResult.Success
-            else AuthResult.ProfileIncomplete
+            routeSignIn(snap.getBoolean("isProfileComplete") == true)
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Guest sign-in failed")
         }
@@ -1770,9 +1769,25 @@ class AuthRepository @Inject constructor(
     ): BindingCheck {
         val claim = when (val res = money.claimGuestIdentity(deviceId, secret, uid = uid)) {
             is MoneyFunctions.Result.Ok -> res.value
-            // The account is already signed in and gated, so this is not worth
-            // undoing a good sign-in for. The binding is confirmed next time.
-            is MoneyFunctions.Result.Failed -> return BindingCheck.Agrees
+            /*
+             * The check could not be made. For a plain guest that is not worth
+             * undoing a good sign-in for — the binding is confirmed next time.
+             *
+             * For an account with Google, email or a phone on it, it IS. This
+             * used to answer `Agrees` regardless, so a failed call let the GUEST
+             * button hand back whatever account was last signed in on the phone
+             * (2026-10-08: tapping guest opened Ruhan's Google account). Fail
+             * closed: the person retries, or uses that account's own sign-in.
+             */
+            is MoneyFunctions.Result.Failed -> {
+                val hasProvider = auth.currentUser?.providerData
+                    ?.any { it.providerId != "firebase" } == true
+                return if (hasProvider) {
+                    BindingCheck.Refuse(
+                        AuthResult.Error("Couldn't check this device's guest account. Please try again.")
+                    )
+                } else BindingCheck.Agrees
+            }
         }
         return when (claim.status) {
             // Agreed, or just recorded. Either way this account owns the device.
@@ -1870,9 +1885,21 @@ class AuthRepository @Inject constructor(
          * and the guest button is deliberately not a second one — otherwise
          * anybody holding the handset after a sign-out would reach it.
          */
+        /*
+         * AUTH-001 (Phase 1A). The server refuses to bind a uid the caller is not
+         * signed in as, and refuses a guest uid already bound to another device.
+         * Neither is something a retry fixes, and neither hands out a session.
+         */
+        "not_owner" -> AuthResult.Error(
+            "Couldn't confirm this guest account belongs to you. Please try again."
+        )
+        "bound_elsewhere" -> AuthResult.IdentityTaken(
+            "This guest account is already in use on another device. Sign in with " +
+            "its phone number, email or Google instead."
+        )
         "upgraded" -> AuthResult.IdentityTaken(
-            "This device's account now signs in with Google or a phone number. " +
-            "Use one of those to continue."
+            "This device's account has been secured, so it now signs in with " +
+            "its phone number, email or Google. Use one of those to continue."
         )
         else -> AuthResult.Error("Couldn't start a guest session. Please try again.")
     }
@@ -2048,21 +2075,59 @@ class AuthRepository @Inject constructor(
         }
 
         /*
-         * `deleted_permanent` deliberately falls through.
+         * ── `deleted_permanent` NO LONGER FALLS THROUGH (C8 — B27) ───────────
          *
-         * The old account's identity has already been released and its history
-         * kept; there is nothing to recover and nothing to warn about. This
-         * person is starting fresh, and the ordinary new-account path is
-         * exactly right.
+         * It used to, on the reasoning that the old identity had been released
+         * and this person was starting fresh. That is true of a NEW uid — and a
+         * new uid never gets this answer: it has no document. The server says
+         * `deleted_permanent` for THIS uid, the deleted account itself, past
+         * its due date but not yet swept (the sweep runs daily and releases the
+         * login last). Falling through walked the person into that dead
+         * account. They are told it was deleted and signed out instead; once
+         * the sweep has released the login, the same phone or Google account
+         * signs up as a genuinely new one.
          */
-
-        if (id.requiresPhone || id.requiresEmail) {
-            return AuthResult.NeedsContactDetails(
-                requiresPhone = id.requiresPhone,
-                requiresEmail = id.requiresEmail,
-                crmRole = id.crmRole,
-            )
+        if (com.zipper.app.util.DeletionWindow.endsAccount(id.decision)) {
+            try { auth.signOut() } catch (_: Exception) {}
+            sessionManager.clear()
+            return AuthResult.AccountDeleted(com.zipper.app.util.DeletionWindow.ACCOUNT_DELETED)
         }
+
+        /*
+         * RF-27: every refusal this build knows was handled above. Anything
+         * else that is not an explicit `allow` used to fall through and carry
+         * on into the account; it now fails closed, exactly as the cold-start
+         * gate does (`SplashGate.decide`). Same cleanup as the unverified
+         * branch: a guest keeps a way back in, anyone else is signed out.
+         */
+        if (!SignInRouting.gateLetsThrough(id.decision)) {
+            if (auth.currentUser?.isAnonymous == true) {
+                mintQuickLoginCredential(deviceId)
+            } else {
+                try { auth.signOut() } catch (_: Exception) {}
+                sessionManager.clear()
+            }
+            return AuthResult.Error(SignInRouting.UNKNOWN_GATE_ANSWER)
+        }
+
+        /*
+         * ── A MISSING CONTACT IS RECORDED, NOT ROUTED ON (C7 — B01, B02) ─────
+         *
+         * This returned `NeedsContactDetails` here, before the session was
+         * started and before anybody looked at `isProfileComplete` — so a Host,
+         * a partner or a member of staff missing a phone or an email was sent
+         * to profile setup on every sign-in, with a finished profile, by a
+         * screen that cannot bind a contact. And the early return skipped
+         * `generateSession` and the guest flag, so these accounts never held a
+         * mobile session at all.
+         *
+         * Now the requirement is stored and the sign-in carries on exactly like
+         * any other: session, quick login, roles, then `SignInRouting` on the
+         * profile alone. The verified way to add the contact is the Settings
+         * row, by OTP or by code — the places that genuinely need both
+         * (`activateHost`, payouts) still refuse server-side without them.
+         */
+        sessionManager.setContactRequirement(id.requiresPhone, id.requiresEmail)
 
         /*
          * Cache the server's answer to "is this still a guest".
@@ -2081,6 +2146,27 @@ class AuthRepository @Inject constructor(
         sessionManager.setGuest(id.isGuest)
 
         return null
+    }
+
+    /**
+     * C7: where a sign-in that has started its session, minted quick login and
+     * synced roles goes next — Main for a finished profile, profile setup
+     * otherwise, and never setup BECAUSE a contact is missing.
+     *
+     * The requirement `gateIdentity` stored is read back and handed to
+     * [SignInRouting.decide] so the decision states it, and so the invariant is
+     * the one its test pins. Every sign-in path ends here.
+     */
+    private suspend fun routeSignIn(isProfileComplete: Boolean): AuthResult {
+        val owesPhone = try { sessionManager.requiresPhone.first() } catch (_: Exception) { false }
+        val owesEmail = try { sessionManager.requiresEmail.first() } catch (_: Exception) { false }
+        return SignInRouting.toResult(
+            SignInRouting.decide(
+                isProfileComplete = isProfileComplete,
+                requiresPhone = owesPhone,
+                requiresEmail = owesEmail,
+            ),
+        )
     }
 
     /**
@@ -2145,28 +2231,22 @@ class AuthRepository @Inject constructor(
     ): AuthResult {
         val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not logged in")
         return try {
-            // ── Email uniqueness guard ─────────────────────────────────────────
-            // The canonical email is the Firebase Auth email (for Google/email-auth users)
-            // OR the one the user typed in the profile setup form (for phone-auth users).
-            val firebaseEmail = auth.currentUser?.email?.takeIf { it.isNotBlank() }
-            val canonicalEmail = (firebaseEmail ?: email).trim().lowercase()
-            if (canonicalEmail.isNotBlank()) {
-                try {
-                    val existing = firestore.collection("users")
-                        .whereEqualTo("email", canonicalEmail)
-                        .limit(5)
-                        .get().await()
-                    val takenByOther = existing.documents.any { it.id != uid }
-                    if (takenByOther) {
-                        return AuthResult.Error(
-                            "This email is already linked to another Zipper account. " +
-                            "Please use a different email address."
-                        )
-                    }
-                } catch (_: Exception) {
-                    // Uniqueness check is best-effort — don't block profile save on a network error.
-                }
-            }
+            /*
+             * ── Phase 1A (CONTACT-001 / CONTACT-002): NO TYPED CONTACT ─────────
+             *
+             * The form's `email` and `phone` used to be written onto the user
+             * document whenever Firebase Auth had none, after a best-effort
+             * "is this email taken" query. A typed value is an unverified
+             * claim, and the user document's contact fields are what other
+             * server paths (host invitations, partner matching) used to read
+             * as identity. The rules now refuse a contact value that is not
+             * the verified one on this account's token, so only those are
+             * written here. A missing phone or email is added through the
+             * verified bind flow (OTP / email link), which writes it server-side.
+             *
+             * The client-side uniqueness query is gone with it: it guarded a
+             * write that no longer happens, and it was an enumeration oracle.
+             */
             // A picked photo overwrites it; otherwise the chosen default avatar
             // is stored as-is, so an account that skipped the photo step still
             // has a face instead of a blank disc.
@@ -2210,11 +2290,6 @@ class AuthRepository @Inject constructor(
                  * `users/{uid}/devices` registry and this field.
                  */
                 "languages" to languagesMaps,
-                "email" to (firebaseUser?.email?.takeIf { it.isNotBlank() } ?: email),
-                // The auth token wins where it has one — it is verified, and a
-                // typed number is not. The form value fills the gap Auth
-                // genuinely has, exactly as `email` does one line above.
-                "phoneNumber" to (firebaseUser?.phoneNumber?.takeIf { it.isNotBlank() } ?: phone),
                 "bio" to bio,
                 "isProfileComplete" to true,
                 "isOnline" to true,
@@ -2231,8 +2306,22 @@ class AuthRepository @Inject constructor(
              * of mixed types and a same-typed array cannot be spread into a
              * `Map<String, Any>`.
              */
+            // Verified contact only — see the Phase 1A note above. The typed
+            // `email` / `phone` parameters are accepted for call-site
+            // compatibility and intentionally not written.
+            val verifiedContact = buildMap<String, Any> {
+                val u = firebaseUser
+                if (u != null) {
+                    val verifiedEmail = u.email
+                    if (!verifiedEmail.isNullOrBlank() && u.isEmailVerified) {
+                        put("email", verifiedEmail.trim().lowercase())
+                    }
+                    val verifiedPhone = u.phoneNumber
+                    if (!verifiedPhone.isNullOrBlank()) put("phoneNumber", verifiedPhone)
+                }
+            }
             val patch: Map<String, Any> =
-                if (photoUrl.isNotBlank()) updates + ("photoUrl" to photoUrl) else updates
+                (if (photoUrl.isNotBlank()) updates + ("photoUrl" to photoUrl) else updates) + verifiedContact
 
             /*
              * `set(merge)`, not `update`.
@@ -2364,6 +2453,13 @@ class AuthRepository @Inject constructor(
                 "You are already a host with another agency. To move, ask your " +
                 "current agency to release you first."
             )
+            HostFunctions.ReferralRefusal.GUEST           -> ReferralResult.Error(
+                "Guest accounts cannot become hosts. Add your phone number or email first."
+            )
+            // C1 (B04): the server's HOST_REVOKED_REFUSAL, word for word.
+            HostFunctions.ReferralRefusal.ROLE_REVOKED    -> ReferralResult.Error(
+                "Your Host role was revoked. Request reinstatement instead of applying again."
+            )
             HostFunctions.ReferralRefusal.UNKNOWN         -> ReferralResult.Error("That code could not be used.")
         }
         is HostFunctions.CodeCheck.Failed -> ReferralResult.Error(res.message)
@@ -2427,6 +2523,9 @@ class AuthRepository @Inject constructor(
     }
 
     private companion object {
+        /** FX-15: the guest path's internal answer for "not this device's guest" — never shown. */
+        const val NOT_THE_DEVICES_GUEST = "not the device's guest"
+
         /**
          * The three `bindVerifiedIdentity` refusals that no retry can turn into
          * a yes, spelled as `FirebaseFunctionsException.Code.name`.
@@ -2434,8 +2533,9 @@ class AuthRepository @Inject constructor(
          * A binding attempt that hits one of these must be ROLLED BACK — the
          * provider comes off the Auth account — because the alternative is an
          * account whose Auth side holds an identifier its Firestore side does
-         * not, which is the divergence `undoPhoneLink` / `undoEmailLink` exist
-         * to prevent. Anything not on this list is treated as unknown and the
+         * not, which is the divergence `undoPhoneLink` exists to prevent. (The
+         * email binding links nothing on the client any more: the server binds
+         * the address after the emailed code checks out, UGP-C.) Anything not on this list is treated as unknown and the
          * link is deliberately left in place, since the server's write is not
          * idempotency-guarded and may have committed with the response lost.
          */
@@ -2486,24 +2586,26 @@ class AuthRepository @Inject constructor(
         /**
          * How long a deleted account can still be recovered.
          *
-         * Must match `GRACE_DAYS` in functions/src/accounts.ts — the client
-         * writes the due date and the server's sweep reads it, so a mismatch
-         * here purges accounts early or leaves them pending past the date the
-         * app promised.
+         * Must match `GRACE_DAYS` in functions/src/accounts.ts — SIXTY days.
+         * This said thirty while the server said sixty (C8, B28), so it now
+         * names the one shared constant instead of repeating a number. The
+         * server stamps the due date; the copy reads either that date or
+         * this.
          */
-        const val GRACE_DAYS = 30
+        const val GRACE_DAYS = com.zipper.app.util.DeletionWindow.GRACE_DAYS
 
-        /**
-         * The path the email sign-in link comes back to. See
-         * [emailLinkSettings].
-         *
-         * MUST match the `android:pathPrefix` on the App Link intent filter in
-         * AndroidManifest.xml. A manifest cannot read a Kotlin constant, so the
-         * two are kept in step by this comment and nothing else — change one and
-         * the link opens a browser instead of the app, silently, on a flow whose
-         * only symptom is "nothing happened when I tapped the email".
+        /*
+         * B11: the network steps of an ordinary sign-out are best-effort, and
+         * the logout now WAITS for them before showing Login — so each one is
+         * bounded. Offline, the push-token delete never completes at all
+         * (Firestore holds the write until it is acknowledged); unbounded, it
+         * would keep somebody on Settings for ever. The mint gets the longest
+         * allowance because for a guest it is the way back in.
          */
-        const val EMAIL_LINK_RETURN_PATH = "/secure-account"
+        const val SIGN_OUT_MINT_TIMEOUT_MS = 10_000L
+        const val SIGN_OUT_STEP_TIMEOUT_MS = 5_000L
+
+        // UGP-C: EMAIL_LINK_RETURN_PATH is gone with the email link and its App Link.
     }
 
     /** A deletion that has been requested and has not happened yet. */
@@ -2511,8 +2613,9 @@ class AuthRepository @Inject constructor(
 
     // ── Soft delete account ───────────────────────────────────────────────────
     //
-    // Marks the user as pending deletion. Cloud Function purges data after 30 days.
-    // If user logs back in within 30 days the account is recovered (isDeleted flag removed).
+    // Marks the user as pending deletion. The server releases the identity after
+    // the recovery window — 60 days (GRACE_DAYS), from the due date it stamps.
+    // Signing back in within it offers the account back (RecoverAccountScreen).
 
     suspend fun softDeleteAccount(): AuthResult {
         val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not logged in")
@@ -2541,7 +2644,7 @@ class AuthRepository @Inject constructor(
              * accounts holding one number, with nothing to say which owns it.
              *
              * The deadline moved to the server for the same reason call billing
-             * did: `now + 30 days` computed on a phone is thirty days after
+             * did: `now + 60 days` computed on a phone is sixty days after
              * whatever that phone believes the date to be.
              */
             when (val res = money.requestAccountDeletion()) {
@@ -2581,15 +2684,66 @@ class AuthRepository @Inject constructor(
         }
     }
 
-    /** Undo a deletion request. Restores the account exactly as it was. */
-    suspend fun recoverAccount(): AuthResult =
+    /**
+     * Undo a deletion request. Restores the account exactly as it was — and
+     * then opens the session the sign-in that found it never started.
+     *
+     * ── B02: RECOVERED, BUT NEVER SIGNED IN ─────────────────────────────────
+     *
+     * `gateIdentity` answers a deleted account with `DeletedRecoverable`
+     * BEFORE the session is claimed, and this used to return Success straight
+     * after the server undid the deletion — so the person went Home with no
+     * mobile session, no fresh quick-login credential and stale role flags.
+     * [openRecoveredSession] runs the same chain as every other sign-in.
+     *
+     * ── C8 (B27): PAST THE DUE DATE ─────────────────────────────────────────
+     *
+     * The server refuses with `RECOVERY_EXPIRED` once `deletionDueAt` has
+     * passed. That is not a retryable error: the account is gone, and the
+     * person is told so and signed out rather than left on a button that will
+     * never work.
+     *
+     * @param deviceId this handset, for the session record and the quick-login
+     *   credential — as on every other sign-in.
+     */
+    suspend fun recoverAccount(deviceId: String = ""): AuthResult =
         when (val res = hostFunctions.recoverAccount()) {
-            is HostFunctions.Result.Ok -> AuthResult.Success
-            is HostFunctions.Result.Failed -> AuthResult.Error(res.userMessage)
+            is HostFunctions.Result.Ok -> openRecoveredSession(deviceId)
+            is HostFunctions.Result.Failed ->
+                if (com.zipper.app.util.DeletionWindow.isRecoveryExpired(res.detail)) {
+                    try { auth.signOut() } catch (_: Exception) {}
+                    try { sessionManager.clear() } catch (_: Exception) {}
+                    AuthResult.AccountDeleted(com.zipper.app.util.DeletionWindow.ACCOUNT_DELETED)
+                } else {
+                    AuthResult.Error(res.userMessage)
+                }
         }
 
     /**
-     * Finish the deletion now rather than waiting out the thirty days.
+     * The tail of a sign-in, for an account that has just been recovered.
+     *
+     * The gate is asked again because the answer has changed — the account is
+     * active now, and the guest flag and the contact requirement were never
+     * recorded on the way in. Then the session, quick login and roles, and the
+     * route by profile completeness, exactly as the other paths do (C7).
+     */
+    private suspend fun openRecoveredSession(deviceId: String): AuthResult {
+        val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not signed in.")
+        return try {
+            gateIdentity(deviceId)?.let { return it }
+            ensureUserDocument(uid)
+            generateSession(uid, deviceId)?.let { return it }
+            mintQuickLoginCredential(deviceId)
+            syncRoles()
+            val snap = firestore.collection("users").document(uid).get().await()
+            routeSignIn(snap.getBoolean("isProfileComplete") == true)
+        } catch (e: Exception) {
+            AuthResult.Error(e.message ?: "Your account is back, but it could not be opened. Try again.")
+        }
+    }
+
+    /**
+     * Finish the deletion now rather than waiting out the recovery window.
      *
      * ── WHAT THIS ACTUALLY DOES, WHICH IS NOT WHAT IT USED TO SAY ────────────
      *
@@ -2689,10 +2843,38 @@ class AuthRepository @Inject constructor(
      *
      * `quickLogin.clear()` is deliberately NOT called. Remembering across an
      * ordinary sign-out is the entire feature. It is cleared on account
-     * deletion, on a server refusal, and on an explicit "forget this device".
+     * deletion and on a server refusal. (The explicit forget-this-device
+     * sign-out was removed with its Settings row, UGP-E2.)
      */
     suspend fun signOut(deviceId: String = "", mintQuickLogin: Boolean = true) {
         val uid = auth.currentUser?.uid
+        com.zipper.app.util.PublicAppeal.forgetRestrictedUid()
+
+        /*
+         * ── B11: THIS SIGN-OUT ENDS ONLY THE SIGN-IN IT STARTED FROM ─────────
+         *
+         * Everything below the mint is network, and the last two lines used to
+         * run unconditionally whenever it finished — `sessionManager.clear()`
+         * and `auth.signOut()`, seconds after Logout had already shown Login.
+         * Somebody who tapped "Continue as …" in that gap was signed in, and
+         * then signed out again by the tail of the logout they had left.
+         *
+         * So the tail runs only while nothing has changed: the uid that started
+         * this is still the one signed in, AND no sign-in has started since
+         * ([signInSerial] — the quick re-sign-in is usually the SAME account,
+         * so the uid alone cannot tell). The session id is taken now, not after
+         * the mint, so the server record closed below is this one and never a
+         * successor's. The callers now also wait for this to finish before they
+         * show Login; the guard is what makes a race harmless rather than rare.
+         */
+        val startedSerial = signInSerial.get()
+        val sessionId = try { sessionManager.sessionToken.first() } catch (_: Exception) { "" }
+        fun stillOurs(): Boolean = SignOutGuard.mayFinish(
+            startedUid = uid,
+            currentUid = auth.currentUser?.uid,
+            startedSerial = startedSerial,
+            currentSerial = signInSerial.get(),
+        )
 
         /*
          * ── A DISPLACED DEVICE MUST NOT MINT ITSELF A WAY BACK ───────────────
@@ -2708,8 +2890,14 @@ class AuthRepository @Inject constructor(
          * device rule with a door cut into it.
          *
          * See `SessionViewModel.tearDownSession`, which passes false.
+         *
+         * B43: [deviceId] is the real handset id on an ordinary logout now. It
+         * was always "" from the logout button, and the server only retires
+         * this device's OTHER credentials when it is told which device it is.
          */
-        if (uid != null && mintQuickLogin) mintQuickLoginCredential(deviceId)
+        if (uid != null && mintQuickLogin) {
+            withTimeoutOrNull(SIGN_OUT_MINT_TIMEOUT_MS) { mintQuickLoginCredential(deviceId) }
+        }
 
         /*
          * Close the server's record of this session.
@@ -2724,51 +2912,55 @@ class AuthRepository @Inject constructor(
          * `endMobileSession` would refuse it anyway — it only clears a session
          * that still matches.
          */
-        if (uid != null && mintQuickLogin) {
+        if (uid != null && mintQuickLogin && sessionId.isNotBlank()) {
             try {
-                val sessionId = sessionManager.sessionToken.first()
-                if (sessionId.isNotBlank()) money.endMobileSession(sessionId)
+                withTimeoutOrNull(SIGN_OUT_STEP_TIMEOUT_MS) { money.endMobileSession(sessionId) }
             } catch (_: Exception) {
             }
         }
 
         // Drop the push token — and only THIS phone's, so the same account
         // signed in elsewhere keeps its notifications. Awaited: after signOut()
-        // the write would be retried without an auth token and refused.
-        uid?.let { com.zipper.app.service.PushNotifications.clearToken(it) }
-        sessionManager.clear()
-        auth.signOut()
+        // the write would be retried without an auth token and refused. Bounded,
+        // because offline that write is never acknowledged; and skipped once a
+        // new sign-in has begun, which will register its own.
+        if (uid != null && stillOurs()) {
+            withTimeoutOrNull(SIGN_OUT_STEP_TIMEOUT_MS) {
+                com.zipper.app.service.PushNotifications.clearToken(uid)
+            }
+        }
+        if (stillOurs()) {
+            // FX-21: remember (or forget) this device's GUEST account, so Login
+            // can warn before a phone or Google sign-in opens a separate one.
+            // Read before `clear()`, which drops the server's guest verdict.
+            try {
+                val mark = GuestLinkWarning.onSignOut(
+                    uid = uid,
+                    providerIds = auth.currentUser?.providerData?.map { it.providerId }.orEmpty(),
+                    serverSaysGuest = sessionManager.isGuest.first(),
+                    rememberedGuestUid = sessionManager.deviceGuestUid.first(),
+                )
+                when (mark) {
+                    is GuestLinkWarning.Mark.Remember -> sessionManager.setDeviceGuestUid(mark.uid)
+                    GuestLinkWarning.Mark.Forget -> sessionManager.clearDeviceGuestUid()
+                    GuestLinkWarning.Mark.Leave -> Unit
+                }
+            } catch (_: Exception) {
+                // A hint for a warning; never worth failing a sign-out over.
+            }
+            // Each on its own: a DataStore failure must not leave the Firebase
+            // session signed in behind a logout that reported success.
+            try { sessionManager.clear() } catch (_: Exception) {}
+            auth.signOut()
+        }
     }
 
-    /**
-     * Sign out AND forget this device, so quick login will not offer the account
-     * back.
-     *
-     * The honest version of "log out" for a shared or borrowed phone. Ordinary
-     * sign-out deliberately remembers.
-     */
-    suspend fun signOutAndForget() {
-        val token = quickLogin.load()?.token
-        if (token != null) {
-            try { money.revokeQuickLogin(token) } catch (_: Exception) {}
-        }
-        quickLogin.clear()
-        /*
-         * And destroy the device key, which is what makes "forget" honest.
-         *
-         * Clearing the secret alone leaves the binding alive, so any credential
-         * minted on this handset that somehow still exists server-side could
-         * still be signed for. Deleting the Keystore entry ends that: no
-         * credential minted here is redeemable again, whatever happened to its
-         * bytes. The next sign-in generates a new key and a new binding.
-         */
-        deviceKey.clear()
-        auth.currentUser?.uid?.let {
-            com.zipper.app.service.PushNotifications.clearToken(it)
-        }
-        sessionManager.clear()
-        auth.signOut()
-    }
+    /** FX-21: this device's remembered guest account ("" when none). Never throws. */
+    suspend fun deviceGuestUid(): String =
+        try { sessionManager.deviceGuestUid.first() } catch (_: Exception) { "" }
+
+    // UGP-E2: `signOutAndForget()` was removed with its Settings row (brief E).
+    // Ordinary `signOut()` above is the one sign-out; it keeps quick login.
 
     /**
      * Throw away a half-finished account.
@@ -2785,7 +2977,7 @@ class AuthRepository @Inject constructor(
      * no login (unreachable forever).
      *
      * REFUSES a completed profile. This is an abandon, not a delete — a real
-     * deletion goes through `softDeleteAccount` and its 30-day window.
+     * deletion goes through `softDeleteAccount` and its recovery window.
      */
     suspend fun abandonSignup(): AuthResult {
         val user = auth.currentUser ?: return AuthResult.Error("Not signed in.")
@@ -2838,12 +3030,35 @@ class AuthRepository @Inject constructor(
                 return AuthResult.Success
             }
 
+            /*
+             * ── B15: THE LOGIN GOES ONLY IF THE DOCUMENT WENT ────────────────
+             *
+             * The document delete used to be `try { … } catch {}` and the login
+             * was deleted regardless — so a refused or failed delete left a
+             * users document with no login behind it, the one state the order
+             * above exists to prevent: unreachable for ever, and still visible
+             * to everybody else. Now a failed delete stops here with nothing
+             * touched — not the login, not the quick-login credential, not the
+             * device key — and the person can retry or finish setting up.
+             */
+            val documentGone = try {
+                firestore.collection("users").document(uid).delete().await()
+                true
+            } catch (_: Exception) {
+                false
+            }
+            if (!documentGone) {
+                return AuthResult.Error(
+                    "This account could not be removed just now, so nothing was deleted. " +
+                        "Check your connection and try again."
+                )
+            }
+
             quickLogin.clear()
             // The account is being thrown away, so the binding goes with it.
             // Leaving the key behind would let the NEXT account minted on this
             // handset inherit a key the discarded one had already registered.
             deviceKey.clear()
-            try { firestore.collection("users").document(uid).delete().await() } catch (_: Exception) {}
             sessionManager.clear()
 
             try {

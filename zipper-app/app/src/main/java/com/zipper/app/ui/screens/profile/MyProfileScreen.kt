@@ -64,10 +64,12 @@ fun MyProfileScreen(
     onNavigateToDailyRewards: () -> Unit = {},
     onNavigateToAgencyDashboard: () -> Unit = {},
     onNavigateToSellerDashboard: () -> Unit = {},
+    /** Mobile parity: the role-aware work hub (CRM capabilities for partners and staff). */
+    onNavigateToWork: () -> Unit = {},
     onNavigateToFeedback: () -> Unit = {},
     /** The liveness capture, for a host who has not done it. Takes their gender. */
     onNavigateToFaceVerification: (String) -> Unit = {},
-    onNavigateToJoinAgency: () -> Unit = {},
+    onNavigateToPartnerHub: () -> Unit = {},
     onLogout: () -> Unit = {},
     viewModel: ProfileViewModel = hiltViewModel(),
 ) {
@@ -178,46 +180,70 @@ fun MyProfileScreen(
             }
 
             /*
-             * ── THE WAY IN FOR SOMEBODY AN AGENCY HAS INVITED ────────────────
+             * "Become a partner" — the four roles, offered or greyed out by the
+             * SERVER's eligibility table, plus this person's applications.
+             * Replaces the lone "Join an agency" row.
              *
-             * The referral code used to be collectable on the first-run setup
-             * form and nowhere else. So an agency inviting a person who already
-             * had the app — which is most of the people they invite — left them
-             * with no way to accept: the code appeared on their profile as a
-             * read-only row, and Go Live told them to "apply with an agency
-             * referral code" with nothing anywhere to type one into. The only
-             * remaining route was a staff member running `grant_host` by hand.
+             * Shown to everyone EXCEPT ZIPPER staff, hosts included: a host
+             * under a main agency may still add a Sub-agency or a Coin Seller
+             * role, and the hub says so. Staff are never partners. `crmRole` is
+             * stamped server-side by `syncMyRoles` from `crmUsers/{uid}` and is
+             * non-blank ONLY for an Owner or a department role (partners get
+             * '') — it is not the `isOfficial` badge. Hiding the card is the
+             * convenience; the API refusing every staff application is the rule.
              *
-             * Shown to everyone who is not already a host, because the app
-             * cannot know who has been invited — the invitation lives in
-             * `hostApplications`, which app users deliberately cannot read. The
-             * screen behind it is honest that a code has to come from an agency.
+             * Approved contact rule (supersedes UGP-A's "not shown to a guest"):
+             * an account without a verified phone or email SEES the card, and
+             * the card says a verified contact comes first. Hiding it explained
+             * nothing; the hub now says what is missing and opens phone or
+             * email verification, then brings the person back. The test is
+             * the Firebase Auth record — the same one the server reads
+             * (`is_unverified_guest`) — never the `users/{uid}` contact
+             * fields, and the server still refuses an application without one.
              */
-            if (!user.isHost) {
-                Row(
-                    Modifier.fillMaxWidth()
-                        .background(c.bgElevated, RoundedCornerShape(Radius.lg))
-                        .border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.lg))
-                        .clickableNoRipple(onNavigateToJoinAgency)
-                        .padding(Space.md),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(Space.md),
+            val authUser = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
+            if (com.zipper.app.util.ContactRules.partnerEntryVisible(
+                    crmRole = user.crmRole,
+                    authPhone = authUser?.phoneNumber,
+                    authEmail = authUser?.email,
+                    authEmailVerified = authUser?.isEmailVerified == true,
+                )
+            ) Row(
+                Modifier.fillMaxWidth()
+                    .background(c.bgElevated, RoundedCornerShape(Radius.lg))
+                    .border(1.dp, c.borderSubtle, RoundedCornerShape(Radius.lg))
+                    .clickableNoRipple(onNavigateToPartnerHub)
+                    .padding(Space.md),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Space.md),
+            ) {
+                Box(
+                    Modifier.size(40.dp).background(c.bgBase, RoundedCornerShape(Radius.sm)),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        Modifier.size(40.dp).background(c.bgBase, RoundedCornerShape(Radius.sm)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(Icons.Outlined.Groups, null, tint = c.brandVip, modifier = Modifier.size(20.dp))
-                    }
-                    Column(Modifier.weight(1f)) {
-                        Text("Join an agency", style = ZipperTheme.type.labelM, color = c.textPrimary)
-                        Text(
-                            "Invited by an agency? Enter their code to become a host.",
-                            style = ZipperTheme.type.caption, color = c.textSecondary,
-                        )
-                    }
-                    Icon(Icons.Default.ChevronRight, null, tint = c.textMuted, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Outlined.Groups, null, tint = c.brandVip, modifier = Modifier.size(20.dp))
                 }
+                Column(Modifier.weight(1f)) {
+                    Text("Become a partner", style = ZipperTheme.type.labelM, color = c.textPrimary)
+                    // B36: never "an agency" for a Host — Host + Agency is a
+                    // forbidden pair, and the hub would only grey it out. A Host
+                    // under a main agency may add a Sub-agency or a Coin Seller
+                    // role; under a sub-agency, a Coin Seller only (the hub says so).
+                    Text(
+                        when {
+                            // Approved contact rule: the card is shown, and says what comes first.
+                            com.zipper.app.util.ContactRules.partnerEntryNeedsContact(
+                                authPhone = authUser?.phoneNumber,
+                                authEmail = authUser?.email,
+                                authEmailVerified = authUser?.isEmailVerified == true,
+                            ) -> "Verify a phone number or email first — we'll show you how."
+                            user.isHost -> "Add a sub-agency or coin seller role."
+                            else -> "Apply as a Host, Agency, Sub-agency or Coin Seller."
+                        },
+                        style = ZipperTheme.type.caption, color = c.textSecondary,
+                    )
+                }
+                Icon(Icons.Default.ChevronRight, null, tint = c.textMuted, modifier = Modifier.size(18.dp))
             }
 
             // Host earnings entry — the host's daily reason to open the app
@@ -247,6 +273,11 @@ fun MyProfileScreen(
                 add(Cell(Icons.Outlined.Videocam, "Call History", onNavigateToCallHistory))
                 if (user.isAgent) add(Cell(Icons.Outlined.Groups, "Agency", onNavigateToAgencyDashboard))
                 if (user.isSeller) add(Cell(Icons.Outlined.Storefront, "Seller", onNavigateToSellerDashboard))
+                // Shown to anyone the server has given a partner or staff role (server-written
+                // flags). The hub itself asks the API what the session may do.
+                if (user.isAgent || user.isSeller || user.isOfficial || user.crmRole.isNotBlank() || user.ownAgencyId.isNotBlank()) {
+                    add(Cell(Icons.Outlined.WorkOutline, "Work", onNavigateToWork))
+                }
                 add(Cell(Icons.Outlined.Settings, "Settings", onNavigateToSettings))
                 add(Cell(Icons.Outlined.ChatBubbleOutline, "Feedback", onNavigateToFeedback))
                 add(Cell(Icons.AutoMirrored.Outlined.Logout, "Log out", { confirmLogout = true }, danger = true))

@@ -1,0 +1,17 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+# Note: Defence in depth: account-wide claim writes never carry mfa_sid.
+--- a/backend/app/services/storage_claims.py
++++ b/backend/app/services/storage_claims.py
+@@ -107,7 +107,10 @@
+         log.warning("storage claim: could not read user %s: %s", uid, exc)
+         return f"could not read the Firebase user: {exc}"
+ 
+-    rest = {k: v for k, v in existing.items() if k not in CLAIM_KEYS}
++    # P1-A3b: `mfa_sid` is a PER-SESSION developer claim (custom-token sign-in
++    # after Owner MFA). Account-wide claims must never carry it — it would then
++    # appear in EVERY sign-in of the account — so it is dropped here, always.
++    rest = {k: v for k, v in existing.items() if k not in CLAIM_KEYS and k != "mfa_sid"}
+     merged = {**rest, **(wanted or {})}
+ 
+     if merged == existing:

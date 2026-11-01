@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# ZIPPER Phase 1A — local validation runner for the developer Mac.
+# Revision 2 (safety). Replaces the first version, which ran `npm install`,
+# let the Gradle wrapper download a Gradle distribution, and ran `adb devices`.
+#
+# WHAT IT RUNS — each step writes its own log, validation-logs/<UTC-stamp>-<step>.log,
+# and every log ends with "# exit=<code>", the command's real exit status:
+#
+#   preflight        checks that every local dependency is ALREADY installed
+#   environment      prints java / node / firebase-CLI versions (read-only)
+#   rules-firestore  tests/firestore.rules.test.mjs          LOCAL Firestore emulator
+#   rules-phase1a    tests/firestore.phase1a.rules.test.mjs  LOCAL Firestore emulator
+#   rules-storage    tests/storage.rules.test.mjs            LOCAL Storage emulator
+#   android-unit     ./gradlew --offline :app:testDebugUnitTest
+#   android-build    ./gradlew --offline :app:assembleDebug   (builds the APK; never installs it)
+#
+# WHAT IT NEVER DOES:
+#   * install or download anything:
+#       - no npm install / npm ci / npx;
+#       - no Gradle distribution download: the wrapper must already be unpacked
+#         locally, and preflight stops if it isn't;
+#       - no Gradle dependency download (`--offline`);
+#       - no Android SDK component download (`-Pandroid.builder.sdkDownload=false`);
+#       - no Firebase emulator download: preflight stops if the emulator JARs
+#         are not already cached;
+#   * deploy, publish, or run any git, cleanup, reset or delete command;
+#   * talk to a phone: there is no adb command in this file;
+#   * reach production data:
+#       - the rules suites run only inside `firebase emulators:exec --only <emulator>`;
+#       - the tests connect to 127.0.0.1;
+#       - GOOGLE_APPLICATION_CREDENTIALS is removed from the test process's environment.
+#     `--project demo-zipper` only names the namespace inside the local emulator.
+#
+# If anything required is missing, PREFLIGHT stops before any step runs, says
+# exactly what is missing and how YOU can install it, and exits 2.
+#
+# Exit status: 0 = every selected step exited 0; 1 = at least one step failed;
+#              2 = preflight refused to start.
+#
+# Run from anywhere:
+#     bash ~/Documents/Projects/zippern/tests/run-phase1a-validation.sh
+# Only some steps:
+#     STEPS="android-unit android-build" bash tests/run-phase1a-validation.sh
+# ─────────────────────────────────────────────────────────────────────────────
+set -u
+
+# No production credentials for any step: nothing in this runner needs them.
+unset GOOGLE_APPLICATION_CREDENTIALS
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LOG_DIR="$ROOT/validation-logs"
+mkdir -p "$LOG_DIR"
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+# Never overwrite an earlier run's logs, even within the same second.
+while [ -e "$LOG_DIR/$STAMP-summary.txt" ] || [ -e "$LOG_DIR/$STAMP-preflight.log" ]; do
+  sleep 1
+  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+done
+SUMMARY="$LOG_DIR/$STAMP-summary.txt"
+PREFLIGHT_LOG="$LOG_DIR/$STAMP-preflight.log"
+
+ALL_STEPS="environment rules-firestore rules-phase1a rules-storage android-unit android-build"
+STEPS="${STEPS:-$ALL_STEPS}"
+
+# Gradle flags that forbid network downloads during the build.
+GRADLE_SAFE_FLAGS="--offline -Pandroid.builder.sdkDownload=false"
+
+# Use JDK 21 if JAVA_HOME is not already set. `java_home` only looks things up.
+if [ -z "${JAVA_HOME:-}" ] && [ -x /usr/libexec/java_home ]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null || true)"
+fi
+export JAVA_HOME="${JAVA_HOME:-}"
+[ -n "$JAVA_HOME" ] && export PATH="$JAVA_HOME/bin:$PATH"
+
+wants() { case " $STEPS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+wants_rules()   { wants rules-firestore || wants rules-phase1a || wants rules-storage; }
+wants_android() { wants android-unit || wants android-build; }
+
+for s in $STEPS; do
+  case " $ALL_STEPS " in
+    *" $s "*) ;;
+    *) echo "Unknown step '$s'. Known steps: $ALL_STEPS" >&2; exit 2 ;;
+  esac
+done
+
+{
+  echo "Phase 1A validation run $STAMP"
+  echo "repo:      $ROOT"
+  echo "steps:     $STEPS"
+  echo "JAVA_HOME: ${JAVA_HOME:-<not set>}"
+  echo ""
+} | tee "$SUMMARY"
+
+# ── Preflight: check, never install ─────────────────────────────────────────
+
+PROBLEMS=0
+problem() { PROBLEMS=$((PROBLEMS + 1)); echo "MISSING: $*" >> "$PREFLIGHT_LOG"; }
+note()    { echo "ok:      $*" >> "$PREFLIGHT_LOG"; }
+
+# The major version of `java` on PATH, or 0.
+java_major() {
+  v="$(java -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n 1)"
+  case "$v" in
+    1.*) echo "$v" | cut -d. -f2 ;;
+    "")  echo 0 ;;
+    *)   echo "$v" | cut -d. -f1 | cut -d- -f1 | cut -d+ -f1 ;;
+  esac
+}
+
+{
+  echo "# step:     preflight (checks only — installs nothing)"
+  echo "# started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "# steps requested: $STEPS"
+  echo "# ───────────────────────────────────────────────────────────"
+} > "$PREFLIGHT_LOG"
+
+if wants_rules || wants_android || wants environment; then
+  if command -v java >/dev/null 2>&1; then
+    JMAJOR="$(java_major)"
+    case "$JMAJOR" in ''|*[!0-9]*) JMAJOR=0 ;; esac
+    note "java on PATH (major version $JMAJOR)"
+  else
+    JMAJOR=0
+    problem "java is not on PATH. Install a JDK 21 yourself (for example: brew install openjdk@21), then re-run."
+  fi
+fi
+
+if wants_rules; then
+  if [ "$JMAJOR" -lt 21 ] 2>/dev/null; then
+    problem "the Firebase emulators need Java 21 or newer (found major version $JMAJOR). Set JAVA_HOME to a JDK 21."
+  fi
+  if command -v node >/dev/null 2>&1; then note "node $(node -v 2>&1)"; else
+    problem "node is not on PATH. Install Node.js yourself, then re-run."; fi
+  if command -v firebase >/dev/null 2>&1; then note "firebase CLI on PATH"; else
+    problem "the firebase CLI is not on PATH. Install it yourself (npm i -g firebase-tools), then re-run."; fi
+  for pkg in "@firebase/rules-unit-testing" "firebase"; do
+    if [ -f "$ROOT/tests/node_modules/$pkg/package.json" ]; then
+      note "tests/node_modules/$pkg present"
+    else
+      problem "tests/node_modules/$pkg is not installed. This runner never installs packages. If you accept it, run yourself:  cd \"$ROOT/tests\" && npm ci"
+    fi
+  done
+  EMU_DIR="${FIREBASE_EMULATORS_PATH:-$HOME/.cache/firebase/emulators}"
+  if wants rules-firestore || wants rules-phase1a; then
+    if ls "$EMU_DIR"/cloud-firestore-emulator*.jar >/dev/null 2>&1; then
+      note "Firestore emulator JAR cached in $EMU_DIR"
+    else
+      problem "no Firestore emulator JAR in $EMU_DIR — the Firebase CLI would download it. If you accept that, run yourself:  firebase setup:emulators:firestore"
+    fi
+  fi
+  if wants rules-storage; then
+    if ls "$EMU_DIR"/cloud-storage-rules-runtime*.jar >/dev/null 2>&1; then
+      note "Storage rules runtime JAR cached in $EMU_DIR"
+    else
+      problem "no Storage rules runtime JAR in $EMU_DIR — the Firebase CLI would download it. If you accept that, run yourself:  firebase setup:emulators:storage"
+    fi
+  fi
+  for t in firestore.rules.test.mjs firestore.phase1a.rules.test.mjs storage.rules.test.mjs; do
+    [ -f "$ROOT/tests/$t" ] || problem "test file tests/$t not found"
+  done
+fi
+
+if wants_android; then
+  if [ "$JMAJOR" -lt 17 ] 2>/dev/null; then
+    problem "the Android build needs Java 17 or newer (found major version $JMAJOR)."
+  fi
+  if [ -x "$ROOT/zipper-app/gradlew" ]; then note "zipper-app/gradlew is executable"; else
+    problem "zipper-app/gradlew is missing or not executable."; fi
+  WRAPPER_PROPS="$ROOT/zipper-app/gradle/wrapper/gradle-wrapper.properties"
+  DIST_URL="$(sed -n 's/^distributionUrl=//p' "$WRAPPER_PROPS" 2>/dev/null | sed 's/\\//g')"
+  DIST_ZIP="$(basename "$DIST_URL" 2>/dev/null)"        # gradle-8.14.5-bin.zip
+  DIST_NAME="${DIST_ZIP%.zip}"                            # gradle-8.14.5-bin
+  DIST_VER="${DIST_NAME%-bin}"; DIST_VER="${DIST_VER%-all}"  # gradle-8.14.5
+  GUH="${GRADLE_USER_HOME:-$HOME/.gradle}"
+  if [ -z "$DIST_NAME" ]; then
+    problem "could not read distributionUrl from $WRAPPER_PROPS"
+  elif ls "$GUH/wrapper/dists/$DIST_NAME"/*/"$DIST_ZIP.ok" >/dev/null 2>&1 \
+       && ls "$GUH/wrapper/dists/$DIST_NAME"/*/"$DIST_VER/bin/gradle" >/dev/null 2>&1; then
+    note "Gradle distribution $DIST_VER already unpacked in $GUH/wrapper/dists/$DIST_NAME"
+  else
+    problem "Gradle distribution $DIST_VER is not installed in $GUH/wrapper/dists — the wrapper would download it. If you accept that, run yourself once:  cd \"$ROOT/zipper-app\" && ./gradlew --version"
+  fi
+  # Android SDK — sdk.dir is the ONLY line read from local.properties (that file
+  # also holds secrets; nothing else from it is read or printed).
+  SDK_DIR="$(sed -n 's/^sdk\.dir=//p' "$ROOT/zipper-app/local.properties" 2>/dev/null | head -n 1)"
+  [ -z "$SDK_DIR" ] && SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+  if [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR" ]; then
+    note "Android SDK at $SDK_DIR"
+    if [ -d "$SDK_DIR/platforms/android-34" ]; then note "SDK platform android-34 installed"; else
+      problem "SDK platform android-34 (compileSdk 34) is not installed in $SDK_DIR. Install it yourself with the SDK Manager."; fi
+    if ls "$SDK_DIR/build-tools/"* >/dev/null 2>&1; then note "SDK build-tools present"; else
+      problem "no SDK build-tools in $SDK_DIR/build-tools. Install them yourself with the SDK Manager."; fi
+  else
+    problem "Android SDK not found (no sdk.dir in zipper-app/local.properties, no ANDROID_HOME). Install it yourself with Android Studio."
+  fi
+fi
+
+{
+  echo "# ───────────────────────────────────────────────────────────"
+  echo "# problems: $PROBLEMS"
+  echo "# finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >> "$PREFLIGHT_LOG"
+
+if [ "$PROBLEMS" -gt 0 ]; then
+  echo "# exit=2" >> "$PREFLIGHT_LOG"
+  {
+    echo "preflight        exit=2   $PREFLIGHT_LOG"
+    echo ""
+    echo "STOPPED before running anything. $PROBLEMS local dependency problem(s):"
+    grep '^MISSING:' "$PREFLIGHT_LOG" | sed 's/^/  /'
+    echo ""
+    echo "Nothing was installed, downloaded, deployed or changed."
+  } | tee -a "$SUMMARY"
+  exit 2
+fi
+echo "# exit=0" >> "$PREFLIGHT_LOG"
+printf '%-16s exit=%-3s %s\n' "preflight" "0" "$PREFLIGHT_LOG" | tee -a "$SUMMARY"
+
+# ── Steps ───────────────────────────────────────────────────────────────────
+
+FAILED=0
+# run <step-name> <working-dir> <command...>
+run() {
+  name="$1"; dir="$2"; shift 2
+  log="$LOG_DIR/$STAMP-$name.log"
+  {
+    echo "# step:     $name"
+    echo "# command:  $*"
+    echo "# cwd:      $dir"
+    echo "# started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# ───────────────────────────────────────────────────────────"
+  } > "$log"
+  ( cd "$dir" && "$@" ) >> "$log" 2>&1
+  code=$?
+  {
+    echo "# ───────────────────────────────────────────────────────────"
+    echo "# finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# exit=$code"
+  } >> "$log"
+  [ "$code" -eq 0 ] || FAILED=$((FAILED + 1))
+  printf '%-16s exit=%-3s %s\n' "$name" "$code" "$log" | tee -a "$SUMMARY"
+}
+
+# Rules suites: local emulator only, and no Google credentials in the test process.
+emulator() {
+  only="$1"; testfile="$2"
+  echo "# runs:     env -u GOOGLE_APPLICATION_CREDENTIALS firebase emulators:exec --only $only --project demo-zipper \"node tests/$testfile\""
+  env -u GOOGLE_APPLICATION_CREDENTIALS \
+    firebase emulators:exec --only "$only" --project demo-zipper "node tests/$testfile"
+}
+
+if wants environment; then
+  run environment "$ROOT" sh -c '
+    echo "== java";     java -version 2>&1
+    echo "== node";     node -v 2>&1 || echo "node not on PATH"
+    echo "== firebase"; firebase --version 2>&1 || echo "firebase CLI not on PATH"
+    echo "== gradle wrapper (configured, not executed)"
+    sed -n "s/^distributionUrl=//p" zipper-app/gradle/wrapper/gradle-wrapper.properties'
+fi
+
+wants rules-firestore && run rules-firestore "$ROOT" emulator firestore firestore.rules.test.mjs
+wants rules-phase1a   && run rules-phase1a   "$ROOT" emulator firestore firestore.phase1a.rules.test.mjs
+wants rules-storage   && run rules-storage   "$ROOT" emulator storage   storage.rules.test.mjs
+
+# shellcheck disable=SC2086  # GRADLE_SAFE_FLAGS is intentionally word-split
+wants android-unit  && run android-unit  "$ROOT/zipper-app" ./gradlew $GRADLE_SAFE_FLAGS :app:testDebugUnitTest
+# shellcheck disable=SC2086
+wants android-build && run android-build "$ROOT/zipper-app" ./gradlew $GRADLE_SAFE_FLAGS :app:assembleDebug
+
+{
+  echo ""
+  if [ "$FAILED" -gt 0 ]; then echo "RESULT: $FAILED step(s) failed."; else echo "RESULT: every selected step exited 0."; fi
+  echo "Logs: $LOG_DIR/$STAMP-*.log   Summary: $SUMMARY"
+  if wants_android && grep -E -q "No cached version|offline mode" "$LOG_DIR/$STAMP"-android-*.log 2>/dev/null; then
+    echo "NOTE: Gradle reported a dependency missing from the offline cache. This runner does not"
+    echo "      download dependencies. If you accept a network build, run it yourself."
+  fi
+} | tee -a "$SUMMARY"
+
+[ "$FAILED" -eq 0 ] || exit 1
+exit 0

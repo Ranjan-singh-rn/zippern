@@ -484,6 +484,73 @@ for (const primary of ['agency', 'seller'] as const) {
   }
 }
 
+// ── Phase 1A: the role-revocation leak ───────────────────────────────────────
+//
+// A login whose agency role was revoked still carried the legacy single
+// `status: 'approved'`. The explicit per-role value was not one of the three
+// this file knew, so it fell through to the legacy field and routed the
+// revoked capability straight back to its dashboard.
+{
+  const revoked = {
+    role: 'agency', status: 'approved', roles: ['agency'], roleStatus: { agency: 'revoked' },
+  } as unknown as PartnerRoleHolder
+  check('Phase 1A — a revoked agency role is not approved', partnerRoleStatus(revoked, 'agency'), 'rejected')
+  check('Phase 1A — and opens no dashboard', approvedPartnerRoles(revoked), [])
+  const suspended = {
+    role: 'seller', status: 'approved', roles: ['seller'], roleStatus: { seller: 'suspended' },
+  } as unknown as PartnerRoleHolder
+  check('Phase 1A — a suspended seller role is not approved', partnerRoleStatus(suspended, 'seller'), 'rejected')
+  const dual = {
+    role: 'agency', status: 'approved', roles: ['agency', 'seller'],
+    roleStatus: { agency: 'revoked', seller: 'approved' },
+  } as unknown as PartnerRoleHolder
+  check('Phase 1A — revoking one capability leaves only the other', approvedPartnerRoles(dual), ['seller'])
+}
+
+// ── Decision 15 (RC): approved, waiting for BOTH verified contacts ───────────
+//
+// The Owner may approve before the login holds a verified phone and a
+// verified email; the role then WAITS. It must route like pending — the
+// waiting room, never the dashboard — whichever shape the document is in.
+{
+  const waitingNew = {
+    role: 'agency', status: 'awaiting_verification', roles: ['agency'],
+    roleStatus: { agency: 'awaiting_verification' },
+  } as unknown as PartnerRoleHolder
+  check('D15 — a waiting agency role reads as waiting', partnerRoleStatus(waitingNew, 'agency'), 'awaiting_verification')
+  check('D15 — and opens no dashboard', approvedPartnerRoles(waitingNew), [])
+  check('D15 — the dashboard sends it to the waiting room',
+    resolvePartnerRedirect(waitingNew, '/agency-dashboard'), '/agency-pending')
+  check('D15 — the waiting room is where it may sit', resolvePartnerRedirect(waitingNew, '/agency-pending'), null)
+
+  // A login whose ONLY status says waiting (no roleStatus): the legacy
+  // predicate "anything else means approved" must not open the dashboard.
+  const waitingLegacy = { role: 'seller', status: 'awaiting_verification' } as unknown as PartnerRoleHolder
+  check('D15 — a legacy-shaped waiting seller is NOT approved',
+    partnerRoleStatus(waitingLegacy, 'seller'), 'awaiting_verification')
+  check('D15 — and lands in the seller waiting room',
+    resolvePartnerRedirect(waitingLegacy, '/seller-dashboard'), '/seller-pending')
+
+  // One started, one waiting: the started one works, the waiting one does not.
+  const startedAndWaiting = {
+    role: 'agency', status: 'approved', roles: ['agency', 'seller'],
+    roleStatus: { agency: 'approved', seller: 'awaiting_verification' },
+  } as unknown as PartnerRoleHolder
+  check('D15 — started + waiting → only the started role is approved',
+    approvedPartnerRoles(startedAndWaiting), ['agency'])
+  check('D15 — the waiting role has no dashboard',
+    resolvePartnerRedirect(startedAndWaiting, '/seller-dashboard'), '/agency-dashboard')
+  check('D15 — but its waiting room (with the verification steps) is reachable',
+    resolvePartnerRedirect(startedAndWaiting, '/seller-pending'), null)
+  // Every path terminates in one hop for the waiting shapes too.
+  for (const u of [waitingNew, waitingLegacy, startedAndWaiting]) {
+    for (const path of PATHS) {
+      const first = resolvePartnerRedirect(u, path)
+      if (first !== null) check(`D15 — one hop from ${path}`, resolvePartnerRedirect(u, first), null)
+    }
+  }
+}
+
 // ── Result ────────────────────────────────────────────────────────────────────
 
 if (failures.length > 0) {

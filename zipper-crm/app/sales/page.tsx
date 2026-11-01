@@ -37,7 +37,10 @@ import { DateRangePicker, defaultRange, type Range } from '@/components/ui/DateR
 import { Denied, Warning } from '@/components/ui/States'
 import UserSearchPicker from '@/components/UserSearchPicker'
 import { useAuth } from '@/components/AuthProvider'
-import { canAccess } from '@/lib/auth'
+import { canAccess, hasPermission } from '@/lib/auth'
+import { IdentityBlock } from '@/components/ui/Identity'
+import { nameOrReference } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import api, { ApiError, type Sale, type SaleStatus } from '@/lib/api'
 import {
   partnerOps, statements,
@@ -150,6 +153,12 @@ export default function Sales() {
     [sales, nameOf],
   )
 
+  // B1: the buyer is a Firebase uid — named from `users` (staff-readable);
+  // email/phone only for a viewer who may read user profiles.
+  const showContacts = hasPermission(crmUser, 'can_view_users')
+  const buyers = useIdentities({ enabled: allowed, people: sales.map((s) => s.buyer_uid) })
+  const buyerLabel = (uid: string) => nameOrReference(buyers.people.get(uid), uid, 'buyer')
+
   const inRange = useMemo(
     () =>
       rows.filter((r) => {
@@ -216,12 +225,15 @@ export default function Sales() {
       hideOnMobile: true,
       value: (r) => r.buyerUid,
       render: (r) => (
-        <Link
+        <IdentityBlock
+          facts={buyers.people.get(r.buyerUid)}
+          id={r.buyerUid}
+          kind="buyer"
+          state={buyers.state}
+          showContacts={showContacts}
           href={`/users/${r.buyerUid}`}
-          className="text-slate-300 hover:text-pink-400 text-xs font-mono transition-colors"
-        >
-          {r.buyerUid}
-        </Link>
+          className="text-xs"
+        />
       ),
     },
     {
@@ -350,7 +362,7 @@ export default function Sales() {
             <ul className="mt-2 space-y-1">
               {failed.slice(0, 5).map((r) => (
                 <li key={r.id} className="text-red-100/85 text-xs">
-                  {r.sellerName} → {r.buyerUid} · {r.diamonds.toLocaleString('en-IN')}{' '}
+                  {r.sellerName} → {buyerLabel(r.buyerUid)} · {r.diamonds.toLocaleString('en-IN')}{' '}
                   diamonds · {whenExact(r.createdAt)}
                   {r.sale.failure ? ` — ${r.sale.failure}` : ''}
                 </li>
@@ -464,6 +476,7 @@ export default function Sales() {
       {approving && (
         <ApproveDialog
           row={approving}
+          buyerLabel={buyerLabel(approving.buyerUid)}
           onClose={() => setApproving(null)}
           onDone={(message) => { setApproving(null); setNotice(message); load() }}
         />
@@ -685,10 +698,12 @@ function FileSaleDialog({
 
 function ApproveDialog({
   row,
+  buyerLabel,
   onClose,
   onDone,
 }: {
   row: Row
+  buyerLabel: string
   onClose: () => void
   onDone: (message: string) => void
 }) {
@@ -719,7 +734,7 @@ function ApproveDialog({
   return (
     <Modal
       title="Approve this sale"
-      subtitle={`${row.sellerName} → ${row.buyerUid}`}
+      subtitle={`${row.sellerName} → ${buyerLabel}`}
       onClose={onClose}
     >
       <div className="p-5 space-y-4">

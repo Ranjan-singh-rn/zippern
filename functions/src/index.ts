@@ -25,6 +25,10 @@ import {
   publicViewChanged,
   toPublicSeller,
 } from './publicSeller'
+import { type CrmUserDoc, syncClaim } from './storageClaims'
+import { assertActiveSession } from './mobileSession'
+import { activeHostRefusal } from './hostEligibility'
+import { rosterRowIsCurrent } from './roster'
 
 const asiaFirestore = functions.region('asia-south1').firestore
 
@@ -34,7 +38,12 @@ const asiaFirestore = functions.region('asia-south1').firestore
 async function sendMail(to: string, subject: string, html: string): Promise<void> {
   // SG_MAIL_KEY is set in functions/.env and deployed automatically by Firebase CLI
   const apiKey = process.env.SG_MAIL_KEY || ''
-  functions.logger.info(`sendMail called — to=${to}, hasKey=${!!apiKey}, keyPrefix=${apiKey.slice(0, 6)}`)
+  // Phase 1A: no part of the key is ever logged (this used to print its first
+  // six characters), and the recipient is reduced to its domain.
+  functions.logger.info('sendMail called', {
+    toDomain: String(to).split('@')[1] ?? '',
+    hasKey: apiKey !== '',
+  })
   if (!apiKey) {
     functions.logger.error('SG_MAIL_KEY not set — email will NOT be sent. Set it in functions/.env or via: firebase functions:config:set sendgrid.key="SG.xxx"')
     return
@@ -47,9 +56,14 @@ async function sendMail(to: string, subject: string, html: string): Promise<void
       subject,
       html,
     })
-    functions.logger.info(`✅ Email sent to ${to}: ${subject}`)
+    // UGP: the recipient is reduced to its domain here too, as the note above
+    // already promised — these two lines used to print the full address.
+    functions.logger.info('✅ Email sent', { toDomain: String(to).split('@')[1] ?? '' })
   } catch (sgErr: any) {
-    functions.logger.error(`❌ SendGrid error sending to ${to}:`, sgErr?.response?.body ?? sgErr)
+    functions.logger.error('❌ SendGrid error', {
+      toDomain: String(to).split('@')[1] ?? '',
+      code: sgErr?.code ?? sgErr?.response?.statusCode ?? '',
+    })
     throw sgErr
   }
 }
@@ -437,6 +451,11 @@ interface ApiResult {
   body: Record<string, unknown> | null
   /** Transport-level failure — unreachable, timed out, unparseable. */
   error: string
+  /**
+   * RF-30: no answer within the timeout. The request may still have been
+   * carried out by the API, so for a write the outcome is UNKNOWN, not failed.
+   */
+  timedOut?: boolean
 }
 
 /** One API call, with a timeout, returning a result rather than throwing. */
@@ -495,6 +514,7 @@ async function callApi(
           : `the backend could not be reached — ${message}`,
         config.key,
       ),
+      timedOut,
     }
   } finally {
     clearTimeout(timer)
@@ -516,6 +536,28 @@ function apiMessage(body: Record<string, unknown> | null): string {
     }
   }
   return ''
+}
+
+/**
+ * The machine-readable part of an API refusal, when it carries one — today the
+ * approved contact rule's `CONTACT_REQUIRED` (backend `ContactRequired`):
+ * `{code, requirement, missing, emailUnverified}`. Only these fields, and only
+ * when `code` is a string, so nothing else from the API body reaches the app.
+ */
+function apiRefusalDetails(body: Record<string, unknown> | null): Record<string, unknown> | null {
+  const detail = body?.detail
+  if (!detail || typeof detail !== 'object') return null
+  const d = detail as Record<string, unknown>
+  if (typeof d.code !== 'string' || d.code === '') return null
+  return {
+    code: d.code,
+    requirement: typeof d.requirement === 'string' ? d.requirement : '',
+    missing: Array.isArray(d.missing) ? d.missing.map((m) => String(m)) : [],
+    emailUnverified: d.emailUnverified === true,
+    // Decision 15 (RC): an address on the account that is not PROVED yet
+    // (for example a CRM login whose credentials email was only sent).
+    emailUnproved: d.emailUnproved === true,
+  }
 }
 
 /** The `outcome` a 409 refusal classifies itself with, if it carried one. */
@@ -1069,6 +1111,10 @@ export const weeklyPayoutReportGenerator = functions
 
       for (const hostDoc of hostsSnap.docs) {
         const host = hostDoc.data()
+        // FX-10 (RF-15): a row `revoke_host` or the account purge marked
+        // inactive is not one of this agency's hosts any more. It used to be
+        // counted, and paid against, because nothing marked it.
+        if (!rosterRowIsCurrent(host)) continue
         const hostUid: string = (host.uid as string) || hostDoc.id
         const hostName: string = (host.name as string) || (host.displayName as string) || 'Unknown Host'
 
@@ -1116,7 +1162,8 @@ export const weeklyPayoutReportGenerator = functions
 
       agencySummaries.push({
         agencyId, agencyName, agencyType, isForeign,
-        hostCount: hostsSnap.size,
+        // FX-10: current hosts only — the rows skipped above are not counted either.
+        hostCount: hostsSnap.docs.filter((d) => rosterRowIsCurrent(d.data())).length,
         eligibleHostCount,
         totalBeansEarned: agencyBeansTotal,
         totalHostPayoutInr: agencyHostPayoutTotal,
@@ -1573,147 +1620,49 @@ export const onRechargeApproved = asiaFirestore
       return null
     }
 
-    const buyerUid: string = after.buyerUid
-    const sellerUid: string = after.sellerUid
-    const diamondPackage: number = after.diamondPackage || 0
-    const amountPaid: number = after.amountPaid || 0
-    const sellerName: string = after.sellerName || 'Seller'
-
-    functions.logger.info(`Recharge ${reqId} approved. Transferring ${diamondPackage} diamonds to ${buyerUid}.`)
-
-    const sellerRef = db.collection('sellers').doc(sellerUid)
-    const buyerRef = db.collection('users').doc(buyerUid)
-    const txRef = db
-      .collection('users')
-      .doc(buyerUid)
-      .collection('diamondTransactions')
-      .doc()
-
-    try {
-      await db.runTransaction(async (tx) => {
-        const sellerSnap = await tx.get(sellerRef)
-        const buyerSnap = await tx.get(buyerRef)
-
-        if (!sellerSnap.exists) {
-          throw new Error(`Seller ${sellerUid} not found.`)
-        }
-        if (!buyerSnap.exists) {
-          throw new Error(`Buyer ${buyerUid} not found.`)
-        }
-
-        const sellerData = sellerSnap.data()!
-        const buyerData = buyerSnap.data()!
-
-        const currentCoinBalance: number = (sellerData.coinBalance as number) || 0
-        const currentDiamonds: number = (buyerData.diamonds as number) || 0
-
-        if (currentCoinBalance < diamondPackage) {
-          // Tagged so the catch can tell "the seller is short" — recoverable
-          // the moment they restock — apart from "the buyer does not exist",
-          // which never becomes true by waiting.
-          const e: Error & { shortfall?: boolean } = new Error(
-            `Seller ${sellerUid} has insufficient coins: ${currentCoinBalance} < ${diamondPackage}.`
-          )
-          e.shortfall = true
-          throw e
-        }
-
-        // Deduct coins from seller
-        tx.update(sellerRef, {
-          coinBalance: currentCoinBalance - diamondPackage,
-          totalCoinsSold: admin.firestore.FieldValue.increment(diamondPackage),
-        })
-
-        // Credit diamonds to buyer
-        tx.update(buyerRef, {
-          diamonds: currentDiamonds + diamondPackage,
-        })
-
-        // Write diamond transaction
-        tx.set(txRef, {
-          type: 'credit',
-          amount: diamondPackage,
-          relatedUserName: sellerName,
-          reason: `Recharge via seller — ₹${amountPaid}`,
-          rechargeRequestId: reqId,
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        })
-      })
-
-      // Write buyer notification (outside transaction — non-critical)
-      await db.collection('notifications').add({
-        type: 'recharge_approved',
-        targetUid: buyerUid,
-        title: 'Recharge Approved!',
-        body: `Your recharge of 💎 ${diamondPackage} diamonds has been approved. Check your balance.`,
-        rechargeRequestId: reqId,
-        isRead: false,
-        createdAt: admin.firestore.Timestamp.now(),
-      })
-
-      functions.logger.info(`Recharge ${reqId} coin transfer completed.`)
-    } catch (err) {
-      functions.logger.error(`Recharge ${reqId} coin transfer failed:`, err)
-
-      const message = err instanceof Error ? err.message : String(err)
-      const shortfall = Boolean((err as { shortfall?: boolean } | null)?.shortfall)
-
-      /*
-       * Put it back where somebody can act on it.
-       *
-       * The buyer has paid. Leaving the request marked `approved` with an error
-       * field nothing renders is the worst of the available outcomes — it looks
-       * settled to everyone and is settled for nobody. `pending` is the truth:
-       * this has not been fulfilled, and it is back on the seller's dashboard
-       * where they can top up their coins and approve it again.
-       *
-       * `transferError` is kept alongside so the seller and the CRM can see WHY
-       * it came back, and `transferAttempts` so a request bouncing repeatedly is
-       * visible rather than looking like a fresh one each time.
-       */
-      await change.after.ref.update({
-        status: 'pending',
-        transferError: message,
-        transferFailedAt: admin.firestore.Timestamp.now(),
-        transferAttempts: admin.firestore.FieldValue.increment(1),
-        // Read by the seller dashboard to explain the row, in the seller's terms
-        // rather than in the log's.
-        transferErrorReason: shortfall
-          ? 'You did not have enough coins to fill this order. Top up, then approve it again.'
-          : 'This transfer could not be completed. Our team has been notified.',
-      })
-
-      /*
-       * And tell the buyer something, because they are the one who is out of
-       * pocket. The old code's only notification was inside the `try`, so on
-       * failure the buyer was told precisely nothing and simply watched a
-       * balance that never moved.
-       */
-      await db.collection('notifications').add({
-        type: 'recharge_delayed',
-        targetUid: buyerUid,
-        title: 'Your recharge is taking longer',
-        body: shortfall
-          ? `${sellerName} is restocking. Your 💎 ${diamondPackage} will arrive once they confirm — nothing has been lost.`
-          : `We could not complete your recharge of 💎 ${diamondPackage} yet. Our team is on it.`,
-        rechargeRequestId: reqId,
-        isRead: false,
-        createdAt: admin.firestore.Timestamp.now(),
-      })
-
-      // Ops needs this in the alert stream, not only in the logs: a buyer who
-      // has paid cash and received nothing is a support call, not a metric.
-      await db.collection('adminAlerts').add({
-        type: 'recharge_transfer_failed',
-        severity: shortfall ? 'warning' : 'critical',
-        message: `Recharge ${reqId}: ${message}`,
-        rechargeRequestId: reqId,
-        buyerUid, sellerUid, diamondPackage, amountPaid,
-        createdAt: admin.firestore.Timestamp.now(),
-        resolved: false,
-      })
+    /*
+     * ── THE CREDIT NO LONGER HAPPENS HERE ─────────────────────────────────
+     *
+     * Recharges are verified by Zipper staff and credited by the API through
+     * the ledger (`backend/app/services/recharges.py`), with idempotency keys,
+     * an audit row and a refund model. When the API approves one it writes
+     * `creditedByLedger: true` onto this document in the same update that
+     * sets `status: 'approved'` — so for a real approval there is nothing
+     * left for this function to do, and doing it anyway would credit twice.
+     *
+     * A status flip WITHOUT that marker is a client: the seller's own tap in
+     * the old Android seller dashboard, or anybody the rules still let update
+     * the document. That used to mint diamonds on the seller's word alone,
+     * non-idempotently. It is now reverted to `pending` with a note the
+     * dashboard renders, and ops is told. Nothing moves.
+     */
+    if (after.creditedByLedger === true) {
+      functions.logger.info(`Recharge ${reqId}: approved and credited by the API ledger. Nothing to do here.`)
+      return null
     }
 
+    functions.logger.warn(
+      `Recharge ${reqId}: status set to 'approved' by a client, not by the API. ` +
+      'Reverting to pending — recharges are verified by Zipper staff.',
+    )
+    await change.after.ref.update({
+      status: 'pending',
+      transferErrorReason:
+        'Recharges are verified by Zipper before diamonds are credited. ' +
+        'This request is back in the queue.',
+      clientApprovalRevertedAt: admin.firestore.Timestamp.now(),
+      clientApprovalAttempts: admin.firestore.FieldValue.increment(1),
+    })
+    await db.collection('adminAlerts').add({
+      type: 'recharge_client_approval_blocked',
+      severity: 'warning',
+      message: `Recharge ${reqId}: a client set status=approved without staff verification; reverted.`,
+      rechargeRequestId: reqId,
+      buyerUid: after.buyerUid ?? '',
+      sellerUid: after.sellerUid ?? '',
+      createdAt: admin.firestore.Timestamp.now(),
+      resolved: false,
+    })
     return null
   })
 
@@ -1778,18 +1727,13 @@ export const onAgencyApproved = asiaFirestore
 
     functions.logger.info(`Agency ${agencyId} approved. Notifying owner ${ownerUid}.`)
 
-    // In-app notification
-    if (ownerUid) {
-      await db.collection('notifications').add({
-        type: 'agency_approved',
-        targetUid: ownerUid,
-        title: 'Agency Approved!',
-        body: `Congratulations ${ownerName}! Your agency "${agencyName}" has been approved. You can now start onboarding hosts.`,
-        agencyId,
-        isRead: false,
-        createdAt: admin.firestore.Timestamp.now(),
-      })
-    }
+    // In-app notification: written by the API when it approves the partner
+    // (`backend/app/services/notices.partner_approved`, idempotent on the
+    // partner id, addressed on `userId`). It used to be written here too — and
+    // gated on `ownerUid`, which no agency form ever wrote, so it never fired.
+    // Writing it here as well now would be a second message for one event.
+    // This trigger keeps the EMAIL, which the API does not send.
+    functions.logger.info(`Agency ${agencyId} approved; in-app notice is the API's. Owner ${ownerUid || '(unknown)'}.`)
 
     // Email notification
     if (email) {
@@ -2065,7 +2009,7 @@ export const onPayoutApproved = asiaFirestore
             const notifRef = db.collection('notifications').doc()
             batch.set(notifRef, {
               type:      'payout_approved',
-              targetUid: ownerUid,
+              userId:    ownerUid,   // `userId` — the field the read rule tests
               title:     'Payout Approved ✅',
               body:      `Your agency "${agencyName}" payout for ${weekLabel} has been approved. Total: ₹${totalPayout.toFixed(2)}. Host bean balances stay as they are until the payout is executed.`,
               weekLabel,
@@ -2139,6 +2083,7 @@ export const generateAgoraToken = functions
   }
 
   const callerUid: string = context.auth.uid
+  await assertActiveSession(callerUid, data, 'generateAgoraToken', context.auth?.token)   // Phase 1A (SESSION-001/003)
   const channelName: string = data.channelName
   /*
    * Mutable, because for a party seat the SERVER decides the Agora uid.
@@ -2194,6 +2139,21 @@ export const generateAgoraToken = functions
     return Array.isArray(list) && list.includes(callerUid)
   }
 
+  /*
+   * B41: the HOST's token — publishing into their own live room or PK — is for
+   * a CURRENT Host. Going live checks `isHost` once, when the room document is
+   * created, and the document outlives it: a Host revoked or removed since kept
+   * getting a publisher token for a room opened before. Refused, not quietly
+   * downgraded to a viewer, so the app can say why the stream will not start.
+   */
+  const refuseUnlessCurrentHost = (): void => {
+    const notHost = activeHostRefusal(callerSnap)
+    if (notHost) {
+      functions.logger.info('agora: refused a host token', { channelName, callerUid, code: notHost.code })
+      throw new functions.https.HttpsError('permission-denied', notHost.message, { code: notHost.code })
+    }
+  }
+
   let role: number = RtcRole.SUBSCRIBER
   let channelKind = 'unknown'
 
@@ -2213,7 +2173,12 @@ export const generateAgoraToken = functions
     if (roomSnap.get('isActive') === false) {
       throw new functions.https.HttpsError('failed-precondition', 'This live has ended.')
     }
-    role = roomSnap.get('hostUid') === callerUid ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER
+    if (roomSnap.get('hostUid') === callerUid) {
+      refuseUnlessCurrentHost()
+      role = RtcRole.PUBLISHER
+    } else {
+      role = RtcRole.SUBSCRIBER
+    }
   } else if (channelName.startsWith('party_')) {
     // Party channels are named `party_<roomId>` so this branch is reachable
     // without a speculative read on every token request.
@@ -2313,6 +2278,7 @@ export const generateAgoraToken = functions
         channelKind = 'pk'
         const mine = pkRooms.docs.find((d) => d.get('hostUid') === callerUid)
         if (mine) {
+          refuseUnlessCurrentHost()
           role = RtcRole.PUBLISHER
         } else {
           // A viewer watching a PK. A kick from either side keeps them out.
@@ -2931,6 +2897,28 @@ const UPDATE_ALLOWLIST: Record<string, { collection: string; docIds: string[] }>
   update_config: { collection: 'appConfig',        docIds: ['control', 'economy'] },
 }
 
+// GOV-1 (Phase 1A.2, B5): the `create` branch is held to the same discipline.
+// It used to run `db.collection(targetCollection).doc(targetDocId).set(payload)`
+// with all three supplied by the browser that filed the request — so one
+// approval could write ANY document, `crmUsers/{owner}` with `role:
+// 'superadmin'` included, overwriting whatever was there, through the Admin SDK
+// and past every rule and audit. The only callers left are the two register
+// forms (zipper-crm/app/agencies/register, zipper-crm/app/sellers/register),
+// and each creates a NEW record whose id is minted here. A request that names
+// a document id is refused, because `.set()` on an existing id is an overwrite.
+const CREATE_ALLOWLIST: Record<string, string> = {
+  create_agency: 'agencies',
+  create_seller: 'sellers',
+}
+
+// GOV-1 (B5): the person who filed a request cannot be the one who approves it.
+// The queue exists so that a second person looks; an Owner approving their own
+// request is one person writing through the Admin SDK with nobody else involved.
+const SELF_APPROVAL_REFUSAL =
+  'This request was approved by the same person who filed it. The approval ' +
+  'queue needs a second person — an Owner other than the requester — so ' +
+  'nothing was applied. File it again and have another Owner approve it.'
+
 // Approval types that used to decide a host application from this queue. They
 // are refused on arrival, for the same reason MONEY_APPROVAL_TYPES are: this is
 // no longer where that decision is made.
@@ -2998,6 +2986,16 @@ export const onApprovalApproved = asiaFirestore
       return null
     }
 
+    // GOV-1 (B5): who approved it. `reviewedBy` is written by the approving
+    // browser — the rules bind its uid to the caller — and it is checked again
+    // here because this is the step that writes with full authority.
+    const approver = await approverRefusal(after)
+    if (approver) {
+      functions.logger.warn(`Approval ${requestId} refused — ${approver}`)
+      await failApproval(change.after.ref, approver, after.reviewNotes as string | undefined)
+      return null
+    }
+
     try {
       const note = await applyApproval(
         type as string,
@@ -3057,6 +3055,62 @@ async function failApproval(
     })
   } catch (err) {
     functions.logger.error('Failed to record approval failure on the request:', err)
+  }
+}
+
+/**
+ * GOV-1 (B5): why this approval may not be applied, or '' when it may.
+ *
+ * The reviewer must be named, must not be the requester, and must be an active
+ * Owner — the only role the rules let approve, re-read from `crmUsers` rather
+ * than trusted from the request.
+ */
+async function approverRefusal(request: FirebaseFirestore.DocumentData): Promise<string> {
+  const uidOf = (who: unknown): string => {
+    const uid = (who as { uid?: unknown } | null | undefined)?.uid
+    return typeof uid === 'string' ? uid.trim() : ''
+  }
+  const reviewer = uidOf(request.reviewedBy)
+  const requester = uidOf(request.requestedBy)
+  if (!reviewer) return 'The approval does not name who approved it, so nothing was applied.'
+  if (!requester) return 'The request does not name who filed it, so nothing was applied.'
+  if (reviewer === requester) return SELF_APPROVAL_REFUSAL
+
+  const snap = await db.collection('crmUsers').doc(reviewer).get()
+  const reviewerDoc = (snap.exists ? snap.data() : undefined) ?? {}
+  if (reviewerDoc.role !== 'superadmin' || reviewerDoc.isActive === false) {
+    return 'Only an active Owner may approve a request in this queue, and the ' +
+      'approval names someone who is not one, so nothing was applied.'
+  }
+  return ''
+}
+
+/**
+ * GOV-1 (B5): what a queued partner registration may contain.
+ *
+ * `ref.set()` below runs through the Admin SDK, so the `agencies` / `sellers`
+ * create rules never see it. Their invariants — `partnerCreateSafe()` and the
+ * zero-balance pin — are restated here: an approved request can open a
+ * PENDING, inactive, unfunded record and nothing more. Approval, activation,
+ * owner links and opening balances are separate, audited operations.
+ */
+function assertPartnerCreatePayload(type: string, payload: Record<string, unknown>): void {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error(`Approval type '${type}' carries no record to create.`)
+  }
+  const refuse = (why: string): never => {
+    throw new Error(`Approval type '${type}' would create a record that ${why}. Nothing was created.`)
+  }
+  const set = (key: string): boolean => payload[key] !== undefined
+  if (set('status') && payload.status !== 'pending') refuse(`is already '${String(payload.status)}' (it must start pending)`)
+  if (set('isActive') && payload.isActive !== false) refuse('is already active')
+  if (set('isApproved') && payload.isApproved !== false) refuse('is already approved')
+  if (set('approvedBy') || set('approvedAt')) refuse('carries an approval')
+  for (const key of ['coinBalance', 'totalCoinsSold']) {
+    if (set(key) && payload[key] !== 0) refuse(`opens with a non-zero ${key}`)
+  }
+  for (const key of ['ownerUid', 'secondRoleOwnerUid']) {
+    if (set(key) && payload[key] !== '' && payload[key] !== null) refuse(`names an owner in ${key}`)
   }
 }
 
@@ -3221,11 +3275,29 @@ async function applyApproval(
   }
 
   if (operation === 'create') {
+    // GOV-1 (B5): only the two partner registrations, each into its own
+    // collection, each a NEW document. See CREATE_ALLOWLIST.
+    const collection = CREATE_ALLOWLIST[type]
+    if (!collection) {
+      throw new Error(
+        `Approval type '${type}' may not create documents. This queue creates ` +
+        'only new agency and seller records (create_agency, create_seller).'
+      )
+    }
+    if (targetCollection !== collection) {
+      throw new Error(`Approval type '${type}' may only create in '${collection}', not '${targetCollection}'.`)
+    }
+    if (targetDocId) {
+      throw new Error(
+        `Approval type '${type}' names a document id ('${targetDocId}'). The id is ` +
+        'minted here; writing to a named id would overwrite that document.'
+      )
+    }
+    assertPartnerCreatePayload(type, payload)
+
     // create_agency / create_seller submit an empty targetDocId — the id is
     // minted here rather than passed through db.collection(x).doc(''), which throws.
-    const ref = targetDocId
-      ? db.collection(targetCollection).doc(targetDocId)
-      : db.collection(targetCollection).doc()
+    const ref = db.collection(collection).doc()
 
     // The CRM account FIRST, the partner record second, and deliberately that
     // way round. `.doc()` mints the id locally and writes nothing, so nothing
@@ -3262,19 +3334,20 @@ async function applyApproval(
     return login.note
   }
 
-  if (operation === 'delete') {
-    if (!targetDocId) throw new Error('A delete approval needs a target document id.')
-    await db.collection(targetCollection).doc(targetDocId).delete()
-    return ''
-  }
-
-  if (operation === 'custom') {
-    if (!targetDocId) throw new Error(`Approval type '${type}' needs a target document id.`)
-    await handleCustomApproval(type, payload, db.collection(targetCollection).doc(targetDocId))
-    return ''
-  }
-
-  throw new Error(`Unknown approval operation '${operation}'.`)
+  // REMOVED — GOV-1 (B5): `delete` and `custom`.
+  //   • delete  ran `db.collection(targetCollection).doc(targetDocId).delete()`
+  //             on whatever the browser named — any document in any collection.
+  //   • custom  ran handleCustomApproval: approve / reject / deactivate /
+  //             reactivate an agency or seller, as a bare status write on any
+  //             document named, skipping partner_ops' eligibility checks,
+  //             per-role status, claims and audit entry.
+  // Nothing in the CRM files either any more. Partner decisions are the
+  // partner-ops API's (POST /api/partner-ops/partners/{id}/approve | reject |
+  // reactivate | revoke), which is audited.
+  throw new Error(
+    `Approval operation '${operation}' is not applied by this queue. It applies ` +
+    'only update_config and new agency / seller registrations.'
+  )
 }
 
 /**
@@ -3406,79 +3479,22 @@ function assertSlabTablesAreSane(payload: Record<string, unknown>): void {
   }
 }
 
-async function handleCustomApproval(
-  type: string,
-  payload: Record<string, unknown>,
-  primaryRef: FirebaseFirestore.DocumentReference
-): Promise<void> {
-  const batch = db.batch()
-
-  if (type === 'approve_agency') {
-    batch.update(primaryRef, {
-      status: 'approved',
-      isActive: true,
-      approvedBy: payload.approvedBy,
-      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
-    })
-    // Also approve the linked crmUsers account
-    if (payload.crmUid) {
-      const crmRef = db.collection('crmUsers').doc(payload.crmUid as string)
-      batch.update(crmRef, { status: 'approved' })
-    }
-  } else if (type === 'reject_agency') {
-    batch.update(primaryRef, {
-      status: 'rejected',
-      rejectedReason: payload.rejectedReason,
-    })
-  } else if (type === 'approve_seller') {
-    batch.update(primaryRef, {
-      isApproved: true,
-      isActive: true,
-      approvedBy: payload.approvedBy,
-      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
-    })
-    if (payload.crmUid) {
-      const crmRef = db.collection('crmUsers').doc(payload.crmUid as string)
-      batch.update(crmRef, { status: 'approved' })
-    }
-  } else if (type === 'deactivate_agency' || type === 'deactivate_seller') {
-    batch.update(primaryRef, { isActive: false })
-  } else if (type === 'reactivate_agency') {
-    batch.update(primaryRef, { isActive: true, status: 'approved' })
-  } else if (type === 'reactivate_seller') {
-    batch.update(primaryRef, { isActive: true, isApproved: true })
-
-  // REMOVED — money branches. These applied balance changes to Firestore the
-  // moment one superadmin flipped a status, with no second approver, no ledger
-  // and no audit entry:
-  //   • credit_beans / debit_beans      users/{uid}.beans (+ totalBeansEarned)
-  //                                     → now a beans BALANCE_CREDIT / BALANCE_DEBIT
-  //                                       card: POST /api/users/{uid}/balance-request,
-  //                                       then POST /api/users/balance-cards/{cardId}/execute
-  //   • credit_diamonds / debit_diamonds users/{uid}.diamonds
-  //                                     → same pair of endpoints, currency 'diamonds'
-  //   • lend_diamonds                   sellers/{id}.coinBalance + a
-  //                                     diamondLending doc with no due date
-  //                                     → now a LENDING_ISSUE card:
-  //                                       POST /api/partner-ops/sellers/{sellerId}/lending,
-  //                                       then POST /api/partner-ops/lending/{cardId}/execute
-  // Execution runs through money.apply_movement (backend/app/services/money.py),
-  // which commits balance + ledger + audit in one Mongo transaction and refuses
-  // a movement without a reason, a duplicate idempotency key, or a debit that
-  // would take a balance below zero.
-  //
-  // They are refused before they reach here (MONEY_APPROVAL_TYPES). This throw is
-  // the backstop: an unhandled type must fail loudly, never commit an empty batch
-  // and report success.
-  } else {
-    throw new Error(
-      `Approval type '${type}' has no handler in this queue. If it moves money, ` +
-      'raise it as a card on the money board instead.'
-    )
-  }
-
-  await batch.commit()
-}
+// REMOVED — GOV-1 (B5): handleCustomApproval, the `custom` operation's handler
+// (approve_agency, reject_agency, approve_seller, deactivate_agency/_seller,
+// reactivate_agency/_seller). It applied each as a bare status write to whatever
+// document the request named. See applyApproval() for where those decisions
+// live now.
+//
+// Its money branches had been removed before that, and are still refused on
+// arrival (MONEY_APPROVAL_TYPES):
+//   • credit_beans / debit_beans / credit_diamonds / debit_diamonds
+//       → POST /api/users/{uid}/balance-request,
+//         then POST /api/users/balance-cards/{cardId}/execute
+//   • lend_diamonds
+//       → POST /api/partner-ops/sellers/{sellerId}/lending,
+//         then POST /api/partner-ops/lending/{cardId}/execute
+// Execution runs through money.apply_movement (backend/app/services/money.py),
+// which commits balance + ledger + audit in one Mongo transaction.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 12. THE SCHEDULED REPORTS, ALERTS AND TRANSACTIONAL SWEEP — Part 8A
@@ -3974,6 +3990,16 @@ const MAX_REASON_CHARS = 1000
  */
 const SOURCE_NOT_REGISTERED_HERE = 'second_role'
 
+/**
+ * FX-06: `source: 'self_app'` — an application the API wrote and registered
+ * itself (backend `submit_partner_application`). See `onPartnerDocumentCreated`.
+ * Decision 16 (RC): `reapply` — a fresh Sub-agency application after a
+ * rejection, written and registered by the API itself
+ * (`partner_applications.reapply_sub_agency`) for the same reason.
+ */
+const SOURCE_REGISTERED_BY_THE_API = 'self_app'
+const SOURCES_REGISTERED_BY_THE_API: ReadonlySet<string> = new Set([SOURCE_REGISTERED_BY_THE_API, 'reapply'])
+
 type PartnerCollection = 'agencies' | 'sellers'
 
 /** What the applicant is called, for the audit reason. Never a figure. */
@@ -4031,23 +4057,40 @@ async function registerPartnerRecord(
     'register a partner',
   )
 
-  /** One place that writes the outcome, so no path can forget to. */
+  /**
+   * One place that writes the outcome, so no path can forget to.
+   *
+   * FX-06: an UPDATE, never a merge-set. A merge-set on a document that was
+   * deleted meanwhile — the API refuses an app application and deletes its
+   * own document while this trigger is still in flight — re-created it as a
+   * stub, which fired this trigger again and became a nameless, ownerless
+   * partner record (DUP-02). `update` fails on a missing document instead,
+   * and a missing document has no outcome to record.
+   */
   const record = async (fields: Record<string, unknown>): Promise<void> => {
     try {
-      await ref.set(
-        {
-          partnerRecord: {
-            ...fields,
-            at: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          // Top level and boolean so the CRM can find these with a single
-          // equality filter and no composite index. This is what puts a failed
-          // registration in front of staff.
-          partnerRecordFailed: fields.status === 'failed',
+      await ref.update({
+        partnerRecord: {
+          ...fields,
+          at: admin.firestore.FieldValue.serverTimestamp(),
         },
-        { merge: true },
-      )
+        // Top level and boolean so the CRM can find these with a single
+        // equality filter and no composite index. This is what puts a failed
+        // registration in front of staff.
+        partnerRecordFailed: fields.status === 'failed',
+      })
     } catch (err) {
+      const missing = (await ref.get().catch(() => null))?.exists === false
+      if (missing) {
+        // Deleted since it was created — by the API refusing the application
+        // that wrote it. Nothing to record on, and nothing is re-created.
+        functions.logger.warn(
+          `${collection}/${partnerId} no longer exists; the registration ` +
+          `outcome (${String(fields.status || '')}) was not recorded and the ` +
+          'document was not re-created.',
+        )
+        return
+      }
       // Now the failure is invisible on the document too. Loud, and nothing
       // else to be done from here.
       functions.logger.error(
@@ -4183,6 +4226,18 @@ async function onPartnerDocumentCreated(
     )
     return null
   }
+  // FX-06: an application filed from the app is written by the API itself
+  // (`submit_partner_application`), which registers it in the same call and
+  // deletes the document again if it refuses. Registering it here as well
+  // only raced that delete (DUP-02). Only the Admin SDK writes this value:
+  // `firestore.rules` pins every client create arm to another source.
+  if (SOURCES_REGISTERED_BY_THE_API.has(String(data.source || ''))) {
+    functions.logger.info(
+      `${collection}/${partnerId} was written by the API (source '${String(data.source)}'), ` +
+      'which registered it when it wrote it. Not registering it again here.',
+    )
+    return null
+  }
 
   const failure = await registerPartnerRecord(collection, partnerId, snap.ref, data)
   if (failure) {
@@ -4215,6 +4270,288 @@ export const registerSellerPartner = partnerRegistrationTrigger
   .onCreate(async (snap, context) =>
     onPartnerDocumentCreated('sellers', context.params.sellerId, snap),
   )
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 13b. APPLYING FOR A PARTNER ROLE FROM THE APP, AND FILING A RECHARGE
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The Android app has no session with the API and the API has no Firebase
+// ID-token dependency, so these callables are the bridge: each verifies the
+// caller's Firebase auth, forwards `context.auth.uid` as the applicant, and
+// presents the partner-registration service key. They decide NOTHING. Every
+// rule — what this person may apply for, which agencies exist and accept,
+// whether a parent is a main agency, one agency-family record per human, the
+// seller a recharge names — is applied by the API against its own records
+// (`backend/app/services/partner_applications.py`, `recharges.py`).
+//
+// The uid is never taken from `data`. A client that sends `applicant_uid` in
+// the payload is ignored; the one on the token is used.
+//
+// Same key as registration, deliberately (`Op.PARTNER_APPLY`,
+// `Op.RECHARGE_REQUEST` in backend/app/core/security.py): one more secret
+// would be one more production configuration step, and the blast radius is
+// identical — pending records that hold nothing.
+
+const partnerApplicationCallable = functions
+  .region('asia-south1')
+  .runWith({ secrets: [PARTNER_REGISTRATION_KEY_ENV], timeoutSeconds: 60, memory: '256MB' })
+  .https
+
+/**
+ * RF-30: the `details.code` of a write whose outcome is not known — the API
+ * did not answer in time, or failed after the request reached it. The app
+ * re-reads what it filed (or replays the same request id) instead of telling
+ * the person it failed.
+ */
+const OUTCOME_UNKNOWN = 'OUTCOME_UNKNOWN'
+
+const OUTCOME_UNKNOWN_MESSAGE =
+  'Zipper did not answer in time, so we cannot tell whether this went through. ' +
+  'Check before you try again.'
+
+/**
+ * Map an API refusal onto the HttpsError the app's `MoneyFunctions` wrapper reads.
+ *
+ * RF-30: [write] is true for a POST. A write that timed out, could not be
+ * delivered, or met a 5xx may still have been carried out, so it is reported
+ * as `deadline-exceeded` with `details.code = OUTCOME_UNKNOWN` — never as
+ * "could not be reached", which told a person whose application WAS filed
+ * that it was not. A read keeps `unavailable`: it is safe to repeat.
+ */
+function apiRefusalToHttpsError(
+  result: ApiResult,
+  fallback: string,
+  write = false,
+): functions.https.HttpsError {
+  const message = apiMessage(result.body) || result.error || fallback
+  if (write && (result.status === null || result.timedOut === true || result.status >= 500)) {
+    functions.logger.warn(`Partner bridge write outcome unknown: ${result.error || `HTTP ${result.status}`}`)
+    return new functions.https.HttpsError('deadline-exceeded', OUTCOME_UNKNOWN_MESSAGE, { code: OUTCOME_UNKNOWN })
+  }
+  if (result.status === 409) {
+    // RF-30: a conflict the API explains ("already filed …") is the API's
+    // sentence, not "could not be reached".
+    return new functions.https.HttpsError('failed-precondition', message)
+  }
+  if (result.status === 422) {
+    // The request's shape was refused before any rule ran. FastAPI's detail is
+    // a list of field errors, not a sentence for a person.
+    return new functions.https.HttpsError('invalid-argument', 'Some details were not accepted. Check the form and try again.')
+  }
+  if (result.status === 400 || result.status === 404) {
+    // Approved contact rule: a refusal that carries a machine-readable code
+    // (`CONTACT_REQUIRED`) is forwarded in `details`, so the app can route to
+    // phone / email verification instead of showing a dead-end sentence.
+    const details = apiRefusalDetails(result.body)
+    return details
+      ? new functions.https.HttpsError('failed-precondition', message, details)
+      : new functions.https.HttpsError('failed-precondition', message)
+  }
+  if (result.status === 401 || result.status === 403) {
+    functions.logger.error(`Partner application credential refused by the API: ${message}`)
+    return new functions.https.HttpsError('internal', 'Applications are temporarily unavailable. Please try again later.')
+  }
+  return new functions.https.HttpsError('unavailable', 'Zipper could not be reached. Please try again.')
+}
+
+async function viaApi(
+  method: 'GET' | 'POST',
+  path: string,
+  payload: Record<string, unknown> | undefined,
+  fallback: string,
+): Promise<Record<string, unknown>> {
+  const { config, problem } = readServiceConfig(PARTNER_REGISTRATION_KEY_ENV, 'file an application')
+  if (!config) {
+    functions.logger.error(`Partner application callable is not configured: ${problem}`)
+    throw new functions.https.HttpsError('internal', 'Applications are temporarily unavailable. Please try again later.')
+  }
+  const result = await callApi(config, method, path, payload)
+  if (!result.ok) throw apiRefusalToHttpsError(result, fallback, method === 'POST')
+  return result.body ?? {}
+}
+
+function requireUid(context: functions.https.CallableContext): string {
+  const uid = context.auth?.uid
+  if (!uid) throw new functions.https.HttpsError('unauthenticated', 'Sign in to continue.')
+  return uid
+}
+
+/** What the signed-in user may apply for, from the API's authoritative records. */
+export const partnerEligibility = partnerApplicationCallable.onCall(async (_data, context) => {
+  const uid = requireUid(context)
+  return viaApi('GET', `/api/partner-ops/applications/eligibility/${encodeURIComponent(uid)}`,
+    undefined, 'Could not read your eligibility.')
+})
+
+// C2 (B05): a reinstatement request for a REVOKED role — the only way back
+// from a revocation, decided by an Owner. The same bridge as the applications:
+// the uid is the token's and never `data`'s, and the API decides everything —
+// whether this person holds a revoked record of that kind, whether the account
+// is restricted, and whether one is already open (then it is returned, not
+// duplicated). Only the shape of the input is checked here.
+const ROLE_APPEAL_KINDS = ['host', 'agency', 'sub_agency', 'seller']
+const ROLE_APPEAL_MIN_CHARS = 20
+const ROLE_APPEAL_MAX_CHARS = 2000
+
+/** Ask for a revoked role back. Pending; restores nothing. */
+export const submitRoleAppeal = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  const kind = String(data?.kind ?? '').trim()
+  if (!ROLE_APPEAL_KINDS.includes(kind)) {
+    throw new functions.https.HttpsError('invalid-argument', 'Choose the revoked role this request is about.')
+  }
+  const statement = String(data?.statement ?? '').trim()
+  if (statement.length < ROLE_APPEAL_MIN_CHARS || statement.length > ROLE_APPEAL_MAX_CHARS) {
+    throw new functions.https.HttpsError(
+      'invalid-argument',
+      `Say why the role should be reinstated, in ${ROLE_APPEAL_MIN_CHARS} to ${ROLE_APPEAL_MAX_CHARS} characters.`,
+    )
+  }
+  return viaApi('POST', '/api/partner-ops/role-appeals', {
+    uid,                      // from the token, never from `data`
+    kind,
+    statement,
+  }, 'Your request could not be filed.')
+})
+
+/** The signed-in user's own reinstatement requests, newest first. */
+export const myRoleAppeals = partnerApplicationCallable.onCall(async (_data, context) => {
+  const uid = requireUid(context)
+  const body = await viaApi('GET', `/api/partner-ops/role-appeals/of/${encodeURIComponent(uid)}`,
+    undefined, 'Could not load your requests.')
+  const appeals = (body as { appeals?: unknown }).appeals
+  return { appeals: Array.isArray(appeals) ? appeals : (Array.isArray(body) ? body : []) }
+})
+
+/** Agencies a sub-agency (main only) or a host (main and sub) may join. */
+export const partnerParents = partnerApplicationCallable.onCall(async (data, context) => {
+  requireUid(context)
+  const forKind = String(data?.forKind ?? 'sub_agency') === 'host' ? 'host' : 'sub_agency'
+  const body = await viaApi('GET', `/api/partner-ops/applications/parents?for_kind=${forKind}`,
+    undefined, 'Could not load agencies.')
+  return { parents: Array.isArray(body) ? body : (body as { parents?: unknown }).parents ?? body }
+})
+
+/** The signed-in user's own partner applications and their status. */
+export const myPartnerApplications = partnerApplicationCallable.onCall(async (_data, context) => {
+  const uid = requireUid(context)
+  const body = await viaApi('GET', `/api/partner-ops/applications/of/${encodeURIComponent(uid)}`,
+    undefined, 'Could not load your applications.')
+  return { applications: Array.isArray(body) ? body : [] }
+})
+
+/** Apply as Agency, Sub-agency or Coin Seller. Pending; approves nothing. */
+export const submitPartnerApplication = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  await assertActiveSession(uid, data, 'submitPartnerApplication', context.auth?.token)   // Phase 1A (SESSION-001/003)
+  const kind = String(data?.kind ?? '')
+  if (!['agency', 'sub_agency', 'seller'].includes(kind)) {
+    throw new functions.https.HttpsError('invalid-argument', 'Choose Agency, Sub-agency or Coin Seller.')
+  }
+  const form = (data?.form && typeof data.form === 'object') ? data.form as Record<string, unknown> : {}
+  const parentId = data?.parentId ? String(data.parentId) : null
+  return viaApi('POST', '/api/partner-ops/applications', {
+    applicant_uid: uid,       // from the token, never from `data`
+    kind,
+    form,
+    parent_id: parentId,
+  }, 'Your application could not be filed.')
+})
+
+/** Apply as Host under a chosen agency or sub-agency. Pending; unverified on approval. */
+export const submitHostApplication = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  await assertActiveSession(uid, data, 'submitHostApplication', context.auth?.token)   // Phase 1A (SESSION-001/003)
+  const parentId = String(data?.parentId ?? '')
+  if (!parentId) throw new functions.https.HttpsError('invalid-argument', 'Choose the agency you want to join.')
+  const form = (data?.form && typeof data.form === 'object') ? data.form as Record<string, unknown> : {}
+  return viaApi('POST', '/api/partner-ops/applications/host', {
+    applicant_uid: uid,
+    form,
+    parent_id: parentId,
+  }, 'Your host application could not be filed.')
+})
+
+// ── Decision 15 (RC): an approved role waits for BOTH verified contacts ─────
+//
+// The Owner may approve a partner whose account does not yet hold both a
+// verified phone and a verified email; the role then WAITS and starts only
+// once both are verified. These three are the app's side of that, on the same
+// bridge and with the same discipline as above: the uid is the token's, never
+// `data`'s, and the API decides everything — it re-reads the verification
+// from Firebase Auth and its own ledger and re-checks the role table, the
+// restriction and the parent before it starts anything.
+
+/** What is verified on the caller's account, and which approved roles wait for it. */
+export const partnerVerificationState = partnerApplicationCallable.onCall(async (_data, context) => {
+  const uid = requireUid(context)
+  return viaApi('GET', `/api/partner-ops/applications/verification/${encodeURIComponent(uid)}`,
+    undefined, 'Could not read your verification.')
+})
+
+/** Re-check the caller's contacts and start every approved role they now allow. */
+export const checkPartnerActivation = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  await assertActiveSession(uid, data, 'checkPartnerActivation', context.auth?.token)
+  return viaApi('POST', '/api/partner-ops/applications/verification/check', {
+    applicant_uid: uid,       // from the token, never from `data`
+  }, 'Could not check your verification.')
+})
+
+/**
+ * The phone or email the caller tried to verify belongs to ANOTHER Zipper
+ * account. Nothing is merged (open decision D3); the API audits it and alerts
+ * staff. The answer is the same whether or not a holder exists.
+ */
+export const reportContactConflict = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  const raw = String(data?.contact ?? '')
+  const contact = raw === 'phone' || raw === 'email' ? raw : ''
+  if (!contact) throw new functions.https.HttpsError('invalid-argument', 'Say whether this is a phone or an email.')
+  const value = String(data?.value ?? '').trim()
+  if (value.length < 3 || value.length > 320) {
+    throw new functions.https.HttpsError('invalid-argument', 'Enter the phone number or email address.')
+  }
+  await viaApi('POST', '/api/partner-ops/applications/verification/conflict', {
+    applicant_uid: uid,       // from the token, never from `data`
+    contact,
+    value,
+  }, 'Could not report this.')
+  return { received: true }
+})
+
+/** A buyer says they paid a Coin Seller. Pending; staff verify before any credit. */
+export const submitRechargeRequest = partnerApplicationCallable.onCall(async (data, context) => {
+  const uid = requireUid(context)
+  await assertActiveSession(uid, data, 'submitRechargeRequest', context.auth?.token)   // Phase 1A (SESSION-001/003)
+  const diamonds = Number(data?.diamonds ?? 0)
+  const amountMinor = Number(data?.amountMinor ?? 0)
+  if (!Number.isInteger(diamonds) || diamonds <= 0) {
+    throw new functions.https.HttpsError('invalid-argument', 'Say how many diamonds you are buying.')
+  }
+  if (!Number.isInteger(amountMinor) || amountMinor <= 0) {
+    throw new functions.https.HttpsError('invalid-argument', 'Say how much you paid.')
+  }
+  // RF-30: one id per recharge form, the same on every retry of it. The API
+  // answers a repeat with the request it already filed for THIS buyer, so an
+  // answer lost to a timeout can be asked for again without filing twice.
+  // Older apps send none and keep the old behaviour.
+  const requestId = String(data?.requestId ?? '').trim()
+  if (requestId && !/^[A-Za-z0-9_-]{8,64}$/.test(requestId)) {
+    throw new functions.https.HttpsError('invalid-argument', 'This request could not be read. Update the app and try again.')
+  }
+  return viaApi('POST', '/api/partner-ops/recharges', {
+    buyer_uid: uid,           // from the token
+    seller_id: String(data?.sellerId ?? ''),
+    diamonds,
+    amount_minor: amountMinor,
+    currency: String(data?.currency ?? 'INR'),
+    payment_method: String(data?.paymentMethod ?? ''),
+    reference: String(data?.reference ?? ''),
+    proof_url: String(data?.proofUrl ?? ''),
+    ...(requestId ? { client_request_id: requestId } : {}),
+  }, 'Your recharge request could not be filed.')
+})
 
 // ── Gift settlement ───────────────────────────────────────────────────────────
 // Lives in its own module: index.ts is already 3,800 lines, and money movement
@@ -4275,6 +4612,8 @@ export {
 export {
   findExistingAccount, syncPhoneKey,
   bindVerifiedIdentity, resolveIdentity,
+  // Google sign-in for an email a guest already bound → that same account.
+  adoptEmailAccount,
   startMobileSession, endMobileSession,
   sweepQuickLoginTokens,
   // Destroys a quick-login secret the moment an account is banned, suspended
@@ -4288,6 +4627,13 @@ export {
   // none of the first one's balance.
   claimGuestIdentity,
 } from './identity'
+
+// UGP-C: binding an email by a six-digit code, in the app. Replaces the
+// Firebase email link (and its App Link back into the app). Binds through the
+// same `bindContactCore` rules as a phone number — see emailOtp.ts.
+export { requestEmailBindCode, verifyEmailBindCode } from './emailOtp'
+// Decision 15 (RC): a CRM partner login confirms its OWN address by code.
+export { requestLoginEmailCode, verifyLoginEmailCode } from './emailOtp'
 
 // ── Payout hold ───────────────────────────────────────────────────────────────
 // Earnings release one week in arrears, so a chargeback lands while the money
@@ -4327,6 +4673,13 @@ export {
   submitHostCapture,
   onAgencyPhotoReplaced,
 } from './hosts'
+
+/**
+ * RC (confirmed): withdrawing a pending invitation deletes its KYC uploads —
+ * the photo and identity documents under the inviting agency's own prefixes,
+ * unless something else still references them. See `invitationCleanup.ts`.
+ */
+export { onHostInvitationWithdrawn } from './invitationCleanup'
 
 /**
  * Cross-user counters and role badges. Both were client writes onto ANOTHER
@@ -4411,5 +4764,50 @@ export const syncPublicSeller = asiaFirestore
       // accumulate keys from older versions of this function.
     )
     functions.logger.info('public seller published', { sellerId })
+    return null
+  })
+
+// ── STORAGE ROLE CLAIM — the partner half ────────────────────────────────────
+//
+// Mirrors an agency's or coin seller's role onto their Firebase token so
+// `storage.rules` can authorise them. See `src/storageClaims.ts` for why only
+// the partner half is provisioned here and why that is a security property
+// rather than a limitation: partner `crmUsers` documents are written by the
+// CLIENT, so a trigger that mirrored `role` verbatim would let a stranger
+// write themselves an owner claim. `decideClaim` can only ever emit 'agency'
+// or 'seller'.
+//
+// Internal claims (owner, observer, the twelve department roles) are set by
+// the API from the Mongo `staff` row — see
+// `backend/app/services/storage_claims.py`. This trigger refuses to touch a
+// uid whose token already carries an API-owned role, so an ordinary
+// `crmUsers` write for a member of staff (a phone-number edit, a
+// `lastLoginAt` touch) cannot cost them their access.
+//
+// `onWrite` rather than `onCreate`: deactivation, reactivation and an agency
+// transfer are all updates, and a deleted document must clear the claim.
+//
+// TOKEN PROPAGATION. A claim set here reaches the client on its next ID-token
+// refresh — within the hour on Firebase's own schedule, or immediately if the
+// client calls `getIdToken(true)`. The CRM forces exactly that after sign-in
+// (`zipper-crm/lib/auth.ts`), so a partner never waits. Nothing is revoked
+// here: withdrawing access clears the claim, and the stale token keeps working
+// until it expires. Where that window is unacceptable the API also revokes
+// refresh tokens on deactivation.
+export const syncStorageRoleClaim = asiaFirestore
+  .document('crmUsers/{uid}')
+  .onWrite(async (change, context) => {
+    const uid = context.params.uid as string
+    const after = (change.after.exists ? change.after.data() : null) as CrmUserDoc | null
+
+    // The decision, the merge and the no-op skip all live in `syncClaim`, so
+    // the behaviour this trigger has is the behaviour the tests drive. All
+    // that is here is the adapter over the Admin SDK.
+    const result = await syncClaim(uid, after, {
+      getClaims: async (u) => (await admin.auth().getUser(u)).customClaims ?? {},
+      setClaims: async (u, claims) => { await admin.auth().setCustomUserClaims(u, claims) },
+    })
+
+    functions.logger.info('storage claim', { uid, ...result })
     return null
   })

@@ -23,6 +23,8 @@ is the I/O underneath them:
 
 from __future__ import annotations
 
+import asyncio
+
 import re
 import sys
 import types
@@ -61,6 +63,8 @@ class HTTPException(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        #: P1-A3 — the MFA refusal carries a header the CRM reads.
+        self.headers = _k.get("headers")
 
 
 class _Status:
@@ -197,6 +201,7 @@ def install_stubs() -> None:
         "pymongo.errors",
         DuplicateKeyError=DuplicateKeyError,
         PyMongoError=PyMongoError,
+        OperationFailure=OperationFailure,
     )
 
     _module("motor")
@@ -253,7 +258,8 @@ def install_stubs() -> None:
     # `sourceAccounts` is only actually tested if the document afterwards looks
     # the way Firestore would have left it. A stub that swallowed them would
     # make every device-ban test pass without proving anything.
-    from tests.fakes import ArrayRemove, ArrayUnion, DeleteField
+    from tests.fakes import ArrayRemove, ArrayUnion, DeleteField, Increment
+    from tests.fakes import transactional as _transactional
 
     _module(
         "firebase_admin.firestore",
@@ -261,7 +267,12 @@ def install_stubs() -> None:
         DELETE_FIELD=DeleteField(),
         ArrayUnion=ArrayUnion,
         ArrayRemove=ArrayRemove,
+        Increment=Increment,
         SERVER_TIMESTAMP=object(),
+        # `appeals.auto_resolve_pending` and `firebase.debit_host_beans` both
+        # decorate with this. See `fakes.transactional` for what it is and is
+        # not: the identity function, with no retry and no contention.
+        transactional=_transactional,
     )
 
     google = sys.modules.get("google") or _module("google")
@@ -284,6 +295,23 @@ def install_stubs() -> None:
     firestore_v1.base_query = sys.modules["google.cloud.firestore_v1.base_query"]
     cloud.firestore_v1 = firestore_v1
     google.cloud = cloud
+
+    # `google.api_core.exceptions.FailedPrecondition` — what Firestore raises
+    # when a composite index is missing. `routers/users.py` and
+    # `routers/partners.py` catch it to turn an opaque 500 into a 503 naming
+    # the index, so the NAME has to resolve at import time or those modules
+    # cannot be imported at all.
+    #
+    # A real exception subclass, not a sentinel: a test that raises it must be
+    # caught by the same `except` clause production uses, otherwise the stub
+    # would quietly make the handler untestable.
+    api_core = _module("google.api_core")
+    _module(
+        "google.api_core.exceptions",
+        FailedPrecondition=type("FailedPrecondition", (Exception,), {}),
+    )
+    api_core.exceptions = sys.modules["google.api_core.exceptions"]
+    google.api_core = api_core
 
     _module(
         "jose",
@@ -448,11 +476,43 @@ class FakeCursor:
         return gen()
 
 
+class OperationFailure(Exception):
+    """`pymongo.errors.OperationFailure` — e.g. IndexOptionsConflict."""
+
+
+def _partial_match(doc: Mapping, expr: Mapping) -> bool:
+    """The subset of partialFilterExpression the code uses: equality, $gt,
+    $exists, $type 'string'. Mongo comparison is type-bracketed, so `$gt: ""`
+    matches only non-empty strings."""
+    for field, cond in expr.items():
+        value = _dig(doc, field)
+        if not isinstance(cond, Mapping):
+            if value != cond:
+                return False
+            continue
+        for op, arg in cond.items():
+            if op == "$gt":
+                if not (isinstance(value, type(arg)) and value > arg):
+                    return False
+            elif op == "$exists":
+                if (value is not None) != bool(arg):
+                    return False
+            elif op == "$type":
+                if arg == "string" and not isinstance(value, str):
+                    return False
+            else:  # pragma: no cover
+                raise NotImplementedError(op)
+    return True
+
+
 class FakeCollection:
     def __init__(self, name: str, unique: tuple[str, ...] = ()):
         self.name = name
         self.docs: list[dict] = []
         self.unique = unique
+        #: Declared compound indexes: name → {key, unique, sparse, partialFilterExpression}.
+        #: Unique ones are enforced with Mongo's real participation rules.
+        self.indexes: dict[str, dict] = {}
         self._seq = 0
         #: Set to an exception to make every write fail — used to prove that a
         #: send with no delivery record is refused rather than sent.
@@ -463,7 +523,27 @@ class FakeCollection:
         self._seq += 1
         return f"{self.name}-{self._seq:016d}"
 
+    @staticmethod
+    def _participates(doc: Mapping, spec: Mapping) -> bool:
+        fields = [f for f, _ in spec["key"]]
+        if spec.get("partialFilterExpression") is not None:
+            return _partial_match(doc, spec["partialFilterExpression"])
+        if spec.get("sparse"):
+            # A sparse COMPOUND index indexes a document holding ANY of its fields.
+            return any(_dig(doc, f) is not None for f in fields)
+        return True
+
     def _check_unique(self, doc: Mapping, exclude: Any = None) -> None:
+        for spec in self.indexes.values():
+            if not spec.get("unique") or not self._participates(doc, spec):
+                continue
+            fields = [f for f, _ in spec["key"]]
+            mine = tuple(_dig(doc, f) for f in fields)
+            for other in self.docs:
+                if other is exclude or other.get("_id") == exclude:
+                    continue
+                if self._participates(other, spec) and tuple(_dig(other, f) for f in fields) == mine:
+                    raise DuplicateKeyError(f"E11000 duplicate key on {fields}: {mine!r}")
         for field in self.unique:
             value = _dig(doc, field)
             if value is None:
@@ -477,6 +557,10 @@ class FakeCollection:
                     )
 
     async def insert_one(self, doc: dict, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         if self.fail_writes:
             raise self.fail_writes
         doc = _copy(doc)
@@ -502,6 +586,10 @@ class FakeCollection:
 
     async def update_one(self, query: Mapping, update: Mapping, upsert: bool = False,
                          session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         if self.fail_writes:
             raise self.fail_writes
         for doc in self.docs:
@@ -536,6 +624,10 @@ class FakeCollection:
         )
 
     async def update_many(self, query: Mapping, update: Mapping, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         n = 0
         for doc in self.docs:
             if _matches(doc, query):
@@ -544,6 +636,10 @@ class FakeCollection:
         return types.SimpleNamespace(matched_count=n, modified_count=n)
 
     async def find_one_and_update(self, query, update, return_document=True, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         for doc in self.docs:
             if _matches(doc, query):
                 before = _copy(doc)
@@ -552,6 +648,10 @@ class FakeCollection:
         return None
 
     async def delete_one(self, query: Mapping, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         for i, doc in enumerate(self.docs):
             if _matches(doc, query):
                 self.docs.pop(i)
@@ -559,6 +659,10 @@ class FakeCollection:
         return types.SimpleNamespace(deleted_count=0)
 
     async def delete_many(self, query: Mapping, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         keep = [d for d in self.docs if not _matches(d, query)]
         removed = len(self.docs) - len(keep)
         self.docs = keep
@@ -569,11 +673,19 @@ class FakeCollection:
         return FakeCursor([_copy(d) for d in self.docs if _matches(d, query or {})])
 
     async def find_one(self, query: Mapping | None = None, sort=None, session=None):
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         found = [_copy(d) for d in self.docs if _matches(d, query or {})]
         found = _sorted(found, sort)
         return found[0] if found else None
 
     async def count_documents(self, query: Mapping | None = None, session=None) -> int:
+        # One real suspension point, so two coroutines INTERLEAVE here the
+        # way they do against Mongo. Without it a fake that never yields runs
+        # every 'race' sequentially and proves nothing about atomicity.
+        await asyncio.sleep(0)
         return sum(1 for d in self.docs if _matches(d, query or {}))
 
     def aggregate(self, pipeline: list[Mapping], *_a, **_k) -> FakeCursor:
@@ -596,8 +708,52 @@ class FakeCollection:
                 raise NotImplementedError(f"FakeDb does not implement {op}")
         return FakeCursor(docs)
 
-    async def create_index(self, *_a, **_k):
-        return "ok"
+    async def create_index(self, keys=None, **opts):
+        if isinstance(keys, (list, tuple)) and keys and isinstance(keys[0], (list, tuple)):
+            key = [(str(f), int(d)) for f, d in keys]
+        elif isinstance(keys, str):
+            key = [(keys, 1)]
+        else:
+            return "ok"
+        name = opts.get("name") or "_".join(f"{f}_{d}" for f, d in key)
+        spec = {
+            "key": key,
+            "unique": bool(opts.get("unique")),
+            "sparse": bool(opts.get("sparse")),
+            "partialFilterExpression": opts.get("partialFilterExpression"),
+        }
+        for other_name, other in self.indexes.items():
+            if other["key"] == key and other_name != name:
+                raise OperationFailure("IndexOptionsConflict: same key pattern, different name/options")
+        if spec["unique"]:
+            # Mongo refuses to build a unique index over existing duplicates.
+            seen: list[tuple] = []
+            for d in self.docs:
+                if self._participates(d, spec):
+                    t = tuple(_dig(d, f) for f, _ in key)
+                    if t in seen:
+                        raise DuplicateKeyError(f"E11000 building {name}: {t!r}")
+                    seen.append(t)
+        self.indexes[name] = spec
+        return name
+
+    async def index_information(self) -> dict:
+        info = {"_id_": {"key": [("_id", 1)]}}
+        for name, spec in self.indexes.items():
+            entry = {"key": list(spec["key"])}
+            if spec["unique"]:
+                entry["unique"] = True
+            if spec["sparse"]:
+                entry["sparse"] = True
+            if spec["partialFilterExpression"] is not None:
+                entry["partialFilterExpression"] = spec["partialFilterExpression"]
+            info[name] = entry
+        return info
+
+    async def drop_index(self, name: str) -> None:
+        if name not in self.indexes:
+            raise OperationFailure(f"index not found with name [{name}]")
+        del self.indexes[name]
 
 
 def _field(doc: Mapping, expr: Any) -> Any:
@@ -916,3 +1072,40 @@ def reinstall_sendgrid() -> None:
 
 def utc(*args) -> datetime:
     return datetime(*args, tzinfo=timezone.utc)
+
+
+# ── Decision 15 (RC): Firebase Auth records for fixtures ─────────────────────
+#
+# A partner role starts only when its login holds BOTH a verified phone and a
+# verified email (`app/services/contact_verification.py`). That reads the
+# Firebase Auth record through `firebase.get_user`, which the stubs above
+# answer with None — "no account", so nothing is verified.
+#
+# Fixtures whose SUBJECT is not the contact rule (lifecycles, transfers,
+# virtual accounts…) install `verified_auth` so the real gate runs and lets
+# their people through — said in each module, at the line that does it. The
+# contact rule itself is exercised with per-uid records, verified and not, in
+# `tests/test_rc_contact_verification.py`; nothing there uses `verified_auth`.
+
+def auth_record(uid: str, *, phone: str = "", email: str = "", email_verified: bool = False,
+                providers: Iterable[str] = ()) -> Any:
+    """One Firebase Auth `UserRecord`, as the code under test reads it."""
+    return types.SimpleNamespace(
+        uid=uid, phone_number=phone, email=email, email_verified=email_verified,
+        provider_data=[types.SimpleNamespace(provider_id=p, email=email) for p in providers],
+    )
+
+
+def _stable_digits(uid: str, n: int = 9) -> str:
+    import hashlib
+
+    return str(int(hashlib.sha256(uid.encode()).hexdigest(), 16) % 10**n).zfill(n)
+
+
+def verified_auth(uid: str) -> Any:
+    """A login with BOTH contacts verified: an SMS-linked phone and a code-verified email.
+
+    No password sign-in method, so the email counts (see `contact_verification`).
+    Deterministic per uid, and unique per uid, like the real thing.
+    """
+    return auth_record(uid, phone=f"+91{_stable_digits(uid)}", email=f"{uid}@x.test", email_verified=True)

@@ -121,6 +121,7 @@ async def issue_session(
     partner_ids: Mapping[str, str] | None = None,
     partner_status: str | None = None,
     renewed_from: str | None = None,
+    mfa_verified: bool = False,
 ) -> tuple[str, datetime]:
     """Mint a session token.
 
@@ -190,6 +191,12 @@ async def issue_session(
         "revoked": False,
         "renewed_from": renewed_from,
     }
+    if role == Role.OWNER:
+        # P1-A3: whether THIS session passed the Owner's second factor. Only an
+        # Owner token carries it; `deps.current_user` limits an Owner session
+        # without it to the MFA routes. Set only by `services/owner_mfa`.
+        claims["mfa"] = bool(mfa_verified)
+        record["mfa_verified"] = bool(mfa_verified)
     if partner_ids is not None or partner_status is not None:
         claims["partners"] = scoped
         claims["partner_status"] = partner_status or ""
@@ -247,7 +254,17 @@ async def verify_session(token: str) -> dict:
         #: The agency record if there is one, otherwise the seller record.
         "partner_id": partner_ids.get("agency") or partner_ids.get("seller") or "",
         "partner_status": str(claims.get("partner_status") or ""),
+        #: P1-A3 — True only on an Owner session that passed MFA. The session
+        #: record must agree: a claim cannot be upgraded without a new token,
+        #: and the record is written by the same call that signs it.
+        "mfa_verified": bool(claims.get("mfa")) and bool(record.get("mfa_verified")),
     }
+
+
+async def _session_expiry(jti: str) -> datetime | None:
+    """The token expiry recorded for a session (P1-A3b binding lifetime)."""
+    record = await get_db()[C.SESSIONS].find_one({"jti": jti}) if jti else None
+    return (record or {}).get("token_expires_at")
 
 
 async def revoke_session(jti: str) -> None:
@@ -390,6 +407,7 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
     if staff is not None:
         if not staff.get("is_active", True):
             raise AuthError("This account has been deactivated.")
+        await _refuse_restricted_app_account(uid)
 
         current = Role(staff["role"])
         if current != role:
@@ -401,21 +419,31 @@ async def renew_session(token: str) -> tuple[str, datetime, dict]:
 
         name = str(staff.get("name", ""))
         await revoke_session(jti)
+        # P1-A3: a renewal continues the SAME sign-in, so an Owner who passed
+        # MFA keeps it and one who has not still has not. An Observer reset of
+        # the Owner's MFA revokes every session, so nothing stale renews.
+        mfa_ok = bool(claims.get("mfa")) and bool(record.get("mfa_verified"))
         new_token, expires = await issue_session(
-            uid=uid, email=email, name=name, role=current, renewed_from=jti
+            uid=uid, email=email, name=name, role=current, renewed_from=jti,
+            mfa_verified=mfa_ok,
         )
         log.info("Renewed the session of %s (%s)", uid, current)
-        return (
-            new_token,
-            expires,
-            {
-                "uid": uid,
-                "email": email,
-                "name": name,
-                "role": str(current),
-                "team": str(team_of(current)) if team_of(current) else None,
-            },
-        )
+        profile = {
+            "uid": uid,
+            "email": email,
+            "name": name,
+            "role": str(current),
+            "team": str(team_of(current)) if team_of(current) else None,
+        }
+        if current == Role.OWNER and mfa_ok and record.get("mfa_binding_id"):
+            # P1-A3b: the Firestore/Storage binding follows a VALID renewal —
+            # moved to the new jti and extended to the new expiry. A binding
+            # removed by sign-out, reset or suspension is never re-created.
+            from app.services import owner_mfa
+
+            new_jti = str((await verify_session(new_token)).get("jti") or "")
+            profile["mfa_firestore_binding"] = await owner_mfa.carry_binding(jti, new_jti, uid, expires)
+        return new_token, expires, profile
 
     if not is_external(role):
         # An internal session whose `staff` row has gone. Falling through to
@@ -667,6 +695,24 @@ async def _staff_for_authenticated_uid(
     )
 
 
+# ── C4 — a restricted app account gets no CRM session ─────────────────────────
+
+
+async def _refuse_restricted_app_account(uid: str) -> None:
+    """Refuse sign-in or renewal for a uid whose APP account is suspended or banned.
+
+    The same verdict `core/account_state` applies to a live session on every
+    re-check, applied at the two moments a session is minted. Raises
+    `AuthError` with the account-restricted sentence.
+    """
+    from app.core.account_state import app_account_refusal_for  # local: keeps the import graph flat
+
+    refusal = await app_account_refusal_for(uid)
+    if refusal is not None:
+        log.info("Refused a CRM session for %s: %s", uid, refusal.reason)
+        raise AuthError(refusal.message)
+
+
 # ── Firebase sign-in (staff, owners, partners) ────────────────────────────────
 
 
@@ -721,6 +767,7 @@ async def sign_in_with_firebase(id_token: str) -> tuple[str, datetime, dict]:
         # and read their own agency the way any other staff member does.
         if not staff.get("is_active", True):
             raise AuthError("This account has been deactivated.")
+        await _refuse_restricted_app_account(uid)
 
         role = Role(staff["role"])
         name = staff.get("name", "")
@@ -881,6 +928,12 @@ def _crm_partner_document(
     if not found and email and email_proven:
         try:
             for doc_id, data in crm.find_by_email(email):
+                # P0-5 (AUTHN-1): only a document whose address the server
+                # stamped as verified on ITS OWN sign-in. A typed partner
+                # address lands on a login document unproven, and matching it
+                # here attached another uid to that partner.
+                if data.get("emailProven") is not True:
+                    continue
                 if str(data.get("role", "")) in _CAPABILITY:
                     # Matched on address because a partner whose document was
                     # written under a different uid — a login recreated after a
@@ -940,6 +993,37 @@ def _claimed_partner_ids(document: Mapping) -> dict[str, str]:
         if value:
             out[capability] = value
     return out
+
+
+async def _rejection_of_login(db, uid: str, document: Mapping) -> str:
+    """Decision 16 (RC): the rejection sentence when EVERY record of this login was rejected; else ''."""
+    from app.services import partners as partner_svc
+
+    ids = set(_claimed_partner_ids(document).values())
+    rows: list[dict] = []
+    async for record in db[C.PARTNERS].find({"owner_crm_uid": uid}):
+        rows.append(record)
+        ids.discard(str(record.get("_id") or ""))
+    for pid in ids:
+        record = await db[C.PARTNERS].find_one({"_id": pid})
+        if record is not None:
+            rows.append(record)
+    if not rows:
+        return ""
+    rejected = str(partner_svc.PartnerStatus.REJECTED)
+    if any(str(r.get("status") or "") != rejected for r in rows):
+        return ""
+
+    def _when(r: dict) -> str:
+        return str(r.get("rejected_at") or r.get("updated_at") or "")
+
+    latest = max(rows, key=_when)
+    reason = str(latest.get("rejection_reason") or "").strip()
+    return (
+        "This application was not approved"
+        + (f": {reason}" if reason else ".")
+        + " You may apply again — a new application is reviewed on its own."
+    )
 
 
 async def resolve_partner_login(
@@ -1011,6 +1095,16 @@ async def resolve_partner_login(
         # The CRM's own deactivation control (`agencies.ts` writes exactly this
         # when an agency account is switched off). Honoured before anything is
         # granted, so turning a partner off in the CRM turns off the API too.
+        #
+        # Decision 16 (RC): a REJECTION also leaves the login inactive, and
+        # "deactivated" is untrue for somebody whose application was simply
+        # refused — they are entitled to the reason, and to apply again. So
+        # when every record this login names was rejected (nothing live,
+        # pending or waiting), the refusal says so, with the reason. Still no
+        # session either way.
+        rejected_only = await _rejection_of_login(db, uid, document)
+        if rejected_only:
+            raise AuthError(rejected_only)
         raise AuthError("This account has been deactivated.")
 
     candidates = _claimed_partner_ids(document)
@@ -1044,6 +1138,7 @@ async def resolve_partner_login(
 
     granted: dict[str, str] = {}
     pending: dict[str, str] = {}
+    awaiting_verification = False
     rejections: list[str] = []
     deactivations: list[str] = []
     name = str(document.get("name") or "").strip()
@@ -1074,8 +1169,16 @@ async def resolve_partner_login(
 
         if status == str(partner_svc.PartnerStatus.APPROVED) and active:
             granted.setdefault(actual, partner_id)
-        elif status == str(partner_svc.PartnerStatus.PENDING):
+        elif status in (
+            str(partner_svc.PartnerStatus.PENDING),
+            # Decision 15 (RC): the same waiting-room session as pending — no
+            # partner ids, nothing to read — so the person can sign in and
+            # verify the contacts their role is waiting for.
+            str(partner_svc.PartnerStatus.AWAITING_VERIFICATION),
+        ):
             pending.setdefault(actual, partner_id)
+            if status == str(partner_svc.PartnerStatus.AWAITING_VERIFICATION):
+                awaiting_verification = True
         elif status == str(partner_svc.PartnerStatus.REJECTED):
             # The reason is `reject_partner`'s, stored on the record and shown
             # verbatim. A rejected applicant currently reapplies because nobody
@@ -1090,6 +1193,14 @@ async def resolve_partner_login(
             )
         else:
             deactivations.append("This account has been deactivated.")
+
+    if granted or pending:
+        # C4: a partner whose APP account is suspended or banned is given no
+        # session — not a scoped one and not a waiting-room one. Checked only
+        # now, when there is a partner to answer for, so a stranger is still
+        # told "No account found" and nothing more. Sign-in and renewal both
+        # come through here.
+        await _refuse_restricted_app_account(uid)
 
     if granted:
         # At least one live capability. A rejected or suspended *second* record
@@ -1108,7 +1219,11 @@ async def resolve_partner_login(
         return PartnerLogin(
             role=role,
             name=name,
-            status=str(partner_svc.PartnerStatus.PENDING),
+            status=(
+                str(partner_svc.PartnerStatus.AWAITING_VERIFICATION)
+                if awaiting_verification
+                else str(partner_svc.PartnerStatus.PENDING)
+            ),
             partner_ids={},
         )
 
@@ -1329,6 +1444,20 @@ class Op:
     #    seller that already exists in Firestore, and it does nothing else. It
     #    approves nobody, moves no balance and creates no liability. ──────────
     PARTNER_REGISTER = "partner.register"
+    # ── Self-application from the app. Held by the SAME partner-registration
+    #    credential (one key, no new production configuration): the Cloud
+    #    Function callables the app uses present it, carrying the signed-in
+    #    user's uid, and this API applies every rule — eligibility, the
+    #    one-agency-per-human family, parent validation — before writing a
+    #    PENDING record that holds nothing. Same blast radius as registering:
+    #    queue noise a reviewer rejects. It also reads eligibility and the list
+    #    of agencies a sub-agency or host may hang under, both of which the app
+    #    shows to its own users anyway. ─────────────────────────────────────
+    PARTNER_APPLY = "partner.apply"
+    # ── A buyer's recharge request, filed from the app through a callable,
+    #    with the same credential. Creates a PENDING request that moves
+    #    nothing; the credit is a separate staff decision. ─────────────────
+    RECHARGE_REQUEST = "recharge.request"
 
 
 KNOWN_OPERATIONS: frozenset[str] = frozenset(
@@ -1340,6 +1469,8 @@ KNOWN_OPERATIONS: frozenset[str] = frozenset(
         Op.EMAIL_SWEEP,
         Op.EMAIL_EVENTS,
         Op.PARTNER_REGISTER,
+        Op.PARTNER_APPLY,
+        Op.RECHARGE_REQUEST,
     }
 )
 
@@ -1455,7 +1586,7 @@ PARTNER_REGISTRATION = ServiceCredential(
         "team": None,
         "service_credential": "partner-registration",
     },
-    operations=frozenset({Op.PARTNER_REGISTER}),
+    operations=frozenset({Op.PARTNER_REGISTER, Op.PARTNER_APPLY, Op.RECHARGE_REQUEST}),
 )
 
 SERVICE_CREDENTIALS: tuple[ServiceCredential, ...] = (

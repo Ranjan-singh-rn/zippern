@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.SellerRecordIdTest" tests="5" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.149Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="the dashboard reads, listens to and toggles the resolved record" classname="com.zipper.app.util.SellerRecordIdTest" time="0.0"/>
+  <testcase name="two sellers keep two records" classname="com.zipper.app.util.SellerRecordIdTest" time="0.0"/>
+  <testcase name="buy coins reads the resolved record" classname="com.zipper.app.util.SellerRecordIdTest" time="0.001"/>
+  <testcase name="no link falls back to a legacy uid-keyed record" classname="com.zipper.app.util.SellerRecordIdTest" time="0.0"/>
+  <testcase name="the linked record wins over the uid" classname="com.zipper.app.util.SellerRecordIdTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

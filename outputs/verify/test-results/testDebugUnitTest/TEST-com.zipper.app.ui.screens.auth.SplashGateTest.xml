@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.auth.SplashGateTest" tests="8" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.047Z" hostname="CW253.local" time="0.002">
+  <properties/>
+  <testcase name="retry is bounded" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <testcase name="suspended routes to the suspension screen with its end date" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.001"/>
+  <testcase name="the splash no longer opens Main on failure and reads from the server" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <testcase name="pending deletion must be answered first" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <testcase name="allow continues" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <testcase name="an unknown decision is never Continue" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.001"/>
+  <testcase name="no server answer is never Continue" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <testcase name="banned and device banned route to their screens" classname="com.zipper.app.ui.screens.auth.SplashGateTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

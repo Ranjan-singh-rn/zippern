@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.ContactRulesTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.138Z" hostname="CW253.local" time="0.0">
+  <properties/>
+  <testcase name="a phone linked on Auth but not bound on the account still offers the row" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="a verified email with no address is not a contact" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="a verified email or a phone is enough on its own" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="staff never see the card, contact or not" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="a guest with no contact sees the card, and it says a verified contact comes first" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="an unverified email is not a contact" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <testcase name="an email counts as bound only when verified on Auth and recorded" classname="com.zipper.app.util.ContactRulesTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

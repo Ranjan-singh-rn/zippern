@@ -1,0 +1,13 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -85,6 +85,8 @@
+     allow_credentials=settings.is_production,
+     allow_methods=["*"],
+     allow_headers=["*"],
++    # P1-A3: lets the CRM tell "finish two-step sign-in" from any other 403.
++    expose_headers=["X-Zipper-MFA-Required"],
+ )
+ 
+ app.include_router(auth.router, prefix="/api")

@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.MyLocation
+import com.zipper.app.util.ALL_COUNTRIES
 import com.zipper.app.util.UserLanguage
 import com.zipper.app.util.languageByCode
 import com.zipper.app.util.toUserLanguage
@@ -112,6 +113,13 @@ fun ProfileSetupScreen(
     // is decided further down, from the role — see `needsEmail` / `needsPhone`.
     var extraEmail by remember { mutableStateOf("") }   // for phone-login users
     var extraPhone by remember { mutableStateOf("") }   // for Google-login users
+    // The country code for that number. It was a fixed "+91" label, so nobody
+    // outside India could give a usable number here. Same list and picker as
+    // the login screen.
+    var phoneCountry by remember { mutableStateOf(ALL_COUNTRIES.first { it.dialCode == "+91" }) }
+    var showPhoneCountryPicker by remember { mutableStateOf(false) }
+    val minPhoneDigits = if (phoneCountry.dialCode == "+91") 10 else 6
+    val extraPhoneE164 = if (extraPhone.isNotBlank()) "${phoneCountry.dialCode}$extraPhone" else ""
 
     /*
      * Whatever name we can honestly offer, by sign-in method.
@@ -259,6 +267,14 @@ fun ProfileSetupScreen(
         if (uiState.setupAbandoned) onNavigateToLogin()
     }
 
+    // B11: "Go back" from the not-a-host dialog — Login once the sign-out is done.
+    LaunchedEffect(uiState.navigateToLogin) {
+        if (uiState.navigateToLogin) {
+            viewModel.onNavigatedToLogin()
+            onNavigateToLogin()
+        }
+    }
+
     // Date picker state
     val datePickerState = rememberDatePickerState(
         initialSelectedDateMillis = System.currentTimeMillis() - (20L * 365 * 24 * 60 * 60 * 1000),
@@ -395,8 +411,15 @@ fun ProfileSetupScreen(
      * The requirement belongs to the ROLE, not to the sign-in method, and only
      * the server knows the role: `resolveIdentity` sets `requiresPhone` and
      * `requiresEmail` for a host, an agency, a seller or a member of CRM staff,
-     * and for nobody else. It reaches the app as
-     * `AuthResult.NeedsContactDetails` and is held on the ViewModel.
+     * and for nobody else.
+     *
+     * C7 (B01): it no longer comes HERE. It used to arrive as
+     * `AuthResult.NeedsContactDetails` and route a finished profile back to this
+     * screen on every sign-in — a screen that cannot bind a contact, with a
+     * fresh ViewModel that had lost the requirement anyway. It is stored in
+     * SessionManager now and settled from Settings by OTP or code, so on this
+     * screen the two flags stay false and only a typed referral code shows the
+     * fields.
      *
      * ── THE DEFAULT IS "DO NOT ASK" ──────────────────────────────────────────
      *
@@ -431,13 +454,13 @@ fun ProfileSetupScreen(
     // Verify button is enabled when code >= 6 chars AND missing fields are filled
     val verifyEnabled = referralCode.length >= 6 &&
         (!needsEmail || extraEmail.isNotBlank()) &&
-        (!needsPhone || extraPhone.length == 10)
+        (!needsPhone || extraPhone.length >= minPhoneDigits)
 
     // Referral code validity is handled in the onClick dialog flow, not by disabling the button
     val canProceed = name.isNotBlank() && gender.isNotBlank() && dob != null && !ageError && city.isNotBlank() &&
         selectedLanguages.isNotEmpty() &&
         (!needsEmail || extraEmail.isNotBlank()) &&
-        (!needsPhone || extraPhone.length == 10) &&
+        (!needsPhone || extraPhone.length >= minPhoneDigits) &&
         (isGuestUser || referralCode.isBlank() || uiState.referralValid || uiState.referralNotFound)
 
     val c = ZipperTheme.colors
@@ -468,39 +491,52 @@ fun ProfileSetupScreen(
         else -> accountPhotoUrl
     }
 
+    // FX-15: busy from the first tap. The ViewModel sets `isLoading` only when
+    // `saveProfile` reaches it, 300 ms later; this covers that gap, so the
+    // button shows busy at once and a second tap inside the delay saves — and
+    // redeems a referral code — nothing.
+    var saveStarting by remember { mutableStateOf(false) }
     fun submit() {
+        // FX-15: a second tap during the 300 ms below starts no second save.
+        if (!SubmitGuard.mayStart(uiState.isLoading || saveStarting)) return
+        saveStarting = true
         focusManager.clearFocus(force = true)
         scope.launch {
-            delay(300)
-            /*
-             * The bio used to be written here, by itself, in a try/catch that
-             * swallowed whatever went wrong — before the real save and outside
-             * it. Two writes for one form, and either could fail alone: a
-             * refused bio was silent, and a bio that landed before a save that
-             * then failed left half a profile behind.
-             *
-             * It is one save now. The screen collects, the repository writes.
-             */
-            viewModel.saveProfile(
-                name = name.trim(), gender = gender, dob = dob!!, age = ageFromDob,
-                city = city.trim(), country = detectedCountry, deviceId = deviceId,
-                photoUri = photoUri, languages = selectedLanguages, email = extraEmail.trim(),
-                bio = bio.trim(),
+            try {
+                delay(300)
                 /*
-                 * The avatar, when there is no file to upload.
+                 * The bio used to be written here, by itself, in a try/catch that
+                 * swallowed whatever went wrong — before the real save and outside
+                 * it. Two writes for one form, and either could fail alone: a
+                 * refused bio was silent, and a bio that landed before a save that
+                 * then failed left half a profile behind.
                  *
-                 * `photoUri` is the only way a picture reached the repository,
-                 * and the repository only writes `photoUrl` when that upload
-                 * produced a download URL — so a default avatar had no route to
-                 * Firestore at all. This is that route: the repository stores it
-                 * verbatim when `photoUri` is null and ignores it otherwise.
+                 * It is one save now. The screen collects, the repository writes.
                  */
-                defaultAvatar = photoUrlToStore,
-                // Stored in the same shape the rest of the platform uses, so it
-                // matches a partner record and an agency's invitation without
-                // anybody having to normalise it later.
-                phone = if (extraPhone.isNotBlank()) "+91$extraPhone" else "",
-            )
+                viewModel.saveProfile(
+                    name = name.trim(), gender = gender, dob = dob!!, age = ageFromDob,
+                    city = city.trim(), country = detectedCountry, deviceId = deviceId,
+                    photoUri = photoUri, languages = selectedLanguages, email = extraEmail.trim(),
+                    bio = bio.trim(),
+                    /*
+                     * The avatar, when there is no file to upload.
+                     *
+                     * `photoUri` is the only way a picture reached the repository,
+                     * and the repository only writes `photoUrl` when that upload
+                     * produced a download URL — so a default avatar had no route to
+                     * Firestore at all. This is that route: the repository stores it
+                     * verbatim when `photoUri` is null and ignores it otherwise.
+                     */
+                    defaultAvatar = photoUrlToStore,
+                    // Stored in the same shape the rest of the platform uses, so it
+                    // matches a partner record and an agency's invitation without
+                    // anybody having to normalise it later.
+                    phone = extraPhoneE164,
+                )
+            } finally {
+                // `saveProfile` has set `isLoading` synchronously by now.
+                saveStarting = false
+            }
         }
     }
 
@@ -722,15 +758,25 @@ fun ProfileSetupScreen(
                             Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
                                 SetupLabel("Phone Number")
                                 SetupBox {
-                                    Text("+91", style = ZipperTheme.type.labelL, color = c.textBrand)
+                                    Text(
+                                        "${phoneCountry.flag} ${phoneCountry.dialCode}",
+                                        style = ZipperTheme.type.labelL, color = c.textBrand,
+                                        modifier = Modifier.clickableNoRipple { showPhoneCountryPicker = true },
+                                    )
                                     Box(Modifier.padding(horizontal = Space.md).width(1.dp).height(24.dp).background(c.borderStrong))
                                     BasicTextField(
-                                        value = extraPhone, onValueChange = { v -> if (v.length <= 10 && v.all(Char::isDigit)) extraPhone = v }, singleLine = true,
+                                        value = extraPhone, onValueChange = { v -> if (v.length <= phoneCountry.maxDigits && v.all(Char::isDigit)) extraPhone = v }, singleLine = true,
                                         textStyle = ZipperTheme.type.bodyL.copy(color = c.textPrimary), cursorBrush = SolidColor(c.brandPrimary),
                                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                                         modifier = Modifier.weight(1f),
-                                        decorationBox = { inner -> if (extraPhone.isEmpty()) Text("10-digit mobile number", style = ZipperTheme.type.bodyL, color = c.textMuted); inner() },
+                                        decorationBox = { inner -> if (extraPhone.isEmpty()) Text("Mobile number", style = ZipperTheme.type.bodyL, color = c.textMuted); inner() },
                                     )
+                                }
+                                if (showPhoneCountryPicker) {
+                                    CountryPickerSheet(
+                                        phoneCountry,
+                                        onSelect = { phoneCountry = it; extraPhone = extraPhone.take(it.maxDigits); showPhoneCountryPicker = false },
+                                    ) { showPhoneCountryPicker = false }
                                 }
                             }
                         }
@@ -754,7 +800,7 @@ fun ProfileSetupScreen(
                             Box(
                                 Modifier.size(56.dp)
                                     .background(if (verifyEnabled) Brush.linearGradient(listOf(c.brandGradientFrom, c.brandGradientTo)) else Brush.linearGradient(listOf(c.bgElevated, c.bgElevated)), RoundedCornerShape(Radius.lg))
-                                    .clickableNoRipple { if (verifyEnabled && !uiState.referralCheckLoading) viewModel.verifyReferralCode(referralCode, overridePhone = if (extraPhone.isNotBlank()) "+91$extraPhone" else "", overrideEmail = extraEmail) },
+                                    .clickableNoRipple { if (verifyEnabled && !uiState.referralCheckLoading) viewModel.verifyReferralCode(referralCode, overridePhone = extraPhoneE164, overrideEmail = extraEmail) },
                                 contentAlignment = Alignment.Center,
                             ) {
                                 // Enabled the square is a brand gradient, so the tick is
@@ -782,7 +828,7 @@ fun ProfileSetupScreen(
                         if (!isGuestUser && referralCode.isNotBlank() && !uiState.referralValid && !uiState.referralNotFound && uiState.referralError != null) showNotAHostDialog = true
                         else submit()
                     },
-                    gradient = true, fullWidth = true, enabled = canProceed && !uiState.isLoading, loading = uiState.isLoading,
+                    gradient = true, fullWidth = true, enabled = canProceed && !uiState.isLoading && !saveStarting, loading = uiState.isLoading || saveStarting,
                     modifier = Modifier.padding(top = Space.sm),
                 )
                 Spacer(Modifier.navigationBarsPadding())
@@ -842,7 +888,10 @@ fun ProfileSetupScreen(
                 title = { Text("Not registered as a host", style = ZipperTheme.type.headingS, color = c.textPrimary) },
                 text = { Text("That referral code doesn't match a host record for your account. Continue as a regular user instead?", style = ZipperTheme.type.bodyM, color = c.textSecondary) },
                 confirmButton = { TextButton({ showNotAHostDialog = false; if (dob != null) submit() }) { Text("Continue as user", color = c.textBrand) } },
-                dismissButton = { TextButton({ showNotAHostDialog = false; viewModel.signOut(); onNavigateToLogin() }) { Text("Go back", color = c.textSecondary) } },
+                // B11: the sign-out only STARTS here. Login is shown by the
+                // `navigateToLogin` effect once it has finished — navigating on
+                // this line destroyed this view model and cancelled it half-way.
+                dismissButton = { TextButton({ showNotAHostDialog = false; viewModel.signOut(deviceId) }) { Text("Go back", color = c.textSecondary) } },
             )
         }
 

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.DeletionWindowTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.139Z" hostname="CW253.local" time="0.005">
+  <properties/>
+  <testcase name="the notice says the account was deleted and names no number of days" classname="com.zipper.app.util.DeletionWindowTest" time="0.001"/>
+  <testcase name="no deactivation copy promises thirty days any more" classname="com.zipper.app.util.DeletionWindowTest" time="0.003"/>
+  <testcase name="deleted_permanent ends the account, the recoverable state does not" classname="com.zipper.app.util.DeletionWindowTest" time="0.0"/>
+  <testcase name="the window is the server's sixty days" classname="com.zipper.app.util.DeletionWindowTest" time="0.0"/>
+  <testcase name="the sign-in gate and recovery refuse instead of entering" classname="com.zipper.app.util.DeletionWindowTest" time="0.0"/>
+  <testcase name="RECOVERY_EXPIRED and only it means the window has closed" classname="com.zipper.app.util.DeletionWindowTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

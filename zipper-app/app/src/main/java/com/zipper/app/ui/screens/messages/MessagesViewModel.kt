@@ -6,6 +6,7 @@ import com.google.firebase.auth.FirebaseAuth
 import com.zipper.app.data.model.BroadcastMessage
 import com.zipper.app.data.model.Conversation
 import com.zipper.app.data.model.SupportTicket
+import com.zipper.app.data.model.UserNotification
 import com.zipper.app.data.repository.ChatRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,11 +18,22 @@ import javax.inject.Inject
 
 data class MessagesUiState(
     val conversations: List<Conversation> = emptyList(),
+    /** Sent to everybody. */
     val broadcasts: List<BroadcastMessage> = emptyList(),
+    /**
+     * Sent to this user alone — warnings, recharge outcomes, approvals. Shown
+     * in the same Official tab as [broadcasts] and interleaved with them by
+     * time, because from the user's side there is one list of things Zipper
+     * has told them, not two.
+     */
+    val notifications: List<UserNotification> = emptyList(),
     val tickets: List<SupportTicket> = emptyList(),
     val isLoading: Boolean = true,
     val totalUnread: Int = 0,
-)
+) {
+    /** Unread personal notices, for the Official tab's count. */
+    val unreadOfficial: Int get() = notifications.count { !it.isRead }
+}
 
 @HiltViewModel
 class MessagesViewModel @Inject constructor(
@@ -45,6 +57,11 @@ class MessagesViewModel @Inject constructor(
         viewModelScope.launch {
             chatRepo.broadcastsFlow().collect { broadcasts ->
                 _state.update { it.copy(broadcasts = broadcasts) }
+            }
+        }
+        viewModelScope.launch {
+            chatRepo.myNotificationsFlow(myUid).collect { notifications ->
+                _state.update { it.copy(notifications = notifications) }
             }
         }
         viewModelScope.launch {

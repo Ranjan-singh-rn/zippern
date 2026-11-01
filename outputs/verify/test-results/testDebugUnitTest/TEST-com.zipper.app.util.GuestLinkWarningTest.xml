@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.GuestLinkWarningTest" tests="8" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.145Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="no account, nothing changes" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.001"/>
+  <testcase name="a server that says not-a-guest wins even with no provider listed" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="the warning shows once a guest is remembered, until acknowledged" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="a long-standing guest the server was never asked about is remembered too" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="signing out of a different, registered account leaves the guest remembered" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="signing out of a guest remembers it" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="the words say separate, nothing merged, and how to keep one account" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <testcase name="the remembered guest, secured since, is forgotten" classname="com.zipper.app.util.GuestLinkWarningTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

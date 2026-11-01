@@ -114,9 +114,10 @@ class DeviceKey @Inject constructor() {
     /**
      * Destroy the key.
      *
-     * Called by "sign out and forget this device". Destroying it is what makes
-     * that honest: without the key, no credential minted on this handset can
-     * ever be redeemed again, whatever happens to its bytes.
+     * Called when a half-made account is thrown away (`AuthRepository`).
+     * Without the key, no credential minted on this handset can ever be
+     * redeemed again, whatever happens to its bytes. ("Sign out and forget this
+     * device", its other caller, was removed — UGP-E2.)
      */
     fun clear() {
         try {

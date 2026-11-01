@@ -1,5 +1,9 @@
 """Revoking staff access, and inviting without hijacking an existing account.
 
+P1 (approved decision 1): the old FIX 3 below — disabling the Firebase account on
+revocation — is REVERSED, because that account is the person's own Zipper app
+account. The "used to mean" note is kept as history.
+
 Two fixes, both in `app/services/staff.py`, and they share a harness because they
 share the one idea: **the Firebase credential is not ours to assume about.**
 
@@ -52,6 +56,19 @@ sent_mail: list[dict] = []
 email_stub = types.ModuleType("app.services.email")
 email_stub.send_staff_invitation = lambda **kw: sent_mail.append({"kind": "invitation", **kw})
 email_stub.send_staff_access_added = lambda **kw: sent_mail.append({"kind": "access_added", **kw})
+
+
+# P1-F — the access-change notices go through `email.deliver` with a dedupe key.
+async def _stub_deliver(**kw):
+    sent_mail.append({"kind": kw.get("kind"), "dedupe_key": kw.get("dedupe_key"), "html": kw.get("html", "")})
+    return {"outcome": "sent"}
+
+
+email_stub.deliver = _stub_deliver
+email_stub.Recipient = lambda **kw: types.SimpleNamespace(**kw)
+email_stub.Sensitivity = types.SimpleNamespace(OPERATIONAL="operational")
+email_stub.page = lambda **kw: kw.get("body", "")
+email_stub.esc = lambda v: str(v)
 sys.modules["app.services.email"] = email_stub
 
 from app.core import audit as audit_mod  # noqa: E402
@@ -114,6 +131,13 @@ fb.get_user = lambda uid: next((u for u in auth_accounts.values() if u.uid == ui
 
 OWNER = {"uid": "owner-1", "name": "Tanishque", "role": Role.OWNER, "team": None}
 
+
+def peek(path: str) -> dict:
+    """One fake-Firestore document as a dict ({} when absent)."""
+    col, doc_id = path.split("/", 1)
+    snap = crm_users.collection(col).document(doc_id).get()
+    return (snap.to_dict() if getattr(snap, "exists", False) else None) or {}
+
 failures: list[str] = []
 checks = 0
 
@@ -146,84 +170,158 @@ def invite(email: str, name: str = "Dev", role: Role = Role.OPS_MEMBER) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIX 3 — revocation reaches Firebase
+#  P1-B1 — revocation ends STAFF access and leaves the personal app account alone
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# Approved decision 1 reverses the old FIX 3. `invite` reuses the person's own
+# Zipper account ("one person, one uid"), so disabling that Firebase account
+# locked them out of their app — wallet, beans, host earnings. Staff access is
+# now revoked by everything that carries it (API sessions, the Mongo row the
+# guards read, `crmUsers.isActive` the Firestore rules read, the Storage claim)
+# and the Firebase account is not touched at all.
 
 reset_auth_calls()
 sent_mail.clear()
 created = invite("revoke-me@example.com", "Revoke Me")
 target_uid = created["uid"]
+run(db[C.SESSIONS].insert_one({"jti": "j-revoke-1", "uid": target_uid, "revoked": False}))
 
 reset_auth_calls()
+sent_mail.clear()
 result = run(svc.deactivate(target_uid, OWNER, "Left the company"))
 
-ok("the account is disabled in Firebase", (target_uid, {"disabled": True}) in AUTH_CALLS["disabled"])
-ok("and its refresh tokens are revoked", target_uid in AUTH_CALLS["revoked"])
-check("the caller is told the revocation is complete", result["fully_revoked"], True)
-check("and the login state is named", result["firebase_login"], "disabled")
-check("the application flag is still set", result["is_active"], False)
+ok("the personal Firebase account is NOT disabled", AUTH_CALLS["disabled"] == [])
+ok("and its refresh tokens are NOT revoked (the app stays signed in)", AUTH_CALLS["revoked"] == [])
+check("the caller is told the personal account is unchanged", result["personal_app_account"], "unchanged")
+check("the staff record is inactive", result["is_active"], False)
+check("…with an explicit status", result["status"], "deactivated")
+row = run(db[C.STAFF].find_one({"uid": target_uid}))
+check("the stored row says deactivated", (row["status"], row["is_active"]), ("deactivated", False))
+sess = run(db[C.SESSIONS].find_one({"jti": "j-revoke-1"}))
+check("the API session is revoked", sess["revoked"], True)
+check("the CRM directory entry is switched off (Firestore grants end)",
+      peek(f"crmUsers/{target_uid}").get("isActive"), False)
+ok("the change is audited as staff.deactivated",
+   any(e.get("action") == audit_mod.Action.STAFF_DEACTIVATED and e.get("subject_id") == target_uid for e in audit_entries))
+ok("the person is emailed after the change, keyed on the event",
+   any(m.get("kind") == "staff.deactivated" and m.get("dedupe_key") for m in sent_mail))
+ok("…and given an in-app notice", peek("notifications/staff_deactivated_audit-id").get("userId") == target_uid)
+ok("the notice carries no reason text", "Left the company" not in str(peek("notifications/staff_deactivated_audit-id")))
 
-# Both calls matter, and for different reasons: `disabled` refuses NEW sign-ins
-# while `revoke_refresh_tokens` invalidates the ID token already in the browser,
-# which otherwise stays acceptable for up to an hour.
-ok("disabling and revoking are both done, not one or the other",
-   len(AUTH_CALLS["disabled"]) == 1 and len(AUTH_CALLS["revoked"]) == 1)
-
-# ── The uid, never the address ────────────────────────────────────────────────
-#
-# Two accounts can share an email across systems. Resolving the target by
-# address would disable somebody nobody revoked and leave the revoked person
-# signing in — the one mistake in this whole function that cannot be noticed
-# from the screen that made it.
-ok("the target is addressed by uid", AUTH_CALLS["disabled"][0][0] == target_uid)
-ok("and the uid is not an email", "@" not in AUTH_CALLS["disabled"][0][0])
-
-# ── Idempotence ───────────────────────────────────────────────────────────────
-reset_auth_calls()
+# Not idempotent by silence: a second deactivation is refused with a sentence.
 try:
     run(svc.deactivate(target_uid, OWNER, "Left the company"))
+    failures.append("deactivating an already-deactivated account should be refused")
+except svc.StaffError as exc:
+    ok("a second deactivation is refused and says why", "already deactivated" in str(exc))
+checks += 1
+
+# ── An inactive row cannot mint a staff session, even with an enabled login ───
+from app.core import account_state  # noqa: E402
+
+refusal = account_state.staff_refusal(row)
+ok("an enabled personal login with a deactivated staff row is refused", refusal is not None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  P1-B2 — reactivation: authorised, reasoned, audited; old sessions stay dead
+# ══════════════════════════════════════════════════════════════════════════════
+
+sent_mail.clear()
+back = run(svc.reactivate(target_uid, OWNER, "Rehired after review"))
+check("reactivated", (back["status"], back["is_active"]), ("active", True))
+check("the CRM directory entry is switched back on",
+      peek(f"crmUsers/{target_uid}").get("isActive"), True)
+check("the old session stays revoked — the person signs in again",
+      run(db[C.SESSIONS].find_one({"jti": "j-revoke-1"}))["revoked"], True)
+ok("audited as staff.reactivated",
+   any(e.get("action") == audit_mod.Action.STAFF_REACTIVATED for e in audit_entries))
+ok("the person is told", any(m.get("kind") == "staff.active" for m in sent_mail))
+ok("the personal login is still untouched", AUTH_CALLS["disabled"] == [])
+
+for label, fn, actor in (
+    ("a reason is required", lambda: svc.reactivate(target_uid, OWNER, "   "), OWNER),
+    ("nobody reactivates themselves", lambda: svc.suspend("owner-1", OWNER, "x" * 5), OWNER),
+):
+    try:
+        run(fn())
+        failures.append(f"{label}: was allowed")
+    except svc.StaffError:
+        pass
     checks += 1
-except Exception as exc:  # noqa: BLE001
+
+# A department admin reaches only their own department's MEMBERS.
+OPS_ADMIN = {"uid": "ops-admin-1", "name": "Ops Admin", "role": Role.OPS_ADMIN, "team": "ops"}
+member = invite("member@example.com", "Member", Role.OPS_MEMBER)
+finance = invite("fin@example.com", "Fin", Role.FINANCE_MEMBER)
+run(svc.suspend(member["uid"], OPS_ADMIN, "On leave this month"))
+check("an ops admin suspends an ops member", run(db[C.STAFF].find_one({"uid": member["uid"]}))["status"], "suspended")
+check("suspension refuses the account at the session guard",
+      account_state.staff_refusal(run(db[C.STAFF].find_one({"uid": member["uid"]}))).reason, "staff_suspended")
+run(svc.reactivate(member["uid"], OPS_ADMIN, "Back from leave"))
+check("…and reactivates them", run(db[C.STAFF].find_one({"uid": member["uid"]}))["status"], "active")
+try:
+    run(svc.suspend(finance["uid"], OPS_ADMIN, "Not my department"))
+    failures.append("an ops admin suspended a finance member")
+except svc.StaffError as exc:
+    ok("an ops admin cannot suspend another department", "own department" in str(exc))
+checks += 1
+
+# Owners: the observer only, and never the last active one.
+OBSERVER = {"uid": "observer:x", "name": "Observer", "role": Role.OBSERVER, "team": None}
+crm_users.collection("crmUsers").document("owner-x").set({"uid": "owner-x", "role": "superadmin", "isActive": True})
+run(db[C.STAFF].insert_one({"uid": "owner-x", "email": "ox@example.com", "name": "Owner X",
+                            "role": "owner", "team": None, "is_active": True}))
+for label, fn in (
+    ("an owner cannot suspend another owner", lambda: svc.suspend("owner-x", OWNER, "Disagreement")),
+    ("the observer cannot suspend the LAST active owner", lambda: svc.suspend("owner-x", OBSERVER, "Testing")),
+):
+    try:
+        run(fn())
+        failures.append(f"{label}: was allowed")
+    except svc.StaffError:
+        pass
     checks += 1
-    failures.append(f"revoking an already-revoked account raised {exc!r}")
-ok("a second revocation disables again rather than failing", len(AUTH_CALLS["disabled"]) == 1)
-
-# ── A missing Firebase account is not a failure ───────────────────────────────
-#
-# The observer has none by design, and a row whose account was removed by hand
-# has none either. There is nothing to revoke and that is not an error.
-reset_auth_calls()
+crm_users.collection("crmUsers").document("owner-y").set({"uid": "owner-y", "role": "superadmin", "isActive": True})
+run(db[C.STAFF].insert_one({"uid": "owner-y", "email": "oy@example.com", "name": "Owner Y",
+                            "role": "owner", "team": None, "is_active": True}))
+# P1-A3b: an Owner's Firestore/Storage MFA bindings must not survive suspension
+# or deactivation, and reactivation must not bring them back.
+from datetime import timedelta as _td  # noqa: E402
 
 
-class _NotFound(Exception):
+def _seed_binding(uid: str) -> None:
+    exp = datetime.now(timezone.utc) + _td(days=1)
+    crm_users.collection("ownerMfaSessions").document(uid).set({
+        "uid": uid, "bindings": {"sid-1": {"state": "active", "authTime": 1, "client": "crm",
+                                           "apiJti": "j", "expiresAt": exp, "createdAt": exp}}})
+
+
+def _has_binding(uid: str) -> bool:
+    return crm_users.collection("ownerMfaSessions").document(uid).get().exists
+
+
+_seed_binding("owner-x")
+run(svc.suspend("owner-x", OBSERVER, "Investigation"))
+check("with two owners, the observer suspends one", run(db[C.STAFF].find_one({"uid": "owner-x"}))["status"], "suspended")
+check("P1-A3b: suspending an Owner removes its MFA bindings", _has_binding("owner-x"), False)
+run(svc.reactivate("owner-x", OBSERVER, "Cleared"))
+check("…and restores them", run(db[C.STAFF].find_one({"uid": "owner-x"}))["status"], "active")
+check("P1-A3b: reactivation does NOT restore MFA bindings", _has_binding("owner-x"), False)
+_seed_binding("owner-x")
+run(svc.deactivate("owner-x", OBSERVER, "Left the business"))
+check("P1-A3b: deactivating an Owner removes its MFA bindings", _has_binding("owner-x"), False)
+run(svc.reactivate("owner-x", OBSERVER, "Returned"))
+_seed_binding("owner-y")
+run(svc.suspend(member["uid"], OPS_ADMIN, "Second leave"))
+check("P1-A3b: suspending a non-owner leaves Owner bindings alone", _has_binding("owner-y"), True)
+run(svc.reactivate(member["uid"], OPS_ADMIN, "Back"))
+try:
+    run(svc.reactivate(OBSERVER["uid"], OWNER, "No"))
+    failures.append("someone reactivated the observer")
+except svc.StaffError:
     pass
-
-
-svc.fb_auth.UserNotFoundError = _NotFound
-fb.fb_auth.UserNotFoundError = _NotFound
-original_update = fb.fb_auth.update_user
-fb.fb_auth.update_user = lambda uid, **k: (_ for _ in ()).throw(_NotFound("no such user"))
-
-ghost = invite("ghost@example.com", "Ghost")
-ghost_result = run(svc.deactivate(ghost["uid"], OWNER, "Never existed in Firebase"))
-check("a missing Firebase account still reports a complete revocation",
-      ghost_result["fully_revoked"], True)
-
-# ── A Firebase failure must NOT be reported as success ────────────────────────
-fb.fb_auth.update_user = lambda uid, **k: (_ for _ in ()).throw(RuntimeError("quota exceeded"))
-audit_entries.clear()
-
-broken = invite("broken@example.com", "Broken")
-broken_result = run(svc.deactivate(broken["uid"], OWNER, "Firebase is down"))
-
-check("a Firebase failure is not reported as fully revoked", broken_result["fully_revoked"], False)
-ok("and the reason reaches the caller", "quota exceeded" in str(broken_result["firebase_login"]))
-ok("the application flags are still applied, so the most valuable half is done",
-   broken_result["is_active"] is False)
-ok("and the failure has its own searchable audit action",
-   any(e.get("action") == audit_mod.Action.STAFF_FIREBASE_REVOKE_FAILED for e in audit_entries))
-
-fb.fb_auth.update_user = original_update
+checks += 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +419,28 @@ except svc.StaffError as exc:
 
 # ── Result ────────────────────────────────────────────────────────────────────
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  P1-B4 — a conflicting partner record refuses the invitation, every held status
+# ══════════════════════════════════════════════════════════════════════════════
+for n, status in enumerate(("pending", "awaiting_verification", "approved", "suspended", "revoked")):
+    email = f"partner{n}@example.com"
+    acct = fake_create_user(email=email)
+    run(db[C.PARTNERS].insert_one({"_id": f"P-{n}", "kind": "agency", "status": status, "owner_crm_uid": acct.uid}))
+    try:
+        invite(email, f"Partner {n}", Role.OPS_MEMBER)
+        failures.append(f"a {status} partner record did not block the invitation")
+    except svc.StaffError as exc:
+        ok(f"a {status} partner record blocks the invitation and names it", status in str(exc))
+        ok(f"…and nothing was created for the {status} case", run(db[C.STAFF].find_one({"email": email})) is None)
+    check(f"the {status} partner record is untouched", run(db[C.PARTNERS].find_one({"_id": f"P-{n}"}))["status"], status)
+    checks += 1
+# A REJECTED application holds nothing: hiring that person is allowed.
+acct = fake_create_user(email="rejected@example.com")
+run(db[C.PARTNERS].insert_one({"_id": "P-rej", "kind": "seller", "status": "rejected", "owner_crm_uid": acct.uid}))
+hired = invite("rejected@example.com", "Rejected Applicant", Role.OPS_MEMBER)
+check("a rejected partner record does not block hiring", hired["status"], "active")
+
 if failures:
     print(f"\n{len(failures)} of {checks} checks FAILED\n")
     for f in failures:
@@ -328,10 +448,9 @@ if failures:
     sys.exit(1)
 
 print(f"\nAll {checks} staff-revocation and invite-safety checks passed.")
-print("  · revocation disables the Firebase account AND revokes its refresh tokens")
-print("  · the target is resolved by uid, never by email address")
-print("  · a Firebase failure is audited and never reported as a complete revocation")
-print("  · a missing Firebase account is not a failure")
+print("  · revocation ends staff access and leaves the personal app account untouched (P1-B1)")
+print("  · suspension and reactivation follow the hierarchy, need a reason, and are audited (P1-B2/B3)")
+print("  · old sessions stay revoked after reactivation; the person is notified (P1-F)")
 print("  · an invitation onto an existing account sends no password link")
 print("  · and a send that could not happen is never announced as sent")
 sys.exit(0)

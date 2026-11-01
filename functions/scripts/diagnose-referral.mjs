@@ -17,8 +17,15 @@
 
 import admin from 'firebase-admin'
 import { createRequire } from 'module'
+import { guardKeyScript } from './_keyScriptGuard.mjs'
 
 const require = createRequire(import.meta.url)
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('diagnose-referral', {
+  keyPath: new URL('../../serviceAccountKey.json', import.meta.url),
+  writes: false,
+})
 const serviceAccount = require('../../serviceAccountKey.json')
 
 const code = (process.argv[2] ?? '').trim().toUpperCase()

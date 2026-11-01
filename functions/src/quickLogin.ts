@@ -28,6 +28,9 @@
 import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
+import {
+  quickLoginMintRefusal, presentedSessionId, DISPLACED_MESSAGE, SESSION_DISPLACED, ACCOUNT_RESTRICTED,
+} from './mobileSession'
 
 import {
   CHALLENGE_TTL_MS,
@@ -44,6 +47,7 @@ import {
   statementProblem,
   type QuickLoginOutcome,
 } from './quickLoginPolicy'
+import { MAX_APPEAL_SLOTS, appealIsPending, reappealProblem, restrictionKeyOf, selfAppealId } from './appealIds'
 
 function store(): admin.firestore.Firestore {
   return admin.firestore()
@@ -54,6 +58,8 @@ const CHALLENGES = 'quickLoginChallenges'
 const RATE = 'quickLoginRate'
 const EVENTS = 'authEvents'
 const APPEALS = 'appeals'
+/** `appeals.source` of one filed on the public web form (backend `public_appeals.SOURCE`). */
+const PUBLIC_WEB_SOURCE = 'public_web'
 
 /** SHA-256 hex. The credential document id, so the raw secret is never stored. */
 function hash(value: string): string {
@@ -78,7 +84,7 @@ function fingerprint(value: string): string {
  *
  * Never carries a secret, a signature or a challenge.
  */
-async function recordEvent(
+export async function recordEvent(
   event: string,
   fields: Record<string, unknown>,
 ): Promise<void> {
@@ -205,6 +211,23 @@ export const mintQuickLoginToken = functions
      */
     if (userSnap.get('isDeleted') === true) {
       throw new functions.https.HttpsError('failed-precondition', 'This account is being deleted.')
+    }
+
+    // Phase 1A (SESSION-002): no credential for a displaced or restricted
+    // provider-backed session. Guests unchanged — see quickLoginMintRefusal.
+    const refused = quickLoginMintRefusal({
+      token: context.auth?.token as Record<string, unknown> | undefined,
+      get: (f) => userSnap.get(f),
+      presented: presentedSessionId(data),
+    })
+    if (refused) {
+      throw new functions.https.HttpsError(
+        'permission-denied',
+        refused === 'displaced'
+          ? DISPLACED_MESSAGE
+          : 'This account is restricted and cannot set up quick sign-in.',
+        { code: refused === 'displaced' ? SESSION_DISPLACED : ACCOUNT_RESTRICTED },
+      )
     }
 
     const secret = crypto.randomBytes(32).toString('base64url')
@@ -379,17 +402,41 @@ export const redeemQuickLogin = functions
      * The challenge transaction above is still needed and still does a different
      * job: it stops the SAME challenge being spent twice. This one stops the
      * same CREDENTIAL being spent twice. Neither subsumes the other.
+     *
+     * ── THE ANSWER IS THE COMMITTED ATTEMPT'S RETURN VALUE, AND NOTHING ELSE ──
+     *
+     * This used to record success in a variable OUTSIDE the callback
+     * (`consumed = true` after the writes). Under contention Firestore rolls an
+     * attempt back and runs the callback AGAIN; the retry found the credential
+     * gone and returned without writing — but the variable still said `true`
+     * from the attempt that was rolled back. Every loser of the race therefore
+     * minted a custom token and was handed a replacement secret that was never
+     * stored: 2 simultaneous redemptions gave 2 sessions, 5 gave 5 (the
+     * cross-system emulator test, 2026-10-20). The serialising test fake never
+     * retries, so it could not show it.
+     *
+     * `runTransaction` resolves with the value returned by the attempt that
+     * COMMITTED. So the decision is that value: `true` only from the one attempt
+     * whose deletion of this credential (and creation of its replacement) was
+     * committed atomically; `false` from an attempt that found it gone. Nothing
+     * is carried between attempts. `consumeChallenge` below already worked this
+     * way, which is why a race on ONE challenge never let two through.
+     *
+     * The invariant: a credential document is consumed by at most one committed
+     * transaction, and only that redemption mints a session or hands out the
+     * replacement. `quickLoginContention.test.js` (fake with real retry) and
+     * `tests/crosssys/functions.crosssys.test.cjs` (emulator) pin it.
      */
     const replacement = crypto.randomBytes(32).toString('base64url')
     const replacementRef = store().collection(CREDENTIALS).doc(hash(replacement))
 
-    let consumed = false
+    let consumed: boolean
     try {
-      await store().runTransaction(async (tx) => {
+      consumed = await store().runTransaction(async (tx): Promise<boolean> => {
         const fresh = await tx.get(credRef)
         // Lost the race, or revoked in the microseconds since the first read.
         // Returning without writing is what makes the loser harmless.
-        if (!fresh.exists) return
+        if (!fresh.exists) return false
 
         tx.delete(credRef)
         tx.set(
@@ -402,7 +449,7 @@ export const redeemQuickLogin = functions
         )
         // The counter goes with the credential it belonged to.
         tx.delete(rateRef)
-        consumed = true
+        return true
       })
     } catch (err) {
       /*
@@ -815,7 +862,7 @@ export const submitAccountAppeal = functions
     }
 
     const name = String(accountSnap?.get('name') ?? '')
-    const written = await store().collection(APPEALS).add({
+    const appeal = {
       subjectUid: uid,
       subjectName: name,
       raisedByUid: uid,
@@ -832,7 +879,45 @@ export const submitAccountAppeal = functions
       status: 'pending',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       originalDecidedBy: '',
+    }
+
+    /*
+     * FX-13 (RF-19): placed at the restriction's deterministic id, in one
+     * transaction — not checked, then added. The check above stays for the
+     * appeals filed before this (automatic ids); this is what stops the app
+     * and this path, or two devices, from both filing one at the same moment.
+     */
+    const restriction = restrictionKeyOf((accountSnap?.exists ? accountSnap.data() : {}) ?? {})
+    const placed = await store().runTransaction(async (tx) => {
+      const decided: unknown[] = []
+      for (let slot = 1; slot <= MAX_APPEAL_SLOTS; slot += 1) {
+        const ref = store().collection(APPEALS).doc(selfAppealId(uid, restriction, slot))
+        const snap = await tx.get(ref)
+        if (!snap.exists) {
+          // RC (confirmed): after a decision, only new evidence or a new reason.
+          const problem = reappealProblem(decided, String((appeal as { statement?: unknown }).statement ?? ''),
+            Array.isArray((appeal as { evidenceUrls?: unknown }).evidenceUrls)
+              ? ((appeal as { evidenceUrls: unknown[] }).evidenceUrls).length : 0)
+          if (problem) return { id: ref.id, created: false, refused: problem }
+          tx.set(ref, appeal)
+          return { id: ref.id, created: true }
+        }
+        if (appealIsPending(snap.data())) return { id: ref.id, created: false }
+        decided.push(snap.get('statement'))
+      }
+      // RC: every slot holds a decided appeal — the deterministic ids are the
+      // only ids the rules accept, so there is nowhere left to file.
+      return { id: '', created: false, refused: 'This restriction has been appealed too many times.' }
     })
+    if ('refused' in placed && placed.refused) {
+      throw new functions.https.HttpsError('failed-precondition', String(placed.refused),
+        { reason: 'reappeal_needs_new_evidence', code: 'reappeal_needs_new_evidence' })
+    }
+    if (!placed.created) {
+      await recordEvent('ACCOUNT_APPEAL_DUPLICATE', { uid })
+      return { status: 'already_pending' as const, appeal: await appealStateFor(uid) }
+    }
+    const written = { id: placed.id }
 
     await recordEvent('ACCOUNT_APPEAL_SUBMITTED', {
       uid,
@@ -896,9 +981,14 @@ async function appealStateFor(uid: string): Promise<{
       .collection(APPEALS)
       .where('subjectUid', '==', uid)
       .where('status', '==', 'pending')
-      .limit(1)
+      .limit(5)
       .get()
-    pending = !open.empty
+    // UGP review: an appeal filed on the PUBLIC web form proves nothing about
+    // who filed it — anybody who knows the account id can. It must not stop
+    // the account's owner, who has just proved themselves with this device's
+    // key, from filing their own; the reviewer sees both, and the public one
+    // is labelled as unverified in the CRM.
+    pending = open.docs.some((d) => d.get('source') !== PUBLIC_WEB_SOURCE)
   } catch (err) {
     /*
      * A read that failed is not a "no appeal" — but it is reported as one, and
@@ -917,10 +1007,11 @@ async function appealStateFor(uid: string): Promise<{
       .collection(APPEALS)
       .where('subjectUid', '==', uid)
       .orderBy('createdAt', 'desc')
-      .limit(1)
+      .limit(5)
       .get()
-    if (last.empty) return none
-    const doc = last.docs[0]
+    // The person's own last appeal — not a stranger's from the public form.
+    const doc = last.docs.find((d) => d.get('source') !== PUBLIC_WEB_SOURCE)
+    if (!doc) return none
     const status = String(doc.get('status') ?? '')
     if (!status || status === 'pending') return none
     return {

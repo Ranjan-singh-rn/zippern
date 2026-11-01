@@ -3,9 +3,7 @@ import {
   doc,
   getDocs,
   addDoc,
-  setDoc,
   updateDoc,
-  deleteDoc,
   query,
   where,
   orderBy,
@@ -14,6 +12,7 @@ import {
   serverTimestamp,
 } from 'firebase/firestore'
 import { db } from '@/lib/firebase'
+import { users as usersApi, tickets as apiTickets, type DeviceBanResult, type DeviceType } from '@/lib/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -99,8 +98,9 @@ export async function getReports(status?: string): Promise<Report[]> {
 
 // bannedDevices only ever grows — devices are soft-unbanned (isActive: false),
 // never deleted — so this read needs a bound. The orderBy('bannedAt') was
-// already here and is left as-is: both writers (banDevice below, and the Android
-// app's auto-ban in AuthRepository) set bannedAt, so nothing is excluded.
+// already here and is left as-is: the server-side writers (the API's ban and
+// device-ban routes, and `barDevice` in the Functions) set bannedAt, so nothing
+// is excluded. No client writes this collection any more (GOV C6).
 // Callers receiving exactly BANNED_DEVICE_LIMIT rows should say so in the UI —
 // older bans then exist off-list.
 export const BANNED_DEVICE_LIMIT = 500
@@ -112,46 +112,45 @@ export async function getBannedDevices(max: number = BANNED_DEVICE_LIMIT): Promi
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as BannedDevice))
 }
 
-// IMPORTANT — the document ID *must* be the deviceId.
+// ── Writing a device ban: through the API, never from this browser ──────────
 //
-// The Android app enforces device bans by reading this exact path:
-//   AuthRepository.getDeviceBanReason() → bannedDevices.document(deviceId)
-//   SplashScreen                        → bannedDevices.document(deviceId)
+// GOV C6 (B30). These two used to write `bannedDevices` straight from the
+// browser — `setDoc` keyed by the device id, `deleteDoc` to lift — which the
+// rules allowed for any ops login, `ops_member` included. That was a second,
+// unaudited ban system: no reason kept, no actor the server could trust (the
+// `bannedBy` uid was whatever the caller passed), no `manualBan` mark, and an
+// unban that could delete a ban somebody else's decision had placed.
 //
-// This previously used addDoc(), which generates a random document ID, so the
-// app's lookup never found CRM-issued bans and **no ban created from the CRM was
-// ever enforced**. setDoc keyed by deviceId fixes that, and additionally makes
-// re-banning the same device idempotent instead of creating duplicate rows.
+// `firestore.rules` now refuses every client write on `bannedDevices`, and the
+// two functions call the audited endpoints instead — the same ones
+// /operations/bans uses:
+//
+//   POST /users/devices/bans                     {device_id, device_type,
+//                                                 reason, user_uids, manual}
+//   POST /users/devices/bans/{device_id}/unban   {reason}
+//
+// The server still keys the document by the device id (the path the Android
+// app reads: AuthRepository.getDeviceBanReason / SplashScreen →
+// bannedDevices.document(deviceId)), and an unban still deletes it, because the
+// app checks only that it exists. The actor is the signed-in session, so there
+// is no `bannedByUid` parameter any more — a caller cannot name somebody else.
 export async function banDevice(
   deviceId: string,
-  deviceType: string,
+  deviceType: DeviceType,
   reason: string,
-  userUids: string[],
-  bannedByUid: string
-): Promise<void> {
-  await setDoc(doc(db, 'bannedDevices', deviceId), {
-    deviceId,
-    deviceType,
+  userUids: string[] = [],
+): Promise<DeviceBanResult> {
+  return usersApi.banDevice({
+    device_id: deviceId,
+    device_type: deviceType,
     reason,
-    userUids,
-    bannedBy: bannedByUid,
-    bannedAt: serverTimestamp(),
-    isActive: true,
+    user_uids: userUids,
   })
 }
 
-// Unban deletes the document rather than setting isActive: false.
-//
-// Both Android read paths check only `snap.exists()` — they do not read
-// isActive. A soft-unban therefore left the device permanently locked out of
-// the app with no way to restore access, which is a far worse outcome than
-// losing the ban row. Removing the document is what actually restores access
-// against the app as it ships today.
-//
-// Follow-up for the Android phase: have the app check `isActive == true` as
-// well, at which point this can go back to a soft-unban and retain history.
-export async function unbanDevice(deviceId: string): Promise<void> {
-  await deleteDoc(doc(db, 'bannedDevices', deviceId))
+/** Lift a device ban. A reason is mandatory — it is what the audit log keeps. */
+export async function unbanDevice(deviceId: string, reason: string): Promise<DeviceBanResult> {
+  return usersApi.unbanDevice(deviceId, reason)
 }
 
 // ── Ops Tickets ──────────────────────────────────────────────────────────────
@@ -193,6 +192,7 @@ export async function getFeedbackTickets(status?: string): Promise<FeedbackTicke
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as FeedbackTicket))
 }
 
-export async function updateFeedbackStatus(id: string, status: string): Promise<void> {
-  await updateDoc(doc(db, 'feedbackTickets', id), { status })
+/** P1-D: through the API (audited, actor from the session). A reason is required. */
+export async function updateFeedbackStatus(id: string, status: string, reason: string): Promise<void> {
+  await apiTickets.update('feedback', id, { status }, reason)
 }

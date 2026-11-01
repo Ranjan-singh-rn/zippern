@@ -770,10 +770,35 @@ SCOPE_CALLS = {"own_partner_id_or_403", "_own_id_or_403"}
 #: which is stated in its own docstring and asserted below.
 PARTNER_WRITE_GUARD = "require_write_or_partner"
 
+#: Decision 15 (RC): the scope of a route that names NO record — it acts on the
+#: signed-in person themselves. Accepted in place of `own_partner_id_or_403`
+#: only on a route with no path parameter and no id field in its body, which is
+#: asserted below; a route with an id in it must scope that id.
+SELF_SCOPE_CALLS = {"own_session_uid"}
+
+
+def _is_id_field(name: str) -> bool:
+    name = name.lower()
+    return name in {"id", "uid"} or name.endswith("_id") or name.endswith("_uid")
+
+
+def _model_fields(tree: ast.AST) -> dict[str, set[str]]:
+    """Each class in a router module → the names of its annotated fields."""
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            out[node.name] = {
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            }
+    return out
+
 
 def routes_of(module: str, mount: str) -> list[dict]:
     """Every route a router file declares, with the dependency guarding it."""
     tree = ast.parse((ROUTERS / f"{module}.py").read_text())
+    models = _model_fields(tree)
 
     prefix = ""
     for node in ast.walk(tree):
@@ -807,14 +832,24 @@ def routes_of(module: str, mount: str) -> list[dict]:
         # Read out of the source rather than asserted route by route, so a write
         # put on the allowlist tomorrow without one is a failing test today
         # rather than a hole nobody is looking for.
-        scopes = bool(
-            {
-                inner.func.id
-                for inner in ast.walk(node)
-                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
-            }
-            & SCOPE_CALLS
-        )
+        called = {
+            inner.func.id
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+        }
+        scopes = bool(called & SCOPE_CALLS)
+        self_scoped = bool(called & SELF_SCOPE_CALLS)
+        # Every id the request can carry into this route: its own parameters
+        # (path and query) and the fields of any body model it takes.
+        request_ids: set[str] = set()
+        for arg in list(node.args.args) + list(node.args.kwonlyargs):
+            if arg.arg in {"user", "self"}:
+                continue
+            if _is_id_field(arg.arg):
+                request_ids.add(arg.arg)
+            annotation = arg.annotation
+            if isinstance(annotation, ast.Name) and annotation.id in models:
+                request_ids |= {f for f in models[annotation.id] if _is_id_field(f)}
 
         for decorator in node.decorator_list:
             if not (
@@ -835,6 +870,8 @@ def routes_of(module: str, mount: str) -> list[dict]:
                     "endpoint": f"{module}.{node.name}",
                     "guards": guards,
                     "scopes": scopes,
+                    "self_scoped": self_scoped,
+                    "request_ids": request_ids,
                 }
             )
     return out
@@ -878,9 +915,31 @@ for route in ALL_ROUTES:
             f"{route['endpoint']} is an allowlisted write and says so in its signature",
             route["guards"] == {PARTNER_WRITE_GUARD},
         )
+        if route["self_scoped"] and not route["scopes"]:
+            # Decision 15 (RC): a write that names no record at all. Safe only
+            # while it really names none — no `{…}` in the path, and no id
+            # parameter or id field in its body — so that is what is asserted.
+            ok(
+                f"{route['endpoint']} is self-scoped and its path carries no id",
+                "{" not in route["path"],
+            )
+            ok(
+                f"{route['endpoint']} is self-scoped and its request carries no id "
+                f"(found {sorted(route['request_ids'])})",
+                not route["request_ids"],
+            )
+        else:
+            ok(
+                f"{route['endpoint']} scopes the id it is handed to the caller's own record",
+                route["scopes"],
+            )
+
+# A route that says "self-scoped" anywhere must mean it, allowlisted or not.
+for route in ALL_ROUTES:
+    if route["self_scoped"] and not route["scopes"]:
         ok(
-            f"{route['endpoint']} scopes the id it is handed to the caller's own record",
-            route["scopes"],
+            f"{route['endpoint']} calls own_session_uid and names no other account",
+            "{" not in route["path"] and not route["request_ids"],
         )
 
 # And the converse: nothing outside the allowlist wears the partner write guard.
@@ -946,9 +1005,28 @@ reachable = [row for row in table if row[2] == "scoped"]
 #
 # The count is pinned on purpose: a route joining this list is a grant to an
 # outside business, and it should cost somebody a deliberate edit here.
-check("exactly seventeen routes are partner-reachable", len(reachable), 17)
+# Nineteen. The eighteenth and nineteenth are `GET /api/documents/{kind}/{record_id}`,
+# which did not widen anything: a partner could already see its own KYC
+# documents on the dashboard, straight from the permanent
+# `?alt=media&token=` URL stored at upload. That URL is a bearer
+# credential Storage Rules are never consulted for, so the route exists
+# to take the dashboard OFF it — refusing partners here would have left
+# them on the permanent link.
+# Twenty-two: `GET /api/partner-ops/buyers/lookup`, so a coin seller can name
+# the buyer of a sale (the CRM may not list `users`). Seller-only, exact match,
+# masked contact details.
+# Twenty-five since Decision 15 (RC): `GET /api/partner-ops/me/verification`
+# and the two self-scoped POSTs beside it, so a person whose approved role is
+# waiting for BOTH verified contacts can see what is missing, start the role
+# once both are verified, and report a contact held by another account. All
+# three act on the session's own uid and take no id (asserted above).
+# Twenty-six since Decision 16 (RC): `POST /api/partner-ops/agencies/
+# {agency_id}/sub-agencies/reapply`, a parent agency filing a FRESH Sub-agency
+# application for a person whose earlier one was rejected. Scoped to the
+# caller's own agency id (asserted above), pending, holding nothing.
+check("exactly twenty-six routes are partner-reachable", len(reachable), 26)
 check(
-    "and they are the seventeen named in PARTNER_REACHABLE",
+    "and they are the twenty-six named in PARTNER_REACHABLE",
     {(row[0], row[1]) for row in reachable},
     set(deps.PARTNER_REACHABLE),
 )
@@ -966,6 +1044,10 @@ check(
     "the routes that take a bare session and were never meant for a partner",
     sorted(unlisted),
     [
+        # P1-A3 — Owner two-step sign-in. Bare session because a PENDING Owner
+        # session (mfa=False) must reach them; `owner_mfa` refuses every role
+        # but Owner (403), and a partner is stopped here before that.
+        ("GET", "/api/auth/mfa/status"),
         # Counts what is waiting on a verifier and a signer. A partner is
         # neither, and the third figure — their own cards in flight — is already
         # on /cards, scoped, with the stage attached.
@@ -990,10 +1072,22 @@ check(
         # `/partners/agencies/{id}/appeals`, which is on the allowlist and
         # filters on `agencyId`; this one is for the person deciding them.
         ("GET", "/api/users/appeals"),
+        # UGP-F: signed links to an appeal's private attachments — staff only.
+        ("GET", "/api/users/appeals/{appeal_id}/evidence"),
         ("GET", "/api/users/devices/bans"),
         ("GET", "/api/users/reports"),
         ("GET", "/api/users/{uid}/history"),
+        ("GET", "/api/users/{uid}/roles"),  # UGP-B: the CRM user page's role inventory
         ("GET", "/api/users/{uid}/warnings"),
+        # P1-A3 — enrol, confirm, verify (reachable by a pending Owner session)
+        # and replace recovery codes (a verified one; `deps` refuses pending).
+        # P1-A3b — retry binding a verified Owner's Firebase sign-in.
+        ("POST", "/api/auth/mfa/bind"),
+        ("POST", "/api/auth/mfa/bind/confirm"),
+        ("POST", "/api/auth/mfa/enrol/confirm"),
+        ("POST", "/api/auth/mfa/enrol/start"),
+        ("POST", "/api/auth/mfa/recovery-codes"),
+        ("POST", "/api/auth/mfa/verify"),
     ],
 )
 
@@ -1045,7 +1139,28 @@ check(
 # `require_write` is for: none of them is reachable by a partner. That is
 # checked one by one below.
 writes = {(row[0], row[1]) for row in table if "require_write" in row[3].split(",")}
-check("require_write guards forty-six routes", len(writes), 46)
+# Forty-eight: `POST /users/{uid}/grant-host` is gone (a host comes through an
+# application now), and three partner-role lifecycle writes arrived —
+# `partners/{id}/revoke`, `recharges/{id}/reject`, `recharges/{id}/refund`.
+# Each decides something about a partner's role or money, which is exactly why
+# none of them may be reachable by a partner.
+# 49 since UGP-B added POST /users/{uid}/restore-host.
+# 53 since the governance phase added four Owner-decided writes: recommending
+# and deciding a reinstatement of a revoked role (C2,
+# `/partner-ops/role-appeals/{id}/recommend|decide`) and filing and deciding a
+# transfer (C3, `/partner-ops/transfers`, `/partner-ops/transfers/{id}/decide`).
+# Each decides something about a partner's role or relationship, which is
+# exactly why none of them may be reachable by a partner.
+# 54 since Decision 15 (RC): `POST /partner-ops/partners/{id}/activate`, staff
+# starting an Owner-approved role whose contacts are now both verified. It
+# re-reads the verification and never bypasses it, and it decides something
+# about a partner's role — so it is not partner-reachable either.
+# 56 since P1-B2/B3: `POST /staff/{uid}/suspend` and `POST /staff/{uid}/reactivate`,
+# staff-only access decisions with the same guard as deactivation.
+# 59 since P1-D: `POST /tickets/team`, `POST /tickets/{kind}/{id}/update` and
+# `POST /tickets/support/{id}/route` — the server-authoritative ticket writes
+# that replace direct client Firestore writes. Staff only; never partner-reachable.
+check("require_write guards fifty-nine routes", len(writes), 59)
 # The four moderation operations are four distinct routes on this guard. Named
 # rather than counted, so that collapsing resume back into unban — which is the
 # defect this pins shut — is a diff somebody reads rather than a number that
@@ -1089,17 +1204,23 @@ for method, path in sorted(writes):
         (method, path) not in deps.PARTNER_REACHABLE,
     )
 
-# Exactly two writes are reachable, they are the two the spec puts in a
-# partner's hands, and everything else on the list is a read.
+# Exactly five writes are reachable, and everything else on the list is a read.
+# Two are the two the spec puts in a partner's hands (they name a seller record
+# and scope it); two are Decision 15's self-scoped verification writes (they
+# name no record at all — the subject is the session's own uid); one is
+# Decision 16's re-application, scoped to the caller's own agency.
 partner_writes = sorted(
     (row[0], row[1])
     for row in reachable
     if row[0] != "GET" and not row[1].endswith("/signout")
 )
 check(
-    "the only two writes a partner may make",
+    "the only five writes a partner may make",
     partner_writes,
     [
+        ("POST", "/api/partner-ops/agencies/{agency_id}/sub-agencies/reapply"),
+        ("POST", "/api/partner-ops/me/verification/check"),
+        ("POST", "/api/partner-ops/me/verification/conflict"),
         ("POST", "/api/partner-ops/sales"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/coin-purchases"),
     ],

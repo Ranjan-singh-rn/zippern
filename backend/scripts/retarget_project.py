@@ -376,10 +376,35 @@ def build_firebase_json(a: argparse.Namespace, body: str) -> tuple[str, list[str
         notes.append(f"firestore.location {fs.get('location')} → {a.firestore_region}")
         fs["location"] = a.firestore_region
 
-    for entry in cfg.get("storage") or []:
-        if isinstance(entry, dict) and entry.get("bucket") != a.bucket:
-            notes.append(f"storage.bucket → {a.bucket}")
-            entry["bucket"] = a.bucket
+    # ── Storage: two shapes, and only one of them names a bucket ────────────
+    #
+    # `firebase.json` used to declare storage as the ARRAY (multi-bucket) form,
+    # `[{bucket, rules}]`, and this loop rewrote the bucket on each entry. It
+    # is now the single-object form, `{rules}`, because the array form binds to
+    # a deploy TARGET that was never registered — see the `//storage` note in
+    # firebase.json.
+    #
+    # Handled explicitly rather than left to fall through. `for entry in {...}`
+    # iterates a dict's KEYS, so the old loop would have run over the string
+    # "rules", failed `isinstance(entry, dict)`, and silently rewritten
+    # nothing — a retarget that reports success and moves no bucket.
+    #
+    # The single-object form needs no rewrite at all: with no bucket named, the
+    # rules follow the project's own default bucket, so pointing `.firebaserc`
+    # at a new project is enough. That is said out loud in the notes, because
+    # "nothing to change" and "the script did not look" read identically in a
+    # diff.
+    storage_cfg = cfg.get("storage")
+    if isinstance(storage_cfg, list):
+        for entry in storage_cfg:
+            if isinstance(entry, dict) and entry.get("bucket") != a.bucket:
+                notes.append(f"storage.bucket → {a.bucket}")
+                entry["bucket"] = a.bucket
+    elif isinstance(storage_cfg, dict):
+        notes.append(
+            "storage: single-object form names no bucket, so it follows the "
+            f"new project's default ({a.bucket}) — nothing to rewrite"
+        )
 
     hosting = cfg.get("hosting")
     if isinstance(hosting, dict):

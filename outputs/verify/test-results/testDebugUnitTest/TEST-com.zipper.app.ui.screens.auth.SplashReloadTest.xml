@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.auth.SplashReloadTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.049Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="only a refused credential ends the session" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <testcase name="a permanently deleted account is told so and signed out, never entered" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.001"/>
+  <testcase name="an unreachable server keeps the session on every kind of failure" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <testcase name="the observer is still signed out without a deletion notice" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <testcase name="a role that owes a contact still continues on a cold start" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <testcase name="the splash classifies the reload failure instead of always signing out" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <testcase name="a network failure is not a dead credential" classname="com.zipper.app.ui.screens.auth.SplashReloadTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

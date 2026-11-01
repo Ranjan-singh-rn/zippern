@@ -22,10 +22,11 @@ import {
   type Dept, type DeptStaffMember,
 } from '@/lib/auth'
 import { db } from '@/lib/firebase'
-import { collection, doc, getDocs, query, serverTimestamp, updateDoc, where } from 'firebase/firestore'
+import { collection, getDocs, query, where } from 'firebase/firestore'
 import {
   getSupportTickets,
   getSupportTicketsByAssignee,
+  closeTicket,
   respondToTicket,
   setSupportTicketStatus,
   setSupportTicketPriority,
@@ -460,9 +461,16 @@ function DetailPanel({
 
   async function handleStatus(s: SupportTicketStatus) {
     if (s === 'closed') { setClosing(true); return }
+    let reason = ''
+    if (ticket.status === 'closed') {
+      // Reopening needs a reason the server keeps in the audit log.
+      const r = window.prompt('A reason is required to reopen this ticket. It is kept in the audit log.')
+      if (r === null || r.trim().length < 3) return
+      reason = r.trim()
+    }
     setSending(true)
     try {
-      await setSupportTicketStatus(ticket.id, s)
+      await setSupportTicketStatus(ticket.id, s, reason)
       onAction()
     } catch (e) {
       setMsg({ type: 'error', text: e instanceof Error ? e.message : 'Failed to update status.' })
@@ -808,12 +816,8 @@ function DetailPanel({
           placeholder="Resolved by refunding the failed recharge; user confirmed…"
           onCancel={() => setClosing(false)}
           onConfirm={async (reason) => {
-            await updateDoc(doc(db, 'supportTickets', ticket.id), {
-              status: 'closed',
-              closeReason: reason,
-              closedAt: serverTimestamp(),
-              closedByName: routedByName,
-            })
+            // P1-D: the server records the closer from the session.
+            await closeTicket(ticket.id, reason)
             setClosing(false)
             onAction()
           }}
@@ -928,8 +932,10 @@ export default function TicketsPage() {
 
   useEffect(() => {
     if (!isAdmin) return
+    // P1-E: names only — `crmUsers` (contact details) is no longer readable
+    // by every admin for every colleague.
     const q = query(
-      collection(db, 'crmUsers'),
+      collection(db, 'staffRoster'),
       where('role', 'in', ['support_admin', 'support_member']),
       where('isActive', '==', true),
     )

@@ -1,0 +1,21 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/db/firebase.py
++++ b/backend/app/db/firebase.py
+@@ -1276,3 +1276,16 @@
+     except Exception:  # noqa: BLE001
+         log.exception("Firestore balance read failed for %s/%s", holder_id, currency)
+         return None
++
++
++def create_custom_token(uid: str, developer_claims: dict) -> str:
++    """P1-A3b: a Firebase custom token for `uid` carrying `developer_claims`.
++
++    On Cloud Run the Admin SDK signs through the IAM `signBlob` API, which needs
++    the runtime service account to hold `roles/iam.serviceAccountTokenCreator`
++    on itself and the IAM Service Account Credentials API enabled. Against the
++    Auth emulator the SDK emits an unsigned token the emulator accepts.
++    The returned token is a credential: never log it.
++    """
++    token = fb_auth.create_custom_token(uid, developer_claims)
++    return token.decode() if isinstance(token, bytes) else str(token)

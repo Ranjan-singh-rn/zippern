@@ -1,0 +1,249 @@
+/**
+ * firestore.rules — Phase 1 team-governance regression tests (Firestore emulator).
+ *
+ *   P1-A1  internal team tickets (`techTickets`) are STAFF-only; partners,
+ *          hosts, normal users, signed-out and deactivated logins are refused.
+ *          A coin seller lists only its own coin purchase requests.
+ *   P1-D   ticket writes are server-only: no client (staff included) creates
+ *          or edits a team ticket, or edits/deletes a feedback or support
+ *          ticket. App users still file and read their own; staff still read.
+ *   P1-E   staff contact details (crmUsers) are read by the holder, an Owner,
+ *          and a department admin for their own department's members only.
+ *          Every member of staff reads names from staffRoster, which no client
+ *          writes.
+ *
+ * Same harness as firestore.ugp.rules.test.mjs (ok/no thunks, classified
+ * failures, one P1GOV-RESULT line). `demo-` project id: never a real project.
+ *
+ * Run from the repository root (needs Java + firebase CLI):
+ *   firebase emulators:exec --only firestore --project demo-zipper "node tests/firestore.p1gov.rules.test.mjs"
+ */
+
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { initializeTestEnvironment } from '@firebase/rules-unit-testing'
+import { doc, setDoc, getDoc, updateDoc, addDoc, collection, getDocs, query, where } from 'firebase/firestore'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const RULES_PATH = process.env.ZIPPER_RULES_FILE || join(here, '..', 'firestore.rules')
+const RULES = readFileSync(RULES_PATH, 'utf8')
+const RULES_SHA256 = createHash('sha256').update(RULES, 'utf8').digest('hex')
+console.log(`rules under test: ${RULES_PATH}`)
+// The exact bytes uploaded to the emulator below — the runner compares this
+// with the file it meant to test.
+console.log(`rules sha256: ${RULES_SHA256}`)
+
+// ── The check harness ───────────────────────────────────────────────────────
+const tally = { checks: 0, failures: 0, ok_denied: 0, ok_error: 0, no_allowed: 0, no_error: 0 }
+const failed = []
+
+function isPermissionDenied(err) {
+  const code = String(err?.code ?? '').toLowerCase()
+  const msg = String(err?.message ?? '').toLowerCase()
+  return code === 'permission-denied' || code === 'permission_denied'
+    || msg.includes('permission_denied') || msg.includes('permission denied')
+}
+
+/** Run one request: 'allowed', 'denied' (by the rules), or 'error' (anything else). */
+async function outcomeOf(run) {
+  try {
+    await run()
+    return { kind: 'allowed' }
+  } catch (err) {
+    return { kind: isPermissionDenied(err) ? 'denied' : 'error', err }
+  }
+}
+
+async function expect(claim, run, shouldPass) {
+  tally.checks += 1
+  const o = await outcomeOf(run)
+  const passed = shouldPass ? o.kind === 'allowed' : o.kind === 'denied'
+  if (passed) return
+  tally.failures += 1
+  const tag = `${shouldPass ? 'ok' : 'no'}:${o.kind}`
+  if (tag === 'ok:denied') tally.ok_denied += 1
+  else if (tag === 'ok:error') tally.ok_error += 1
+  else if (tag === 'no:allowed') tally.no_allowed += 1
+  else tally.no_error += 1
+  failed.push(`[${tag}] ${claim}`)
+  const why = o.kind === 'allowed'
+    ? 'the request was ALLOWED'
+    : String(o.err?.message ?? o.err).split('\n')[0]
+  console.error(`  FAIL  [${tag}] ${claim}\n        ${why}`)
+}
+const ok = (claim, run) => expect(claim, run, true)
+const no = (claim, run) => expect(claim, run, false)
+
+function printResult(aborted) {
+  console.log(
+    `P1GOV-RESULT checks=${tally.checks} failures=${tally.failures} ok_denied=${tally.ok_denied} ` +
+    `ok_error=${tally.ok_error} no_allowed=${tally.no_allowed} no_error=${tally.no_error} ` +
+    `aborted=${aborted ? 1 : 0} rules_sha256=${RULES_SHA256}`,
+  )
+}
+
+// ── The environment ─────────────────────────────────────────────────────────
+const testEnv = await initializeTestEnvironment({
+  projectId: 'demo-zipper',
+  firestore: { rules: RULES, host: '127.0.0.1', port: 8080 },
+})
+
+async function seed(path, data) {
+  await testEnv.withSecurityRulesDisabled(async (c) => {
+    await setDoc(doc(c.firestore(), path), data)
+  })
+}
+// One handle per context — see the note at the top.
+const handles = new Map()
+function fs(ctx) {
+  if (!handles.has(ctx)) handles.set(ctx, ctx.firestore())
+  return handles.get(ctx)
+}
+const D = (ctx, path) => doc(fs(ctx), path)
+
+async function main() {
+  await testEnv.clearFirestore()
+
+  // ── Who is who ──────────────────────────────────────────────────────────
+  const staffDoc = (uid, role, extra = {}) => seed(`crmUsers/${uid}`, { uid, role, isActive: true, ...extra })
+  await staffDoc('uidOwner', 'superadmin')
+  await staffDoc('uidTechAdmin', 'tech_admin')
+  await staffDoc('uidOpsMember', 'ops_member')
+  await staffDoc('uidSupport', 'support_member')
+  await staffDoc('uidGone', 'ops_member', { isActive: false })
+  await seed('crmUsers/uidAgency', { uid: 'uidAgency', role: 'agency', isActive: true, status: 'approved', agencyId: 'AG1', roleStatus: { agency: 'approved' } })
+  await seed('crmUsers/uidSubAg', { uid: 'uidSubAg', role: 'agency', isActive: true, status: 'approved', agencyId: 'AG_SUB', roleStatus: { agency: 'approved' } })
+  await seed('crmUsers/uidSeller', { uid: 'uidSeller', role: 'seller', isActive: true, status: 'approved', sellerId: 'SL1', roleStatus: { seller: 'approved' } })
+  await seed('crmUsers/uidSeller2', { uid: 'uidSeller2', role: 'seller', isActive: true, status: 'approved', sellerId: 'SL2', roleStatus: { seller: 'approved' } })
+  await seed('users/uidHost', { name: 'h', isHost: true })
+  await seed('users/uidUser', { name: 'u' })
+
+  const ctx = (uid) => testEnv.authenticatedContext(uid, { email: `${uid}@example.test`, email_verified: true })
+  const owner = ctx('uidOwner'), techAdmin = ctx('uidTechAdmin'), opsMember = ctx('uidOpsMember')
+  const support = ctx('uidSupport'), gone = ctx('uidGone')
+  const agency = ctx('uidAgency'), subAg = ctx('uidSubAg'), seller = ctx('uidSeller')
+  const host = ctx('uidHost'), user = ctx('uidUser'), nobody = testEnv.unauthenticatedContext()
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('P1-A1 — internal team tickets are staff-only')
+  // ══════════════════════════════════════════════════════════════════════════
+  const TICKET = { title: 'Routed app ticket', description: 'An app user wrote this.', category: 'support',
+    priority: 'medium', status: 'open', source: 'app', assignedTeam: 'tech', reportedBy: 'Support', labels: [], attachmentUrls: [] }
+  await seed('techTickets/T1', TICKET)
+
+  for (const [who, c] of [['the owner', owner], ['a tech admin', techAdmin], ['an ops member', opsMember], ['a support member', support]]) {
+    await ok(`${who} reads an internal ticket`, () => getDoc(D(c, 'techTickets/T1')))
+  }
+  await ok('a staff member lists the board', () => getDocs(collection(fs(opsMember), 'techTickets')))
+  // P1-D: filing and moving go through /api/tickets — the browser cannot.
+  await no('a staff member cannot file a ticket from the browser', () => setDoc(D(opsMember, 'techTickets/T_NEW'), TICKET))
+  await no('a staff member cannot move a ticket from the browser', () => updateDoc(D(techAdmin, 'techTickets/T1'), { status: 'in_progress' }))
+  await no('the owner cannot rewrite the reporter from the browser', () => updateDoc(D(owner, 'techTickets/T1'), { reportedBy: 'Someone else' }))
+
+  for (const [who, c] of [['an agency', agency], ['a sub-agency', subAg], ['a coin seller', seller], ['a host', host], ['a normal user', user], ['a signed-out caller', nobody], ['a deactivated staff login', gone]]) {
+    await no(`${who} cannot read an internal ticket`, () => getDoc(D(c, 'techTickets/T1')))
+    await no(`${who} cannot list the board`, () => getDocs(collection(fs(c), 'techTickets')))
+    await no(`${who} cannot file a ticket`, () => setDoc(D(c, `techTickets/T_${Math.random().toString(36).slice(2)}`), TICKET))
+    await no(`${who} cannot edit a ticket`, () => updateDoc(D(c, 'techTickets/T1'), { status: 'done' }))
+  }
+  await no('only an owner deletes a ticket (ops member refused)', () => import('firebase/firestore').then(m => m.deleteDoc(D(opsMember, 'techTickets/T1'))))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('P1-D — feedback and support tickets: app users file, the server edits')
+  // ══════════════════════════════════════════════════════════════════════════
+  const { deleteDoc } = await import('firebase/firestore')
+  for (const col of ['feedbackTickets', 'supportTickets']) {
+    await seed(`${col}/F1`, { userId: 'uidUser', subject: 'Coins missing', message: 'I paid', status: 'open', priority: 'medium' })
+    await ok(`${col}: an app user files their own`, () => setDoc(D(user, `${col}/NEW_${col}`), { userId: 'uidUser', subject: 's', message: 'm', status: 'open' }))
+    await no(`${col}: an app user cannot file one as somebody else`, () => setDoc(D(user, `${col}/FORGED_${col}`), { userId: 'uidHost', subject: 's', message: 'm', status: 'open' }))
+    await ok(`${col}: the app user reads their own`, () => getDoc(D(user, `${col}/F1`)))
+    await no(`${col}: another app user cannot read it`, () => getDoc(D(host, `${col}/F1`)))
+    for (const [who, c] of [['the owner', owner], ['a support member', support], ['an ops member', opsMember]]) {
+      await ok(`${col}: ${who} reads it`, () => getDoc(D(c, `${col}/F1`)))
+      await no(`${col}: ${who} cannot edit it from the browser`, () => updateDoc(D(c, `${col}/F1`), { status: 'closed', statusChangedByName: 'Forged' }))
+      await no(`${col}: ${who} cannot delete it from the browser`, () => deleteDoc(D(c, `${col}/F1`)))
+    }
+    await no(`${col}: the app user cannot edit their own (e.g. mark it resolved)`, () => updateDoc(D(user, `${col}/F1`), { status: 'resolved' }))
+    await no(`${col}: an agency cannot read it`, () => getDoc(D(agency, `${col}/F1`)))
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('P1-A1 — a seller lists only its own coin purchase requests')
+  // ══════════════════════════════════════════════════════════════════════════
+  await seed('sellers/SL1', { crmUid: 'uidSeller', displayName: 's1' })
+  await seed('sellers/SL2', { crmUid: 'uidSeller2', displayName: 's2' })
+  await seed('coinPurchaseRequests/P1', { sellerUid: 'SL1', coinsRequested: 100, status: 'pending' })
+  await seed('coinPurchaseRequests/P2', { sellerUid: 'SL2', coinsRequested: 200, status: 'pending' })
+  const cpr = (c) => collection(fs(c), 'coinPurchaseRequests')
+  await ok('a seller lists its own requests (the dashboard query)', () => getDocs(query(cpr(seller), where('sellerUid', '==', 'SL1'))))
+  await no('a seller cannot list another seller\'s requests', () => getDocs(query(cpr(seller), where('sellerUid', '==', 'SL2'))))
+  await no('a seller cannot list every request by leaving the filter off', () => getDocs(cpr(seller)))
+  await no('an agency cannot list purchase requests', () => getDocs(cpr(agency)))
+  await ok('finance / owner still list all', () => getDocs(cpr(owner)))
+
+  // ══════════════════════════════════════════════════════════════════════════
+  console.log('P1-E — staff contact details are least-privilege; names come from staffRoster')
+  // ══════════════════════════════════════════════════════════════════════════
+  const CONTACT = { phone: '+910000000000', personalEmail: 'p@example.test', address: 'x' }
+  await staffDoc('uidEOpsAdmin', 'ops_admin', { dept: 'ops', ...CONTACT })
+  await staffDoc('uidEOpsAdmin2', 'ops_admin', { dept: 'ops', ...CONTACT })
+  await staffDoc('uidEOpsMember', 'ops_member', { dept: 'ops', ...CONTACT })
+  await staffDoc('uidEOpsMember2', 'ops_member', { dept: 'ops', ...CONTACT })
+  await staffDoc('uidETechMember', 'tech_member', { dept: 'tech', ...CONTACT })
+  await staffDoc('uidETechAdmin', 'tech_admin', { dept: 'tech', ...CONTACT })
+  const eOpsAdmin = ctx('uidEOpsAdmin'), eOpsMember = ctx('uidEOpsMember'), eTechAdmin = ctx('uidETechAdmin')
+  const eTechMember = ctx('uidETechMember')
+
+  await ok('a member reads their own document', () => getDoc(D(eOpsMember, 'crmUsers/uidEOpsMember')))
+  await ok('an Owner reads any staff document', () => getDoc(D(owner, 'crmUsers/uidEOpsMember')))
+  await ok('an Owner reads a partner document', () => getDoc(D(owner, 'crmUsers/uidAgency')))
+  await ok('a department admin reads a member of their own department', () => getDoc(D(eOpsAdmin, 'crmUsers/uidEOpsMember')))
+  await no('a department admin cannot read another department\'s member', () => getDoc(D(eTechAdmin, 'crmUsers/uidEOpsMember')))
+  await no('a department admin cannot read a fellow admin\'s contacts', () => getDoc(D(eOpsAdmin, 'crmUsers/uidEOpsAdmin2')))
+  await no('a department admin cannot read an Owner\'s document', () => getDoc(D(eOpsAdmin, 'crmUsers/uidOwner')))
+  await no('a member cannot read a colleague\'s contact details', () => getDoc(D(eOpsMember, 'crmUsers/uidEOpsMember2')))
+  await no('a member cannot read their own admin\'s contact details', () => getDoc(D(eOpsMember, 'crmUsers/uidEOpsAdmin')))
+  await no('a member cannot read a partner\'s document', () => getDoc(D(eTechMember, 'crmUsers/uidAgency')))
+  await no('a department admin cannot read a partner\'s document', () => getDoc(D(eOpsAdmin, 'crmUsers/uidSeller')))
+  await no('a member cannot list crmUsers', () => getDocs(collection(fs(eOpsMember), 'crmUsers')))
+  await no('a department admin cannot list every crmUsers document', () => getDocs(collection(fs(eOpsAdmin), 'crmUsers')))
+  await no('a partner cannot read a staff document', () => getDoc(D(agency, 'crmUsers/uidEOpsMember')))
+
+  await seed('staffRoster/uidEOpsMember', { uid: 'uidEOpsMember', name: 'Ops Member', role: 'ops_member', dept: 'ops', isActive: true })
+  await seed('staffRoster/uidEOpsAdmin', { uid: 'uidEOpsAdmin', name: 'Ops Admin', role: 'ops_admin', dept: 'ops', isActive: true })
+  await ok('a member reads the names-only roster (assignee pickers)', () =>
+    getDocs(query(collection(fs(eTechMember), 'staffRoster'), where('role', 'in', ['ops_admin', 'ops_member']))))
+  await ok('a support member lists the roster', () => getDocs(collection(fs(support), 'staffRoster')))
+  for (const [who, c] of [['an agency', agency], ['a coin seller', seller], ['a normal user', user], ['a signed-out caller', nobody], ['a deactivated staff login', gone]]) {
+    await no(`${who} cannot read the staff roster`, () => getDocs(collection(fs(c), 'staffRoster')))
+  }
+  await no('no client writes the roster (not even an Owner)', () => setDoc(D(owner, 'staffRoster/uidX'), { name: 'x', role: 'ops_admin' }))
+  await no('a member cannot rename themselves on the roster', () => updateDoc(D(eOpsMember, 'staffRoster/uidEOpsMember'), { name: 'Boss' }))
+}
+
+// ── Result ──────────────────────────────────────────────────────────────────
+let aborted = false
+try {
+  await main()
+} catch (err) {
+  // Seeding or the harness itself failed: the run is incomplete, and says so.
+  aborted = true
+  console.error(`ABORTED: ${String(err?.message ?? err).split('\n')[0]}`)
+} finally {
+  await testEnv.cleanup().catch(() => undefined)
+}
+if (tally.failures > 0) {
+  console.error(`\n${tally.failures} of ${tally.checks} P1 governance rule checks FAILED:`)
+  for (const f of failed) console.error(`  · ${f}`)
+}
+if (!aborted && tally.failures === 0) console.log(`\nAll ${tally.checks} P1 governance rule checks passed.`)
+printResult(aborted)
+// Not `process.exit()` here: stdout to a pipe is asynchronous on macOS, and an
+// immediate exit can drop the UGP-RESULT line the runner reads. The exit code
+// is set and the process ends once the output has drained; the unref'd timer
+// only matters if a stray handle would otherwise keep the emulator run waiting.
+const code = aborted || tally.failures > 0 ? 1 : 0
+process.exitCode = code
+setTimeout(() => process.exit(code), 2000).unref()

@@ -25,6 +25,8 @@ import {
 } from '@/lib/apiPartners'
 import { CurrencyNote, FromTheServer, Section, Th } from './MoneyUI'
 import type { Period } from './MoneyUI'
+import type { RosterHost } from './HostEarnings'
+import { ID_LABEL } from '@/lib/identity'
 
 export function CommissionDerivation({
   basis,
@@ -32,6 +34,7 @@ export function CommissionDerivation({
   rule,
   period,
   loading,
+  roster = [],
 }: {
   basis: CommissionBasis | null
   /** The server's own sentence for why the derivation could not be run. */
@@ -40,7 +43,10 @@ export function CommissionDerivation({
   rule: string
   period: Period
   loading: boolean
+  /** B1: the agency's own roster (already loaded by AgencyMoney) — names for the host ids. */
+  roster?: ReadonlyArray<RosterHost>
 }) {
+  const rosterName = (uid: string) => (roster.find((r) => r.uid === uid)?.name ?? '').trim()
   if (loading) {
     return (
       <Section
@@ -292,7 +298,7 @@ export function CommissionDerivation({
       />
 
       {/* ── Per-host shares ───────────────────────────────────────────────── */}
-      <HostShares basis={basis} />
+      <HostShares basis={basis} rosterName={rosterName} />
     </Section>
   )
 }
@@ -450,7 +456,7 @@ function SlabTable({
  * total, and this splits that one figure by the beans each host cashed out. The
  * server says as much on every row and this shows it rather than paraphrasing.
  */
-function HostShares({ basis }: { basis: CommissionBasis }) {
+function HostShares({ basis, rosterName }: { basis: CommissionBasis; rosterName: (uid: string) => string }) {
   if (basis.hosts.length === 0) {
     return (
       <div className="border-t border-slate-800 px-4 sm:px-5 py-4">
@@ -492,8 +498,11 @@ function HostShares({ basis }: { basis: CommissionBasis }) {
             {basis.hosts.map((h) => (
               <tr key={h.host_id} className="border-b border-slate-800/60 last:border-0">
                 <td className="px-4 sm:px-5 py-3">
-                  <p className="text-slate-200 text-sm font-mono truncate max-w-[10rem] sm:max-w-none">
-                    {h.host_id}
+                  {rosterName(h.host_id) && (
+                    <p className="text-slate-200 text-sm truncate max-w-[10rem] sm:max-w-none">{rosterName(h.host_id)}</p>
+                  )}
+                  <p className={`${rosterName(h.host_id) ? 'text-slate-600 text-[11px]' : 'text-slate-200 text-sm'} font-mono truncate max-w-[10rem] sm:max-w-none`}>
+                    {ID_LABEL.host}: {h.host_id}
                   </p>
                   <p className="text-slate-600 text-[11px] mt-0.5 leading-snug">
                     {h.share_note}

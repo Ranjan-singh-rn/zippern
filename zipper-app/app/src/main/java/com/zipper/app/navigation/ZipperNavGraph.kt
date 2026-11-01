@@ -8,6 +8,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -68,7 +69,11 @@ import com.zipper.app.ui.screens.agency.AgencyDashboardScreen
 import com.zipper.app.ui.screens.seller.BuyCoinScreen
 import com.zipper.app.ui.screens.seller.SellerDashboardScreen
 import com.zipper.app.ui.screens.social.LikesScreen
-import com.zipper.app.ui.screens.host.JoinAgencyScreen
+import com.zipper.app.ui.screens.partner.PartnerApplyScreen
+import com.zipper.app.ui.screens.partner.PartnerHubScreen
+import com.zipper.app.ui.screens.partner.RechargeRequestScreen
+import com.zipper.app.ui.components.LoadingState
+import com.zipper.app.ui.components.clickableNoRipple
 import com.zipper.app.ui.theme.ZipperPink
 
 @Composable
@@ -78,9 +83,26 @@ fun ZipperNavGraph(
     // One AuthViewModel for the graph so sign-out (token clear + Firebase
     // signOut + session clear) runs from every logout entry point.
     val authVm: com.zipper.app.ui.screens.auth.AuthViewModel = hiltViewModel()
+    /*
+     * B43: the handset's own id, for the quick-login credential minted on the
+     * way out. Logout passed nothing, so the server recorded every such
+     * credential against device "" and never retired this phone's older ones.
+     * Read the same way Login, Splash and profile setup read it.
+     */
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val deviceId = remember {
+        android.provider.Settings.Secure.getString(
+            context.contentResolver, android.provider.Settings.Secure.ANDROID_ID,
+        ) ?: ""
+    }
+    /*
+     * B11: starts the sign-out and NOTHING else. Login is shown by the effect
+     * below once the sign-out has actually finished — it used to be navigated
+     * to on the next line, while the sign-out was still running, and the tail
+     * of that sign-out then wiped whatever was signed in on Login by then.
+     */
     val signOutAndGoToLogin: () -> Unit = {
-        authVm.signOut()
-        navController.navigate(Screen.Login.route) { popUpTo(0) { inclusive = true } }
+        authVm.signOut(deviceId)
     }
     /*
      * Leave only once the deletion request has actually landed.
@@ -95,6 +117,13 @@ fun ZipperNavGraph(
     LaunchedEffect(authState.accountDeleted) {
         if (authState.accountDeleted) {
             authVm.onAccountDeleted()
+            navController.navigate(Screen.Login.route) { popUpTo(0) { inclusive = true } }
+        }
+    }
+    // B11: the same shape for a sign-out — Login only once it has finished.
+    LaunchedEffect(authState.navigateToLogin) {
+        if (authState.navigateToLogin) {
+            authVm.onNavigatedToLogin()
             navController.navigate(Screen.Login.route) { popUpTo(0) { inclusive = true } }
         }
     }
@@ -162,6 +191,13 @@ fun ZipperNavGraph(
                         popUpTo(0) { inclusive = true }
                     }
                 },
+                // C7: a recovered account whose profile was never finished goes
+                // to setup, like any other sign-in — never Home half-made.
+                onRecoveredNeedsSetup = {
+                    navController.navigate(Screen.ProfileSetup.route) {
+                        popUpTo(0) { inclusive = true }
+                    }
+                },
                 // The account is gone and the session with it. Login, where the
                 // same phone number can now sign up again from scratch.
                 onDeletedForGood = {
@@ -175,30 +211,47 @@ fun ZipperNavGraph(
         /*
          * A guest turning their account into a permanent one.
          *
-         * Both exits are `popBackStack()` — back to Settings, and nowhere else.
-         * The session is not touched by this flow in either direction: on success
-         * it is the same uid with a number on it, and on a refusal it is the same
-         * uid with nothing changed at all, so there is no reason to disturb the
-         * stack and every reason not to.
+         * The session's uid is not changed by this flow in either direction: on
+         * success it is the same uid with a number on it, and on a refusal it is
+         * the same uid with nothing changed at all.
+         *
+         * UGP-C: success ends on SETTINGS, explicitly — `popBackStack()` only
+         * got there when Settings happened to be the screen underneath. Cancel
+         * is still a plain Back.
          */
         composable(Screen.SecureAccount.route) {
             SecureAccountScreen(
-                onDone = { navController.popBackStack() },
+                onDone = { navController.backToSettings(Screen.SecureAccount.route) },
                 onCancel = { navController.popBackStack() },
             )
         }
 
         /*
-         * The same thing by email.
-         *
-         * Both exits are `popBackStack()` for the same reasons as above. One
-         * extra property this destination has to keep: `MainActivity` navigates
-         * here with `launchSingleTop` when a sign-in link comes back, so if the
-         * person is already standing on it — the ordinary case, the app was
-         * simply in the background — the screen and its ViewModel are NOT
-         * recreated and the link lands in the flow that is already running.
+         * The same thing by email — by a six-digit code, inside the app (UGP-C).
+         * No link, no mail-client round trip, no deep link back into this
+         * destination: the old link flow and its `MainActivity` hand-off are
+         * gone, along with the sign-in mode this screen used to have.
          */
         composable(Screen.SecureEmail.route) {
+            SecureEmailScreen(
+                onDone = { navController.backToSettings(Screen.SecureEmail.route) },
+                onCancel = { navController.popBackStack() },
+            )
+        }
+
+        /*
+         * Approved contact rule: the same two screens, opened from the partner
+         * hub or an application form. Done — or Cancel — returns to the screen
+         * that opened them, which re-reads the server's answer on resume, so
+         * the person goes back to the application they meant to make.
+         */
+        composable(Screen.SecureAccountForPartner.route) {
+            SecureAccountScreen(
+                onDone = { navController.popBackStack() },
+                onCancel = { navController.popBackStack() },
+            )
+        }
+        composable(Screen.SecureEmailForPartner.route) {
             SecureEmailScreen(
                 onDone = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
@@ -372,33 +425,53 @@ fun ZipperNavGraph(
                 onNavigateToChat             = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
                 onNavigateToAgencyDashboard  = { navController.navigate(Screen.AgencyDashboard.route) },
                 onNavigateToSellerDashboard  = { navController.navigate(Screen.SellerDashboard.route) },
+                onNavigateToWork             = { navController.navigate(Screen.Work.route) },
                 onNavigateToFeedback         = { navController.navigate(Screen.Feedback.route) },
                 // Not popUpTo(0) here: this host is already using the app, and
                 // the capture is skippable — Back must return them to Me.
                 onNavigateToFaceVerification = { gender ->
                     navController.navigate(Screen.FaceVerification.createRoute(gender))
                 },
-                onNavigateToJoinAgency = { navController.navigate(Screen.JoinAgency.route) },
+                onNavigateToPartnerHub = { navController.navigate(Screen.PartnerHub.route) },
                 onLogout = signOutAndGoToLogin,
             )
         }
 
-        /*
-         * Redeeming an agency code on an account that already exists.
-         *
-         * Popped off the stack on success rather than left behind: the code has
-         * been consumed, so returning to the form with Back would offer a
-         * submission the server will now refuse as already used. The capture
-         * screen it hands on to is the same one the first-run flow uses.
-         */
-        composable(Screen.JoinAgency.route) {
-            JoinAgencyScreen(
+        // ── Becoming a partner ────────────────────────────────────────────
+        composable(Screen.PartnerHub.route) {
+            PartnerHubScreen(
                 onBack = { navController.popBackStack() },
-                onActivated = {
-                    navController.navigate(Screen.FaceVerification.createRoute("unknown")) {
-                        popUpTo(Screen.JoinAgency.route) { inclusive = true }
-                    }
+                onApply = { kind -> navController.navigate(Screen.PartnerApply.createRoute(kind)) },
+                onVerifyPhone = { navController.navigate(Screen.SecureAccountForPartner.route) },
+                onVerifyEmail = { navController.navigate(Screen.SecureEmailForPartner.route) },
+            )
+        }
+        composable(
+            Screen.PartnerApply.route,
+            arguments = listOf(navArgument("kind") { type = NavType.StringType }),
+        ) {
+            PartnerApplyScreen(
+                onBack = { navController.popBackStack() },
+                // Back to the hub, which re-reads eligibility and shows the
+                // application as pending; the form is popped so Back cannot
+                // re-submit it.
+                onDone = {
+                    navController.popBackStack(Screen.PartnerHub.route, inclusive = false)
                 },
+                onVerifyPhone = { navController.navigate(Screen.SecureAccountForPartner.route) },
+                onVerifyEmail = { navController.navigate(Screen.SecureEmailForPartner.route) },
+            )
+        }
+        composable(
+            Screen.RechargeRequest.route,
+            arguments = listOf(
+                navArgument("sellerId") { type = NavType.StringType },
+                navArgument("sellerName") { type = NavType.StringType },
+            ),
+        ) {
+            RechargeRequestScreen(
+                onBack = { navController.popBackStack() },
+                onDone = { navController.popBackStack() },
             )
         }
 
@@ -582,6 +655,7 @@ fun ZipperNavGraph(
                 title  = title,
                 gifts  = giftState.gifts,
                 onBack = { navController.popBackStack() },
+                isLoading = giftState.isLoading,
             )
         }
 
@@ -603,6 +677,7 @@ fun ZipperNavGraph(
                 onBack         = { navController.popBackStack() },
                 onMessage      = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
                 onViewProfile  = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
+                onPaid         = { sellerId, name -> navController.navigate(Screen.RechargeRequest.createRoute(sellerId, name)) },
             )
         }
 
@@ -717,6 +792,27 @@ fun ZipperNavGraph(
                 isAgent                       = state.user?.isAgent ?: false,
                 isSeller                      = state.user?.isSeller ?: false,
                 isGuest                       = isGuestAccount,
+                // What this account has BOUND today. Each missing one gets an
+                // "Add …" row — for every account, not only guests: a phone
+                // account may add an email and the other way round.
+                //
+                // UGP-1.7: bound = on the Auth record AND recorded on
+                // users/{uid}. Reading the Auth record alone hid the row after
+                // a link whose server bind had failed — the one state whose
+                // retry lives behind that row.
+                //
+                // Until the profile has loaded the document side is unknown, so
+                // neither row is shown — rather than both flashing up for every
+                // account and moving the layout under a finger (UGP review).
+                hasPhone                      = state.user == null || com.zipper.app.util.ContactRules.phoneBound(
+                    authPhone = FirebaseAuth.getInstance().currentUser?.phoneNumber,
+                    docPhone  = state.user?.phoneNumber,
+                ),
+                hasEmail                      = state.user == null || com.zipper.app.util.ContactRules.emailBound(
+                    authEmail         = FirebaseAuth.getInstance().currentUser?.email,
+                    authEmailVerified = FirebaseAuth.getInstance().currentUser?.isEmailVerified == true,
+                    docEmail          = state.user?.email,
+                ),
                 onThemeChange                 = { vm.saveTheme(it) },
                 onLanguageChange              = { code ->
                     vm.saveLanguage(code)
@@ -737,24 +833,8 @@ fun ZipperNavGraph(
                 onPrivacyPolicy               = { navController.navigate(Screen.LegalDoc.createRoute("privacy_policy")) },
                 onTerms                       = { navController.navigate(Screen.LegalDoc.createRoute("terms_of_service")) },
                 onLogout                      = signOutAndGoToLogin,
-                /*
-                 * NOT `signOutAndGoToLogin`. The difference is the whole point.
-                 *
-                 * `authVm.signOut()` mints a quick-login secret on the way out
-                 * so the account can be recovered with one tap; this calls
-                 * `signOutAndForget()`, which revokes that secret server-side
-                 * and erases it from Block Store, so the login screen comes back
-                 * with no "Continue as …" button on it.
-                 *
-                 * Same `popUpTo(0)` as every other sign-out: the whole stack
-                 * goes, so Back cannot walk into a screen belonging to an
-                 * account that is no longer signed in.
-                 */
-                onSignOutAndForget            = {
-                    authVm.signOutAndForget()
-                    navController.navigate(Screen.Login.route) { popUpTo(0) { inclusive = true } }
-                },
-                // Guests only — the rows are not rendered for anyone else. See
+                // UGP-E2: no "Sign out and forget this device" any more.
+                // Rendered for any account missing a bound contact. See
                 // the section in SettingsScreen for why they are the first thing
                 // on the screen for the people who do see them.
                 onSecureAccount               = { navController.navigate(Screen.SecureAccount.route) },
@@ -862,7 +942,13 @@ fun ZipperNavGraph(
 
         // ── Agency Dashboard ──────────────────────────────────────────────
         composable(Screen.AgencyDashboard.route) {
-            AgencyDashboardScreen(onBack = { navController.popBackStack() })
+            AgencyDashboardScreen(
+                onBack = { navController.popBackStack() },
+                // B2: a host row opens the host's PUBLIC profile — the same
+                // destination Home, call history and likes already use.
+                onOpenHost = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
+                onOpenHostEarnings = { id -> navController.navigate(Screen.WorkModule.createRoute("agency.hosts", id)) },
+            )
         }
 
         // ── Seller Dashboard ──────────────────────────────────────────────
@@ -873,9 +959,58 @@ fun ZipperNavGraph(
             )
         }
 
+        // ── Work (mobile parity) ──────────────────────────────────────────
+        // One hub, one list and one detail render every declared CRM capability;
+        // the API session decides what each person is offered and allowed.
+        val workNav = object : com.zipper.app.ui.screens.work.WorkNav {
+            override fun module(moduleId: String, param: String) { navController.navigate(Screen.WorkModule.createRoute(moduleId, param)) }
+            override fun detail(moduleId: String) { navController.navigate(Screen.WorkDetail.createRoute(moduleId)) }
+            override fun appProfile(uid: String) { navController.navigate(Screen.UserProfile.createRoute(uid)) }
+            override fun appLive(roomId: String) { navController.navigate(Screen.LiveViewer.createRoute(roomId)) }
+            override fun back() { navController.popBackStack() }
+        }
+        composable(Screen.Work.route) {
+            com.zipper.app.ui.screens.work.WorkHubScreen(nav = workNav)
+        }
+        composable(
+            route = Screen.WorkModule.route,
+            arguments = listOf(
+                navArgument("moduleId") { type = NavType.StringType },
+                navArgument("p") { type = NavType.StringType; defaultValue = "" },
+            ),
+        ) {
+            com.zipper.app.ui.screens.work.WorkListScreen(nav = workNav)
+        }
+        composable(
+            route = Screen.WorkDetail.route,
+            arguments = listOf(navArgument("moduleId") { type = NavType.StringType }),
+        ) {
+            com.zipper.app.ui.screens.work.WorkDetailScreen(nav = workNav)
+        }
+
         // ── Buy Coins (seller pays Zippern to top up coin inventory) ──────
         composable(Screen.BuyCoin.route) {
             BuyCoinScreen(onBack = { navController.popBackStack() })
+        }
+    }
+
+    /*
+     * B11: while a sign-out runs, cover the screen it was started from.
+     *
+     * Login now waits for the sign-out to finish — usually a second or two of
+     * network — and the screen underneath must not look idle, or invite a
+     * second tap on something that belongs to an account on its way out. A
+     * sibling of the NavHost, so it sits above whichever destination is shown;
+     * the empty click swallows taps until it goes.
+     */
+    if (authState.signingOut) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background.copy(alpha = 0.72f))
+                .clickableNoRipple { },
+        ) {
+            LoadingState()
         }
     }
 }
@@ -895,4 +1030,22 @@ fun applyAppLocale(@Suppress("UNUSED_PARAMETER") context: android.content.Contex
     else
         androidx.core.os.LocaleListCompat.forLanguageTags(languageCode)
     androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(list)
+}
+
+// ── Contact binding exit ─────────────────────────────────────────────────────
+
+/**
+ * UGP-C: a finished phone or email binding always lands on Settings.
+ *
+ * If Settings is already underneath (the ordinary case — it is the only screen
+ * with the "Add …" rows) this pops back to it, so Back from Settings behaves as
+ * it always did. Otherwise the binding screen is replaced by Settings, so Back
+ * can never return to a "Done" step for a flow that is over.
+ */
+internal fun NavHostController.backToSettings(fromRoute: String) {
+    if (popBackStack(Screen.Settings.route, inclusive = false)) return
+    navigate(Screen.Settings.route) {
+        popUpTo(fromRoute) { inclusive = true }
+        launchSingleTop = true
+    }
 }

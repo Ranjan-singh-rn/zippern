@@ -36,8 +36,11 @@ import {
 } from 'lucide-react'
 import api, {
   ApiError,
-  type Appeal, type AppealOutcome, type AppealStatus, type AppealVerdict,
+  type Appeal, type AppealEvidenceLink, type AppealOutcome, type AppealStatus, type AppealVerdict,
 } from '@/lib/api'
+import {
+  isActionable, isReviewerDecision, presentAppealStatus,
+} from '@/lib/appealStatus'
 import { Denied, Empty, ErrorState, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
@@ -50,17 +53,33 @@ const MIN_REASON = 10
 
 type Tab = 'pending' | AppealStatus | 'all'
 
+/**
+ * Waiting stays first and alone, because it is the only tab with work in it.
+ * The other three are outcomes, and `Resolved` sits with them rather than
+ * being folded into one of them — an appeal closed because an admin lifted the
+ * restriction is not an appeal somebody overturned, and burying it under
+ * `Overturned` would silently inflate how often reviewers agree with
+ * appellants.
+ */
 const TABS: { key: Tab; label: string }[] = [
   { key: 'pending', label: 'Waiting' },
   { key: 'overturned', label: 'Overturned' },
   { key: 'upheld', label: 'Upheld' },
+  { key: 'resolved', label: 'Resolved' },
   { key: 'all', label: 'All' },
 ]
 
-const STATUS_TONES: Record<string, string> = {
-  pending: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
-  upheld: 'bg-slate-700 text-slate-300 border-slate-600',
-  overturned: 'bg-green-500/15 text-green-300 border-green-500/30',
+/** What `All` means per tab, when the queue comes back empty. */
+const EMPTY_HINTS: Record<Tab, string> = {
+  pending:
+    'Every appeal raised has been decided. This is the queue reporting itself ' +
+    'empty, not a read that failed.',
+  overturned: 'No appeal has been overturned yet.',
+  upheld: 'No appeal has been upheld yet.',
+  resolved:
+    'No appeal has been closed this way yet. An appeal lands here when an ' +
+    'admin lifts the restriction directly while the appeal is still waiting.',
+  all: 'No appeal has been raised yet.',
 }
 
 /** A Firestore timestamp or an ISO string, in milliseconds. */
@@ -87,8 +106,12 @@ const STALE_DAYS = 2
 
 function isStale(a: Appeal): boolean {
   const t = millis(a.createdAt)
+  // `isActionable`, not `status === 'pending'`: stale means somebody is still
+  // waiting on us. A resolved appeal is old but nobody is waiting — the
+  // restriction is already gone — so it must not be flagged amber as if it
+  // were a neglected queue item.
   return (
-    a.status === 'pending' &&
+    isActionable(a.status) &&
     t !== null &&
     Date.now() - t > STALE_DAYS * 86400000
   )
@@ -244,11 +267,7 @@ export default function AppealsPage() {
         <div className="bg-slate-900 border border-slate-800 rounded-xl">
           <Empty
             title={tab === 'pending' ? 'Nobody is waiting on an appeal' : 'Nothing here'}
-            hint={
-              tab === 'pending'
-                ? 'Every appeal raised has been decided. This is the queue reporting itself empty, not a read that failed.'
-                : 'No appeal has reached this state yet.'
-            }
+            hint={EMPTY_HINTS[tab]}
             icon={<ShieldCheck size={26} />}
           />
         </div>
@@ -273,10 +292,23 @@ export default function AppealsPage() {
                     {' · raised by '}
                     {a.raisedByRole === 'agency'
                       ? `their agency${a.raisedByName ? ` (${a.raisedByName})` : ''}`
-                      : 'the account itself'}
+                      : a.source === 'public_web'
+                        ? `the public appeal page${a.reference ? ` · reference ${a.reference}` : ''}`
+                        : 'the account itself'}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {a.source === 'public_web' && (
+                    // UGP review: the public page identifies an account by its
+                    // id (or name + profile id) — details others can know. The
+                    // person who wrote this may not be the account's owner.
+                    <span
+                      className="text-xs px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300"
+                      title="Filed on the public web page without signing in. Anybody who knows the account id can file one — the writer is not verified as the account's owner."
+                    >
+                      Identity not verified
+                    </span>
+                  )}
                   <span
                     className={`flex items-center gap-1 text-xs px-2 py-1 rounded ${
                       isStale(a) ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-800 text-slate-400'
@@ -284,8 +316,12 @@ export default function AppealsPage() {
                   >
                     <Clock size={11} /> {age(a.createdAt)}
                   </span>
-                  <span className={`text-xs px-2 py-1 rounded border ${STATUS_TONES[a.status] ?? ''}`}>
-                    {a.status}
+                  <span
+                    className={`text-xs px-2 py-1 rounded border ${
+                      presentAppealStatus(a.status).tone
+                    }`}
+                  >
+                    {presentAppealStatus(a.status).label}
                   </span>
                   <Link
                     href={`/users/${a.subjectUid}`}
@@ -299,6 +335,10 @@ export default function AppealsPage() {
               <p className="text-slate-200 text-sm bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 whitespace-pre-wrap">
                 {a.statement}
               </p>
+
+              {(a.evidence ?? []).length > 0 && (
+                <PrivateEvidence appealId={a.id} count={(a.evidence ?? []).length} onZoom={setZoom} />
+              )}
 
               {(a.evidenceUrls ?? []).length > 0 && (
                 <div className="grid grid-cols-3 gap-2 max-w-sm mt-3">
@@ -315,14 +355,23 @@ export default function AppealsPage() {
                 </div>
               )}
 
-              {a.status === 'pending' ? (
+              {/*
+                Three branches, not two. This used to be
+                `status === 'pending' ? decide : "A reviewer said: …"`, which
+                meant every status that was not pending got presented as a
+                reviewer's decision. `resolved` has no reviewer — the server
+                refuses to name one — so the old `else` printed "A reviewer
+                said:" above a sentence nobody had said, about an appeal nobody
+                had read.
+              */}
+              {isActionable(a.status) ? (
                 <button
                   onClick={() => open(a)}
                   className="mt-4 flex items-center gap-1.5 bg-pink-500 hover:bg-pink-600 text-white font-medium rounded-lg px-4 py-2 text-sm transition-colors"
                 >
                   <Scale size={14} /> Decide this
                 </button>
-              ) : (
+              ) : isReviewerDecision(a.status) ? (
                 <div className="mt-3 border-t border-slate-800 pt-3">
                   <p className="text-slate-400 text-sm">
                     <span className="text-slate-500">{a.decidedByName || 'A reviewer'} said:</span>{' '}
@@ -334,6 +383,22 @@ export default function AppealsPage() {
                   {(a.outstanding ?? []).map((o) => (
                     <p key={o} className="text-amber-300/90 text-xs mt-1">• {o}</p>
                   ))}
+                </div>
+              ) : (
+                <div className="mt-3 border-t border-slate-800 pt-3">
+                  <p className="text-slate-400 text-sm">
+                    {presentAppealStatus(a.status).note}
+                  </p>
+                  {a.resolvedByName && (
+                    <p className="text-slate-500 text-xs mt-1.5">
+                      {a.resolvedTrigger === 'resume'
+                        ? 'The suspension was ended early by '
+                        : a.resolvedTrigger === 'unban'
+                          ? 'The ban was lifted by '
+                          : 'The restriction was removed by '}
+                      {a.resolvedByName}.
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -445,6 +510,66 @@ export default function AppealsPage() {
             </div>
           </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * UGP-F: a public-web appeal's attachments are PRIVATE objects. They are shown
+ * through fifteen-minute signed links fetched on demand, never a stored URL —
+ * images as thumbnails (click to zoom), videos in a player.
+ */
+function PrivateEvidence({
+  appealId, count, onZoom,
+}: { appealId: string; count: number; onZoom: (url: string) => void }) {
+  const [links, setLinks] = useState<AppealEvidenceLink[] | null>(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function load() {
+    setBusy(true)
+    setError('')
+    try {
+      setLinks((await api.users.appealEvidence(appealId)).evidence)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'The attachments could not be opened.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (links === null) {
+    return (
+      <div className="mt-3">
+        <button
+          onClick={load}
+          disabled={busy}
+          className="text-pink-300 hover:text-pink-200 text-xs underline underline-offset-2 disabled:opacity-50"
+        >
+          {busy ? 'Opening…' : `Show ${count} attachment${count === 1 ? '' : 's'}`}
+        </button>
+        {error && <p className="text-amber-300 text-xs mt-1">{error}</p>}
+      </div>
+    )
+  }
+  return (
+    <div className="grid grid-cols-3 gap-2 max-w-md mt-3">
+      {links.map((l, i) =>
+        !l.url ? (
+          <p key={i} className="text-amber-300 text-xs col-span-3">{l.error || 'This attachment could not be opened.'}</p>
+        ) : l.kind === 'video' ? (
+          <video key={i} src={l.url} controls className="w-full h-24 bg-black rounded-lg border border-slate-700 col-span-3" />
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            key={i}
+            src={l.url}
+            alt="Evidence"
+            onClick={() => onZoom(l.url as string)}
+            className="w-full h-20 object-cover bg-slate-950 rounded-lg border border-slate-700 hover:border-pink-500/50 cursor-zoom-in transition-colors"
+          />
+        ),
       )}
     </div>
   )

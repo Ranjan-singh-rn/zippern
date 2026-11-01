@@ -48,7 +48,14 @@ data class User(
 
     // Host
     val isHost: Boolean = false,
+    /** The agency this person works under AS A HOST. Never their own agency. */
     val agencyId: String = "",
+    /**
+     * The person's OWN Agency / Sub-agency, while they hold the Agency role.
+     * Written server-side (`syncMyRoles`, `push_app_role_flags`). Kept apart
+     * from [agencyId] so a Host who also runs a Sub-agency keeps both.
+     */
+    val ownAgencyId: String = "",
     val callRateBeans: Int = 375,
     val hostLevel: Int = 0,                  // 0–10, based on total beans earned from calls+gifts
     val hostCallEarnings: Long = 0,          // total beans from calls
@@ -234,6 +241,7 @@ data class User(
             wealthLevel = (doc.getLong("wealthLevel") ?: 0L).toInt(),
             isHost = doc.getBoolean("isHost") ?: false,
             agencyId = doc.getString("agencyId") ?: "",
+            ownAgencyId = doc.getString("ownAgencyId") ?: "",
             callRateBeans = (doc.getLong("callRateBeans") ?: 375L).toInt(),
             hostLevel = (doc.getLong("hostLevel") ?: 0L).toInt(),
             hostCallEarnings = doc.getLong("hostCallEarnings") ?: 0L,

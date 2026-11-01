@@ -16,6 +16,7 @@ from motor.motor_asyncio import (
 from pymongo import ASCENDING, DESCENDING
 
 from app.config import settings
+from app.core import isolation
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ class C:
     STAFF = "staff"                 # CRM staff and owners
     OBSERVER_OTP = "observer_otp"   # one-time codes for observer login
     SESSIONS = "sessions"           # issued session tokens (revocable)
+    #: P1-A3 — one row per Owner: encrypted TOTP secret, hashed recovery codes,
+    #: failure counter / lock, last accepted time-step (replay guard).
+    OWNER_MFA = "owner_mfa"
     AUDIT = "audit"                 # append-only history
     LEDGER = "ledger"               # every balance movement
     BALANCES = "balances"           # current balance per holder
@@ -46,7 +50,15 @@ class C:
     PARTNERS = "partners"           # agencies and sellers
     RATES = "rates"                 # versioned economy rates
     SALES = "partner_sales"         # seller → buyer diamond sales
+    #: A buyer's manual recharge through a Coin Seller: the buyer pays the
+    #: seller outside the app, files the reference and proof, and STAFF verify
+    #: before any diamond moves. The decision side of `rechargeRequests` — the
+    #: Firestore document of the same id is the app-readable mirror.
+    RECHARGES = "recharges"
     SUBAGENCY_PAYOUTS = "subagency_payouts"  # two-leg payouts via a parent agency
+    #: UGP-F: send counters for the PUBLIC appeal form (per hashed client
+    #: address and per account). Counters only — never an address in clear.
+    PUBLIC_APPEAL_RATE = "public_appeal_rate"
 
     # ── Reporting, email and alerts — Part 8A ────────────────────────────────
     # One row per attempted send, written before the provider is called and
@@ -125,12 +137,24 @@ class C:
     RECONCILIATION = "reconciliation"
 
 
-async def connect() -> None:
+async def connect(*, ensure: bool = True) -> None:
+    """Connect, behind the isolation check, then build the indexes.
+
+    `ensure=False` skips `ensure_indexes()` — which is DDL — for read-only
+    tools (`scripts/d17_legacy_partners.py`'s survey) that must not change a
+    database they only read. The isolation check runs either way.
+    """
     global _client
+    # Before a client exists: outside production only a MongoDB on this machine
+    # is allowed, and a production run off Cloud Run must be confirmed. So the
+    # `ensure_indexes()` below can never run against a database this process was
+    # not meant to reach. See app/core/isolation.py.
+    isolation.assert_mongo_allowed(settings)
     _client = AsyncIOMotorClient(settings.mongo_uri, tz_aware=True)
     await _client.admin.command("ping")
     log.info("Connected to MongoDB (%s)", settings.mongo_db)
-    await ensure_indexes()
+    if ensure:
+        await ensure_indexes()
 
 
 async def disconnect() -> None:
@@ -138,6 +162,98 @@ async def disconnect() -> None:
     if _client is not None:
         _client.close()
         _client = None
+
+
+# ── One payment reference per seller — and ONLY real references ──────────────
+#
+# This used to be `unique=True, sparse=True` on `(seller_id, reference)`. A
+# sparse COMPOUND index indexes every document that has ANY of its fields, so a
+# request with a `seller_id` and no `reference` was indexed as
+# `(seller, null)` — and the second proof-only request to the same seller was
+# refused as a duplicate. A partial index on "reference is a non-empty string"
+# indexes exactly the requests that carry a real reference, which is the rule.
+RECHARGE_REFERENCE_KEY = [("seller_id", ASCENDING), ("reference", ASCENDING)]
+RECHARGE_REFERENCE_INDEX = "recharges_seller_reference_unique"
+RECHARGE_REFERENCE_FILTER = {"reference": {"$gt": ""}}
+
+
+async def ensure_recharge_reference_index(db) -> str:
+    """Make the reference index the partial one. Idempotent; touches nothing else.
+
+    Returns "present", "created" or "replaced". Only an index on EXACTLY this
+    key pattern is ever dropped, and only when it is not already the partial
+    unique one. No document is read or written. If creation fails (it can only
+    fail on real duplicate references already stored) the failure is logged at
+    ERROR and re-raised — the submit path still refuses a reused reference with
+    its own lookup, but nobody is allowed to believe the index exists.
+    """
+    coll = db[C.RECHARGES]
+    info = await coll.index_information()
+    outcome = "created"
+    for name, spec in info.items():
+        key = [(str(k), int(v)) for k, v in spec.get("key", [])]
+        if key != RECHARGE_REFERENCE_KEY:
+            continue
+        if spec.get("unique") and spec.get("partialFilterExpression") == RECHARGE_REFERENCE_FILTER:
+            return "present"
+        await coll.drop_index(name)
+        outcome = "replaced"
+    try:
+        await coll.create_index(
+            RECHARGE_REFERENCE_KEY,
+            name=RECHARGE_REFERENCE_INDEX,
+            unique=True,
+            partialFilterExpression=RECHARGE_REFERENCE_FILTER,
+        )
+    except Exception:
+        log.exception("recharges: the (seller_id, reference) unique index could not be built")
+        raise
+    log.info("recharges: reference index %s", outcome)
+    return outcome
+
+
+#: RF-30: one recharge request per (buyer, app request id). The app sends the
+#: same id on every retry of one form, so a reply lost to a timeout can be
+#: asked for again without filing twice; two copies racing in are resolved by
+#: this index and `services.recharges` answers the loser with the winner.
+#: Partial on a non-empty id, so requests from older apps (no id) take no part.
+RECHARGE_REQUEST_ID_KEY = [("buyer_uid", ASCENDING), ("client_request_id", ASCENDING)]
+RECHARGE_REQUEST_ID_INDEX = "recharges_buyer_request_id_unique"
+RECHARGE_REQUEST_ID_FILTER = {"client_request_id": {"$gt": ""}}
+
+
+async def ensure_recharge_request_id_index(db) -> str:
+    """Build the one-request-per-app-id index. Idempotent; reads and writes no documents.
+
+    No stored request carries `client_request_id` before this release, so the
+    build cannot meet a duplicate.
+    """
+    return await db[C.RECHARGES].create_index(
+        RECHARGE_REQUEST_ID_KEY,
+        name=RECHARGE_REQUEST_ID_INDEX,
+        unique=True,
+        partialFilterExpression=RECHARGE_REQUEST_ID_FILTER,
+    )
+
+
+#: UGP-D (review): ONE deduction card per warning. Two requests in flight with
+#: the same request id both look for the warning's card, both find none and
+#: both raise one; signing both would take the money twice. With this index the
+#: second insert is refused and `services.users` answers with the first card.
+#: Partial on a string `payload.warning_id`, so no other card takes part.
+WARNING_CARD_KEY = [("payload.warning_id", ASCENDING)]
+WARNING_CARD_INDEX = "cards_one_per_warning"
+WARNING_CARD_FILTER = {"payload.warning_id": {"$type": "string"}}
+
+
+async def ensure_warning_card_index(db) -> str:
+    """Build the one-card-per-warning index. Idempotent; reads and writes no documents."""
+    return await db[C.CARDS].create_index(
+        WARNING_CARD_KEY,
+        name=WARNING_CARD_INDEX,
+        unique=True,
+        partialFilterExpression=WARNING_CARD_FILTER,
+    )
 
 
 async def ensure_indexes() -> None:
@@ -230,10 +346,20 @@ async def ensure_indexes() -> None:
     )
     # Duplicate-invoice detection, shown on the card before an owner signs.
     await db[C.CARDS].create_index([("payload.invoice_ref", ASCENDING)], sparse=True)
+    # UGP-D: one deduction card per warning (see WARNING_CARD_INDEX).
+    await ensure_warning_card_index(db)
 
     await db[C.SALES].create_index([("seller_id", ASCENDING), ("created_at", DESCENDING)])
     await db[C.SALES].create_index([("status", ASCENDING), ("created_at", DESCENDING)])
     await db[C.SALES].create_index([("buyer_uid", ASCENDING), ("created_at", DESCENDING)])
+    # Recharges: the CRM queue by status, a buyer's own list, a seller's own
+    # list — and the duplicate-reference check, which is per seller because two
+    # sellers' banks may legitimately issue the same UTR.
+    await db[C.RECHARGES].create_index([("status", ASCENDING), ("created_at", DESCENDING)])
+    await db[C.RECHARGES].create_index([("buyer_uid", ASCENDING), ("created_at", DESCENDING)])
+    await db[C.RECHARGES].create_index([("seller_id", ASCENDING), ("created_at", DESCENDING)])
+    await ensure_recharge_reference_index(db)
+    await ensure_recharge_request_id_index(db)   # RF-30
 
     await db[C.SUBAGENCY_PAYOUTS].create_index([("status", ASCENDING), ("created_at", DESCENDING)])
     await db[C.SUBAGENCY_PAYOUTS].create_index([("card_id", ASCENDING)])

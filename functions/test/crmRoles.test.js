@@ -204,3 +204,109 @@ describe('no role is ever flattened to admin or team', () => {
     }
   })
 })
+
+// ── Agency + Seller, and one capability withdrawn ─────────────────────────────
+//
+// The app's Agency tag and dashboard come from `isAgent`. A login that holds
+// both capabilities lists both in `roles`; when one is revoked, its entry in
+// `roleStatus` says so and the flag must follow — the other must not move.
+describe('multi-role logins and per-capability status', () => {
+  const both = (roleStatus) => deriveRoleFlags('agency', ['agency', 'seller'], true, true, roleStatus)
+
+  test('Agency + Seller, both approved → both tags', () => {
+    const f = both({ agency: 'approved', seller: 'approved' })
+    expect(f.isAgent).toBe(true)
+    expect(f.isSeller).toBe(true)
+  })
+  test('adding Seller never removes Agency — primary role stays agency', () => {
+    const f = deriveRoleFlags('agency', ['agency', 'seller'], true, true, { agency: 'approved', seller: 'pending' })
+    expect(f.isAgent).toBe(true)
+  })
+  test('agency revoked → Agency tag gone, Seller kept', () => {
+    const f = both({ agency: 'revoked', seller: 'approved' })
+    expect(f.isAgent).toBe(false)
+    expect(f.isSeller).toBe(true)
+  })
+  test('seller revoked → Seller gone, Agency kept', () => {
+    const f = both({ agency: 'approved', seller: 'revoked' })
+    expect(f.isAgent).toBe(true)
+    expect(f.isSeller).toBe(false)
+  })
+  test('suspended and rejected also withdraw the tag', () => {
+    expect(both({ agency: 'suspended' }).isAgent).toBe(false)
+    expect(both({ agency: 'rejected' }).isAgent).toBe(false)
+  })
+  test('no roleStatus at all → behaves exactly as before', () => {
+    const f = deriveRoleFlags('agency', ['agency', 'seller'], true, true)
+    expect(f.isAgent).toBe(true)
+    expect(f.isSeller).toBe(true)
+  })
+  test('a partner never gets a staff crmRole', () => {
+    expect(both({ agency: 'approved' }).crmRole).toBe('')
+  })
+})
+
+describe('production shapes from diagnose_app_identity (2026-10-07)', () => {
+  test('CRM-created Agency: role agency, status approved, no roleStatus → isAgent', () => {
+    const f = deriveRoleFlags('agency', undefined, true, true, undefined, 'approved')
+    expect(f.isAgent).toBe(true)
+    expect(f.isSeller).toBe(false)
+    expect(f.crmRole).toBe('')
+  })
+  test('Ruhan shape: roles [agency, seller], both approved → both tags', () => {
+    const f = deriveRoleFlags('agency', ['agency', 'seller'], true, true,
+      { agency: 'approved', seller: 'approved' }, 'approved')
+    expect(f.isAgent).toBe(true)
+    expect(f.isSeller).toBe(true)
+  })
+  test('a PENDING agency application earns no tag', () => {
+    expect(deriveRoleFlags('agency', ['agency'], true, true, undefined, 'pending').isAgent).toBe(false)
+    expect(deriveRoleFlags('agency', ['agency'], true, true, { agency: 'pending' }, 'pending').isAgent).toBe(false)
+  })
+  test('approved Seller + pending Agency → Seller only', () => {
+    const f = deriveRoleFlags('seller', ['seller', 'agency'], true, true,
+      { seller: 'approved', agency: 'pending' }, 'approved')
+    expect(f.isSeller).toBe(true)
+    expect(f.isAgent).toBe(false)
+  })
+  test('per-capability status wins over the login status', () => {
+    const f = deriveRoleFlags('agency', ['agency', 'seller'], true, true,
+      { agency: 'suspended' }, 'approved')
+    expect(f.isAgent).toBe(false)
+    expect(f.isSeller).toBe(true)
+  })
+  test('legacy document with no status at all is treated as approved', () => {
+    expect(deriveRoleFlags('agency', undefined, true, true).isAgent).toBe(true)
+  })
+})
+
+
+describe('hostBlockedBy — the role table on the referral-code path (B5)', () => {
+  const { hostBlockedBy } = require('../lib/crmRoles')
+  test('no crmUsers document → may be a Host', () => expect(hostBlockedBy(null)).toBe(''))
+  test('an approved Agency may not be a Host', () =>
+    expect(hostBlockedBy({ role: 'agency', status: 'approved' })).not.toBe(''))
+  test('a PENDING Agency may not be a Host either', () =>
+    expect(hostBlockedBy({ role: 'agency', status: 'pending', roleStatus: { agency: 'pending' } })).not.toBe(''))
+  // C1 (B04) reverses what this asserted ("a revoked Agency no longer blocks
+  // Host"): a revoked record still constrains the role table exactly like a
+  // held one, because restoring it must never produce Agency + Host. Only a
+  // REJECTED record releases it.
+  test('a revoked Agency still blocks Host (C1)', () => {
+    expect(hostBlockedBy({ role: 'agency', roleStatus: { agency: 'revoked' } })).not.toBe('')
+    expect(hostBlockedBy({ role: 'agency', status: 'revoked' })).not.toBe('')
+  })
+  test('a rejected Agency no longer blocks Host', () => {
+    expect(hostBlockedBy({ role: 'agency', roleStatus: { agency: 'rejected' } })).toBe('')
+    expect(hostBlockedBy({ role: 'agency', status: 'rejected' })).toBe('')
+  })
+  test('a Seller may be a Host', () =>
+    expect(hostBlockedBy({ role: 'seller', status: 'approved' })).toBe(''))
+  test('Seller + Agency may not', () =>
+    expect(hostBlockedBy({ role: 'seller', roles: ['seller', 'agency'],
+      roleStatus: { seller: 'approved', agency: 'approved' } })).not.toBe(''))
+  test('staff (Owner, department) may not', () => {
+    expect(hostBlockedBy({ role: 'superadmin' })).toContain('staff')
+    expect(hostBlockedBy({ role: 'ops_member' })).toContain('staff')
+  })
+})

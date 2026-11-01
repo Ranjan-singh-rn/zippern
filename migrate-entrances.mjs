@@ -24,6 +24,7 @@ import { readFileSync, existsSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
+import { guardKeyScript } from './functions/scripts/_keyScriptGuard.mjs'
 
 const require    = createRequire(import.meta.url)
 const __dirname  = dirname(fileURLToPath(import.meta.url))
@@ -36,6 +37,12 @@ const STORAGE_BUCKET = 'zipper-83816.firebasestorage.app'
 const LOTTIE_DIR = join(__dirname, 'zipper-crm', 'public', 'lottie', 'entrances')
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('migrate-entrances', {
+  keyPath: new URL('./serviceAccountKey.json', import.meta.url),
+  writes: true,
+})
 const serviceAccount = require('./serviceAccountKey.json')
 admin.initializeApp({
   credential:    admin.credential.cert(serviceAccount),

@@ -130,8 +130,11 @@ SELLER = {
 }
 
 # No crmId at all — the unique sparse index must not be handed a null.
+# FX-09: it names its login (`crmUid`), because a record that names no login
+# can no longer be APPROVED (section 7 approves this one).
 SELLER_NO_CRM_ID = {
     "displayName": "Corner Shop Coins",
+    "crmUid": "crm-uid-corner-shop",
     "isApproved": False,
     "isActive": False,
 }
@@ -181,6 +184,34 @@ def fake_sync(partner: dict, fields: dict) -> bool:
 
 ops.get_db = lambda: db
 partner_svc.get_db = lambda: db
+# `partner_ops.create` now claims the human's role family before it writes
+# (one Agency per Firebase identity), and `partner_roles` reads Mongo
+# through its own import, so it needs the same fake db.
+from app.services import partner_roles as _partner_roles  # noqa: E402
+_partner_roles.get_db = lambda: db  # type: ignore[assignment]
+# Approval re-checks the role table (partner_applications) and staff identity
+# (users), so both read the same fake Mongo.
+from app.services import partner_applications as _apps  # noqa: E402
+
+# Phase 1A (AUTH-002): these fixtures are verified people; the guest refusal
+# is covered by tests/test_phase1a_identity.py.
+_apps.is_unverified_guest = lambda uid: False
+from app.services import users as _users_mod  # noqa: E402
+_apps.get_db = lambda: db  # type: ignore[assignment]
+_users_mod.get_db = lambda: db  # type: ignore[assignment]
+# …and the role table reads the person's app profile (Host or not) from
+# Firestore. An empty fake: nobody in this file is a Host or staff.
+from app.db import firebase as _firebase_mod  # noqa: E402
+from tests import harness as _rc_harness  # noqa: E402
+
+# Decision 15 (RC): every login in these fixtures holds BOTH verified contacts
+# (an SMS-linked phone and a code-verified email) — the subject of this module
+# is not the contact rule, which tests/test_rc_contact_verification.py runs with
+# per-uid records, verified and not.
+_firebase_mod.get_user = _rc_harness.verified_auth  # type: ignore[assignment]
+from tests.fakes import FakeFirestore as _FakeFirestore  # noqa: E402
+_role_fs = _FakeFirestore()
+_firebase_mod.firestore_client = lambda: _role_fs  # type: ignore[assignment]
 audit_mod.record = fake_audit_record
 ops.audit.record = fake_audit_record
 ops._read_firestore_partner = fake_read_firestore
@@ -268,6 +299,26 @@ check(
 # 2. Creation from a sub-agency — parent carried, different slab table
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── The parent is validated server-side, and a PENDING parent is refused ────
+#
+# A sub-agency sits only under an APPROVED, ACTIVE main agency. The main
+# agency above was created pending, so the first attempt must be refused with
+# nothing written — no record, no claim, no audit row.
+audits_before = len(audit_entries)
+refused = ""
+try:
+    asyncio.run(ops.create_partner("agency-sub-1", REASON, ACTOR))
+except ops.PartnerOpsError as exc:
+    refused = str(exc)
+ok("a sub-agency under a PENDING parent is refused", "pending" in refused.lower())
+ok("…naming the parent", "Skyline Talents" in refused)
+ok("…and nothing was created", "agency-sub-1" not in db["partners"].docs)
+check("…and nothing was audited", len(audit_entries), audits_before)
+
+# Approve the parent (what `approve_partner` writes), then the sub-agency may exist.
+stored("agency-main-1")["status"] = "approved"
+stored("agency-main-1")["is_active"] = True
+
 sub = asyncio.run(ops.create_partner("agency-sub-1", REASON, ACTOR))
 
 check("sub-agency → kind", sub["kind"], "sub_agency")
@@ -296,6 +347,12 @@ check(
 sub2 = asyncio.run(ops.create_partner("agency-sub-2", REASON, ACTOR))
 check("parent implies sub-agency", sub2["kind"], "sub_agency")
 check("parent implies sub-agency → parent kept", sub2["parent_id"], "agency-main-1")
+
+# Fixture bookkeeping only: the main agency goes back to the pending state the
+# rest of this file was written against, so that section 7's own
+# `approve_partner("agency-main-1")` is still the first approval.
+stored("agency-main-1")["status"] = "pending"
+stored("agency-main-1")["is_active"] = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -505,9 +562,26 @@ for dotted in (
 # 7. Approval creates the record, in the same flow
 # ══════════════════════════════════════════════════════════════════════════════
 
+# FX-09: a record that names no login is NOT approved — "attach a login first".
+FIRESTORE["agency-never-seen-ownerless"] = (
+    "agencies",
+    {"crmId": "E5F6G7H9", "type": "main", "agencyName": "Nobody's Talents"},
+)
+_fx09 = refuses(
+    "FX-09: approving a record that names no login is refused",
+    lambda: ops.approve_partner("agency-never-seen-ownerless", "Reviewed the file; approving.", ACTOR),
+)
+ok("FX-09: …saying to attach a login first", "Attach a login first" in _fx09)
+check(
+    "FX-09: …and it is not approved",
+    (db["partners"].docs.get("agency-never-seen-ownerless") or {}).get("status", "pending"),
+    "pending",
+)
+
 FIRESTORE["agency-never-seen"] = (
     "agencies",
-    {"crmId": "E5F6G7H8", "type": "main", "agencyName": "Late Arrival Talents"},
+    {"crmId": "E5F6G7H8", "type": "main", "agencyName": "Late Arrival Talents",
+     "crmUid": "crm-uid-late-arrival"},
 )
 
 ok(
@@ -579,13 +653,119 @@ FIRESTORE["agency-orphan-sub"] = (
     "agencies",
     {"crmId": "F6G7H8I9", "type": "sub", "agencyName": "Orphan Sub"},
 )
-orphan = asyncio.run(ops.create_partner("agency-orphan-sub", REASON, ACTOR))
-check("a sub-agency with no parent is still a sub-agency", orphan["kind"], "sub_agency")
-check("with no parent invented for it", orphan["parent_id"], None)
-ok(
-    "and a warning that a payout cannot be raised for it",
-    any("parentAgencyId" in w for w in orphan["warnings"]),
+# A sub-agency with no parent used to be created with a warning. It is refused
+# now: a sub-agency sits under exactly one approved main agency, and one that
+# names none is not a valid record of anything — it could not be paid, and it
+# could not be told whose hosts it was recruiting for.
+orphan_msg = refuses(
+    "a sub-agency with no parent is refused",
+    lambda: ops.create_partner("agency-orphan-sub", REASON, ACTOR),
 )
+ok("…and the refusal says a main agency must be named",
+   "must name the main agency" in orphan_msg)
+ok("…and nothing was written", "agency-orphan-sub" not in db["partners"].docs)
+
+# Mirroring (the backfill) still represents what it finds, orphan included.
+mirrored, made, warns = asyncio.run(
+    ops.ensure_partner_record("agency-orphan-sub", ACTOR, REASON, enforce_role_family=False)
+)
+check("the backfill mirror still creates it", made, True)
+check("with no parent invented for it", mirrored["parent_id"], None)
+ok("and the payout warning", any("parentAgencyId" in w for w in warns))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. One human, one agency — and the refusal arrives as a 400, not a 500
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `refuses()` above fails the test if anything other than `PartnerOpsError`
+# comes out, which is the whole point of this section. `partner_roles` raises
+# its own `RoleConflict`, and NOTHING in `routers/partner_ops.py` catches that
+# class — every route there does `except PartnerOpsError` -> 400. So an
+# unwrapped RoleConflict would leave as an unhandled 500: the caller is told
+# "Internal Server Error", the message naming the agency they already hold is
+# swallowed, and a rule working exactly as designed reads as a crash.
+
+SECOND_AGENCY_SAME_HUMAN = dict(
+    MAIN_AGENCY,
+    crmId="Z9Y8X7W6",
+    agencyName="Second Agency, Same Person",
+    # The production duplicate's shape: a different document, the same human.
+    crmUid=MAIN_AGENCY["crmUid"],
+    ownerUid=MAIN_AGENCY["ownerUid"],
+)
+FIRESTORE["agency-main-1-again"] = ("agencies", SECOND_AGENCY_SAME_HUMAN)
+
+msg = refuses(
+    "a second main agency for a human who already holds one",
+    lambda: ops.create_partner("agency-main-1-again", REASON, ACTOR),
+)
+ok("the refusal names the agency already held", "agency-main-1" in msg)
+ok("and explains the rule rather than just saying no", "one agency record" in msg)
+ok("no second record was written", "agency-main-1-again" not in db["partners"].docs)
+
+# The combination that must KEEP working, through the real creation path.
+FIRESTORE["seller-same-human"] = (
+    "sellers",
+    {
+        "crmId": "S9S8S7S6",
+        "crmUid": MAIN_AGENCY["crmUid"],
+        "ownerUid": MAIN_AGENCY["ownerUid"],
+        "displayName": "Same Person, Coin Shop",
+        "status": "approved",
+        "isApproved": True,
+    },
+)
+both = asyncio.run(ops.create_partner("seller-same-human", REASON, ACTOR))
+check("the same human may still hold a Coin Seller", both["created"], True)
+check("  and it is a seller, not a second agency", both["kind"], "seller")
+
+# A sub-agency for that same human is the case the brief singles out.
+FIRESTORE["sub-for-agency-human"] = (
+    "agencies",
+    {
+        "crmId": "B1B2B3B4",
+        "type": "sub",
+        "parentAgencyId": "agency-main-1",
+        "agencyName": "Sub Held By The Agency Owner",
+        "crmUid": MAIN_AGENCY["crmUid"],
+        "ownerUid": MAIN_AGENCY["ownerUid"],
+    },
+)
+sub_msg = refuses(
+    "a sub-agency for the human who already holds a main agency",
+    lambda: ops.create_partner("sub-for-agency-human", REASON, ACTOR),
+)
+# The parent check runs first and says it in the most specific words: this is
+# their OWN agency. (A sub under somebody ELSE's agency is refused by the
+# shared-family rule — asserted next.)
+ok("the refusal says it is their own agency", "your own agency" in sub_msg)
+ok("and no sub-agency record was written",
+   "sub-for-agency-human" not in db["partners"].docs)
+
+# Same human, a sub-agency under a DIFFERENT approved main agency — the
+# shared-family rule is what refuses this one.
+FIRESTORE["agency-other-main"] = (
+    "agencies",
+    {"crmId": "O1O2O3O4", "crmUid": "crm-uid-other", "ownerUid": "owner-other",
+     "type": "main", "agencyName": "Other Main", "status": "approved", "isActive": True},
+)
+asyncio.run(ops.create_partner("agency-other-main", REASON, ACTOR))
+stored("agency-other-main")["status"] = "approved"
+stored("agency-other-main")["is_active"] = True
+FIRESTORE["sub-under-other"] = (
+    "agencies",
+    {"crmId": "B5B6B7B8", "type": "sub", "parentAgencyId": "agency-other-main",
+     "agencyName": "Sub Under Other", "crmUid": MAIN_AGENCY["crmUid"],
+     "ownerUid": MAIN_AGENCY["ownerUid"]},
+)
+fam_msg = refuses(
+    "a sub-agency under another agency, for a human who already holds a main agency",
+    lambda: ops.create_partner("sub-under-other", REASON, ACTOR),
+)
+ok("the sub-agency refusal explains the shared family",
+   "Sub-agency are the same family" in fam_msg)
+ok("and no record was written", "sub-under-other" not in db["partners"].docs)
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
@@ -603,5 +783,7 @@ print("  · every balance opens at zero, and no balance is duplicated onto the r
 print("  · creating twice is a no-op — no second record, no audit entry, no reset")
 print("  · an id that names no Firestore agency or seller is refused")
 print("  · approval creates the record in the same flow, and audits both")
+print("  · a second agency for one human is refused as a 400, not a 500")
+print("  · Agency + Coin Seller still creates; Agency + Sub-agency does not")
 print(f"  · all {len(READ_BY)} fields the other services read are present")
 sys.exit(0)

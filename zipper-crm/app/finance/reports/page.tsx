@@ -33,6 +33,8 @@ import {
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, CrmRole } from '@/lib/auth'
 import api, { ApiError } from '@/lib/api'
+import { nameOrReference } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 import { Column, DataTable } from '@/components/ui/DataTable'
 import { DateRangePicker, PRESETS, Range, toParams } from '@/components/ui/DateRange'
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
@@ -135,6 +137,8 @@ export default function WeeklyPayoutRunsPage() {
   const [hosts, setHosts] = useState<AgencyHost[]>([])
   const [hostsLoading, setHostsLoading] = useState(false)
   const [hostsError, setHostsError] = useState('')
+  // B1: each host_id is a Firebase uid — named from `users` (names only).
+  const hostNames = useIdentities({ people: hosts.map((h) => h.host_id) })
 
   const load = useCallback(() => {
     if (!allowed || !apiReady) return
@@ -562,9 +566,10 @@ export default function WeeklyPayoutRunsPage() {
                                 <td className="px-3 py-2.5 text-sm">
                                   <Link
                                     href={`/users/${encodeURIComponent(h.host_id)}`}
-                                    className="text-slate-200 hover:text-pink-400 font-mono text-xs transition-colors"
+                                    title={h.host_id}
+                                    className="text-slate-200 hover:text-pink-400 text-xs transition-colors"
                                   >
-                                    {h.host_id}
+                                    {nameOrReference(hostNames.people.get(h.host_id), h.host_id, 'host')}
                                   </Link>
                                 </td>
                                 <td className="px-3 py-2.5 text-sm text-right text-emerald-300 tabular-nums">

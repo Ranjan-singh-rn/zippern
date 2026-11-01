@@ -181,6 +181,29 @@ describe('account state', () => {
     expect(P.destroysCredential('suspended')).toBe(false)
   })
 
+  test('C9 (B25): the document a SUSPENSION writes is labelled suspended, not banned', () => {
+    // `suspend_user` sets all three. `isBanned` is the app's one gate, true for
+    // a suspension too, and reading it first was the bug.
+    const real = account({ accountState: 'suspended', isBanned: true, isSuspended: true })
+    expect(attempt({ account: real })).toBe('suspended')
+    expect(P.permitsAppeal(attempt({ account: real }))).toBe(true)
+    // A document from before `accountState` carried a moderation value.
+    expect(attempt({ account: account({ accountState: '', isBanned: true, isSuspended: true }) })).toBe('suspended')
+  })
+
+  test('C9 (B25): a BAN stays a ban — today\'s shape, and one with a stale isSuspended', () => {
+    expect(attempt({ account: account({ accountState: 'banned', isBanned: true, isSuspended: false }) })).toBe('banned')
+    expect(attempt({ account: account({ accountState: 'banned', isBanned: true, isSuspended: true }) })).toBe('banned')
+  })
+
+  test('C9 (B25): the credential\'s fate is unchanged — both keep it, deletion does not', () => {
+    // A suspended account that also has a deletion pending kept its credential
+    // before (it read as banned) and keeps it now (it reads as suspended).
+    const both = account({ accountState: 'suspended', isBanned: true, isSuspended: true, isDeleted: true })
+    expect(P.destroysCredential(attempt({ account: both }))).toBe(false)
+    expect(attempt({ account: account({ isDeleted: true, accountState: 'recovery_pending' }) })).toBe('deleted')
+  })
+
   test('a missing account record is refused', () => {
     expect(attempt({ account: null })).toBe('refused')
   })

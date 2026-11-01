@@ -1,0 +1,49 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/services/staff.py
++++ b/backend/app/services/staff.py
+@@ -870,6 +870,11 @@
+ 
+     # Existing sessions carry the old role in their token, so they are revoked.
+     await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
++    if str(old_role) == str(Role.OWNER):
++        # P1-A3b: an Owner MFA binding must not outlive the Owner role.
++        from app.services import owner_mfa
++
++        await owner_mfa.clear_all_bindings(uid, "Role changed away from Owner", actor=actor)
+ 
+     # And the CRM directory, or the shell shows one role while the API enforces
+     # another — a `finance_admin` demoted to `finance_member` would keep the
+@@ -962,6 +967,19 @@
+     # Sessions first. Whatever else fails below, the live token stops working —
+     # a revocation that gets halfway should get the most valuable half done.
+     await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
++
++    # P1-A3b (narrow port for the MFA release): an Owner's Firestore/Storage MFA
++    # bindings end with the Owner's access. A binding is what lets a custom-token
++    # Firebase session act as an Owner in the rules. Cleared here, early, so that a
++    # failure further down cannot leave one standing; and deleted, not flagged,
++    # because a reinstatement re-enables a login whose refresh tokens were never
++    # revoked (db/firebase.set_user_disabled) - a surviving binding would let that
++    # old browser session back in without a new MFA.
++    mfa_bindings_cleared = True
++    if R.is_owner(target_role):
++        from app.services import owner_mfa
++
++        mfa_bindings_cleared = await owner_mfa.clear_all_bindings(uid, "Owner deactivated", actor=actor)
+     await db[C.STAFF].update_one(
+         {"uid": uid},
+         {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}},
+@@ -1051,7 +1069,11 @@
+     # completed revocation, and the one thing that must never happen is the
+     # caller being told it is done while the person can still sign in.
+     person["firebase_login"] = "disabled" if not firebase_problem else firebase_problem
+-    person["fully_revoked"] = not firebase_problem and not claim_problem
++    person["owner_mfa_bindings"] = (
++        ("cleared" if mfa_bindings_cleared else "NOT CLEARED - deactivate again to retry")
++        if R.is_owner(target_role) else "n/a"
++    )
++    person["fully_revoked"] = not firebase_problem and not claim_problem and mfa_bindings_cleared
+     return person
+ 
+ 

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.SignInRoutingTest" tests="32" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.843Z" hostname="CW253.local" time="0.018">
+  <properties/>
+  <testcase name="an adoption with no token, or an unknown status, is a failure too" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a restricted account at session start is not told to check its connection" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.002"/>
+  <testcase name="only the server's own none keeps the new account" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="logout shows Login only after the sign-out, with the real device id" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a complete profile that owes an email, or both, goes Main" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="gateIdentity refuses an unknown answer after every known refusal and before the session" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="the gate records a contact requirement and no longer returns one" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a failure never keeps the new account" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="a sign-in started since — even into the same account — is never wiped" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="a complete profile that owes a phone goes Main" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="abandon deletes the login only after the document is gone (B15)" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="another account signed in since is never wiped" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="an incomplete profile goes to setup, whatever it owes" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="an undisturbed sign-out finishes" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="the sign-out tail is guarded and its network steps are bounded" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.002"/>
+  <testcase name="a none answer for any other reason keeps the new account, as before" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="the Google path passes the reason and whether a document exists" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="the guest path runs the device binding check inside quick login" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="the route becomes the result the view model navigates on" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="refusals and errors open nothing" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a complete profile is never sent to setup" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="quick login asks its pre-session check before the gate, the document and the session" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a usable adoption adopts" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="only an explicit allow lets a sign-in carry on" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="a Google adoption failure fails closed instead of creating a document (B13)" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="caller_not_fresh for a login with NO users document is retried, then fails closed" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="caller_not_fresh for a login that HAS a document still keeps it" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="caller_not_fresh for a login with ANOTHER provider and no document keeps it, as before" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="every sign-in path routes through SignInRouting" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="every result that enters the account takes the guest binding check" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <testcase name="a new phone or Google login writes its document only after the gate" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.001"/>
+  <testcase name="a failed call is retried once and then fails closed" classname="com.zipper.app.data.repository.SignInRoutingTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

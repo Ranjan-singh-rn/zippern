@@ -30,10 +30,11 @@ import {
 } from 'firebase/firestore'
 import {
   AlertTriangle, ArrowDown, Check, Download, Loader2, RefreshCw, Search, Shield,
-  ShieldOff, Star, X, type LucideIcon,
+  ShieldOff, X, type LucideIcon,
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
 import { searchUsers, type UserRecord } from '@/lib/firestore'
+import { userRowActionKeys } from '@/lib/crmRoles'
 import { downloadCsv } from '@/components/ui/DataTable'
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
@@ -43,6 +44,7 @@ import {
   DEFAULT_SUSPENSION, SuspendDuration, suspensionDays, suspensionProblem,
   suspensionResult, type SuspensionTerm,
 } from '@/components/SuspendDuration'
+import { profilePhotoSrc } from '@/lib/profilePhoto'
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member',
@@ -97,7 +99,10 @@ type Counts = Partial<Record<FilterKey, number>>
 
 // ── Row actions ──────────────────────────────────────────────────────────────
 
-type ActionKey = 'ban' | 'unban' | 'suspend' | 'resume' | 'grant_host'
+// Moderation only. `grant_host` was here and is gone: a Host comes through an
+// application decided on /kyc, like every partner role, and the backend route
+// behind the old button no longer exists. See `lib/crmRoles.ts`.
+type ActionKey = 'ban' | 'unban' | 'suspend' | 'resume'
 
 interface ActionSpec {
   key: ActionKey
@@ -156,17 +161,6 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     reasonHint: 'Why is the suspension ending early? An appeal, a mistake, time served…',
     className: 'bg-green-500/10 hover:bg-green-500/20 border-green-500/30 text-green-300',
   },
-  grant_host: {
-    key: 'grant_host',
-    label: 'Make host',
-    icon: Star,
-    title: 'Make this user a host',
-    effect:
-      'The user can go live. Their existing agency link is left alone — use the account page if it needs to change.',
-    confirmLabel: 'Grant host',
-    reasonHint: 'Why they are being made a host.',
-    className: 'bg-yellow-500/10 hover:bg-yellow-500/20 border-yellow-500/30 text-yellow-300',
-  },
 }
 
 // ── Mapping and formatting ───────────────────────────────────────────────────
@@ -179,6 +173,7 @@ function mapUser(d: QueryDocumentSnapshot<DocumentData>): UserRecord {
     email: data.email ?? '',
     phoneNumber: data.phoneNumber ?? '',
     photoUrl: data.photoUrl ?? '',
+    crmRole: typeof data.crmRole === 'string' ? data.crmRole : '',
     diamonds: data.diamonds ?? 0,
     beans: data.beans ?? 0,
     isHost: data.isHost ?? false,
@@ -383,33 +378,24 @@ export default function UsersPage() {
     )
   }, [rows])
 
-  const actionsFor = useCallback((u: UserRecord): ActionSpec[] => {
-    /*
-     * Which reversal to offer, and why `isBanned` alone cannot answer it.
-     *
-     * `isBanned` is the app's "cannot use the app" gate and it is true for a
-     * SUSPENSION as well as a ban. So this row used to offer Unban on every
-     * suspended account — and the server refuses that with "use Resume",
-     * because a suspension never barred a device and unbanning would go looking
-     * for device bans to lift that do not exist.
-     *
-     * `accountState` is what distinguishes them. The boolean fallbacks are for
-     * documents written before that field existed.
-     */
-    const suspended = u.accountState === 'suspended' || (u.isSuspended === true && !u.accountState)
-    const banned = u.accountState === 'banned' || (u.isBanned && !suspended)
-    const list: ActionSpec[] = [
-      banned ? ACTIONS.unban : suspended ? ACTIONS.resume : ACTIONS.ban,
-    ]
-    // The lighter of the two restrictions, offered next to the heavier one and
-    // only where it can be applied. `states: ['active']` on the account page
-    // says the same thing — the server refuses a suspension on an account that
-    // is already restricted, and a button whose only outcome is a refusal
-    // teaches the operator nothing.
-    if (!banned && !suspended) list.push(ACTIONS.suspend)
-    if (!u.isHost) list.push(ACTIONS.grant_host)
-    return list
-  }, [])
+  /*
+   * Which actions this row may offer.
+   *
+   * The decision lives in `lib/crmRoles.ts` — pure, no React, no Firebase — so
+   * it can be run on its own by `crmRoles.spec.ts`. This function does nothing
+   * but turn the chosen keys into the specs that draw the buttons.
+   *
+   * It used to decide here, and it asked only about ACCOUNT STATE: banned,
+   * suspended, host. Nothing asked who the account belonged to, so production
+   * offered Ban, Suspend and Make host beside all three Owners and the App
+   * Admin. The internal-identity guard existed, but only in
+   * `app/users/[uid]/UserActions.tsx`, where this screen could not reach it.
+   */
+  const actionsFor = useCallback(
+    (u: UserRecord): ActionSpec[] =>
+      userRowActionKeys(u, crmUser?.uid).map((key) => ACTIONS[key]),
+    [crmUser?.uid],
+  )
 
   const sortNote = useMemo(() => SORTS[sort], [sort])
 
@@ -595,9 +581,9 @@ export default function UsersPage() {
                   >
                     <td className="px-4 sm:px-5 py-3.5 text-sm">
                       <div className="flex items-center gap-2.5">
-                        {u.photoUrl ? (
+                        {profilePhotoSrc(u.photoUrl) ? (
                           // eslint-disable-next-line @next/next/no-img-element
-                          <img src={u.photoUrl} alt="" className="w-8 h-8 rounded-full object-cover shrink-0" />
+                          <img src={profilePhotoSrc(u.photoUrl)} alt="" className="w-8 h-8 rounded-full object-cover shrink-0" />
                         ) : (
                           <div className="w-8 h-8 rounded-full bg-pink-500/20 flex items-center justify-center text-pink-400 text-xs font-bold shrink-0">
                             {u.name?.[0]?.toUpperCase() ?? '?'}
@@ -792,10 +778,6 @@ function ReasonModal({
         case 'resume':
           await api.users.resume(user.uid, why)
           onDone(`Suspension lifted. ${who} can use the app again.`)
-          break
-        case 'grant_host':
-          await api.users.grantHost(user.uid, why)
-          onDone(`${who} is now a host and can go live.`)
           break
       }
     } catch (err) {

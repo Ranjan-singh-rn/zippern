@@ -1,0 +1,123 @@
+# PROPOSED — not applied. Base: deployed ruleset b2104a12-6598-4985-a91d-4d861e18a66e (20 Oct 08:54Z)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+# Note: The gateAnswers hunk must ship only after the MFA CRM is live (the current CRM still writes gateAnswers on an Owner first login).
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -40,8 +40,48 @@
+     }
+ 
+     // Read the role field from crmUsers (called only when isCrmUser() is already true)
++    //
++    // P1-A3b — OWNER MFA BOUNDARY. An Owner's authority here holds only for a
++    // Firebase sign-in the backend has bound to an API session that passed MFA
++    // (`ownerMfaOk()` below). Until then the Owner's role reads as
++    // 'superadmin_mfa_pending', which no helper accepts — so every grant that
++    // trusts `superadmin` (isSuperAdmin, isAdmin, the department helpers,
++    // isStaff, hasPerm, canDecideCoinOps) refuses a password-only Owner without
++    // any individual grant being edited. Self-access by uid (`isOwner(uid)`)
++    // does not go through this, so the MFA login screen can still read the
++    // Owner's own crmUsers document. Non-owners never evaluate ownerMfaOk().
+     function crmRole() {
+-      return get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('role', '');
++      let r = get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('role', '');
++      return (r != 'superadmin' || ownerMfaOk()) ? r : 'superadmin_mfa_pending';
++    }
++
++    // P1-A3b — which Owner sign-ins passed MFA. After MFA the backend mints a
++    // Firebase custom token carrying the developer claim `mfa_sid` for ONE new
++    // Firebase session (CRM: replaces its sign-in; Android: a separate
++    // `ownerWork` app) and, once that session's ID token is presented back,
++    // marks ownerMfaSessions/{uid}.bindings[mfa_sid] ACTIVE with that token's
++    // auth_time. Written only by the backend (Admin SDK).
++    //
++    // Accepted only when ALL hold: the token carries a non-empty `mfa_sid`
++    // (only server-signed custom tokens can put it there), the session was
++    // made from a custom token, the binding exists, is 'active' (minted-but-
++    // unconfirmed grants nothing), its authTime equals THIS token's auth_time
++    // (a second redemption of the same custom token fails), and it has not
++    // expired. A password/Google/phone sign-in — the same second or not — and
++    // every other custom token (e.g. quick login) carry no mfa_sid.
++    function ownerMfaOk() {
++      let sid = request.auth.token.get('mfa_sid', '');
++      let p = /databases/$(database)/documents/ownerMfaSessions/$(request.auth.uid);
++      return sid is string && sid != ''
++          && request.auth.token.get('firebase', {}).get('sign_in_provider', '') == 'custom'
++          && exists(p)
++          && ownerMfaBindingLive(get(p).data.get('bindings', {}).get(sid, {}));
++    }
++
++    function ownerMfaBindingLive(b) {
++      return b.get('state', '') == 'active'
++          && b.get('authTime', -1) == request.auth.token.get('auth_time', -2)
++          && b.get('expiresAt', timestamp.value(0)) > request.time;
+     }
+ 
+     // CRM user holding the AGENCY capability — the agency portal login.
+@@ -305,8 +345,14 @@
+     // owner document written before that table existed may carry an empty
+     // `permissions`, and "the owner is locked out of the money screens" is not a
+     // failure this file should be able to cause. Owner authority is positional.
++    //
++    // P1-A3b: a pending Owner's `permissions` array lists every capability, so
++    // the array is not consulted for one — `crmRole()` already reads
++    // 'superadmin_mfa_pending' for them, and that is refused explicitly here.
+     function hasPerm(p) {
+-      return isCrmUser() && (crmRole() == 'superadmin' || p in crmPermissions());
++      return isCrmUser()
++          && crmRole() != 'superadmin_mfa_pending'
++          && (crmRole() == 'superadmin' || p in crmPermissions());
+     }
+ 
+     // ── Deciding, as distinct from doing ────────────────────────────────────
+@@ -914,6 +960,13 @@
+     // client may write it — a browser that could would verify itself. The
+     // person may read their own; staff may read any (support). The Admin SDK
+     // writes it and is not governed by these rules.
++    // P1-A3b: Owner MFA bindings. Server-only — no client, Owners included, may
++    // read or write them (a readable binding would tell an attacker which
++    // sign-in to imitate; a writable one would be the bypass itself).
++    match /ownerMfaSessions/{uid} {
++      allow read, write: if false;
++    }
++
+     match /contactVerifications/{uid} {
+       allow read: if request.auth != null && (request.auth.uid == uid || isStaff());
+       allow write: if false;
+@@ -1029,31 +1082,15 @@
+                               .hasAny(['role', 'roles', 'roleStatus', 'permissions',
+                                        'isActive', 'status', 'agencyId', 'sellerId',
+                                        'dept', 'team', 'uid', 'email',
+-                                       'accountRestricted']))
++                                       'accountRestricted', 'gateAnswers']))
+                     || (isCrmUser() && request.auth.uid == uid
+                         && request.resource.data.diff(resource.data)
+                              .affectedKeys().hasOnly(['lastLoginAt']))
+-                    /*
+-                     * Phase 1A validation fix — an Owner's FIRST-LOGIN gate.
+-                     *
+-                     * The CRM's superadmin gate (`saveGateAnswers` in
+-                     * zipper-crm/lib/auth.ts, called only from the first-login
+-                     * setup on /login) writes the Owner's OWN `gateAnswers`.
+-                     * That write used to ride on the unconditional
+-                     * `isSuperAdmin()` arm. Phase 1A correctly stopped that arm
+-                     * touching the caller's own document — which also stopped
+-                     * this one write, so an Owner with no answers yet (for
+-                     * example one the Observer has just provisioned) could not
+-                     * get past /login.
+-                     *
+-                     * Restored narrowly: own document, `gateAnswers` only, and
+-                     * only while none are set. Changing answers that already
+-                     * exist is not a self-service action.
+-                     */
+-                    || (isSuperAdmin() && request.auth.uid == uid
+-                        && resource.data.get('gateAnswers', null) == null
+-                        && request.resource.data.diff(resource.data)
+-                             .affectedKeys().hasOnly(['gateAnswers']))
++                    // P1-A3: the Owner FIRST-LOGIN gate arm (own `gateAnswers`,
++                    // once) is REMOVED with the gate itself. Owners now pass
++                    // server-enforced TOTP (backend `services/owner_mfa.py`), and
++                    // `gateAnswers` is written by no client at all — it is in
++                    // the refused list of the superadmin arm above.
+                     // ── Your own contact details, and nothing else ────────────
+                     //
+                     // /profile lets every person in the CRM — staff, agency and

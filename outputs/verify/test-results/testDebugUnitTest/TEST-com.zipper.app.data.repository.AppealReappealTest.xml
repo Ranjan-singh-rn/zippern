@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.repository.AppealReappealTest" tests="3" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.777Z" hostname="CW253.local" time="0.005">
+  <properties/>
+  <testcase name="a different statement is different" classname="com.zipper.app.data.repository.AppealReappealTest" time="0.004"/>
+  <testcase name="the same statement with different case and spacing is the same statement" classname="com.zipper.app.data.repository.AppealReappealTest" time="0.0"/>
+  <testcase name="the refusal says what would be accepted" classname="com.zipper.app.data.repository.AppealReappealTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

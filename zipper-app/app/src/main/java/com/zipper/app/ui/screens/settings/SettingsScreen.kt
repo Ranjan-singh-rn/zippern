@@ -34,6 +34,7 @@ import com.zipper.app.ui.components.*
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.DeletionWindow
 
 /*
  * Settings — Figma "07 Settings / 01 Settings" (96:2).
@@ -80,30 +81,22 @@ fun SettingsScreen(
     onPrivacyPolicy: () -> Unit = {},
     onTerms: () -> Unit = {},
     onLogout: () -> Unit = {},
+    // UGP-E2: the forget-this-device sign-out is gone (brief E). It revoked
+    // the quick-login credential but left the guest device secret in place, so
+    // "Continue as Guest" re-opened the same guest anyway and its dialog
+    // promised something it did not do. Log out and Switch account remain.
     /**
-     * Sign out AND erase the quick-sign-in secret from this handset.
+     * Open the flow that attaches a phone number to this account.
      *
-     * Deliberately separate from [onLogout]. An ordinary sign-out REMEMBERS the
-     * account — that is the feature, not an oversight — so on a borrowed or
-     * shared phone "Log out" leaves a one-tap route straight back into the
-     * account, photo and name included, for whoever picks it up next.
-     */
-    onSignOutAndForget: () -> Unit = {},
-    /**
-     * Open the flow that attaches a phone number to a guest account.
-     *
-     * Shown to guests and nobody else — see the section in the body for what a
-     * guest account actually is and why this is the most important row on the
-     * screen for the people who can see it.
+     * Shown to every account that has no phone bound yet (UGP-1.7) — for a
+     * guest it is the most important row on the screen, see the section in the
+     * body for what a guest account actually is.
      */
     onSecureAccount: () -> Unit = {},
     /**
-     * Open the flow that attaches an EMAIL address to a guest account.
-     *
-     * A separate destination rather than a mode on [onSecureAccount], because
-     * the two flows differ where it matters: one never leaves the app and one
-     * ends by leaving it for a mail client and being reopened by a link. See
-     * `SecureEmailScreen` for the whole argument.
+     * Open the flow that attaches an EMAIL address to this account — by a
+     * six-digit code sent to it and typed back here (UGP-C). Nothing leaves the
+     * app and no link is involved; see `SecureEmailScreen`.
      */
     onSecureEmail: () -> Unit = {},
     /**
@@ -130,6 +123,14 @@ fun SettingsScreen(
      */
     isGuest: Boolean = false,
     /**
+     * A phone number / an email is BOUND to this account — on the Auth record
+     * and recorded on `users/{uid}` (see `util/ContactRules`). A contact that is
+     * linked but not yet bound still shows its "Add …" row, because that row is
+     * where the retry lives.
+     */
+    hasPhone: Boolean = false,
+    hasEmail: Boolean = false,
+    /**
      * Run the OTA update check by hand. Null when in-app updating is off — see
      * `BuildConfig.OTA_ENABLED` in app/build.gradle.kts — in which case the row
      * below is the plain, untappable version line it has always been.
@@ -144,7 +145,6 @@ fun SettingsScreen(
     val context = LocalContext.current
     var showDelete by remember { mutableStateOf(false) }
     var showLogout by remember { mutableStateOf(false) }
-    var showForget by remember { mutableStateOf(false) }
     var showLanguage by remember { mutableStateOf(false) }
     val currentLanguage = remember(savedLanguage) { SUPPORTED_LANGUAGES.find { it.code == savedLanguage } ?: SUPPORTED_LANGUAGES.first() }
 
@@ -178,11 +178,18 @@ fun SettingsScreen(
              * fewer of them will. Whoever has no SIM in this handset, or no
              * number they are willing to give, now has a door of their own.
              */
-            if (isGuest) {
+            // One row per contact the account does NOT have yet — for every
+            // account, not only guests. A guest who added an email still sees
+            // "Add your phone number", and a phone account can add an email.
+            // UGP-C/E: the two are no longer equivalent. A phone number signs
+            // the account in on any phone (OTP); an email no longer signs
+            // anybody in by itself ("Continue with Email" is gone) — it is a
+            // verified contact for recovery and for partner applications.
+            if (!hasPhone || !hasEmail) {
                 Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
-                    Group("Secure your account") {
-                        SettingRow(Icons.Outlined.Phone, "Add your phone number", onClick = onSecureAccount)
-                        SettingRow(Icons.Outlined.MailOutline, "Add your email", onClick = onSecureEmail)
+                    Group(if (isGuest) "Secure your account" else "Sign-in and recovery") {
+                        if (!hasPhone) SettingRow(Icons.Outlined.Phone, "Add your phone number", onClick = onSecureAccount)
+                        if (!hasEmail) SettingRow(Icons.Outlined.MailOutline, "Add your email", onClick = onSecureEmail)
                     }
                     /*
                      * The sentence goes under the card rather than on the row.
@@ -191,8 +198,11 @@ fun SettingsScreen(
                      * wrap out of the row or push the label out of it.
                      */
                     Text(
-                        "You are signed in as a guest, so this account only exists on " +
-                            "this phone. Adding either one keeps it.",
+                        if (isGuest) "You are signed in as a guest, so this account only exists on " +
+                            "this phone. A phone number lets you sign in to it on any phone; an " +
+                            "email helps you recover it."
+                        else "A phone number lets you sign in on any phone. An email helps you " +
+                            "recover the account.",
                         style = ZipperTheme.type.caption, color = c.textMuted,
                         modifier = Modifier.padding(horizontal = Space.xs),
                     )
@@ -270,42 +280,6 @@ fun SettingsScreen(
 
             Group(null) {
                 SettingRow(Icons.AutoMirrored.Outlined.Logout, "Log out", onClick = { showLogout = true })
-                /*
-                 * THE HONEST "LOG OUT" FOR A PHONE THAT IS NOT YOURS.
-                 *
-                 * "Log out" above deliberately keeps the quick-sign-in secret:
-                 * remembering the account across a sign-out is the whole point
-                 * of it, and for a guest it is the only thing that can ever
-                 * return their balance, since an anonymous credential cannot be
-                 * re-obtained from an SMS or a Google picker.
-                 *
-                 * That is exactly wrong on a borrowed handset. Somebody who
-                 * signs in on a friend's phone, taps Log out and hands it back
-                 * has left a button on the login screen showing their photo and
-                 * their name that signs straight back into their account, with
-                 * their diamonds in it, for whoever holds the phone next. They
-                 * did the one thing the app offered and it did not do what they
-                 * assumed.
-                 *
-                 * So there are two rows, and the difference is stated in words
-                 * rather than implied: this is the one that forgets. Kept as a
-                 * separate row rather than a checkbox on the dialog above
-                 * because a person reaching for "log out" on a shared phone is
-                 * not in a mood to read a dialog, and a second unticked box is
-                 * how you end up with the default anyway.
-                 *
-                 * No `value` text on this row on purpose. `SettingRow` gives the
-                 * label `weight(1f)` and everything else takes its width first,
-                 * so a trailing chip would push the longest label in Settings
-                 * onto a second line inside a row that is a fixed 52dp tall. The
-                 * sentence that explains it lives in the dialog, one tap away,
-                 * where there is room to say it properly.
-                 */
-                SettingRow(
-                    Icons.AutoMirrored.Outlined.Logout,
-                    "Sign out and forget this device",
-                    onClick = { showForget = true },
-                )
                 SettingRow(Icons.Outlined.DeleteForever, "Delete account", danger = true, onClick = { showDelete = true })
             }
             Spacer(Modifier.navigationBarsPadding().height(Space.lg))
@@ -321,32 +295,6 @@ fun SettingsScreen(
             dismissButton = { TextButton({ showLogout = false }) { Text("Cancel", color = c.textSecondary) } },
         )
     }
-    if (showForget) {
-        AlertDialog(
-            onDismissRequest = { showForget = false }, containerColor = c.bgElevated,
-            title = { Text("Forget this device?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
-            /*
-             * Says what it does and what it costs, in that order, without the
-             * word "token" in it.
-             *
-             * The second sentence matters most to guests: signing in again means
-             * a phone number or a Google account, and a guest account has
-             * neither. Better they read that here than discover it on a login
-             * screen with no button on it.
-             */
-            text = {
-                Text(
-                    "For a shared phone. Removes quick sign-in for this account, so " +
-                        "nobody can tap straight back in from this handset.\n\n" +
-                        "Your account and balances are untouched — but you will need your " +
-                        "phone number or Google account to sign in again.",
-                    style = ZipperTheme.type.bodyM, color = c.textSecondary,
-                )
-            },
-            confirmButton = { TextButton({ showForget = false; onSignOutAndForget() }) { Text("Sign out and forget", color = c.statusDanger) } },
-            dismissButton = { TextButton({ showForget = false }) { Text("Cancel", color = c.textSecondary) } },
-        )
-    }
     if (showDelete) {
         /*
          * ── THIS DIALOG USED TO BE FALSE ─────────────────────────────────────
@@ -357,19 +305,19 @@ fun SettingsScreen(
          *
          * It is not permanent — `requestAccountDeletion` in
          * functions/src/accounts.ts moves the account to `recovery_pending` and
-         * it can be restored in one tap for thirty days. The history is not
+         * it can be restored in one tap for sixty days. The history is not
          * removed — `RETAINED_SUBCOLLECTIONS` names seven that survive for the
          * life of the CRM, the user document itself becomes the historical
          * record rather than being deleted, and messages, coin purchases and
          * gift history are never touched by the purge at all. And nothing is
-         * forfeited on the day they tap this; it happens thirty days later, if
+         * forfeited on the day they tap this; it happens sixty days later, if
          * they do not come back.
          *
          * Every one of those errors runs the same way: it frightens somebody out
          * of a reversible decision, and then quietly keeps what it told them was
          * destroyed. That is the worst pairing a deletion dialog can have, and it
          * is why this text is now four plain sentences in the order the person
-         * experiences them — what happens now, the thirty days, what is lost at
+         * experiences them — what happens now, the sixty days, what is lost at
          * the end, and what is kept regardless.
          *
          * `AuthRepository.softDeleteAccount` and `deleteAccountNow` have
@@ -380,12 +328,15 @@ fun SettingsScreen(
             onDismissRequest = { showDelete = false }, containerColor = c.bgElevated,
             title = { Text("Delete account?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
             text = {
+                // C8 (B28): the server keeps the account recoverable for SIXTY
+                // days (GRACE_DAYS in functions/src/accounts.ts); this said
+                // thirty. The number comes from the one shared constant now.
                 Text(
                     "You are signed out straight away and your profile disappears — " +
                         "calls and messages stop, and nobody can find you.\n\n" +
-                        "For 30 days nothing is destroyed. Sign in again before then " +
+                        "For ${DeletionWindow.GRACE_DAYS} days nothing is destroyed. Sign in again before then " +
                         "and we will offer your account back, exactly as it was.\n\n" +
-                        "After 30 days it is final: your profile, photos, followers and " +
+                        "After ${DeletionWindow.GRACE_DAYS} days it is final: your profile, photos, followers and " +
                         "anything you bought are deleted, you can no longer sign in, and " +
                         "any diamonds or beans left on the account go with it.\n\n" +
                         "Your purchase and earnings records are kept, so a payment " +

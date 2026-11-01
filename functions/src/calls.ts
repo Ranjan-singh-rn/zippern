@@ -85,7 +85,16 @@ interface CallIdRequest {
  * `functions/test/pricing.test.js` now walks every pairing on every deploy.
  */
 import { rateFor } from './pricing'
-import { assertActiveSession } from './mobileSession'
+import {
+  assertActiveSession, presentedSessionId, restrictionVerdict, signInPredatesCutoff,
+} from './mobileSession'
+
+/**
+ * P0-6: end reasons decided by the server's tick gate. A call ended for one of
+ * these bills NOTHING past the payer's last good tick (no grace), and the
+ * reason survives whatever the client sends to `endCall` afterwards.
+ */
+const GATED_END_REASONS = new Set(['party_restricted', 'session_displaced'])
 
 
 // ── startCall ────────────────────────────────────────────────────────────────
@@ -97,7 +106,7 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
     if (!callerUid) throw new HttpsError('unauthenticated', 'Sign in to call.')
     // Auth-only guard. See functions/src/mobileSession.ts: refuses when the
     // caller presents a session id that is not the account's active one.
-    await assertActiveSession(callerUid, data, 'startCall')
+    await assertActiveSession(callerUid, data, 'startCall', context.auth?.token)
 
     const { peerUid, idempotencyKey } = data ?? {}
     if (!peerUid || typeof peerUid !== 'string') {
@@ -229,6 +238,7 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
     const context = { auth: req.auth }
     const uid = context.auth?.uid
     if (!uid) throw new HttpsError('unauthenticated', 'Not signed in.')
+    await assertActiveSession(uid, req.data, 'acceptCall', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const { callId } = data ?? {}
     if (!callId) throw new HttpsError('invalid-argument', 'callId is required.')
 
@@ -353,6 +363,17 @@ export const tickCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) 
         return { charged: 0, endNow: call.status === 'ended', status: call.status }
       }
 
+      const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
+      const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
+
+      // P0-6 (FIN-1): only the PAYER's device vouches for billed time. An
+      // earner's tick used to bill the payer for everything elapsed and keep
+      // `lastTickAt` fresh, so a call stayed billable after the payer's app had
+      // gone. It now moves nothing and refreshes nothing.
+      if (uid !== payerUid) {
+        return { charged: 0, endNow: false, status: call.status, tickIndex: Number(call.tickIndex ?? 0) }
+      }
+
       const startedAt: admin.firestore.Timestamp | null = call.startedAt ?? null
       if (!startedAt) return { charged: 0, endNow: false, status: call.status }
 
@@ -371,12 +392,32 @@ export const tickCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>) 
       const perTick = Math.ceil((perMin * TICK_SECONDS) / 60)
       const pct = Number(call.receiverPct ?? 50)
 
-      const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
-      const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
       const payerRef  = db.collection('users').doc(payerUid)
       const earnerRef = db.collection('users').doc(earnerUid)
 
-      const payerSnap = await tx.get(payerRef)
+      const [payerSnap, earnerSnap] = await Promise.all([tx.get(payerRef), tx.get(earnerRef)])
+
+      // P0-6 (FIN-2): a call ends — charging nothing more — when either party
+      // may no longer be on it (banned, suspended, deleting), or when the
+      // payer's sign-in predates the account's cut-off or no longer holds the
+      // session. Ended, not refused: the device can always let go of the call,
+      // and settlement bills only up to the last good tick (see settleAndClose).
+      const restricted = restrictionVerdict((f) => payerSnap.get(f))
+        || restrictionVerdict((f) => earnerSnap.get(f))
+      const presented = presentedSessionId(data)
+      const recordedSession = String(
+        (payerSnap.get('activeMobileSession') as Record<string, unknown> | undefined)?.sessionId ?? '',
+      )
+      const displaced = signInPredatesCutoff(
+        payerSnap.get('credentialsValidAfter'), req.auth?.token?.auth_time, Math.floor(Date.now() / 1000),
+      ) || (presented !== '' && recordedSession !== '' && presented !== recordedSession)
+      if (restricted || displaced) {
+        const endReason = restricted ? 'party_restricted' : 'session_displaced'
+        logger.warn('tickCall ended a call at the gate', { callId, endReason })
+        tx.update(callRef, { status: 'ending', endReason })
+        return { charged: 0, endNow: true, status: 'ending', tickIndex: ticksCharged, endReason }
+      }
+
       const payerBalance = Number(payerSnap.get('diamonds') ?? 0)
 
       // Charge only what they can afford, then end the call.
@@ -467,7 +508,23 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
     }
 
     const startedAt: admin.firestore.Timestamp | null = call.startedAt ?? null
-    const durationSeconds = startedAt ? Math.floor((Date.now() - startedAt.toMillis()) / 1000) : 0
+    const nowMs = Date.now()
+    const durationSeconds = startedAt ? Math.floor((nowMs - startedAt.toMillis()) / 1000) : 0
+
+    // P0-6 (FINANCE-016): bill only time the payer's device vouched for — up
+    // to its last tick plus one tick of grace, never up to "now". The watchdog
+    // runs two minutes after the last tick, and that silence used to be billed
+    // at full rate. A call ended by the tick gate gets no grace at all, and the
+    // server's reason stands over whatever the client sends afterwards.
+    const gatedEnd = call.status === 'ending' && GATED_END_REASONS.has(String(call.endReason ?? ''))
+    const finalReason = gatedEnd ? String(call.endReason) : reason
+    const lastTickMs = typeof call.lastTickAt?.toMillis === 'function'
+      ? call.lastTickAt.toMillis()
+      : (startedAt ? startedAt.toMillis() : nowMs)
+    const billUntilMs = Math.min(nowMs, lastTickMs + (gatedEnd ? 0 : TICK_SECONDS * 1000))
+    const billableSeconds = startedAt
+      ? Math.max(0, Math.floor((billUntilMs - startedAt.toMillis()) / 1000))
+      : 0
 
     const payerUid  = call.earner === 'caller' ? call.receiverId : call.callerId
     const earnerUid = call.earner === 'caller' ? call.callerId  : call.receiverId
@@ -481,7 +538,7 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
     const perMin  = Number(call.perMinRateDiamonds ?? 0)
     const perTick = Math.ceil((perMin * TICK_SECONDS) / 60)
     const pct     = Number(call.receiverPct ?? 50)
-    const ticksDue     = startedAt ? Math.floor(durationSeconds / TICK_SECONDS) : 0
+    const ticksDue     = startedAt ? Math.floor(billableSeconds / TICK_SECONDS) : 0
     const ticksCharged = Number(call.tickIndex ?? 0)
     const payerBalance = Number(payerSnap.get('diamonds') ?? 0)
     const finalTicks   = Math.max(0, Math.min(ticksDue - ticksCharged,
@@ -526,7 +583,7 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
 
     tx.update(callRef, {
       status: 'ended',
-      endReason: reason,
+      endReason: finalReason,
       endedAt: now,
       durationSeconds,
       diamondsCharged: totalDiamonds,
@@ -597,7 +654,7 @@ async function settleAndClose(callId: string, byUid: string | null, reason: stri
       callerUid:   call.callerId,
       receiverUid: call.receiverId,
       status: 'ended',
-      endReason: reason,
+      endReason: finalReason,
       endedAt: now,
       timestamp: now,
       durationSeconds,

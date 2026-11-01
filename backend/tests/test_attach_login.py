@@ -58,6 +58,7 @@ from app.db import firebase as firebase_mod  # noqa: E402
 from app.db.mongo import C  # noqa: E402
 from app.services import crm_directory as crm  # noqa: E402
 from app.services import partner_ops as ops  # noqa: E402
+from app.services import partner_roles  # noqa: E402
 
 failures: list[str] = []
 checks = 0
@@ -144,6 +145,19 @@ class World:
 
         ops.get_db = lambda: self.db  # type: ignore[assignment]
         audit_mod.get_db = lambda: self.db  # type: ignore[assignment]
+        # Attaching a login now claims the human's role family — it is the
+        # second way somebody becomes an agency's owner, and the only one the
+        # one-agency-per-human rule used to miss. `partner_roles` reaches
+        # Mongo through its own import, so it needs the same fake.
+        partner_roles.get_db = lambda: self.db  # type: ignore[assignment]
+        # B16: attaching now runs the same role table approval runs, which
+        # reads what the person holds through `partner_applications` (and the
+        # staff check through `users`). Same fake, same reason as above.
+        from app.services import partner_applications as apps_mod
+        from app.services import users as users_mod
+
+        apps_mod.get_db = lambda: self.db  # type: ignore[assignment]
+        users_mod.get_db = lambda: self.db  # type: ignore[assignment]
         firebase_mod.firestore_client = lambda: self.fs  # type: ignore[assignment]
         firebase_mod.get_user_by_email = self._by_email  # type: ignore[assignment]
         ops.fb_auth.create_user = self._create  # type: ignore[assignment]
@@ -414,18 +428,6 @@ message = refuses_and_creates_nothing(
 )
 ok("names the partner it belongs to", "agency-b" in message)
 
-# The uid clash: the address has a Firebase account whose uid already signs in
-# as another partner, and no crmUsers document to reveal it.
-w.account("reused@example.test", "uid-reused")
-w.db[C.PARTNERS].docs["agency-b"]["owner_crm_uid"] = "uid-reused"
-message = refuses_and_creates_nothing(
-    "a uid that already signs in as another partner", w,
-    lambda: attach(w, "agency-a", "reused@example.test"),
-)
-ok("names the partner it already signs in as", "agency-b" in message)
-ok("and points at the right route for a second capability",
-   "second-capability" in message or "second capability" in message)
-
 # A Firestore outage cannot be read as "no login attached".
 w.fs.collection("agencies").fail_on("get")
 message = refuses_and_creates_nothing(
@@ -439,6 +441,119 @@ w.fs.collection("agencies").clear_failures()
 final = asyncio.run(attach(w, "agency-a", "finally@example.test"))
 check("the record was left in a state that still works",
       w.stored("agency-a")["owner_crm_uid"], final["owner_crm_uid"])
+
+# ── FROM HERE, EACH CASE GETS ITS OWN WORLD ─────────────────────────────────
+#
+# `World()` repoints the module-level seams (`ops.get_db` and friends) at its
+# own fakes, so the newest one is what the code under test actually reads. The
+# blocks below therefore have to come AFTER every remaining use of `w` — an
+# earlier draft put them in the middle of this section and the checks that
+# followed went looking for `agency-a` in a database that had never heard of
+# it.
+
+# ── THE ROLE-FAMILY CLASH: a second agency for one human ───────────────────
+#
+# Linking is the second way somebody becomes an agency's owner, and it is the
+# one the rule used to miss.
+#
+# NOTE WHAT THIS PROVES ABOUT PRE-EXISTING DATA. `their-first-agency` is seeded
+# straight into Mongo with an `owner_crm_uid` and NO claim sentinel — the shape
+# of every partner in production, because the claim collection was created
+# with this rule and is empty for all of them. A check that read only its own
+# sentinels would find nothing here and allow the link. It reads `partners`.
+#
+# Its own world, like everything below. Run against the shared `w` above, a
+# mutant that lets the link through does not report a failed check: it links
+# `agency-a`, and the later cases that reuse `agency-a` die with a traceback
+# instead. A regression should name itself.
+w1b = World()
+w1b.partner("their-first-agency", "agency", owner_crm_uid="uid-reused")
+w1b.account("reused@example.test", "uid-reused")
+w1b.partner("a-second-agency", "agency")
+
+message = refuses_and_creates_nothing(
+    "linking a second agency to a human who already holds one", w1b,
+    lambda: attach(w1b, "a-second-agency", "reused@example.test"),
+)
+ok("names the agency they already hold", "their-first-agency" in message)
+ok("and states the rule", "one agency record" in message)
+ok("and says nothing was created", "Nothing was created" in message)
+check("the second agency is still unlinked — the record is unchanged",
+      w1b.stored("a-second-agency").get("owner_crm_uid"), None)
+check("and so is the first",
+      w1b.stored("their-first-agency")["owner_crm_uid"], "uid-reused")
+ok("the claim is not left behind by the refusal — a refused link must not "
+   "lock the human out of the family for ever",
+   not [d for d in w1b.db[partner_roles.PARTNER_ROLE_CLAIMS].docs.values()
+        if d.get("partner_id") == "a-second-agency"])
+
+
+# ── THE COMBINATION THE OLD CHECK WRONGLY REFUSED ───────────────────────────
+#
+# A FRESH WORLD for each of the next cases, deliberately. Run against `w` they
+# would pass or fail for the wrong reason: the attach above writes a `crmUsers`
+# document for that address, and the "one address is one login" check — an
+# older, separate rule — fires before the family check and would be the thing
+# answering. Each case below tests exactly one rule.
+#
+# The old clash check was `find_one({"owner_crm_uid": uid})` — ANY other
+# partner, of any kind. Its own message said "a login holds at most one agency
+# record and one seller record", and then refused the second of those.
+# Attaching a coin seller to somebody who runs an agency was rejected with a
+# message describing it as permitted.
+w2 = World()
+w2.partner("their-agency", "agency", owner_crm_uid="uid-both")
+w2.account("both@example.test", "uid-both")
+w2.partner("their-coin-shop", "seller")
+allowed = asyncio.run(attach(w2, "their-coin-shop", "both@example.test"))
+check("an agency owner CAN be given a coin-seller login",
+      allowed["owner_crm_uid"], "uid-both")
+check("and Mongo carries it",
+      w2.stored("their-coin-shop")["owner_crm_uid"], "uid-both")
+check("their agency is untouched by it",
+      w2.stored("their-agency")["owner_crm_uid"], "uid-both")
+
+# ── A SUB-AGENCY IS THE SAME FAMILY AS AN AGENCY ────────────────────────────
+w3 = World()
+w3.partner("their-agency", "agency", owner_crm_uid="uid-sub")
+w3.account("sub@example.test", "uid-sub")
+w3.partner("a-sub-agency", "sub_agency")
+message = refuses_and_creates_nothing(
+    "linking a sub-agency to a human who already holds an agency", w3,
+    lambda: attach(w3, "a-sub-agency", "sub@example.test"),
+)
+ok("the sub-agency refusal explains the shared family",
+   "Sub-agency are the same family" in message)
+check("and the sub-agency is still unlinked",
+      w3.stored("a-sub-agency").get("owner_crm_uid"), None)
+check("and the agency they already held is unchanged",
+      w3.stored("their-agency")["owner_crm_uid"], "uid-sub")
+
+# ── A REJECTED AGENCY DOES NOT HOLD THE SLOT ────────────────────────────────
+# One LIVE agency per human, not one ever. Otherwise a single refused
+# application would be a life sentence.
+w4 = World()
+w4.partner("agency-rejected", "agency", status="rejected",
+           owner_crm_uid="uid-reapplies")
+w4.account("reapplies@example.test", "uid-reapplies")
+w4.partner("agency-fresh-try", "agency")
+again = asyncio.run(attach(w4, "agency-fresh-try", "reapplies@example.test"))
+check("a human whose only agency was REJECTED may be linked to a new one",
+      again["owner_crm_uid"], "uid-reapplies")
+
+# ── A SUSPENDED AGENCY DOES ─────────────────────────────────────────────────
+# A suspension is temporary and the business still exists, so it keeps its
+# place. This is the line between the two, and it is easy to get backwards.
+w5 = World()
+w5.partner("agency-suspended", "agency", status="suspended",
+           owner_crm_uid="uid-suspended")
+w5.account("suspended@example.test", "uid-suspended")
+w5.partner("agency-while-suspended", "agency")
+message = refuses_and_creates_nothing(
+    "a suspended agency still holds the slot", w5,
+    lambda: attach(w5, "agency-while-suspended", "suspended@example.test"),
+)
+ok("named in the refusal", "agency-suspended" in message)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -516,6 +631,120 @@ except crm.DirectoryError as exc:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  6. Two staff members linking the same person at the same moment
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The check that matters is not "is this refused" — section 2 covers that —
+# but "can BOTH succeed". A read-then-write guard passes for both callers when
+# they interleave, and the result is the production bug: one human, two
+# agencies, each created by somebody who checked first and was told it was
+# fine.
+#
+# Eight agencies, one address, launched together. The claim is an `_id` insert,
+# so Mongo settles it: exactly one caller may come back with a link.
+
+w6 = World()
+w6.account("raced@example.test", "uid-raced")
+for i in range(8):
+    w6.partner(f"agency-race-{i}", "agency")
+
+async def _race() -> list:
+    # `asyncio.gather` has to be built INSIDE the running loop. Called from
+    # `asyncio.run(asyncio.gather(...))` it is evaluated first, with no loop
+    # yet, and 3.10 raises rather than making one.
+    return await asyncio.gather(
+        *[attach(w6, f"agency-race-{i}", "raced@example.test") for i in range(8)],
+        return_exceptions=True,
+    )
+
+
+outcomes = asyncio.run(_race())
+won = [o for o in outcomes if not isinstance(o, Exception)]
+lost = [o for o in outcomes if isinstance(o, ops.PartnerOpsError)]
+other = [o for o in outcomes if isinstance(o, Exception)
+         and not isinstance(o, ops.PartnerOpsError)]
+
+check("eight simultaneous links → exactly ONE succeeds", len(won), 1)
+check("     and the other seven are refused, not crashed", len(lost), 7)
+check("     with nothing raised that is not a refusal", other, [])
+
+linked = [pid for pid in (f"agency-race-{i}" for i in range(8))
+          if str(w6.stored(pid).get("owner_crm_uid") or "")]
+check("exactly one agency carries the link in Mongo", len(linked), 1)
+check("and it is the one that was reported", linked, [won[0]["id"]])
+check("exactly one agency-family claim exists for this human",
+      len([d for d in w6.db[partner_roles.PARTNER_ROLE_CLAIMS].docs.values()
+           if d.get("owner_uid") == "uid-raced"
+           and d.get("family") == partner_roles.AGENCY_FAMILY]), 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. Staff can still create and run an UNLINKED agency
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Said out loud because the cheapest way to make the rule above hold is to
+# require an owner on every record, and that would break staff onboarding:
+# `/agencies/register` deliberately creates the agency first and attaches the
+# login after, so the half-finished state is visible on /agencies rather than
+# invisible.
+#
+# An unlinked record belongs to nobody, so it holds no family and bars nobody.
+
+w7 = World()
+w7.partner("agency-unlinked-a", "agency")
+w7.partner("agency-unlinked-b", "agency")
+
+check("an unlinked agency has no owner", w7.stored("agency-unlinked-a").get("owner_crm_uid"), None)
+check("two of them can coexist", len(w7.db[C.PARTNERS].docs), 2)
+check("and neither claims a role family",
+      len(w7.db[partner_roles.PARTNER_ROLE_CLAIMS].docs), 0)
+
+# Both are still attachable — to DIFFERENT humans.
+w7.account("owner-one@example.test", "uid-one")
+w7.account("owner-two@example.test", "uid-two")
+one = asyncio.run(attach(w7, "agency-unlinked-a", "owner-one@example.test"))
+two = asyncio.run(attach(w7, "agency-unlinked-b", "owner-two@example.test"))
+check("the first unlinked agency links to a human with no agency",
+      one["owner_crm_uid"], "uid-one")
+check("the second links to a DIFFERENT human",
+      two["owner_crm_uid"], "uid-two")
+ok("two humans, two agencies, both allowed", one["owner_crm_uid"] != two["owner_crm_uid"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  B16 — attaching runs the whole role table, not only the family lock
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The lock is one rule of several. A Host given an agency's login passed it,
+# because Host + Agency is a rule of the table and not of the family claim.
+
+w16 = World()
+w16.partner("their-agency", "agency", owner_crm_uid="uid-their-owner")
+w16.partner("agency-for-a-host", "agency")
+w16.account("host@example.test", "uid-host")
+w16.fs.collection("users").docs["uid-host"] = {"name": "Hema", "isHost": True, "agencyId": "their-agency"}
+message = refuses_and_creates_nothing(
+    "B16: a Host cannot be given an agency's login", w16,
+    lambda: attach(w16, "agency-for-a-host", "host@example.test"),
+)
+ok("B16: …told it is the Host rule", "Host" in message)
+ok("B16: …and that no login was attached", "No login was attached" in message)
+ok("B16: …and the family claim it took was given back",
+   "agency:uid-host" not in w16.db[partner_roles.PARTNER_ROLE_CLAIMS].docs)
+
+# C1 at the same door: a REVOKED agency still holds its owner's place.
+w16b = World()
+w16b.partner("agency-revoked", "agency", status="revoked", owner_crm_uid="uid-revoked")
+w16b.account("revoked@example.test", "uid-revoked")
+w16b.partner("agency-again", "agency")
+message = refuses_and_creates_nothing(
+    "C1: the owner of a REVOKED agency cannot be given another", w16b,
+    lambda: attach(w16b, "agency-again", "revoked@example.test"),
+)
+ok("C1: …the revoked agency is what holds the place", "agency-revoked" in message)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Result
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -532,10 +761,18 @@ print("  · it grants a sign-in and nothing else: status, credit, cash and coins
 print("    are byte-for-byte what they were, and no approval is recorded")
 print("  · every mutation carries a mandatory reason into the audit log, with")
 print("    who decided and the fact that the status did not move")
-print("  · a partner that is already linked, a staff address, an address that")
-print("    holds another partner's account and a uid that already signs in as")
-print("    one are all refused — and none of them creates a Firebase account,")
-print("    a document or an audit entry")
+print("  · a partner that is already linked, a staff address and an address")
+print("    that holds another partner's account are all refused — and none of")
+print("    them creates a Firebase account, a document or an audit entry")
+print("  · LINKING GOES THROUGH THE ONE-AGENCY-PER-HUMAN RULE: a second agency")
+print("    is refused even when the holder has no claim sentinel, because the")
+print("    `partners` records are read and not just this rule's own bookkeeping")
+print("  · an agency owner may still be given a coin-seller login; a sub-agency")
+print("    is the same family as an agency and is refused")
+print("  · rejected releases the slot, suspended keeps it")
+print("  · eight simultaneous links resolve to exactly one owned agency")
+print("  · unlinked agencies still work: staff create them, they claim nothing,")
+print("    and two of them link to two different humans")
 print("  · a Firestore failure does not unwind the grant; Mongo is authoritative")
 print("    and the caller is told which half is missing")
 print("  · mirror() with no partner id still removes an agency's document, so")

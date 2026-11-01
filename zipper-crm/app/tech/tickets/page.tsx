@@ -19,14 +19,24 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { doc, serverTimestamp, updateDoc } from 'firebase/firestore'
-import { db } from '@/lib/firebase'
 import { useAuth } from '@/components/AuthProvider'
 import {
   canAccess, getDeptFromRole, getDeptStaff, DEPT_NAMES, DEPT_LABELS, STAFF_ROLES,
   type Dept, type CrmRole, type DeptStaffMember,
 } from '@/lib/auth'
-import { getTechTickets, createTicket, updateTicket, type TechTicket } from '@/lib/tech'
+import { getTechTickets, createTicket, updateTicket, ticketChangeNeedsReason, type TechTicket } from '@/lib/tech'
+
+/**
+ * P1-D: closing and reopening a ticket need a reason the server records in the
+ * audit log. Returns null when the person cancels; never an empty string.
+ */
+function askReason(what: string): string | null {
+  for (;;) {
+    const r = window.prompt(`A reason is required to ${what}. It is kept in the audit log.`)
+    if (r === null) return null
+    if (r.trim().length >= 3) return r.trim()
+  }
+}
 import {
   Plus, X, ChevronRight, Loader2, Users, Smartphone, Building, Search,
   Link2, Link2Off, Lock, AlertTriangle, Filter, Clock,
@@ -326,20 +336,14 @@ export default function TeamTicketsPage() {
     setActionError('')
     try {
       const assignee = staffByDept[form.assignedTeam].find((m) => m.uid === form.assignedTo)
+      // P1-D: the server sets the reporter and the assignee's name.
       await createTicket({
         title: form.title.trim(),
         description: form.description.trim(),
         category: form.category,
         priority: form.priority,
         assignedTeam: form.assignedTeam,
-        source: 'crm',
-        reportedBy: crmUser.name || crmUser.email,
-        reportedByDept: myDept ?? undefined,
-        status: 'open',
         assignedTo: assignee?.uid,
-        assignedToName: assignee?.name,
-        labels: [],
-        attachmentUrls: [],
       })
       setShowModal(false)
       setForm(makeDefaultForm(myDept))
@@ -370,10 +374,13 @@ export default function TeamTicketsPage() {
       if (refusal) { setActionError(refusal); return }
     }
     setActionError('')
+    const why = ticketChangeNeedsReason(ticket, { status: next })
+    const reason = why ? askReason(why) : ''
+    if (reason === null) return
     const before = tickets
     setTickets((prev) => prev.map((t) => (t.id === ticket.id ? { ...t, status: next } : t)))
     try {
-      await updateTicket(ticket.id, { status: next })
+      await updateTicket(ticket.id, { status: next }, reason)
     } catch (e) {
       setTickets(before)
       setActionError(e instanceof Error ? e.message : 'Could not move the ticket.')
@@ -384,10 +391,7 @@ export default function TeamTicketsPage() {
     const assignee = staffByDept[ticket.assignedTeam]?.find((m) => m.uid === uid)
     setActionError('')
     try {
-      await updateTicket(ticket.id, {
-        assignedTo: assignee?.uid ?? '',
-        assignedToName: assignee?.name ?? '',
-      })
+      await updateTicket(ticket.id, { assignedTo: assignee?.uid ?? '' })
       await load()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Could not reassign the ticket.')
@@ -662,12 +666,7 @@ export default function TeamTicketsPage() {
           byId={deps.byId}
           onCancel={() => setLinking(null)}
           onConfirm={async (blockerId, reason) => {
-            await updateDoc(doc(db, 'techTickets', linking.id), {
-              blockedBy: blockerId,
-              blockedReason: reason,
-              blockedAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            })
+            await updateTicket(linking.id, { blockedBy: blockerId }, reason)
             setLinking(null)
             await load()
           }}
@@ -683,11 +682,8 @@ export default function TeamTicketsPage() {
           placeholder="Blocker turned out to be unrelated / was split into its own ticket…"
           onCancel={() => setUnlinking(null)}
           onConfirm={async (reason) => {
-            await updateDoc(doc(db, 'techTickets', unlinking.id), {
-              blockedBy: null,
-              blockedReason: `Cleared: ${reason}`,
-              updatedAt: serverTimestamp(),
-            })
+            // The server stores it as `Cleared: <reason>`.
+            await updateTicket(unlinking.id, { blockedBy: null }, reason)
             setUnlinking(null)
             await load()
           }}

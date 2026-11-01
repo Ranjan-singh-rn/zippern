@@ -29,6 +29,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
+import SecureDocuments from '@/components/SecureDocuments'
 import Link from 'next/link'
 import {
   AlertTriangle, ChevronRight, ExternalLink, FileText, ImageOff, Landmark,
@@ -95,18 +96,32 @@ export default function HostRecord({
     setLoading(true)
     setFailure('')
     try {
-      // `activatedByUid` is the only field that ties an application to an
-      // account — it is written by `activateHost` when the code is redeemed.
-      // An invitation nobody has redeemed has no uid at all and is therefore
+      // Two fields tie an application to an account (UGP 2.4):
+      //   * `activatedByUid` — written by `activateHost` when an agency's
+      //     invitation code is redeemed;
+      //   * `applicantUid`   — a SELF-application, filed from the app by the
+      //     signed-in person, known from the moment it exists.
+      // The server decides on either (`decide_host_application`), so this
+      // reads both. An invitation nobody has redeemed has neither and is
       // correctly absent here; it lives on /kyc until somebody enters the code.
-      const snap = await getDocs(query(
-        collection(db, 'hostApplications'),
-        where('activatedByUid', '==', uid),
-        limit(5),
-      ))
-      if (snap.empty) { setApp(null); setLoading(false); return }
-      // Newest decided one wins if somebody has been invited twice.
-      const doc = snap.docs[snap.docs.length - 1]
+      const [byCode, bySelf] = await Promise.all([
+        getDocs(query(collection(db, 'hostApplications'), where('activatedByUid', '==', uid), limit(5))),
+        getDocs(query(collection(db, 'hostApplications'), where('applicantUid', '==', uid), limit(5))),
+      ])
+      const seen = new Map<string, (typeof byCode.docs)[number]>()
+      for (const d of [...byCode.docs, ...bySelf.docs]) seen.set(d.id, d)
+      if (seen.size === 0) { setApp(null); setLoading(false); return }
+      // The most recent one wins if somebody has applied or been invited twice.
+      const when = (raw: Record<string, unknown>): number => {
+        for (const key of ['decidedAt', 'activatedAt', 'createdAt', 'submittedAt']) {
+          const v = raw[key] as { toMillis?: () => number } | undefined
+          if (v && typeof v.toMillis === 'function') return v.toMillis()
+        }
+        return 0
+      }
+      const doc = Array.from(seen.values()).sort(
+        (a, b) => when(b.data() as Record<string, unknown>) - when(a.data() as Record<string, unknown>),
+      )[0]
       const raw = doc.data() as Record<string, unknown>
       setApp({
         id: doc.id,
@@ -262,23 +277,12 @@ export default function HostRecord({
             )}
           </div>
 
+          {/* Through the API behind short-lived signed URLs — see the note
+              in components/SecureDocuments.tsx. `app.kycDocUrls` holds
+              permanent bearer URLs and must not reach a browser. */}
           <p className="text-slate-400 text-sm font-medium mb-2">KYC documents</p>
-          {app.kycDocUrls.filter(Boolean).length === 0 ? (
-            <p className="text-slate-500 text-sm">
-              No documents were uploaded with this application.
-            </p>
-          ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {app.kycDocUrls.filter(Boolean).map((url, i) => (
-                <DocThumb
-                  key={url}
-                  label={labels[i] ?? `Document ${i + 1}`}
-                  url={url}
-                  onZoom={() => setZoom(url)}
-                />
-              ))}
-            </div>
-          )}
+          <SecureDocuments kind="host" recordId={app.id}
+            emptyHint="No documents were uploaded with this application." />
         </>
       )}
 

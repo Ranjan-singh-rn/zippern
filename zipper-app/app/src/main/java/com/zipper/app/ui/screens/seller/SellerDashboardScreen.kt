@@ -41,6 +41,7 @@ import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldPath
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
@@ -50,6 +51,8 @@ import com.zipper.app.ui.screens.profile.GlassCard
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.AgencyIdentity
+import com.zipper.app.util.RechargeDisplay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -78,7 +81,10 @@ private data class SellerDoc(
 
 private data class RechargeRequest(
     val id: String = "",
+    /** The name the request recorded, if any (the API's mirror does not write one). */
     val buyerName: String = "",
+    /** The buyer's uid — the API's mirror writes `buyerUid`; their name comes from `publicProfiles`. */
+    val buyerUid: String = "",
     /**
      * The diamond count, which is also the number of coins this approval takes
      * out of the seller's stock — `onRechargeApproved` deducts `diamondPackage`
@@ -148,6 +154,7 @@ private fun DocumentSnapshot.numberOrNull(field: String): Double? = when (val ra
 private fun DocumentSnapshot.toRechargeRequest() = RechargeRequest(
     id = id,
     buyerName = getString("buyerName") ?: "",
+    buyerUid = getString("buyerUid") ?: "",
     diamondPackage = numberOrNull("diamondPackage")?.toLong(),
     amountPaid = numberOrNull("amountPaid"),
     paymentScreenshotUrl = getString("paymentScreenshotUrl") ?: "",
@@ -194,18 +201,20 @@ fun SellerDashboardScreen(
     val scope = rememberCoroutineScope()
 
     var sellerDoc by remember { mutableStateOf<SellerDoc?>(null) }
+    // FX-05: the seller RECORD's id, from the login document (crmUsers/{uid}.sellerId);
+    // the uid only for a legacy uid-keyed record. See util/SellerRecordId.
+    var sellerId by remember { mutableStateOf("") }
     var isOnlineToggle by remember { mutableStateOf(false) }
     var pendingRequests by remember { mutableStateOf<List<RechargeRequest>>(emptyList()) }
     var historyRequests by remember { mutableStateOf<List<RechargeRequest>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var selectedTab by remember { mutableIntStateOf(0) }   // 0=Pending, 1=History
-
-    // Reject dialog state
-    var rejectDialogRequest by remember { mutableStateOf<RechargeRequest?>(null) }
-    var rejectReason by remember { mutableStateOf("") }
-    var rejectLoading by remember { mutableStateOf(false) }
-    var rejectError by remember { mutableStateOf<String?>(null) }
+    // B1: buyers' PUBLIC names (publicProfiles — a name, never a contact), by uid.
+    // A uid absent after a successful lookup has no profile; a failed lookup is
+    // "Name unavailable", never "not found".
+    var buyerNames by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var buyerLookupOk by remember { mutableStateOf(false) }
 
     // The payment proof, full screen. Null = closed.
     var proofUrl by remember { mutableStateOf<String?>(null) }
@@ -231,8 +240,13 @@ fun SellerDashboardScreen(
             return@LaunchedEffect
         }
         try {
-            // Fetch seller doc
-            val sellerSnap = Firebase.firestore.collection("sellers").document(currentUid).get().await()
+            // FX-05: resolve which seller record is this login's, then fetch it.
+            val crmSellerId = try {
+                Firebase.firestore.collection("crmUsers").document(currentUid).get().await().getString("sellerId")
+            } catch (_: Exception) { null }
+            val resolvedId = com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)
+            sellerId = resolvedId
+            val sellerSnap = Firebase.firestore.collection("sellers").document(resolvedId).get().await()
             val doc = sellerSnap.toSellerDoc()
             sellerDoc = doc
             isOnlineToggle = doc.isOnline
@@ -248,11 +262,29 @@ fun SellerDashboardScreen(
             // Fetch history (last 20 non-pending)
             val historySnap = Firebase.firestore.collection("rechargeRequests")
                 .whereEqualTo("sellerUid", currentUid)
-                .whereIn("status", listOf("approved", "rejected"))
+                // B1: every non-pending status the API mirrors, so a refunded or
+                // reversed request stays in History as what it became.
+                .whereIn("status", RechargeDisplay.HISTORY_STATUSES)
                 .orderBy("createdAt", Query.Direction.DESCENDING)
                 .limit(20)
                 .get().await()
             historyRequests = historySnap.documents.map { it.toRechargeRequest() }
+
+            // B1: buyer names, one `in` query per 30 buyers. Best effort — a
+            // refusal or a network failure leaves the rows on "Name unavailable"
+            // with the labelled Buyer ID; it never takes the dashboard down.
+            try {
+                val found = mutableMapOf<String, String>()
+                for (batch in RechargeDisplay.lookupBatches((pendingRequests + historyRequests).map { it.buyerUid })) {
+                    val snap = Firebase.firestore.collection("publicProfiles")
+                        .whereIn(FieldPath.documentId(), batch).get().await()
+                    snap.documents.forEach { d -> found[d.id] = (d.getString("name") ?: d.getString("displayName") ?: "").trim() }
+                }
+                buyerNames = found
+                buyerLookupOk = true
+            } catch (_: Exception) {
+                buyerLookupOk = false
+            }
         } catch (e: Exception) {
             errorMessage = e.message ?: "Failed to load seller data"
         } finally {
@@ -274,9 +306,9 @@ fun SellerDashboardScreen(
      * A listener error is deliberately not surfaced: the last known balance on
      * screen is more use than blanking a dashboard that has already loaded.
      */
-    DisposableEffect(currentUid) {
-        val registration = if (currentUid.isBlank()) null else
-            Firebase.firestore.collection("sellers").document(currentUid)
+    DisposableEffect(sellerId) {
+        val registration = if (sellerId.isBlank()) null else
+            Firebase.firestore.collection("sellers").document(sellerId)
                 .addSnapshotListener { snap, err ->
                     if (err == null && snap != null && snap.exists()) sellerDoc = snap.toSellerDoc()
                 }
@@ -285,78 +317,10 @@ fun SellerDashboardScreen(
 
     proofUrl?.let { url -> ProofViewer(url = url, onClose = { proofUrl = null }) }
 
-    // Reject dialog
-    rejectDialogRequest?.let { request ->
-        val dismiss = { if (!rejectLoading) { rejectDialogRequest = null; rejectReason = ""; rejectError = null } }
-        AlertDialog(
-            onDismissRequest = dismiss,
-            containerColor = c.bgElevated,
-            title = { Text("Reject request", style = ZipperTheme.type.headingS, color = c.textPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
-                    Text("Enter a reason for rejecting this request:", style = ZipperTheme.type.bodyM, color = c.textSecondary)
-                    Row(
-                        Modifier.fillMaxWidth().heightIn(min = 48.dp).background(c.bgRaised, RoundedCornerShape(Radius.lg))
-                            .border(1.dp, c.borderDefault, RoundedCornerShape(Radius.lg)).padding(horizontal = Space.md, vertical = Space.sm),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        BasicTextField(
-                            value = rejectReason, onValueChange = { rejectReason = it }, maxLines = 3,
-                            textStyle = ZipperTheme.type.bodyL.copy(color = c.textPrimary),
-                            cursorBrush = SolidColor(c.brandPrimary),
-                            modifier = Modifier.weight(1f),
-                            decorationBox = { inner ->
-                                if (rejectReason.isEmpty()) Text("Reason (e.g. wrong amount)", style = ZipperTheme.type.bodyL, color = c.textMuted)
-                                inner()
-                            },
-                        )
-                    }
-                    // The refusal, kept in front of the seller with their typed
-                    // reason still in the field, so the rejection is not lost.
-                    rejectError?.let { RowNotice(it, c.statusDanger) }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        rejectLoading = true
-                        rejectError = null
-                        scope.launch {
-                            try {
-                                Firebase.firestore.collection("rechargeRequests").document(request.id)
-                                    .update(mapOf("status" to "rejected", "rejectedReason" to rejectReason.trim()))
-                                    .await()
-                                /*
-                                 * Dismissing is the success path's job, and only
-                                 * the success path's.
-                                 *
-                                 * This used to sit in a `finally` that cleared
-                                 * the spinner and closed the dialog whether the
-                                 * update committed or threw, so a
-                                 * PERMISSION_DENIED looked exactly like a
-                                 * rejection: the row left Pending on this screen
-                                 * while the document was still `pending` on the
-                                 * server, and it reappeared on the next load
-                                 * with nothing to explain itself.
-                                 */
-                                pendingRequests = pendingRequests.filterNot { it.id == request.id }
-                                historyRequests = listOf(request.copy(status = "rejected")) + historyRequests
-                                rejectLoading = false
-                                rejectDialogRequest = null
-                                rejectReason = ""
-                                actionNotice = "Rejected. The reason is saved on the request."
-                            } catch (e: Exception) {
-                                rejectError = writeFailureMessage(e)
-                                rejectLoading = false
-                            }
-                        }
-                    },
-                    enabled = rejectReason.isNotBlank() && !rejectLoading,
-                ) { Text(if (rejectLoading) "Rejecting…" else "Reject", style = ZipperTheme.type.labelM, color = c.statusDanger) }
-            },
-            dismissButton = { TextButton(onClick = dismiss) { Text("Cancel", style = ZipperTheme.type.labelM, color = c.textSecondary) } },
-        )
-    }
+    // The reject dialog that lived here wrote `status: 'rejected'` straight
+    // onto the request. Recharge decisions are Zipper staff's, through the API,
+    // and `firestore.rules` now refuses every client write to this collection —
+    // so the dialog is gone rather than left as a button that always fails.
 
     ZipperScreen(topBar = { TopBar("Seller panel", onBack = onBack) { CurrencyPill(Currency.Coin, sellerDoc?.coinBalance ?: 0L) } }) { _ ->
         Box(Modifier.fillMaxSize()) {
@@ -384,7 +348,7 @@ fun SellerDashboardScreen(
                                             isOnlineToggle = newValue
                                             scope.launch {
                                                 try {
-                                                    Firebase.firestore.collection("sellers").document(currentUid).update("isOnline", newValue).await()
+                                                    Firebase.firestore.collection("sellers").document(sellerId.ifBlank { currentUid }).update("isOnline", newValue).await()
                                                 } catch (_: Exception) {
                                                     isOnlineToggle = !newValue // revert on failure
                                                 }
@@ -434,85 +398,53 @@ fun SellerDashboardScreen(
                             items(pendingRequests, key = { it.id }) { req ->
                                 RequestRow(
                                     request = req,
+                                    buyerName = RechargeDisplay.buyerName(req.buyerUid, buyerNames[req.buyerUid], req.buyerName, buyerLookupOk, buyerNames.containsKey(req.buyerUid)),
                                     showBalance = true,
                                     coinBalance = sellerDoc?.coinBalance,
                                     onViewProof = { proofUrl = it },
                                     failure = approveFailure?.takeIf { it.first == req.id }?.second,
                                 ) {
-                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
-                                        ZipperButton(
-                                            "Reject", { rejectDialogRequest = req; rejectReason = ""; rejectError = null },
-                                            modifier = Modifier.weight(1f), style = ButtonStyle.Danger, size = ButtonSize.Small,
-                                        )
-                                        ZipperButton(
-                                            "Approve", {
-                                                approvingId = req.id
-                                                approveFailure = null
-                                                scope.launch {
-                                                    try {
-                                                        Firebase.firestore.collection("rechargeRequests").document(req.id).update("status", "approved").await()
-                                                        pendingRequests = pendingRequests.filterNot { it.id == req.id }
-                                                        historyRequests = listOf(req.copy(status = "approved")) + historyRequests
-                                                        /*
-                                                         * "Running", not "done".
-                                                         * The coins move in
-                                                         * `onRechargeApproved`,
-                                                         * after this write, and
-                                                         * that transfer can send
-                                                         * the request back to
-                                                         * Pending — promising the
-                                                         * buyer their diamonds
-                                                         * here would be a promise
-                                                         * this screen cannot keep.
-                                                         */
-                                                        actionNotice = req.diamondPackage
-                                                            ?.let { "Approved — ${indianGrouping(it)} diamonds. The transfer is running; your coin balance updates when it lands." }
-                                                            ?: "Approved. The transfer is running; your coin balance updates when it lands."
-                                                    } catch (e: Exception) {
-                                                        /*
-                                                         * This was
-                                                         * `catch (_: Exception) {}`,
-                                                         * which made a refused
-                                                         * approval indistinguishable
-                                                         * from a successful one:
-                                                         * the row stayed put, the
-                                                         * seller tapped again, and
-                                                         * nothing anywhere said
-                                                         * why. The row keeps its
-                                                         * place in Pending — which
-                                                         * is the truth — and now
-                                                         * carries the reason.
-                                                         */
-                                                        approveFailure = req.id to writeFailureMessage(e)
-                                                    } finally {
-                                                        approvingId = null
-                                                    }
-                                                }
-                                            },
-                                            modifier = Modifier.weight(1f), size = ButtonSize.Small, gradient = true,
-                                            // One approval at a time: a second tap
-                                            // while the first is in flight fires
-                                            // against a row this screen has already
-                                            // moved to History.
-                                            enabled = approvingId == null,
-                                            loading = approvingId == req.id,
-                                        )
-                                    }
+                                    /*
+                                     * ── READ-ONLY NOW ─────────────────────────────
+                                     *
+                                     * The seller's own Approve used to flip this
+                                     * document to `approved`, and a Cloud Function
+                                     * credited the buyer on that word alone: no
+                                     * proof, no reference, no verification, and not
+                                     * idempotent. Recharges are verified by Zipper
+                                     * staff on /recharges and credited by the API
+                                     * through the ledger. A status written from
+                                     * here is reverted by the server, so the
+                                     * buttons are gone rather than left to fail.
+                                     *
+                                     * The seller still sees every request against
+                                     * them, the proof, and the outcome.
+                                     */
+                                    RowNotice(
+                                        when {
+                                            req.transferErrorReason.isNotBlank() -> req.transferErrorReason
+                                            else -> "Awaiting verification by Zipper. Your coins move and the buyer is credited once the payment is confirmed."
+                                        },
+                                        c.statusWarning,
+                                    )
                                 }
                             }
                         }
                     } else {
                         if (historyRequests.isEmpty()) {
-                            item { EmptyState(Icons.Outlined.Inbox, "No history yet", "Approved and rejected requests will be listed here.") }
+                            item { EmptyState(Icons.Outlined.Inbox, "No history yet", "Approved, rejected and refunded requests will be listed here.") }
                         } else {
                             items(historyRequests, key = { it.id }) { req ->
-                                val (tint, label) = when (req.status) {
-                                    "approved" -> c.statusSuccess to "Approved"
-                                    "rejected" -> c.statusDanger to "Rejected"
-                                    else -> c.textMuted to req.status.replaceFirstChar { it.uppercase() }
+                                val (tone, label) = RechargeDisplay.status(req.status)
+                                val tint = when (tone) {
+                                    RechargeDisplay.Tone.Success -> c.statusSuccess
+                                    RechargeDisplay.Tone.Danger -> c.statusDanger
+                                    RechargeDisplay.Tone.Warning -> c.statusWarning
+                                    RechargeDisplay.Tone.Neutral -> c.textMuted
                                 }
                                 RequestRow(
                                     request = req,
+                                    buyerName = RechargeDisplay.buyerName(req.buyerUid, buyerNames[req.buyerUid], req.buyerName, buyerLookupOk, buyerNames.containsKey(req.buyerUid)),
                                     onViewProof = { proofUrl = it },
                                     trailing = { Chip(label, tint = tint.copy(0.14f), contentColor = tint) },
                                 )
@@ -573,6 +505,8 @@ private fun RowNotice(text: String, tint: Color) {
 @Composable
 private fun RequestRow(
     request: RechargeRequest,
+    /** B1: the buyer's display name, or the sentence saying why there isn't one. */
+    buyerName: String,
     showBalance: Boolean = false,
     coinBalance: Long? = null,
     onViewProof: ((String) -> Unit)? = null,
@@ -585,9 +519,13 @@ private fun RequestRow(
     val paid = request.amountPaid
     GlassCard(padding = PaddingValues(Space.md)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
-            Avatar(null, size = AvatarSize.MD, initial = request.buyerName)
+            Avatar(null, size = AvatarSize.MD, initial = if (AgencyIdentity.isName(buyerName)) AgencyIdentity.initial(buyerName) else "?")
             Column(Modifier.weight(1f)) {
-                Text(request.buyerName.ifBlank { "Unknown buyer" }, style = ZipperTheme.type.labelM, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(buyerName, style = ZipperTheme.type.labelM, color = if (AgencyIdentity.isName(buyerName)) c.textPrimary else c.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    AgencyIdentity.reference(AgencyIdentity.BUYER_ID, request.buyerUid) + " · " + AgencyIdentity.reference(AgencyIdentity.REQUEST_ID, request.id),
+                    style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                )
                 if (diamonds != null) Price(Currency.Diamond, diamonds, color = c.currencyDiamond)
                 else Text("Diamond count not recorded", style = ZipperTheme.type.caption, color = c.statusWarning)
                 if (paid != null) Text("₹${indianGrouping(paid.toLong())}", style = ZipperTheme.type.numericS, color = c.textPrimary)

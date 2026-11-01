@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation'
 import {
   crmSignIn,
   crmSignOut,
-  saveGateAnswers,
   sendCrmPasswordReset,
   crmSignInWithGoogle,
   completeGoogleLink,
@@ -15,10 +14,19 @@ import {
   CrmUser,
 } from '@/lib/auth'
 import { useAuth } from '@/components/AuthProvider'
+import api, { ApiError, firestoreBindingOf, getSessionToken, type FirestoreBinding, type OwnerMfaEnrolment } from '@/lib/api'
 
-function normalize(s: string) {
-  return s.trim().toLowerCase().replace(/\s+/g, ' ')
+/** P1-A3: wait for AuthProvider's API session exchange rather than racing it. */
+async function waitForApiSession(ms = 15000): Promise<boolean> {
+  const until = Date.now() + ms
+  while (Date.now() < until) {
+    if (getSessionToken()) return true
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  return !!getSessionToken()
 }
+
+type MfaStage = 'loading' | 'enrol' | 'verify' | 'codes' | 'blocked' | 'unbound'
 
 export default function LoginPage() {
   const router = useRouter()
@@ -89,44 +97,52 @@ export default function LoginPage() {
     setForgotError('')
   }
 
-  // The signed-in user waiting at the gate
+  // ── P1-A3: Owner two-step sign-in (replaces the browser-only question gate) ──
+  // The API enforces this: an Owner session that has not passed a code is
+  // refused on every route but the MFA ones. This screen only drives the steps.
   const [pendingUser, setPendingUser] = useState<CrmUser | null>(null)
+  const [mfaStage, setMfaStage]       = useState<MfaStage | null>(null)
+  const [enrolment, setEnrolment]     = useState<OwnerMfaEnrolment | null>(null)
+  const [mfaCode, setMfaCode]         = useState('')
+  const [useRecovery, setUseRecovery] = useState(false)
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([])
+  const [mfaError, setMfaError]       = useState('')
+  const [mfaBusy, setMfaBusy]         = useState(false)
+  // P1-A3b: whether this browser's Firebase sign-in was bound (Firestore/Storage).
+  const [binding, setBinding]         = useState<FirestoreBinding | undefined>(undefined)
 
-  // Gate verification state (returning superadmin)
-  const [showGate, setShowGate]         = useState(false)
-  const [gateA1, setGateA1]             = useState('')
-  const [gateA2, setGateA2]             = useState('')
-  const [gateA3, setGateA3]             = useState('')
-  const [gateError, setGateError]       = useState('')
-  const [gateAttempts, setGateAttempts] = useState(0)
+  /** Into the CRM — unless Firestore/Storage stayed locked, which is said, not hidden. */
+  function enterOrExplain(b: FirestoreBinding | undefined) {
+    setBinding(b)
+    if (!b || b.state === 'bound') { setMfaStage(null); router.push('/'); return }
+    setMfaStage('unbound')
+  }
 
-  // Gate setup state (first-time superadmin — no saved answers yet)
-  const [showSetup, setShowSetup]     = useState(false)
-  const [setupA1, setSetupA1]         = useState('')
-  const [setupA2, setSetupA2]         = useState('')
-  const [setupA3, setSetupA3]         = useState('')
-  const [setupError, setSetupError]   = useState('')
-  const [setupSaving, setSetupSaving] = useState(false)
+  async function handleRetryBind() {
+    setMfaError('')
+    setMfaBusy(true)
+    try {
+      enterOrExplain(await api.auth.mfaBind())
+    } catch (e) {
+      setMfaError(e instanceof ApiError ? e.message : 'Could not unlock Firestore. Try again.')
+    } finally {
+      setMfaBusy(false)
+    }
+  }
 
   // Handle persisted session on page load ONLY.
   // This runs exactly once when loading finishes — it does NOT fire again when
   // crmUser changes after the login form is submitted. That prevents the race
-  // condition where AuthProvider's setCrmUser (which may carry 314zipper's cached
-  // gateAnswers) fires AFTER handleLogin's setShowSetup(true) is queued but
-  // before React commits it, causing setShowGate(true) to fire instead.
+  // condition where AuthProvider's setCrmUser fires AFTER handleLogin has
+  // already started the Owner's two-step sign-in, starting it a second time.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (loading) return          // still resolving
     if (!crmUser) return         // not logged in — show login form
-    if (showGate || showSetup) return  // already handling gate/setup
+    if (mfaStage) return  // already handling two-step sign-in
     // Persisted session: user was already logged in when they visited /login
     if (crmUser.role === 'superadmin') {
-      setPendingUser(crmUser)
-      if (crmUser.gateAnswers) {
-        setShowGate(true)
-      } else {
-        setShowSetup(true)
-      }
+      void beginMfa(crmUser)
     } else {
       router.push('/')
     }
@@ -135,18 +151,50 @@ export default function LoginPage() {
   /**
    * Where every successful sign-in goes, whichever door it came through.
    *
-   * The superadmin gate is a property of the ACCOUNT, not of the password
-   * form — so a Google sign-in has to pass it too. Keeping this in one
-   * function is what stops "Continue with Google" quietly becoming the way
-   * around it.
+   * Owner two-step sign-in is a property of the ACCOUNT, not of the password
+   * form — so a Google sign-in passes it too. (The API enforces it whichever
+   * door was used; this keeps the screen from offering a dashboard that will
+   * refuse every call.)
    */
   function afterSignedIn(user: CrmUser) {
     if (user.role === 'superadmin') {
-      setPendingUser(user)
-      if (user.gateAnswers) setShowGate(true)
-      else setShowSetup(true)   // first login — set up their gate answers
+      void beginMfa(user)
     } else {
       router.push('/')
+    }
+  }
+
+  /** Where does this Owner stand? Verified → in; enrolled → code; else set up. */
+  async function beginMfa(user: CrmUser) {
+    setPendingUser(user)
+    setMfaStage('loading')
+    setMfaError('')
+    setMfaCode('')
+    try {
+      if (!(await waitForApiSession())) {
+        setMfaError('Could not reach the business API to finish signing in. Try again.')
+        setMfaStage('blocked')
+        return
+      }
+      const st = await api.auth.mfaStatus()
+      if (st.verified) { router.push('/'); return }
+      if (st.configured === false) {
+        setMfaError('Two-step sign-in is not configured on the server yet. Ask whoever runs the deployment to set OWNER_MFA_ENCRYPTION_KEY.')
+        setMfaStage('blocked')
+        return
+      }
+      if (st.locked_until) {
+        setMfaError(`Too many wrong codes. Try again after ${new Date(st.locked_until).toLocaleTimeString()}.`)
+      }
+      if (st.enrolled) {
+        setMfaStage('verify')
+      } else {
+        setEnrolment(await api.auth.mfaEnrolStart())
+        setMfaStage('enrol')
+      }
+    } catch (e) {
+      setMfaError(e instanceof Error ? e.message : 'Could not start two-step sign-in.')
+      setMfaStage('blocked')
     }
   }
 
@@ -294,65 +342,42 @@ export default function LoginPage() {
     }
   }
 
-  // ── Step 2a: First-time gate setup ─────────────────────────────────────────
-  async function handleSetupSubmit() {
-    setSetupError('')
-    if (!setupA1.trim()) { setSetupError('Please enter your full name.'); return }
-    if (!setupA2.trim()) { setSetupError('Please enter your phone number.'); return }
-    if (!setupA3.trim()) { setSetupError('Please enter your called name.'); return }
-    if (!pendingUser)    { setSetupError('Session error. Please log in again.'); return }
-
-    setSetupSaving(true)
+  // ── Step 2a: First sign-in — set up an authenticator app ──────────────────
+  async function handleEnrolConfirm() {
+    setMfaError('')
+    setMfaBusy(true)
     try {
-      await saveGateAnswers(pendingUser.uid, {
-        q1: setupA1,
-        q2: setupA2,
-        q3: setupA3,
-      })
-      // Gate answers saved — go straight to dashboard
-      setShowSetup(false)
-      router.push('/')
-    } catch {
-      setSetupError('Failed to save. Please try again.')
+      const { user, recoveryCodes: codes } = await api.auth.mfaEnrolConfirm(mfaCode.trim())
+      setBinding(firestoreBindingOf(user))
+      setRecoveryCodes(codes)
+      setMfaCode('')
+      setMfaStage('codes')
+    } catch (e) {
+      setMfaError(e instanceof ApiError ? e.message : 'Could not check the code. Try again.')
     } finally {
-      setSetupSaving(false)
+      setMfaBusy(false)
     }
   }
 
-  // ── Step 2b: Gate verification (returning superadmin) ──────────────────────
-  async function handleGateSubmit() {
-    if (!pendingUser?.gateAnswers) return
-    const { q1, q2, q3 } = pendingUser.gateAnswers
-    let err = ''
-    if (normalize(gateA1) !== q1) err = 'Incorrect answer for Question 1.'
-    else if (gateA2.trim() !== q2) err = 'Incorrect phone number.'
-    else if (normalize(gateA3) !== q3) err = 'Incorrect called name.'
-
-    if (err) {
-      const attempts = gateAttempts + 1
-      setGateAttempts(attempts)
-      if (attempts >= 3) {
-        setGateError('Too many wrong attempts. Access denied.')
-        await crmSignOut()
-        setTimeout(() => {
-          setShowGate(false); setPendingUser(null)
-          setGateA1(''); setGateA2(''); setGateA3('')
-          setGateAttempts(0); setGateError('')
-        }, 2500)
-      } else {
-        setGateError(`${err} (${3 - attempts} attempt${3 - attempts === 1 ? '' : 's'} left)`)
-      }
-      return
+  // ── Step 2b: Every later sign-in — a code from the app, or a recovery code ─
+  async function handleVerify() {
+    setMfaError('')
+    setMfaBusy(true)
+    try {
+      const user = await api.auth.mfaVerify(useRecovery ? { recoveryCode: mfaCode.trim() } : { code: mfaCode.trim() })
+      enterOrExplain(firestoreBindingOf(user))
+    } catch (e) {
+      setMfaError(e instanceof ApiError ? e.message : 'Could not check the code. Try again.')
+    } finally {
+      setMfaBusy(false)
     }
-    setShowGate(false)
-    router.push('/')
   }
 
   async function handleCancel() {
+    await api.auth.signOut().catch(() => undefined)
     await crmSignOut()
-    setShowGate(false); setShowSetup(false); setPendingUser(null)
-    setGateA1(''); setGateA2(''); setGateA3(''); setGateError('')
-    setSetupA1(''); setSetupA2(''); setSetupA3(''); setSetupError('')
+    setMfaStage(null); setPendingUser(null); setEnrolment(null)
+    setMfaCode(''); setMfaError(''); setRecoveryCodes([]); setUseRecovery(false)
   }
 
   if (loading) {
@@ -366,106 +391,15 @@ export default function LoginPage() {
     )
   }
 
-  // ── First-time gate setup ──────────────────────────────────────────────────
-  if (showSetup) {
-    return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
-        <div className="w-full max-w-sm">
-          <div className="text-center mb-8">
-            <div className="w-16 h-16 bg-yellow-500/10 border border-yellow-500/30 rounded-full flex items-center justify-center mx-auto mb-4">
-              <span className="text-2xl">🛡️</span>
-            </div>
-            <h1 className="text-2xl font-black text-white">Set Your Security Gate</h1>
-            <p className="text-slate-400 text-sm mt-1">
-              You'll be asked these every time you log in as SuperAdmin.
-            </p>
-          </div>
-
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl space-y-5">
-            <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg px-4 py-3">
-              <p className="text-blue-300 text-xs">
-                These answers are personal to you. Choose something only you know. They can't be recovered — remember them!
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                1. Your Full Name
-              </label>
-              <input
-                autoFocus
-                type="text"
-                value={setupA1}
-                onChange={(e) => setSetupA1(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && document.getElementById('setupA2')?.focus()}
-                placeholder="e.g. Soumya Ranjan Singh"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                2. Your Phone Number
-              </label>
-              <input
-                id="setupA2"
-                type="text"
-                value={setupA2}
-                onChange={(e) => setSetupA2(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && document.getElementById('setupA3')?.focus()}
-                placeholder="e.g. 8908641811"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                3. Your Called Name (Nickname)
-              </label>
-              <input
-                id="setupA3"
-                type="text"
-                value={setupA3}
-                onChange={(e) => setSetupA3(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSetupSubmit()}
-                placeholder="e.g. kanha"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-
-            {setupError && (
-              <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3">
-                <p className="text-red-400 text-sm">{setupError}</p>
-              </div>
-            )}
-
-            <div className="flex gap-3 pt-1">
-              <button
-                onClick={handleCancel}
-                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSetupSubmit}
-                disabled={setupSaving || !setupA1.trim() || !setupA2.trim() || !setupA3.trim()}
-                className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/50 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors flex items-center justify-center gap-2"
-              >
-                {setupSaving ? (
-                  <><span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Saving…</>
-                ) : (
-                  'Save & Enter CRM'
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  // ── Security Gate (returning superadmin) ───────────────────────────────────
-  if (showGate) {
+  // ── Owner two-step sign-in (P1-A3) ─────────────────────────────────────────
+  if (mfaStage) {
+    const title =
+      mfaStage === 'enrol' ? 'Set up two-step sign-in'
+      : mfaStage === 'codes' ? 'Save your recovery codes'
+      : mfaStage === 'verify' ? 'Two-step sign-in'
+      : mfaStage === 'blocked' ? 'Cannot finish signing in'
+      : mfaStage === 'unbound' ? 'Signed in — some screens are locked'
+      : 'Checking…'
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
         <div className="w-full max-w-sm">
@@ -473,81 +407,149 @@ export default function LoginPage() {
             <div className="w-16 h-16 bg-pink-500/10 border border-pink-500/30 rounded-full flex items-center justify-center mx-auto mb-4">
               <span className="text-2xl">🔐</span>
             </div>
-            <h1 className="text-2xl font-black text-white">Identity Verification</h1>
-            <p className="text-slate-400 text-sm mt-1">Answer all three questions to continue</p>
+            <h1 className="text-2xl font-black text-white">{title}</h1>
+            {pendingUser?.email && <p className="text-slate-400 text-sm mt-1">{pendingUser.email}</p>}
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl space-y-5">
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                1. Who are you?
-              </label>
-              <input
-                autoFocus
-                type="text"
-                value={gateA1}
-                onChange={(e) => setGateA1(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && document.getElementById('gateA2')?.focus()}
-                placeholder="Full name"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                2. What is your phone number?
-              </label>
-              <input
-                id="gateA2"
-                type="text"
-                value={gateA2}
-                onChange={(e) => setGateA2(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && document.getElementById('gateA3')?.focus()}
-                placeholder="10-digit mobile"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
-                3. What is your called name?
-              </label>
-              <input
-                id="gateA3"
-                type="text"
-                value={gateA3}
-                onChange={(e) => setGateA3(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleGateSubmit()}
-                placeholder="Nickname / called name"
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
-              />
-            </div>
-
-            {gateError && (
-              <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3">
-                <p className="text-red-400 text-sm">{gateError}</p>
+            {mfaStage === 'loading' && (
+              <div className="flex justify-center py-4">
+                <div className="w-8 h-8 border-2 border-pink-500 border-t-transparent rounded-full animate-spin" />
               </div>
             )}
 
-            <div className="flex gap-3 pt-1">
-              <button
-                onClick={handleCancel}
-                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleGateSubmit}
-                disabled={!gateA1.trim() || !gateA2.trim() || !gateA3.trim()}
-                className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/50 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
-              >
-                Verify
-              </button>
-            </div>
+            {mfaStage === 'enrol' && enrolment && (
+              <>
+                <p className="text-slate-300 text-sm">
+                  Owner accounts need a code from an authenticator app (Google Authenticator,
+                  Microsoft Authenticator, 1Password…) every time they sign in.
+                </p>
+                <ol className="text-slate-400 text-sm list-decimal pl-5 space-y-1">
+                  <li>In the app, add an account and choose <b>enter a setup key</b>.</li>
+                  <li>Type the key below (time-based, 6 digits).</li>
+                  <li>Enter the 6-digit code the app shows.</li>
+                </ol>
+                <div className="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3">
+                  <p className="text-slate-500 text-xs uppercase tracking-wide mb-1">Setup key</p>
+                  <p className="text-white font-mono text-sm break-all select-all">
+                    {enrolment.secret.replace(/(.{4})/g, '$1 ').trim()}
+                  </p>
+                </div>
+                <a href={enrolment.otpauth_uri} className="block text-pink-400 text-xs underline">
+                  On this phone? Open in your authenticator app
+                </a>
+              </>
+            )}
+
+            {mfaStage === 'unbound' && (
+              <>
+                <p className="text-slate-300 text-sm">
+                  Your code was accepted, but this browser&apos;s sign-in could not be linked to it, so
+                  screens that read Firestore or stored documents directly stay locked for your Owner account.
+                </p>
+                {binding?.reason && <p className="text-amber-300 text-sm">{binding.reason}</p>}
+                <div className="flex gap-3 pt-1">
+                  <button onClick={handleRetryBind} disabled={mfaBusy}
+                    className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/50 text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors">
+                    {mfaBusy ? 'Trying…' : 'Retry unlock'}
+                  </button>
+                  <button onClick={() => { setMfaStage(null); router.push('/') }}
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-3 text-sm transition-colors">
+                    Continue anyway
+                  </button>
+                </div>
+              </>
+            )}
+
+            {mfaStage === 'codes' && (
+              <>
+                <p className="text-slate-300 text-sm">
+                  Each code signs you in once if you lose your phone. They are shown only now —
+                  keep them somewhere safe, away from this computer.
+                </p>
+                <div className="grid grid-cols-2 gap-2 bg-slate-800 border border-slate-700 rounded-lg p-4 font-mono text-sm text-white select-all">
+                  {recoveryCodes.map((c) => <span key={c}>{c}</span>)}
+                </div>
+                <button
+                  onClick={() => { setRecoveryCodes([]); enterOrExplain(binding) }}
+                  className="w-full bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
+                >
+                  I have saved them — enter the CRM
+                </button>
+              </>
+            )}
+
+            {(mfaStage === 'enrol' || mfaStage === 'verify') && (
+              <div>
+                <label className="block text-slate-400 text-xs font-medium mb-1.5 uppercase tracking-wide">
+                  {useRecovery ? 'Recovery code' : 'Code from your authenticator app'}
+                </label>
+                <input
+                  autoFocus
+                  inputMode={useRecovery ? 'text' : 'numeric'}
+                  autoComplete="one-time-code"
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && (mfaStage === 'enrol' ? handleEnrolConfirm() : handleVerify())}
+                  placeholder={useRecovery ? 'xxxxx-xxxxx' : '123456'}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"
+                />
+                {mfaStage === 'verify' && (
+                  <button
+                    type="button"
+                    onClick={() => { setUseRecovery((v) => !v); setMfaCode(''); setMfaError('') }}
+                    className="mt-2 text-xs text-slate-400 hover:text-white underline"
+                  >
+                    {useRecovery ? 'Use the authenticator app instead' : 'Lost your phone? Use a recovery code'}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {mfaError && (
+              <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3">
+                <p className="text-red-400 text-sm">{mfaError}</p>
+              </div>
+            )}
+
+            {mfaStage !== 'codes' && (
+              <div className="flex gap-3 pt-1">
+                <button
+                  onClick={handleCancel}
+                  className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
+                >
+                  {mfaStage === 'blocked' ? 'Sign out' : 'Cancel'}
+                </button>
+                {mfaStage === 'blocked' && pendingUser && (
+                  <button
+                    onClick={() => beginMfa(pendingUser)}
+                    className="flex-1 bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
+                  >
+                    Try again
+                  </button>
+                )}
+                {(mfaStage === 'enrol' || mfaStage === 'verify') && (
+                  <button
+                    onClick={mfaStage === 'enrol' ? handleEnrolConfirm : handleVerify}
+                    disabled={mfaBusy || mfaCode.trim().length < 6}
+                    className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:bg-pink-500/50 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors"
+                  >
+                    {mfaBusy ? 'Checking…' : mfaStage === 'enrol' ? 'Turn on & continue' : 'Verify'}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {mfaStage === 'verify' && (
+              <p className="text-slate-500 text-xs">
+                Lost your phone and your recovery codes? The Observer can reset your two-step sign-in.
+              </p>
+            )}
           </div>
         </div>
       </div>
     )
   }
-
 
   // ── Forgot Password ────────────────────────────────────────────────────────
   if (showForgot) {

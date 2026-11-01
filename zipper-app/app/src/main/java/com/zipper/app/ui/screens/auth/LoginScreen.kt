@@ -58,6 +58,7 @@ import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.zipper.app.R
 import com.zipper.app.util.installedVersionLabel
+import com.zipper.app.util.GuestLinkWarning
 import com.zipper.app.ui.components.*
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
@@ -114,7 +115,7 @@ fun LoginScreen(
         untilMillis: Long,
     ) -> Unit = { _, _, _ -> },
     /**
-     * The account signed in fine but is inside its 30-day deletion window, so
+     * The account signed in fine but is inside its 60-day deletion window, so
      * the person has to choose between restoring it and starting over.
      *
      * The same destination SplashScreen sends a pending deletion to. Both routes
@@ -125,6 +126,12 @@ fun LoginScreen(
      */
     onNavigateToRecoverAccount: () -> Unit = {},
     onNavigateToTerms: () -> Unit,
+    // UGP-E1: there is no "Continue with Email" entry. It was a Firebase
+    // email-LINK sign-in that could mint a brand-new uid beside the device's
+    // guest (one human, two identities) and was the only door the email deep
+    // link existed for. The ways in are phone OTP, Google, guest and the
+    // device's quick-login card. An email is now something an account BINDS
+    // (Settings → Secure your account, by a code), not a way to sign in.
     viewModel: AuthViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -173,6 +180,25 @@ fun LoginScreen(
     LaunchedEffect(quickLoginProbe) { quickLogin = viewModel.savedQuickLogin() }
 
     /*
+     * FX-21 (minimal): this device's guest account, if one was signed out of
+     * here. Phone OTP and Google are SIGN-INS, never links — with a guest on
+     * the device they open a SEPARATE account. Say so before they start, and
+     * offer the guest account (Settings → Secure your account adds the phone
+     * or email to it in place). Nothing is merged or moved.
+     */
+    var deviceGuestUid by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { deviceGuestUid = viewModel.deviceGuestUid() }
+    var guestWarningAcknowledged by remember { mutableStateOf(false) }
+    var pendingSeparateSignIn by remember { mutableStateOf<(() -> Unit)?>(null) }
+    fun afterGuestWarning(signIn: () -> Unit) {
+        if (GuestLinkWarning.shouldWarn(deviceGuestUid, guestWarningAcknowledged)) {
+            pendingSeparateSignIn = signIn
+        } else {
+            signIn()
+        }
+    }
+
+    /*
      * Why they are looking at a login screen they did not ask for.
      *
      * Consumed once, on the first composition — see ForcedSignOut. A person
@@ -209,11 +235,23 @@ fun LoginScreen(
             } catch (_: GetCredentialException) { /* cancelled */ }
         }
     }
+    // FX-15: busy from the first tap. The ViewModel sets `isLoading` only when
+    // `sendOtp` reaches it, 500 ms later; this covers that gap, so the button
+    // shows busy at once and a second tap inside the delay starts nothing.
+    var otpStarting by remember { mutableStateOf(false) }
     fun sendOtp() {
+        // FX-15: not while a verification is already starting or running.
+        if (!SubmitGuard.mayStart(uiState.isLoading || otpStarting)) return
+        otpStarting = true
         focusManager.clearFocus(force = true)
         scope.launch {
-            delay(500) // let the keyboard hide before Firebase launches reCAPTCHA
-            viewModel.sendOtp("${selectedCountry.dialCode}$phone", context as Activity, deviceId)
+            try {
+                delay(500) // let the keyboard hide before Firebase launches reCAPTCHA
+                viewModel.sendOtp("${selectedCountry.dialCode}$phone", context as Activity, deviceId)
+            } finally {
+                // `sendOtp` has set `isLoading` synchronously by now.
+                otpStarting = false
+            }
         }
     }
 
@@ -232,7 +270,10 @@ fun LoginScreen(
      * auto-read by Play Services, was also the one path on which a banned device
      * sailed through and the session record was claimed with an empty deviceId.
      */
-    LaunchedEffect(uiState.otpAutoFilled) { uiState.otpAutoFilled?.let { otp = it; viewModel.verifyOtp(it, deviceId) } }
+    // FX-15: consumed once — a recreated screen must not run the same code again.
+    LaunchedEffect(uiState.otpAutoFilled) {
+        uiState.otpAutoFilled?.let { otp = it; viewModel.verifyOtp(it, deviceId); viewModel.consumeAutoFilledOtp() }
+    }
     LaunchedEffect(uiState.navigateToProfileSetup) { if (uiState.navigateToProfileSetup) { viewModel.onNavigatedToProfileSetup(); onNavigateToProfileSetup() } }
     LaunchedEffect(uiState.navigateToMain) { if (uiState.navigateToMain) { viewModel.onNavigatedToMain(); onNavigateToMain() } }
     LaunchedEffect(uiState.navigateToBanned) { if (uiState.navigateToBanned) { viewModel.onNavigatedToBanned(); onNavigateToBanned(uiState.bannedReason, uiState.bannedKind, uiState.suspendedUntilMs) } }
@@ -299,9 +340,9 @@ fun LoginScreen(
                     phone = phone, onPhone = { v -> phone = v.filter { it.isDigit() }.take(selectedCountry.maxDigits) },
                     country = selectedCountry, onPickCountry = { showCountryPicker = true },
                     termsAccepted = termsAccepted, onTerms = { termsAccepted = it }, onOpenTerms = onNavigateToTerms,
-                    loading = uiState.isLoading,
-                    onGetOtp = ::sendOtp,
-                    onGoogle = ::launchGoogleSignIn,
+                    loading = uiState.isLoading || otpStarting,
+                    onGetOtp = { afterGuestWarning(::sendOtp) },
+                    onGoogle = { afterGuestWarning(::launchGoogleSignIn) },
                     onGuest = { viewModel.signInAsGuest(deviceId) },
                     quickLogin = quickLogin,
                     onQuickLogin = { viewModel.quickLogin(deviceId) },
@@ -312,7 +353,7 @@ fun LoginScreen(
                 OtpStage(
                     phoneLabel = "${selectedCountry.dialCode} $phone",
                     otp = otp, onOtp = { otp = it.filter { ch -> ch.isDigit() }.take(6) },
-                    loading = uiState.isLoading, resendIn = resendIn,
+                    loading = uiState.isLoading || otpStarting, resendIn = resendIn,
                     onVerify = { focusManager.clearFocus(force = true); viewModel.verifyOtp(otp, deviceId) },
                     onChangeNumber = { otpStage = false },
                     onResend = { resendIn = 45; sendOtp() },
@@ -327,6 +368,28 @@ fun LoginScreen(
 
     if (showCountryPicker) {
         CountryPickerSheet(selectedCountry, onSelect = { selectedCountry = it; showCountryPicker = false }) { showCountryPicker = false }
+    }
+
+    // FX-21: the warning, before a phone or Google sign-in starts.
+    pendingSeparateSignIn?.let { signIn ->
+        AlertDialog(
+            onDismissRequest = { pendingSeparateSignIn = null }, containerColor = c.bgElevated,
+            title = { Text(GuestLinkWarning.TITLE, style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text(GuestLinkWarning.BODY, style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+            confirmButton = {
+                TextButton({
+                    pendingSeparateSignIn = null
+                    viewModel.signInAsGuest(deviceId)
+                }) { Text(GuestLinkWarning.CONTINUE_AS_GUEST, color = c.textPrimary) }
+            },
+            dismissButton = {
+                TextButton({
+                    pendingSeparateSignIn = null
+                    guestWarningAcknowledged = true
+                    signIn()
+                }) { Text(GuestLinkWarning.SIGN_IN_SEPARATELY, color = c.textSecondary) }
+            },
+        )
     }
 }
 
@@ -524,7 +587,8 @@ private fun OtpStage(
                 Text("Verify OTP", style = ZipperTheme.type.headingL, color = c.textPrimary)
                 Text("Sent to $phoneLabel", style = ZipperTheme.type.bodyM, color = c.textSecondary)
             }
-            OtpCodeBoxes(code = otp, onCode = onOtp, onDone = onVerify)
+            // FX-15: the keyboard's Done is gated on loading, like the button.
+            OtpCodeBoxes(code = otp, onCode = onOtp, onDone = { if (SubmitGuard.mayStart(loading)) onVerify() })
         }
         Column(verticalArrangement = Arrangement.spacedBy(Space.xl), horizontalAlignment = Alignment.CenterHorizontally) {
             ZipperButton("Verify", onVerify, gradient = true, fullWidth = true, enabled = otp.length == 6 && !loading, loading = loading)

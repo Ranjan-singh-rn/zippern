@@ -1,0 +1,31 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/tests/test_partner_session.py
++++ b/backend/tests/test_partner_session.py
+@@ -1044,6 +1044,10 @@
+     "the routes that take a bare session and were never meant for a partner",
+     sorted(unlisted),
+     [
++        # P1-A3 — Owner two-step sign-in. Bare session because a PENDING Owner
++        # session (mfa=False) must reach them; `owner_mfa` refuses every role
++        # but Owner (403), and a partner is stopped here before that.
++        ("GET", "/api/auth/mfa/status"),
+         # Counts what is waiting on a verifier and a signer. A partner is
+         # neither, and the third figure — their own cards in flight — is already
+         # on /cards, scoped, with the stage attached.
+@@ -1075,6 +1079,15 @@
+         ("GET", "/api/users/{uid}/history"),
+         ("GET", "/api/users/{uid}/roles"),  # UGP-B: the CRM user page's role inventory
+         ("GET", "/api/users/{uid}/warnings"),
++        # P1-A3 — enrol, confirm, verify (reachable by a pending Owner session)
++        # and replace recovery codes (a verified one; `deps` refuses pending).
++        # P1-A3b — retry binding a verified Owner's Firebase sign-in.
++        ("POST", "/api/auth/mfa/bind"),
++        ("POST", "/api/auth/mfa/bind/confirm"),
++        ("POST", "/api/auth/mfa/enrol/confirm"),
++        ("POST", "/api/auth/mfa/enrol/start"),
++        ("POST", "/api/auth/mfa/recovery-codes"),
++        ("POST", "/api/auth/mfa/verify"),
+     ],
+ )
+ 

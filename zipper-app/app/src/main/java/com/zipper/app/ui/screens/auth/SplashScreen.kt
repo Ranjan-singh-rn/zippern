@@ -20,11 +20,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.material3.Text
+import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
+import com.google.firebase.firestore.Source
 import com.zipper.app.data.model.AccountRestriction
 import com.zipper.app.data.model.restrictionOf
+import com.zipper.app.util.DeviceBan
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.millis
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.tasks.await
 import android.provider.Settings
@@ -57,7 +62,8 @@ fun SplashScreen(
     onNavigateToSuspended: (reason: String, untilMillis: Long) -> Unit = { _, _ -> },
     /** An account with a deletion pending, which must be answered before entry. */
     onNavigateToRecoverAccount: () -> Unit = {},
-    sessionManager: SessionManager = hiltViewModel<SplashViewModel>().sessionManager,
+    splashViewModel: SplashViewModel = hiltViewModel(),
+    sessionManager: SessionManager = splashViewModel.sessionManager,
     /**
      * Injected for [SessionViewModel.tearDownSession] alone.
      *
@@ -69,10 +75,21 @@ fun SplashScreen(
 ) {
     val context = LocalContext.current
     val scale = remember { Animatable(0.6f) }
+    /*
+     * Phase 1A (AUTH-003): a recoverable error state. Non-null means the gate
+     * could not get an authoritative answer and has STOPPED — it does not guess.
+     * Retry re-runs the whole gate; Sign out tears the session down cleanly.
+     */
+    var gateError by remember { mutableStateOf<String?>(null) }
+    var attempt by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
 
-    LaunchedEffect(Unit) {
-        scale.animateTo(1f, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy))
-        delay(800)
+    LaunchedEffect(attempt) {
+        gateError = null
+        if (attempt == 0) {
+            scale.animateTo(1f, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy))
+            delay(800)
+        }
 
         // Device-level ban check — blocks reinstalled accounts too
         val deviceId = Settings.Secure.getString(
@@ -82,7 +99,9 @@ fun SplashScreen(
             try {
                 val deviceBanSnap = FirebaseFirestore.getInstance()
                     .collection("bannedDevices").document(deviceId).get().await()
-                if (deviceBanSnap.exists()) {
+                // B44: a LIFTED bar is kept with `isActive: false` and bars
+                // nothing — the server's own reading. See DeviceBan.
+                if (DeviceBan.applies(deviceBanSnap.exists(), deviceBanSnap.getBoolean("isActive"))) {
                     // `ifBlank`, not just `?:` — a `reason` field that exists
                     // and is empty is not null, and an empty last segment does
                     // not match the route pattern, so the navigation would be
@@ -93,9 +112,11 @@ fun SplashScreen(
                     return@LaunchedEffect
                 }
             } catch (_: Exception) {
-                // PERMISSION_DENIED (rules not deployed yet) or network error —
-                // treat as "not banned" and continue. The proper fix is deploying
-                // Firestore security rules for the bannedDevices collection.
+                // Not decisive on its own any more. A signed-in session is gated
+                // by `resolveIdentity` below, which answers `device_banned`
+                // authoritatively; a signed-out one goes to Login, whose sign-in
+                // gate asks the same question. Neither path enters the app on
+                // the strength of this read failing.
             }
         }
 
@@ -135,28 +156,94 @@ fun SplashScreen(
             user.reload().await()
         } catch (e: Exception) {
             /*
-             * The credential will not load — expired, revoked, or the account
-             * was disabled underneath us.
+             * ── B03: ONLY A REFUSED CREDENTIAL ENDS THE SESSION ──────────────
              *
-             * This branch used to call `FirebaseAuth.signOut()` and nothing
-             * else. The push token stayed registered against the uid, so the
-             * account carried on ringing a phone that could no longer answer it,
-             * and SessionManager kept a session id for a session that was gone.
-             * `tearDownSession` is the same complete sequence MainActivity's
-             * kick handler runs, and it is awaited rather than raced because the
-             * next line navigates away.
+             * This treated EVERY exception as "the credential will not load"
+             * and tore the session down — so opening the app with no signal
+             * logged its owner out, and for a GUEST destroyed the anonymous
+             * credential, which is the only copy of their account. Now
+             * `SplashGate.reloadFailure` decides: Firebase's own refusal
+             * (disabled, deleted, revoked, malformed) still signs out exactly as
+             * before; anything else — no network, a timeout — stops on the
+             * retry state below and changes nothing.
+             *
+             * The sign-out itself is unchanged. It used to call
+             * `FirebaseAuth.signOut()` and nothing else, leaving the push token
+             * registered and SessionManager holding a dead session id;
+             * `tearDownSession` is the complete sequence MainActivity's kick
+             * handler runs, awaited because the next line navigates away.
              */
-            ForcedSignOut.raise(ForcedSignOut.SESSION_EXPIRED)
-            sessionViewModel.tearDownSession()
-            onNavigateToLogin()
+            if (SplashGate.endsSession(SplashGate.reloadFailure(e))) {
+                ForcedSignOut.raise(ForcedSignOut.SESSION_EXPIRED)
+                sessionViewModel.tearDownSession()
+                onNavigateToLogin()
+            } else {
+                gateError = "We couldn't check your sign-in right now. Check your connection and try again."
+            }
             return@LaunchedEffect
         }
 
+        /*
+         * ── Phase 1A (AUTH-003): THE SERVER DECIDES, AND FAILURE IS CLOSED ──
+         *
+         * `resolveIdentity`, with a bounded retry. Banned, suspended, device-
+         * barred and pending-deletion are answered by the server, not read
+         * from a document the SDK may have served from its offline cache. No
+         * answer → the error state below, never Main.
+         */
+        when (val verdict = splashViewModel.verifyIdentity(deviceId)) {
+            is SplashVerdict.Unverified -> { gateError = verdict.message; return@LaunchedEffect }
+            is SplashVerdict.DeviceBanned -> { onNavigateToDeviceBanned(verdict.reason); return@LaunchedEffect }
+            is SplashVerdict.Banned -> { onNavigateToBanned(verdict.reason); return@LaunchedEffect }
+            is SplashVerdict.Suspended -> {
+                onNavigateToSuspended(verdict.reason, verdict.untilMs); return@LaunchedEffect
+            }
+            SplashVerdict.Recover -> { onNavigateToRecoverAccount(); return@LaunchedEffect }
+            SplashVerdict.SignOut -> {
+                sessionViewModel.tearDownSession()
+                onNavigateToLogin()
+                return@LaunchedEffect
+            }
+            // C8 (B27): never into a deleted account. Said on the login screen.
+            is SplashVerdict.AccountDeleted -> {
+                ForcedSignOut.raise(verdict.message)
+                sessionViewModel.tearDownSession()
+                onNavigateToLogin()
+                return@LaunchedEffect
+            }
+            SplashVerdict.Continue -> Unit
+        }
+
         try {
-            val snap = FirebaseFirestore.getInstance()
-                .collection("users").document(user.uid).get().await()
+            // From the SERVER, never the offline cache: a stale cached document
+            // is how a restriction or a displacement got stepped around.
+            var snap: com.google.firebase.firestore.DocumentSnapshot? = null
+            for (n in 1..SplashGate.MAX_ATTEMPTS) {
+                delay(SplashGate.backoffMs(n))
+                snap = try {
+                    FirebaseFirestore.getInstance()
+                        .collection("users").document(user.uid).get(Source.SERVER).await()
+                } catch (_: Exception) { null }
+                if (snap != null) break
+            }
+            if (snap == null) {
+                gateError = "We couldn't load your account right now. Check your connection and try again."
+                return@LaunchedEffect
+            }
             if (!snap.exists()) {
-                onNavigateToProfileSetup()
+                /*
+                 * FX-07: a live session with no users document is a sign-in
+                 * that never finished — not a new profile. Profile Setup used
+                 * to create the document here with `set(merge)`, skipping the
+                 * Google adoption question (a duplicate account for an email
+                 * that already had one), the mobile session and the guest
+                 * device binding. The sign-in is restarted instead, so it runs
+                 * all of them; a returning account gets its document back from
+                 * `ensureUserDocument` on that sign-in.
+                 */
+                ForcedSignOut.raise(ForcedSignOut.SIGN_IN_INCOMPLETE)
+                sessionViewModel.tearDownSession()
+                onNavigateToLogin()
                 return@LaunchedEffect
             }
 
@@ -278,10 +365,18 @@ fun SplashScreen(
             // host who has not captured yet lands on Home and is prompted
             // there, because an unverified host can still go live and earn —
             // they just cannot be featured or withdraw.
+            // Role flags from the authoritative `crmUsers/{uid}`, refreshed on a
+            // restored session too — see SplashViewModel.refreshRoles. Done
+            // BEFORE the profile gate and independent of it: an approved
+            // Agency is an Agency whether or not their app profile is complete.
+            splashViewModel.refreshRoles()
+
             val profileComplete = snap.getBoolean("isProfileComplete") ?: false
             if (!profileComplete) onNavigateToProfileSetup() else onNavigateToMain()
         } catch (e: Exception) {
-            onNavigateToMain()
+            // Phase 1A (AUTH-003): this used to be `onNavigateToMain()` — any
+            // failure at all opened the app. It now stops on the error state.
+            gateError = "Something went wrong while checking your account. Please try again."
         }
     }
 
@@ -305,9 +400,27 @@ fun SplashScreen(
             Text("Zipper", style = ZipperTheme.type.displayM, color = c.textPrimary)
             Text("LIVE. CONNECT. SHINE.", style = ZipperTheme.type.overline, color = c.brandVip)
         }
-        CircularProgressIndicator(
-            color = c.brandPrimary, strokeWidth = 2.dp,
-            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 48.dp).size(24.dp),
-        )
+        val err = gateError
+        if (err == null) {
+            CircularProgressIndicator(
+                color = c.brandPrimary, strokeWidth = 2.dp,
+                modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 48.dp).size(24.dp),
+            )
+        } else {
+            Column(
+                Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 40.dp, start = 24.dp, end = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(Space.sm),
+            ) {
+                Text(err, style = ZipperTheme.type.bodyM, color = c.textPrimary)
+                Button(onClick = { attempt += 1 }) { Text("Try again") }
+                TextButton(onClick = {
+                    scope.launch {
+                        sessionViewModel.tearDownSession()
+                        onNavigateToLogin()
+                    }
+                }) { Text("Sign out") }
+            }
+        }
     }
 }

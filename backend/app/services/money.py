@@ -204,6 +204,21 @@ async def apply_movement(m: Movement) -> MovementResult:
         synced = firebase.sync_balance_to_firestore(
             str(m.holder_type), m.holder_id, str(m.currency), m.amount
         )
+        if not synced:
+            # The ledger is committed and the app's balance did not move. Say
+            # so on the balance row, with the exact delta still owed, so
+            # `find_replica_drift` (and anyone reading it) sees the gap instead
+            # of a silent False that a retry's DuplicateMovement then hides.
+            try:
+                await db[C.BALANCES].update_one(key, {
+                    "$set": {"replica_stale": True, "replica_stale_at": now},
+                    "$push": {"replica_pending": {
+                        "delta": m.amount, "idempotency_key": m.idempotency_key,
+                        "ledger_id": str(ledger_result.inserted_id), "at": now,
+                    }},
+                })
+            except Exception:  # noqa: BLE001 — logged loudly; the ledger stands
+                log.exception("Could not mark %s/%s/%s replica_stale", m.holder_type, m.holder_id, m.currency)
 
     return MovementResult(
         ledger_id=str(ledger_result.inserted_id),

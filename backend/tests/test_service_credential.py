@@ -448,6 +448,10 @@ install(
     "app.services.partners",
     module("app.services.partners", PartnerKind=object, PartnerStatus=object),
 )
+# The router also imports the application and recharge services, which are
+# not under test here and need the real `PartnerStatus`; stubbed the same way.
+install("app.services.partner_applications", module("app.services.partner_applications"))
+install("app.services.recharges", module("app.services.recharges"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -486,7 +490,9 @@ check(
         "commission.preview",
         "email.events",
         "email.sweep",
+        "partner.apply",
         "partner.register",
+        "recharge.request",
         "reports.send",
     ],
 )
@@ -573,10 +579,15 @@ check("…reads its key from its own environment variable",
       registration.env_var, "SERVICE_KEY_PARTNER_REGISTRATION")
 check("…and from its own settings attribute",
       registration.settings_attr, "service_key_partner_registration")
+# Three operations on one key, deliberately: registering a record the signup
+# forms wrote, filing an application from the app on a signed-in user's
+# behalf, and filing a recharge request. All three create PENDING records that
+# hold nothing and decide nothing; widening the key rather than minting a
+# fourth avoided a production configuration change.
 check(
-    "…and holds exactly one operation",
+    "…and holds the three onboarding operations",
     sorted(registration.operations),
-    ["partner.register"],
+    ["partner.apply", "partner.register", "recharge.request"],
 )
 
 # Every pair is disjoint, checked as pairs rather than trusting the module's own
@@ -848,7 +859,7 @@ for node in deps_tree.body:
                     service_dep_names[target.id] = operation
 
 check(
-    "exactly seven dependencies accept a service key",
+    "exactly nine dependencies accept a service key",
     sorted(service_dep_names),
     [
         "internal_or_accrual_service",
@@ -856,7 +867,9 @@ check(
         "team_admin_or_accrual_service",
         "team_admin_or_alerts_service",
         "team_admin_or_email_sweep_service",
+        "team_admin_or_partner_apply_service",
         "team_admin_or_partner_registration_service",
+        "team_admin_or_recharge_request_service",
         "team_admin_or_reporting_service",
     ],
 )
@@ -869,7 +882,9 @@ check(
         "team_admin_or_accrual_service": "Op.COMMISSION_ACCRUE",
         "team_admin_or_alerts_service": "Op.ALERTS_SCAN",
         "team_admin_or_email_sweep_service": "Op.EMAIL_SWEEP",
+        "team_admin_or_partner_apply_service": "Op.PARTNER_APPLY",
         "team_admin_or_partner_registration_service": "Op.PARTNER_REGISTER",
+        "team_admin_or_recharge_request_service": "Op.RECHARGE_REQUEST",
         "team_admin_or_reporting_service": "Op.REPORTS_SEND",
     },
 )
@@ -938,22 +953,29 @@ for path in sorted((ROOT / "app" / "routers").glob("*.py")):
             accepting.append(f"{method.upper()} {path.stem}{route}")
 
 ok("the API has a meaningful number of routes to be excluded from", total_routes > 30)
+# Twenty: the governance phase added the two app-facing reinstatement routes
+# (C2) — filing a request for a revoked role and reading one's own — behind the
+# SAME partner-apply wrapper `partnerEligibility` uses. Same blast radius as an
+# application: a pending request that grants nothing, decided by the Owner.
+# Twenty-three since Decision 15 (RC): the app's three verification routes,
+# behind the same wrapper, for a person whose Owner-approved role waits for
+# BOTH verified contacts — read what is missing, start what is now allowed,
+# report a contact held by another account. None of them can start a role the
+# Owner did not approve, or one whose contacts are not both verified: the
+# check re-reads Firebase Auth and the server's ledger and re-runs the role
+# table, the restriction and the parent. The worst a leaked key does here is
+# start, a little early, a role that would start at the person's next visit.
 check(
-    "exactly twelve routes in the whole API accept a credential, and these are they",
+    "exactly twenty-three routes in the whole API accept a credential, and these are they",
     sorted(accepting),
     [
-        # The nightly economy reconciliation, and the read of what it found.
-        #
-        # Both were added with `scheduledReconciliation` and neither was
-        # recorded here, which is what this list exists to prevent — not
-        # because these two are dangerous, but because "which routes can be
-        # driven by a key rather than a person" is a question that has to be
-        # answered deliberately every time it changes. The reporting
-        # credential, like every other scheduled job: it compares Firestore
-        # against the ledger and writes a reconciliation row. It creates no
-        # liability and moves no balance.
         "GET notifications/reconciliation",
         "GET partner_ops/agencies/{agency_id}/commission-preview",
+        "GET partner_ops/applications/eligibility/{uid}",
+        "GET partner_ops/applications/of/{uid}",
+        "GET partner_ops/applications/parents",
+        "GET partner_ops/applications/verification/{uid}",
+        "GET role_appeals/of/{uid}",
         "POST notifications/jobs/alerts",
         "POST notifications/jobs/daily",
         "POST notifications/jobs/monthly",
@@ -962,17 +984,14 @@ check(
         "POST notifications/jobs/transactional-sweep",
         "POST notifications/provider-events",
         "POST partner_ops/agencies/{agency_id}/commission-accruals",
-        # The onboarding triggers. A different credential again, holding only
-        # `partner.register`. This route creates an EMPTY, pending record and is
-        # the reason an applicant is visible to staff at all — it is the one
-        # thing the browser could never do, because an external partner holds no
-        # API session.
+        "POST partner_ops/applications",
+        "POST partner_ops/applications/host",
+        "POST partner_ops/applications/verification/check",
+        "POST partner_ops/applications/verification/conflict",
         "POST partner_ops/partners",
-        # 8A.3 — the Sunday business report. Reporting credential, not the
-        # accrual one: it reads the ledger and emails what it found, and creates
-        # no liability. It lives in the reports router rather than notifications
-        # because it *is* a report; notifications is how it goes out.
+        "POST partner_ops/recharges",
         "POST reports/jobs/weekly-business",
+        "POST role_appeals",
     ],
 )
 # No two credentials meet on any route: the accrual key opens exactly the two
@@ -980,7 +999,31 @@ check(
 # that send, plus the reconciliation pair, which compares rather than sends —
 # the registration key exactly one, and no operation appears on another's route.
 accrual_deps = {"internal_or_accrual_service", "team_admin_or_accrual_service"}
-registration_deps = {"team_admin_or_partner_registration_service"}
+registration_deps = {
+    "team_admin_or_partner_registration_service",
+    "team_admin_or_partner_apply_service",
+    "team_admin_or_recharge_request_service",
+}
+#: Every route the onboarding key may open. Pending records that hold nothing,
+#: and reads the app already shows its users.
+ONBOARDING_ROUTES = {
+    "POST partner_ops/partners",
+    "GET partner_ops/applications/eligibility/{uid}",
+    "GET partner_ops/applications/parents",
+    "GET partner_ops/applications/of/{uid}",
+    "POST partner_ops/applications",
+    "POST partner_ops/applications/host",
+    "POST partner_ops/recharges",
+    # C2 — a reinstatement request for a revoked role, and the person's own list.
+    "POST role_appeals",
+    "GET role_appeals/of/{uid}",
+    # Decision 15 (RC) — the person's own verification, and starting an
+    # Owner-approved role once BOTH contacts are verified (re-read, never taken
+    # on the caller's word).
+    "GET partner_ops/applications/verification/{uid}",
+    "POST partner_ops/applications/verification/check",
+    "POST partner_ops/applications/verification/conflict",
+}
 reporting_deps = set(service_dep_names) - accrual_deps - registration_deps
 for path in sorted((ROOT / "app" / "routers").glob("*.py")):
     for method, route, used in routes_of(path):
@@ -999,10 +1042,9 @@ for path in sorted((ROOT / "app" / "routers").glob("*.py")):
             # Asserted here rather than left to the list above, because the
             # failure this guards against is somebody wiring the dependency onto
             # a second route later.
-            check(
-                "the registration credential opens only POST /partners",
-                f"{method.upper()} {path.stem}{route}",
-                "POST partner_ops/partners",
+            ok(
+                f"the onboarding credential opens only onboarding routes ({method.upper()} {path.stem}{route})",
+                f"{method.upper()} {path.stem}{route}" in ONBOARDING_ROUTES,
             )
         if opened_by_reporting:
             # The guard here is about *authority*, not about which file a route
@@ -1037,8 +1079,17 @@ check(
     sorted(runtime_accepting),
     [
         "GET /agencies/{agency_id}/commission-preview [commission.preview]",
+        "GET /applications/eligibility/{uid} [partner.apply]",
+        "GET /applications/of/{uid} [partner.apply]",
+        "GET /applications/parents [partner.apply]",
+        "GET /applications/verification/{uid} [partner.apply]",
         "POST /agencies/{agency_id}/commission-accruals [commission.accrue]",
+        "POST /applications [partner.apply]",
+        "POST /applications/host [partner.apply]",
+        "POST /applications/verification/check [partner.apply]",
+        "POST /applications/verification/conflict [partner.apply]",
         "POST /partners [partner.register]",
+        "POST /recharges [recharge.request]",
     ],
 )
 
@@ -1696,7 +1747,10 @@ if functions_index.exists():
             "ZIPPER_REPORTING_KEY",
             "ZIPPER_PARTNER_REGISTRATION_KEY",
         }) == 3
-        and index_text.count("secrets: [PARTNER_REGISTRATION_KEY_ENV]") == 1,
+        # Two declarations now: the registration triggers, and the app's
+        # "Join as …" / recharge callables, which present the same key for the
+        # same reason (pending records that hold nothing). Still one secret.
+        and index_text.count("secrets: [PARTNER_REGISTRATION_KEY_ENV]") == 2,
     )
     KEY_ENVS = ["ACCRUAL_KEY_ENV", "REPORTING_KEY_ENV", "PARTNER_REGISTRATION_KEY_ENV"]
     for first in KEY_ENVS:

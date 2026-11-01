@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.055Z" hostname="CW253.local" time="0.005">
+  <properties/>
+  <testcase name="the verification state parser keeps only what started" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.003"/>
+  <testcase name="the eligibility parser reads the activation block and the host application status" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.0"/>
+  <testcase name="hasAwaiting asks the server to check only when something waits" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.001"/>
+  <testcase name="a waiting Host application is listed too" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.001"/>
+  <testcase name="a waiting agency is listed as waiting, not as held" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.0"/>
+  <testcase name="the eligibility parser reads the role rule's parent pin" classname="com.zipper.app.ui.screens.partner.PartnerHubAwaitingTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

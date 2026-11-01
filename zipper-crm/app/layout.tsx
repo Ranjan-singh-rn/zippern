@@ -56,6 +56,7 @@ import {
   Eye,
   Scale,
   HandCoins,
+  Coins,
   ShieldAlert,
   Activity,
   FileSpreadsheet,
@@ -70,6 +71,9 @@ import {
   Settings2,
   HeartPulse,
   ScanFace,
+  RotateCcw,
+  ArrowRightLeft,
+  Lock,
 } from 'lucide-react'
 
 // Every screen below reads an endpoint behind `_require_oversight` or
@@ -162,6 +166,9 @@ const navGroups: NavGroup[] = [
       // inventory down. The endpoints existed for a while with no screen, so in
       // the running CRM inventory never decremented at all.
       { href: '/sales',          label: 'Seller Sales',    icon: ShoppingCart, roles: ['superadmin', 'ops_admin', 'ops_member', 'finance_admin', 'finance_member'] },
+      // Buyer-filed recharges through a Coin Seller: staff verify the payment
+      // here; the API credits through the ledger, once. There is no gateway.
+      { href: '/recharges',      label: 'Recharges',       icon: Coins,        roles: ['superadmin', 'ops_admin', 'ops_member', 'finance_admin', 'finance_member'] },
       /*
        * `ops_admin` is here because they are the only non-owner role that holds
        * `can_approve_kyc` and `can_approve_seller` — and they had no link to
@@ -175,6 +182,16 @@ const navGroups: NavGroup[] = [
        */
       { href: '/agencies',       label: 'Agencies',        icon: Building2,   roles: ['superadmin', 'app_admin', 'ops_admin'] },
       { href: '/kyc',            label: 'KYC',             icon: FileCheck,   roles: ['superadmin', 'app_admin', 'ops_admin'] },
+      // GOV C2 / C3: the two queues where reviewers RECOMMEND and the Owner
+      // DECIDES — a revoked role asked back, and a Host or Sub-agency moved to
+      // another agency. Beside KYC because the same people work them: the
+      // server admits `can_approve_kyc` / `can_approve_seller` holders and the
+      // Owner, which in the role table is ops_admin and the Owner alone.
+      { href: '/role-appeals',   label: 'Reinstatement requests', icon: RotateCcw,      roles: ['superadmin', 'ops_admin'] },
+      { href: '/transfers',      label: 'Transfer requests',      icon: ArrowRightLeft, roles: ['superadmin', 'ops_admin'] },
+      // RC (confirmed, CRM-FLOW 9.48): money behind a suspension, ban or
+      // revocation waits here for the Owner. Owner only, like the API.
+      { href: '/frozen-money',   label: 'Frozen money',           icon: Lock,           roles: ['superadmin'] },
     ],
   },
   {
@@ -756,6 +773,8 @@ function AppShell({ children }: { children: React.ReactNode }) {
                    || pathname === '/observer'      || pathname === '/observer/'
                    || pathname === '/agency-signup'  || pathname === '/agency-signup/'
                    || pathname === '/seller-signup'  || pathname === '/seller-signup/'
+                   // UGP-F: the public appeal — for people locked out of the app.
+                   || pathname === '/appeal'         || pathname === '/appeal/'
 
   const isPendingPage = pathname.startsWith('/agency-pending')
                      || pathname.startsWith('/seller-pending')

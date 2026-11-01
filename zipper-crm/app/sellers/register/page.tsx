@@ -83,7 +83,7 @@ import { useState, useRef } from 'react'
 import { db, storage } from '@/lib/firebase'
 import { addDoc, collection, serverTimestamp, doc, updateDoc } from 'firebase/firestore'
 import {
-  createPartnerLogin, createSellerAccount, generateCrmId, canAccess,
+  createPartnerLoginThen, createSellerAccount, generateCrmId, canAccess,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
 import {
@@ -94,12 +94,15 @@ import {
 import Link from 'next/link'
 import { useAuth } from '@/components/AuthProvider'
 import { submitApproval } from '@/lib/approvals'
+import { isRecordNotWritten, recordNotWrittenMessage } from '@/lib/loginThenRecord'
 import { ApiError } from '@/lib/api'
 import { inventory, coins as coinText, type DuplicateRef } from '@/lib/apiPartners'
 import {
   findPartnersByEmail, normaliseEmail, statusPhrase, loginPhrase,
   duplicateHeadline, type ExistingPartner,
 } from '@/lib/partnerDuplicates'
+import PhoneInput from '@/components/PhoneInput'
+import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
 
 /**
  * What happened to the opening load, kept separate from "the seller was
@@ -173,6 +176,8 @@ export default function RegisterSellerPage() {
     password:        '',
     confirmPassword: '',
   })
+  // Flags an already-registered email / phone while it is being typed.
+  const registered = useRegisteredCheck(form.email, form.phone)
 
   // ── Opening coin load — raised as a card, never written here ────────────────
   const [initialBalance, setInitialBalance] = useState('0')
@@ -393,15 +398,87 @@ export default function RegisterSellerPage() {
       // carries `crmUid`, which identifies the login and unlocks nothing.
       // `adminMode: true` runs it on a throwaway secondary Firebase app so the
       // staff member's own session survives.
+      //
+      // RC: the record is written INSIDE the login's step (`createPartnerLoginThen`),
+      // so when it fails the login made a moment ago is removed again rather
+      // than left in Auth holding the address with nothing behind it — the
+      // retry this page invites would otherwise be refused on the address.
       let crmUid: string
+      let createdSellerId = ''
       try {
-        crmUid = await createPartnerLogin({
-          email:     emailLower,
-          password:  form.password,
-          kind:      'seller',
-          adminMode: true,
-        })
+        const created = await createPartnerLoginThen(
+          { email: emailLower, password: form.password, kind: 'seller' },
+          async (uid) => {
+            if (isSuperAdmin) {
+              // Superadmin: create directly, holding nothing.
+              //
+              // Written WITHOUT `crmUid`. If the two writes below fail, the
+              // record is left with no login attached — which is exactly what
+              // `/sellers` badges, so the state is visible rather than
+              // invisible. Writing the link here would hide it behind a uid
+              // whose CRM account does not exist.
+              const docRef = await addDoc(collection(db, 'sellers'), {
+                ...sellerPayload,
+                ownerUid:    '',
+                createdBy:   crmUser?.uid ?? '',
+                createdAt:   serverTimestamp(),
+                /*
+                 * `_resendEmail` is NOT written here, and used to be.
+                 *
+                 * The resend triggers are `onUpdate` and fire only when the
+                 * field CHANGES, so a value present from the very first write
+                 * fired nothing — the resend was dead on arrival. And had it
+                 * ever fired, it would have duplicated the registration email
+                 * that `onSellerRegistered` already sends on create,
+                 * unconditionally, for staff-registered sellers as well as
+                 * self-signed-up ones.
+                 *
+                 * The field is now written only by the Resend button on the
+                 * partner list, which is an update to an existing document and
+                 * therefore the state change the trigger was built to watch.
+                 */
+              })
+              return docRef.id
+            }
+            // ── Admin / other: submit for superadmin approval ──────────────
+            //
+            // `crmUid` — not a password — is what travels through the queue.
+            // It names the Firebase Auth account created moments ago, and it
+            // is a public identifier: holding it grants nothing, and nobody,
+            // superadmin included, can read the password back out of it.
+            //
+            // `onApprovalApproved` in functions/src/index.ts writes the
+            // `crmUsers` document against that uid when the request is
+            // approved, and does it BEFORE it creates the seller, so a failure
+            // there leaves no seller behind rather than one nobody can sign in
+            // as. `crmUid` is in the payload, so the same `ref.set` that
+            // creates the seller also writes the back-link the rules bind on —
+            // there is no second write to miss.
+            await submitApproval({
+              type:             'create_seller',
+              description:      `Create coin seller: ${form.displayName.trim()} (${emailLower})`,
+              targetLabel:      `Seller: ${form.displayName.trim()}`,
+              targetCollection: 'sellers',
+              targetDocId:      '',
+              operation:        'create',
+              payload:          { ...sellerPayload, crmUid: uid },
+              requestedBy: {
+                uid:  crmUser?.uid  ?? '',
+                name: crmUser?.name ?? '',
+                role: crmUser?.role ?? '',
+              },
+            })
+            return ''
+          },
+        )
+        crmUid = created.uid
+        createdSellerId = created.result
       } catch (authErr: unknown) {
+        if (isRecordNotWritten(authErr)) {
+          console.error('Seller record could not be written:', authErr.reason)
+          setError(recordNotWrittenMessage(authErr, emailLower, 'coin seller'))
+          return
+        }
         setError(
           errorCode(authErr) === 'auth/email-already-in-use'
             ? `A login already exists for ${emailLower}, so nothing was created. `
@@ -415,45 +492,19 @@ export default function RegisterSellerPage() {
       }
 
       if (isSuperAdmin) {
-        // Superadmin: create directly, holding nothing.
-        //
-        // Written WITHOUT `crmUid`. If the two writes below fail, the record is
-        // left with no login attached — which is exactly what `/sellers` badges,
-        // so the state is visible rather than invisible. Writing the link here
-        // would hide it behind a uid whose CRM account does not exist.
-        const docRef = await addDoc(collection(db, 'sellers'), {
-          ...sellerPayload,
-          ownerUid:    '',
-          createdBy:   crmUser?.uid ?? '',
-          createdAt:   serverTimestamp(),
-          /*
-           * `_resendEmail` is NOT written here, and used to be.
-           *
-           * The resend triggers are `onUpdate` and fire only when the field
-           * CHANGES, so a value present from the very first write fired nothing
-           * — the resend was dead on arrival. And had it ever fired, it would
-           * have duplicated the registration email that `onSellerRegistered`
-           * already sends on create, unconditionally, for staff-registered
-           * sellers as well as self-signed-up ones.
-           *
-           * The field is now written only by the Resend button on the partner
-           * list, which is an update to an existing document and therefore the
-           * state change the trigger was built to watch.
-           */
-        })
-        setSellerId(docRef.id)
+        setSellerId(createdSellerId)
 
         try {
           await createSellerAccount({
             email:          emailLower,
             name:           form.displayName.trim(),
             phone:          form.phone.replace(/\s/g, ''),
-            sellerId:       docRef.id,
+            sellerId:       createdSellerId,
             adminMode:      true,
             uid:            crmUid,
             linkPartnerDoc: false,
           })
-          await updateDoc(doc(db, 'sellers', docRef.id), { crmUid })
+          await updateDoc(doc(db, 'sellers', createdSellerId), { crmUid })
           setLogin({ kind: 'attached', email: emailLower })
         } catch (linkErr: unknown) {
           // The seller record is committed and is a real application, so it is
@@ -471,37 +522,10 @@ export default function RegisterSellerPage() {
         // Raised last, and deliberately not fatal: the seller record is already
         // committed, so a refusal here must not read as "the seller was not
         // created". The outcome is reported separately on the success screen.
-        setOpening(await raiseOpeningLoad(docRef.id, balance))
+        setOpening(await raiseOpeningLoad(createdSellerId, balance))
 
         setSuccess(true)
       } else {
-        // ── Admin / other: submit for superadmin approval ────────────────────
-        //
-        // `crmUid` — not a password — is what travels through the queue. It
-        // names the Firebase Auth account created moments ago, and it is a
-        // public identifier: holding it grants nothing, and nobody, superadmin
-        // included, can read the password back out of it.
-        //
-        // `onApprovalApproved` in functions/src/index.ts writes the `crmUsers`
-        // document against that uid when the request is approved, and does it
-        // BEFORE it creates the seller, so a failure there leaves no seller
-        // behind rather than one nobody can sign in as. `crmUid` is in the
-        // payload, so the same `ref.set` that creates the seller also writes
-        // the back-link the rules bind on — there is no second write to miss.
-        await submitApproval({
-          type:             'create_seller',
-          description:      `Create coin seller: ${form.displayName.trim()} (${emailLower})`,
-          targetLabel:      `Seller: ${form.displayName.trim()}`,
-          targetCollection: 'sellers',
-          targetDocId:      '',
-          operation:        'create',
-          payload:          { ...sellerPayload, crmUid },
-          requestedBy: {
-            uid:  crmUser?.uid  ?? '',
-            name: crmUser?.name ?? '',
-            role: crmUser?.role ?? '',
-          },
-        })
         setLogin({ kind: 'attached', email: emailLower })
         setSubmittedForApproval(true)
       }
@@ -774,13 +798,15 @@ export default function RegisterSellerPage() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className={labelClass}><Phone className="w-3.5 h-3.5 inline mr-1 text-pink-400" />Phone *</label>
-              <input type="tel" className={inputClass} placeholder="+91 9876543210"
-                value={form.phone} onChange={e => set('phone', e.target.value)} />
+              <PhoneInput className={inputClass} placeholder="Mobile number"
+                value={form.phone} onChange={v => set('phone', v)} />
+              {registered.phone && <p className="text-xs text-red-400 mt-1">{registered.phone}</p>}
             </div>
             <div>
               <label className={labelClass}><Mail className="w-3.5 h-3.5 inline mr-1 text-pink-400" />Email *</label>
               <input type="email" className={inputClass} placeholder="seller@email.com"
                 value={form.email} onChange={e => set('email', e.target.value)} />
+              {registered.email && <p className="text-xs text-red-400 mt-1">{registered.email}</p>}
             </div>
           </div>
 

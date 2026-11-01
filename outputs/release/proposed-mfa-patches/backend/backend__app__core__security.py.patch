@@ -1,0 +1,87 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/app/core/security.py
++++ b/backend/app/core/security.py
+@@ -121,6 +121,7 @@
+     partner_ids: Mapping[str, str] | None = None,
+     partner_status: str | None = None,
+     renewed_from: str | None = None,
++    mfa_verified: bool = False,
+ ) -> tuple[str, datetime]:
+     """Mint a session token.
+ 
+@@ -190,6 +191,12 @@
+         "revoked": False,
+         "renewed_from": renewed_from,
+     }
++    if role == Role.OWNER:
++        # P1-A3: whether THIS session passed the Owner's second factor. Only an
++        # Owner token carries it; `deps.current_user` limits an Owner session
++        # without it to the MFA routes. Set only by `services/owner_mfa`.
++        claims["mfa"] = bool(mfa_verified)
++        record["mfa_verified"] = bool(mfa_verified)
+     if partner_ids is not None or partner_status is not None:
+         claims["partners"] = scoped
+         claims["partner_status"] = partner_status or ""
+@@ -247,7 +254,17 @@
+         #: The agency record if there is one, otherwise the seller record.
+         "partner_id": partner_ids.get("agency") or partner_ids.get("seller") or "",
+         "partner_status": str(claims.get("partner_status") or ""),
++        #: P1-A3 — True only on an Owner session that passed MFA. The session
++        #: record must agree: a claim cannot be upgraded without a new token,
++        #: and the record is written by the same call that signs it.
++        "mfa_verified": bool(claims.get("mfa")) and bool(record.get("mfa_verified")),
+     }
++
++
++async def _session_expiry(jti: str) -> datetime | None:
++    """The token expiry recorded for a session (P1-A3b binding lifetime)."""
++    record = await get_db()[C.SESSIONS].find_one({"jti": jti}) if jti else None
++    return (record or {}).get("token_expires_at")
+ 
+ 
+ async def revoke_session(jti: str) -> None:
+@@ -402,21 +419,31 @@
+ 
+         name = str(staff.get("name", ""))
+         await revoke_session(jti)
++        # P1-A3: a renewal continues the SAME sign-in, so an Owner who passed
++        # MFA keeps it and one who has not still has not. An Observer reset of
++        # the Owner's MFA revokes every session, so nothing stale renews.
++        mfa_ok = bool(claims.get("mfa")) and bool(record.get("mfa_verified"))
+         new_token, expires = await issue_session(
+-            uid=uid, email=email, name=name, role=current, renewed_from=jti
++            uid=uid, email=email, name=name, role=current, renewed_from=jti,
++            mfa_verified=mfa_ok,
+         )
+         log.info("Renewed the session of %s (%s)", uid, current)
+-        return (
+-            new_token,
+-            expires,
+-            {
+-                "uid": uid,
+-                "email": email,
+-                "name": name,
+-                "role": str(current),
+-                "team": str(team_of(current)) if team_of(current) else None,
+-            },
+-        )
++        profile = {
++            "uid": uid,
++            "email": email,
++            "name": name,
++            "role": str(current),
++            "team": str(team_of(current)) if team_of(current) else None,
++        }
++        if current == Role.OWNER and mfa_ok and record.get("mfa_binding_id"):
++            # P1-A3b: the Firestore/Storage binding follows a VALID renewal —
++            # moved to the new jti and extended to the new expiry. A binding
++            # removed by sign-out, reset or suspension is never re-created.
++            from app.services import owner_mfa
++
++            new_jti = str((await verify_session(new_token)).get("jti") or "")
++            profile["mfa_firestore_binding"] = await owner_mfa.carry_binding(jti, new_jti, uid, expires)
++        return new_token, expires, profile
+ 
+     if not is_external(role):
+         # An internal session whose `staff` row has gone. Falling through to

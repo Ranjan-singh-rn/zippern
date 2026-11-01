@@ -35,6 +35,10 @@ import {
 import { initializeApp, deleteApp } from 'firebase/app'
 import { auth, db, firebaseConfig } from './firebase'
 import type { PartnerRole, PartnerRoleStatus } from './partnerRouting'
+import { runSubAgencyCreation } from './subAgencyCreation'
+import { runLoginThenRecord } from './loginThenRecord'
+import { asksApiWhyInactive, inactiveLoginMessage } from './crmDoor'
+import { auth as apiAuth } from './api'
 
 // One login can hold both partner capabilities — agency AND coin seller. The
 // model, the routing table and the legacy fallbacks live in ./partnerRouting,
@@ -138,10 +142,15 @@ export interface DeptStaffMember {
   role: CrmRole
 }
 
-/** Active CRM staff (admin + member) belonging to a department — used for ticket assignment pickers */
+/**
+ * Active CRM staff (admin + member) belonging to a department — used for ticket
+ * assignment pickers. P1-E: read from `staffRoster` (names, roles, department;
+ * readable by all staff, written only by the API), not `crmUsers`, which holds
+ * contact details and is readable only by owners and a member's own admin.
+ */
 export async function getDeptStaff(dept: Dept): Promise<DeptStaffMember[]> {
   const q = query(
-    collection(db, 'crmUsers'),
+    collection(db, 'staffRoster'),
     where('role', 'in', [`${dept}_admin`, `${dept}_member`]),
   )
   const snap = await getDocs(q)
@@ -331,12 +340,6 @@ export const DEFAULT_PERMISSIONS: Record<CrmRole, Permission[]> = {
 
 // ── CrmUser type ────────────────────────────────────────────────────────────
 
-export interface GateAnswers {
-  q1: string   // Who are you? (full name)
-  q2: string   // Phone number
-  q3: string   // Called name / nickname
-}
-
 /** Generates a human-readable 8-character uppercase alphanumeric ID, e.g. "A1B2C3D4" */
 export function generateCrmId(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // no 0/O/1/I to avoid confusion
@@ -401,11 +404,13 @@ export interface CrmUser {
   sellerUid?:   string       // legacy field
   sellerId?:    string       // sellers collection doc ID
   isActive:     boolean
+  // GOV C4 (B06): the human behind this login is suspended or banned in the
+  // app. Written by the API alone (`services/users.py`); absent = unrestricted.
+  accountRestricted?: boolean
   status?:      'pending' | 'approved'
   createdBy:    string
   createdAt:    Timestamp | null
   lastLoginAt:  Timestamp | null
-  gateAnswers?: GateAnswers  // per-user security gate answers (set on first superadmin login)
 }
 
 // ── Superadmin seeding lives in the backend, not here ────────────────────────
@@ -424,6 +429,10 @@ export interface CrmUser {
 
 // ── Sign in ─────────────────────────────────────────────────────────────────
 // Now accepts a real personal email directly (no username→email mapping)
+
+/** GOV C4: `core/account_state.ACCOUNT_RESTRICTED_MESSAGE`, word for word. */
+export const ACCOUNT_RESTRICTED_MESSAGE =
+  'This account is suspended or banned. Partner access is closed until it is lifted.'
 
 /**
  * Turn an ALREADY-AUTHENTICATED uid into the CRM user behind it.
@@ -458,8 +467,23 @@ async function resolveCrmUser(uid: string): Promise<CrmUser> {
   const data = { ...raw, role: normalizeCrmRole(raw.role) } as CrmUser
 
   if (!data.isActive) {
+    // Decision 16 (RC): a REJECTED partner's login is inactive too, and
+    // "deactivated" is untrue for them. Ask the API why — while the Firebase
+    // session still exists to ask with — and show its sentence (lib/crmDoor).
+    // No session is opened either way; the browser is signed out below.
+    const apiRefusal = asksApiWhyInactive(data.role)
+      ? await apiAuth.refusalForCurrentLogin().catch(() => '')
+      : ''
     await firebaseSignOut(auth)
-    throw new Error('This account has been deactivated.')
+    throw new Error(inactiveLoginMessage(data.role, apiRefusal))
+  }
+
+  // GOV C4 (B06): the API refuses this login a session while the app account is
+  // suspended or banned (401 at sign-in, 403 on a live session) and the rules
+  // refuse its writes, so it is refused at the door with the API's sentence.
+  if (data.accountRestricted === true) {
+    await firebaseSignOut(auth)
+    throw new Error(ACCOUNT_RESTRICTED_MESSAGE)
   }
 
   // Two writes, not one, and only the first of them may fail loudly.
@@ -636,6 +660,49 @@ export async function refreshEmailVerified(): Promise<boolean> {
   if (!user) return false
   await user.reload()
   return user.emailVerified === true
+}
+
+/**
+ * P0-5 (AUTHN-2): the public partner forms file nothing until the signed-in
+ * login's address is CONFIRMED, because `firestore.rules` binds the record, the
+ * CRM account and the back-link to a verified email only.
+ *
+ * Verified → the ID token is refreshed so the rules see `email_verified`, and
+ * the form carries on. Not verified → the confirmation email is sent and the
+ * applicant is told to open it and submit again; nothing has been written.
+ * A failure to check is reported as such, never as "verified".
+ */
+export async function ensurePartnerEmailVerified(): Promise<
+  { ok: true } | { ok: false; message: string }
+> {
+  const user = auth.currentUser
+  if (!user) return { ok: false, message: 'Your login could not be found. Please try again.' }
+  let verified: boolean
+  try {
+    verified = await refreshEmailVerified()
+  } catch {
+    return {
+      ok: false,
+      message: 'Your login could not be checked with Firebase, so nothing was submitted. Please try again.',
+    }
+  }
+  if (verified) {
+    await user.getIdToken(true)
+    return { ok: true }
+  }
+  let sent = true
+  try {
+    await sendEmailVerification(user)
+  } catch {
+    sent = false   // throttled or offline — the instruction below still applies
+  }
+  const address = user.email ?? 'your address'
+  return {
+    ok: false,
+    message: (sent ? `We have sent a confirmation link to ${address}. ` : '')
+      + 'Open the link in that email to confirm your address, then press Submit '
+      + 'again. Nothing has been submitted yet.',
+  }
 }
 
 /**
@@ -1020,16 +1087,9 @@ export async function updateOwnContactDetails(
   })
 }
 
-// ── Save per-user gate answers (called after first superadmin login) ─────────
-
-export async function saveGateAnswers(uid: string, answers: GateAnswers): Promise<void> {
-  const normalized: GateAnswers = {
-    q1: answers.q1.trim().toLowerCase().replace(/\s+/g, ' '),
-    q2: answers.q2.trim(),
-    q3: answers.q3.trim().toLowerCase().replace(/\s+/g, ' '),
-  }
-  await updateDoc(doc(db, 'crmUsers', uid), { gateAnswers: normalized })
-}
+// P1-A3: the Owner "security gate" (three questions stored in plain text on
+// crmUsers.gateAnswers and checked in the browser) was removed. Owners use
+// server-enforced TOTP — see backend/app/services/owner_mfa.py.
 
 // ── Send password reset email to a CRM team member ──────────────────────────
 
@@ -1044,6 +1104,7 @@ export async function sendCrmPasswordReset(email: string): Promise<void> {
 // that needs the raw Firestore collection, including agency and seller records,
 // which never appear in `staff`.
 
+/** Owners only since P1-E — the rules refuse anyone else a full list. Unused. */
 export async function listCrmUsers(): Promise<CrmUser[]> {
   const snap = await getDocs(collection(db, 'crmUsers'))
   return snap.docs.map((d) => d.data() as CrmUser)
@@ -1107,6 +1168,46 @@ export async function createPartnerLogin(params: {
   } finally {
     await deleteApp(secondaryApp)
   }
+}
+
+/**
+ * RC — staff registration: the login, then the record, and the login removed
+ * again if the record cannot be written (`lib/loginThenRecord.ts`).
+ *
+ * Same login as `createPartnerLogin({ adminMode: true })` — a secondary app, so
+ * the staff member's own session survives — but the secondary session stays
+ * signed in until `writeRecord` has finished: the new user can delete only
+ * itself, so this is the one moment its removal is possible from a browser.
+ * Throws the login's own error (address in use…) when no login was made, and
+ * `RecordNotWritten` (with `loginRemoved`) when the record failed.
+ */
+export async function createPartnerLoginThen<T>(
+  params: { email: string; password: string; kind: 'agency' | 'seller' },
+  writeRecord: (uid: string) => Promise<T>,
+): Promise<{ uid: string; result: T }> {
+  const emailLower = params.email.trim().toLowerCase()
+  const secondaryApp = initializeApp(firebaseConfig, `${params.kind}_${Date.now()}`)
+  const secondaryAuth = getAuth(secondaryApp)
+  return runLoginThenRecord({
+    createLogin: async () => {
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, params.password)
+      return cred.user.uid
+    },
+    writeRecord,
+    deleteLogin: async (uid) => {
+      const user = secondaryAuth.currentUser
+      if (!user || user.uid !== uid) throw new Error('The new login is no longer signed in, so it cannot be removed.')
+      // The secondary session's own new user — the only account it may delete.
+      await deleteUser(user)
+    },
+    finish: async () => {
+      try {
+        if (secondaryAuth.currentUser) await firebaseSignOut(secondaryAuth)
+      } finally {
+        await deleteApp(secondaryApp)
+      }
+    },
+  })
 }
 
 // ── The same login, created by Google instead of by a password ───────────────
@@ -1321,10 +1422,8 @@ export async function createAgencyAccount(params: {
   return uid
 }
 
-// ── Approve an agency's CRM account (called from agency detail page) ──────────
-export async function approveAgencyAccount(crmUid: string): Promise<void> {
-  await updateDoc(doc(db, 'crmUsers', crmUid), { status: 'approved' })
-}
+// Phase 1A: a direct `crmUsers.status` write was removed here. Partner
+// approval is a backend operation (POST /api/partner-ops/partners/{id}/approve).
 
 // ── Coin seller self-signup — creates Firebase Auth + CrmUser from public form ──
 // Called from /seller-signup page (NO admin session — seller fills this themselves).
@@ -1387,10 +1486,8 @@ export async function createSellerAccount(params: {
   return uid
 }
 
-// ── Approve a seller's CRM account (called from seller detail page) ───────────
-export async function approveSellerAccount(crmUid: string): Promise<void> {
-  await updateDoc(doc(db, 'crmUsers', crmUid), { status: 'approved' })
-}
+// Phase 1A: a direct `crmUsers.status` write was removed here. Partner
+// approval is a backend operation (POST /api/partner-ops/partners/{id}/approve).
 
 // ── Create sub-agency CRM account from an agency user's session ───────────────
 //
@@ -1398,44 +1495,105 @@ export async function approveSellerAccount(crmUid: string): Promise<void> {
 // primary DB (blocked for agency-role users by Firestore rules) — this function
 // uses a secondary Firebase app for BOTH Auth and Firestore. The new sub-agency
 // owner's auth token satisfies the "allow create if auth.uid == uid" rule.
+//
+// ── GOV B07: AND IT LEAVES THE RECORD WITH ITS OWNER ─────────────────────────
+//
+// The sub-agency record used to end this flow naming nobody: the parent's
+// login may put only its OWN uid on a record it creates (`partnerCreateSafe`
+// in firestore.rules), the new login did not exist yet when the record was
+// written, and nothing wrote `crmUid` afterwards. So the API's per-person
+// rules — one agency-family record per human, Host + Agency refused — could
+// not see who held it, and the same human could be approved for a second
+// agency or a Host role beside it.
+//
+// The new login now writes its own `crmUid` back-link, once, with its own
+// token, straight after its `crmUsers` document — the narrow arm in the
+// `agencies` update rule bound exactly like that document's create. There is
+// no backend endpoint an agency login may call to create a sub-agency (attach-
+// login is a team-admin route), so the link is written here at creation time.
+//
+// `linked: false` means the record and the login BOTH exist and only the link
+// was refused. That is not a failure to retry — a retry would refuse on the
+// address — and the caller says so instead.
+//
+// ── FX-03: THE LOGIN COMES FIRST ─────────────────────────────────────────────
+//
+// This used to be called AFTER the dashboard had written the `agencies`
+// record, so `auth/email-already-in-use` (the failure a retry is guaranteed to
+// hit) arrived after the record was committed: every failed attempt left a
+// pending sub-agency nobody owned, which the registration trigger gave a Mongo
+// record of its own, and every retry added another. Now the caller passes the
+// record write in as `writeRecord`, and `runSubAgencyCreation`
+// (lib/subAgencyCreation.ts, with its spec) runs: login → record (the login is
+// deleted again if the record write fails) → the login's own crmUsers
+// document → the back-link. The crmUsers create is bound by the rules to a
+// record that already names the address (`agencyNamesCaller`), which is why it
+// still comes after the record.
+export interface SubAgencyAccount {
+  uid: string
+  /** The `agencies` document id the caller's `writeRecord` returned. */
+  agencyId: string
+  /** True once `agencies/{agencyId}.crmUid` names this login. */
+  linked: boolean
+  /** True once the login's own `crmUsers` document exists. */
+  loginDocWritten: boolean
+}
+
 export async function createSubAgencyAccount(params: {
   email: string
   password: string
   name: string
   phone: string
-  agencyId: string
-}): Promise<string> {
+  /**
+   * Writes the `agencies` record with the CALLER's (the parent agency's)
+   * session and returns its id. Called only once the login exists.
+   */
+  writeRecord: () => Promise<string>
+}): Promise<SubAgencyAccount> {
   const emailLower = params.email.trim().toLowerCase()
 
   const secondaryApp = initializeApp(firebaseConfig, `subagency_${Date.now()}`)
   const secondaryAuth = getAuth(secondaryApp)
   const secondaryDb = getFirestore(secondaryApp)
 
-  let uid: string
-  try {
-    const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, params.password)
-    uid = cred.user.uid
-
-    // Write crmUsers doc using the new user's own auth token — satisfies Firestore rules
-    await setDoc(doc(secondaryDb, 'crmUsers', uid), {
-      uid,
-      email:       emailLower,
-      name:        params.name.trim(),
-      phone:       params.phone.trim(),
-      role:        'agency' as CrmRole,
-      permissions: DEFAULT_PERMISSIONS['agency'],
-      agencyId:    params.agencyId,
-      isActive:    true,
-      status:      'pending',
-      createdBy:   'agency_created',
-      createdAt:   serverTimestamp(),
-      lastLoginAt: null,
-    })
-
-    await firebaseSignOut(secondaryAuth)
-  } finally {
-    await deleteApp(secondaryApp)
-  }
-
-  return uid
+  return runSubAgencyCreation({
+    createLogin: async () => {
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, params.password)
+      return cred.user.uid
+    },
+    writeRecord: params.writeRecord,
+    deleteLogin: async () => {
+      // The new login is the secondary session's own user; deleting it frees
+      // the address, so the retry the user will make is not refused on it.
+      if (secondaryAuth.currentUser) await deleteUser(secondaryAuth.currentUser)
+    },
+    writeLoginDoc: async (uid, agencyId) => {
+      // Written with the new user's own token — satisfies Firestore rules.
+      await setDoc(doc(secondaryDb, 'crmUsers', uid), {
+        uid,
+        email:       emailLower,
+        name:        params.name.trim(),
+        phone:       params.phone.trim(),
+        role:        'agency' as CrmRole,
+        permissions: DEFAULT_PERMISSIONS['agency'],
+        agencyId,
+        isActive:    true,
+        status:      'pending',
+        createdBy:   'agency_created',
+        createdAt:   serverTimestamp(),
+        lastLoginAt: null,
+      })
+    },
+    writeBackLink: async (uid, agencyId) => {
+      // GOV B07: the owner link, written by the login it names.
+      await updateDoc(doc(secondaryDb, 'agencies', agencyId), { crmUid: uid })
+    },
+    finish: async () => {
+      try {
+        await firebaseSignOut(secondaryAuth)
+      } finally {
+        await deleteApp(secondaryApp)
+      }
+    },
+  })
 }

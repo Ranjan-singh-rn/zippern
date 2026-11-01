@@ -29,7 +29,15 @@ data class AuthUiState(
     val otpAutoFilled: String? = null,
     val faceVerificationAttempts: Int = 0,
     val navigateToFaceVerification: Boolean = false,
+    /**
+     * B11: an ordinary sign-out has FINISHED, and only now may Login be shown.
+     * Set by [AuthViewModel.signOut] once the repository is done, consumed by
+     * [AuthViewModel.onNavigatedToLogin] — the same pattern as
+     * [accountDeleted], so the navigation survives a rotation mid-sign-out.
+     */
     val navigateToLogin: Boolean = false,
+    /** B11: a sign-out is in flight. The graph covers the screen while it runs. */
+    val signingOut: Boolean = false,
     val accountDeleted: Boolean = false,
     /**
      * The person backed out of profile setup and the half-made account has
@@ -53,6 +61,11 @@ data class AuthUiState(
      * one their sign-in could not supply.
      *
      * Default false on purpose: until the server has answered, ask for nothing.
+     *
+     * C7: no sign-in sets these any more. The requirement is stored in
+     * SessionManager and settled from Settings, by OTP or by code; it used to
+     * arrive here with `NeedsContactDetails` and send a finished profile back
+     * to setup on every sign-in (B01).
      */
     val requiresPhone: Boolean = false,
     val requiresEmail: Boolean = false,
@@ -136,6 +149,9 @@ class AuthViewModel @Inject constructor(
     // ── Phone OTP ─────────────────────────────────────────────────────────────
 
     fun sendOtp(phoneNumber: String, activity: Activity, deviceId: String = "") {
+        // FX-15: one verification at a time — a second tap during the delay
+        // before this runs, or while it is in flight, sends no second SMS.
+        if (!SubmitGuard.mayStart(_uiState.value.isLoading)) return
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
             val banReason = repo.getDeviceBanReason(deviceId)
@@ -180,6 +196,9 @@ class AuthViewModel @Inject constructor(
     }
 
     fun verifyOtp(code: String, deviceId: String = "") {
+        // FX-15: the keyboard's Done, the Verify button and the SMS auto-fill
+        // can all arrive for one code; only the first starts a sign-in.
+        if (!SubmitGuard.mayStart(_uiState.value.isLoading)) return
         val verificationId = _uiState.value.verificationId ?: return
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
@@ -198,6 +217,13 @@ class AuthViewModel @Inject constructor(
             }
         }
     }
+
+    /**
+     * FX-15: the auto-read SMS code is used ONCE. It used to stay in the state,
+     * so the screen's effect ran it again whenever the screen was recreated (a
+     * dark-mode or language change) — a second sign-in for the same code.
+     */
+    fun consumeAutoFilledOtp() = _uiState.update { it.copy(otpAutoFilled = null) }
 
     // ── Google Sign-In ────────────────────────────────────────────────────────
 
@@ -308,6 +334,9 @@ class AuthViewModel @Inject constructor(
          */
         defaultAvatar: String = "",
     ) {
+        // FX-15: a double tap on "Let's Go!" (the screen waits 300 ms before
+        // calling this) saves — and activates a referral code — once.
+        if (!SubmitGuard.mayStart(_uiState.value.isLoading)) return
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
             when (val result = repo.saveUserProfile(name, gender, dob, age, city, country, deviceId, photoUri, languages, email, phone, bio, defaultAvatar)) {
@@ -510,6 +539,9 @@ class AuthViewModel @Inject constructor(
     suspend fun savedQuickLogin(): com.zipper.app.util.QuickLoginStore.Saved? =
         repo.savedQuickLogin()
 
+    /** FX-21: this device's remembered guest account ("" when none) — see GuestLinkWarning. */
+    suspend fun deviceGuestUid(): String = repo.deviceGuestUid()
+
     /**
      * Sign back into the account most recently signed out from this device.
      *
@@ -558,16 +590,18 @@ class AuthViewModel @Inject constructor(
                 }
             is AuthResult.DeletedRecoverable ->
                 _uiState.update { it.copy(isLoading = false, navigateToRecoverAccount = true) }
-            is AuthResult.NeedsContactDetails ->
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        navigateToProfileSetup = true,
-                        requiresPhone = result.requiresPhone,
-                        requiresEmail = result.requiresEmail,
-                        crmRole = result.crmRole,
-                    )
-                }
+            /*
+             * C7: there is no `NeedsContactDetails` arm any more. A missing
+             * contact used to land here and go to profile setup — every sign-in,
+             * finished profile or not (B01). It is stored by the repository now
+             * and the sign-in arrives as Success or ProfileIncomplete like any
+             * other.
+             *
+             * C8 (B27): the account's recovery window is over. Already signed
+             * out; say so on the login screen and stay there.
+             */
+            is AuthResult.AccountDeleted ->
+                _uiState.update { it.copy(isLoading = false, error = result.message) }
             is AuthResult.Error ->
                 _uiState.update { it.copy(isLoading = false, error = result.message) }
             is AuthResult.CodeSent ->
@@ -577,30 +611,56 @@ class AuthViewModel @Inject constructor(
 
     // ── Consume navigation events ─────────────────────────────────────────────
 
-    fun signOut() {
-        viewModelScope.launch {
-            repo.signOut()
-            _uiState.update { it.copy(navigateToMain = false, navigateToOtp = false, navigateToProfileSetup = false) }
-        }
-    }
-
     /**
-     * Sign out AND forget this device, so quick sign-in will not offer the
-     * account back.
+     * Log out, Switch account, "Back to login" and profile setup's "Go back".
      *
-     * The honest "log out" for a shared or borrowed phone. Ordinary sign-out
-     * deliberately remembers — that is the whole of the quick sign-in feature —
-     * so there has to be a second door for the person who does not want to be
-     * remembered.
+     * ── B11: LOGIN WAITS FOR THE SIGN-OUT ───────────────────────────────────
+     *
+     * Every caller used to navigate on the same line as this call, while the
+     * repository was still minting quick login, ending the server session and
+     * dropping the push token — and its last two lines then cleared the session
+     * and signed Firebase out, whatever had happened in the meantime. A quick
+     * re-sign-in on the Login screen was wiped by the logout before it.
+     * Profile setup's "Go back" had it worse: its navigation destroyed this
+     * view model's scope, cancelling the sign-out half-way.
+     *
+     * Now nothing navigates until the repository returns: [navigateToLogin] is
+     * set only then. The repository also refuses to finish if a sign-in has
+     * started since (see `AuthRepository.signOut`), so a race is harmless as
+     * well as unlikely.
+     *
+     * @param deviceId B43: this handset's id, so the quick-login credential
+     *   minted on the way out is recorded against the device that holds it. It
+     *   was always "" from here.
      */
-    fun signOutAndForget() {
+    fun signOut(deviceId: String = "") {
+        // One at a time. A second tap must not start a second sign-out.
+        if (_uiState.value.signingOut) return
+        _uiState.update { it.copy(signingOut = true) }
         viewModelScope.launch {
-            repo.signOutAndForget()
+            try {
+                repo.signOut(deviceId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Every step inside is best-effort; Login is still the right
+                // place to land, and the guard there makes a stale session
+                // harmless.
+            }
             _uiState.update {
-                it.copy(navigateToMain = false, navigateToOtp = false, navigateToProfileSetup = false)
+                it.copy(
+                    signingOut = false,
+                    navigateToLogin = true,
+                    navigateToMain = false,
+                    navigateToOtp = false,
+                    navigateToProfileSetup = false,
+                )
             }
         }
     }
+
+    // UGP-E2: `signOutAndForget()` was removed with its Settings row. Log out
+    // (above) and Switch account are the sign-out paths.
 
     /**
      * Back out of profile setup and throw the half-made account away.

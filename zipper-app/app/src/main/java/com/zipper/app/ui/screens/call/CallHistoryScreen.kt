@@ -47,6 +47,8 @@ fun CallHistoryScreen(
     ZipperScreen(topBar = { TopBar("Call history", onBack = onBack) }) { _ ->
         when {
             state.isLoading -> LoadingState()
+            // B2: a failed read is not an empty history.
+            state.error != null && state.calls.isEmpty() -> EmptyState(Icons.Outlined.Call, "Call history unavailable", state.error ?: "", actionLabel = "Try again", onAction = viewModel::load)
             state.calls.isEmpty() -> EmptyState(Icons.Outlined.Call, "No calls yet", "Open a host's profile and start a video call — every call you make or receive shows up here.")
             else -> LazyColumn(contentPadding = PaddingValues(bottom = Space.xl)) {
                 items(state.calls) { call ->

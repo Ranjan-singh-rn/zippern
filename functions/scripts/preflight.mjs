@@ -17,8 +17,15 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import admin from 'firebase-admin'
+import { guardKeyScript } from './_keyScriptGuard.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('preflight', {
+  keyPath: new URL('../../serviceAccountKey.json', import.meta.url),
+  writes: false,
+})
 const keyPath = resolve(here, '../../serviceAccountKey.json')
 
 admin.initializeApp({

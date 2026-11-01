@@ -31,6 +31,7 @@
 
 import api from '@/lib/api'
 import { partnerOps } from '@/lib/apiPartners'
+import { awaitingLabel } from '@/lib/contactVerification'
 import type { Item } from '@/lib/reviewQueues'
 
 export type DecisionAction = 'approve' | 'reject' | 'register'
@@ -84,8 +85,12 @@ export async function decideReviewItem(
     return decided.note ?? ''
   }
 
-  if (approve) await partnerOps.approve(item.id, reason)
-  else await partnerOps.reject(item.id, reason)
+  if (approve) {
+    const out = await partnerOps.approve(item.id, reason)
+    // Decision 15 (RC): approved by the Owner, NOT started — the login still
+    // needs both verified contacts. The queue says so instead of "approved".
+    if (out?.awaiting_verification) return awaitingLabel(out.missing ?? [])
+  } else await partnerOps.reject(item.id, reason)
   return ''
 }
 

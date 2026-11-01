@@ -414,6 +414,7 @@ export function AgencyMoney({
             rule={statement?.ok ? statement.value.commission_rule : ''}
             period={period}
             loading={statement === null}
+            roster={roster}
           />
 
           <CommissionLedger

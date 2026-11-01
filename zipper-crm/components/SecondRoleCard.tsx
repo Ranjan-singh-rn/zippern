@@ -25,7 +25,9 @@ import { Building2, ShoppingBag, Clock, ArrowRight, X, Loader2, AlertTriangle } 
 import { useAuth } from '@/components/AuthProvider'
 import {
   availableSecondRole,
+  heldPartnerRecords,
   requestSecondRole,
+  type HeldPartnerRecords,
   secondRoleRefusal,
   SecondRoleError,
 } from '@/lib/partnerRoles'
@@ -65,7 +67,29 @@ export function SecondRoleCard() {
   const [filed, setFiled] = useState('')
   const [refusal, setRefusal] = useState('')
 
-  const available = availableSecondRole(crmUser)
+  // What the partner RECORDS say this login holds, rather than the
+  // denormalised `crmUsers.agencyId` copy of it. Undefined until the query
+  // comes back, which is what the first render uses — and on that render
+  // `availableSecondRole` falls back to the old field, so the card can appear
+  // and then withdraw. That is the right way round: offering and retracting
+  // costs a flicker, while the reverse offers an application the API will
+  // refuse.
+  const [held, setHeld] = useState<HeldPartnerRecords | undefined>(undefined)
+
+  useEffect(() => {
+    if (!crmUser) return
+    let live = true
+    heldPartnerRecords(crmUser)
+      .then((h) => { if (live) setHeld(h) })
+      .catch(() => {
+        // Not silently "nothing held". `availableSecondRole` makes no offer
+        // on an unchecked result, which is the fail-closed answer.
+        if (live) setHeld({ checked: false, reason: 'The lookup failed.' })
+      })
+    return () => { live = false }
+  }, [crmUser])
+
+  const available = availableSecondRole(crmUser, held)
   const primary = primaryPartnerRole(crmUser)
   const other: PartnerRole | null =
     primary === 'agency' ? 'seller' : primary === 'seller' ? 'agency' : null

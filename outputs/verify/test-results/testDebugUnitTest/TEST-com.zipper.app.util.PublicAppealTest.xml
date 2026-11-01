@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.PublicAppealTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.147Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="both restriction screens offer the web appeal" classname="com.zipper.app.util.PublicAppealTest" time="0.0"/>
+  <testcase name="the signed-in account id wins, the quick-login one is the fallback" classname="com.zipper.app.util.PublicAppealTest" time="0.0"/>
+  <testcase name="a public-web appeal neither blocks the owner's own appeal nor reads as theirs" classname="com.zipper.app.util.PublicAppealTest" time="0.0"/>
+  <testcase name="the address is the CRM public route" classname="com.zipper.app.util.PublicAppealTest" time="0.0"/>
+  <testcase name="a quick-login ban hands the account id to the screen" classname="com.zipper.app.util.PublicAppealTest" time="0.001"/>
+  <testcase name="the id is forgotten, so a later screen never shows the previous person's" classname="com.zipper.app.util.PublicAppealTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

@@ -80,59 +80,11 @@
             </intent-filter>
 
             <!--
-              Firebase email sign-in link — the return leg of "Add your email".
-
-              WHY AN APP LINK AND NOT THE CUSTOM SCHEME ABOVE
-              A sign-in link is mailed, so it is opened by a mail client, and it
-              has to survive being forwarded, previewed and scanned by whatever
-              is between us and the inbox. Those all require a real https URL,
-              and Firebase will only mint the link on a domain it has authorised
-              — so the custom scheme that carries the reCAPTCHA return cannot
-              carry this one.
-
-              WHAT MATCHES
-              /__/auth/ is Firebase's own reserved path, where the action handler
-              lives. /secure-account is our continueUrl and MUST stay in step
-              with AuthRepository.EMAIL_LINK_RETURN_PATH; a manifest cannot read
-              a Kotlin constant, so the two are held together by comments at both
-              ends and nothing else.
-
-              Both are scoped by path on purpose, but NOT for the reason first
-              written here. The CRM is not on this host: .firebaserc maps the
-              hosting target "production" to the site `zipperlive`, so the SPA
-              is served from zipperlive.web.app. `zipper-83816.firebaseapp.com`
-              is the Firebase AUTH domain, and that is the real hazard:
-              /__/auth/ is Firebase's whole reserved namespace on it and also
-              contains /__/auth/handler — the OAuth return used by Google
-              sign-in in the CRM and by phone-auth reCAPTCHA in this very app.
-              An autoVerify'd filter over the namespace would have this app
-              intercepting its own reCAPTCHA callback.
-
-              /__/auth/links is the exact path Firebase documents for the
-              email-link return, and it is the only part of the namespace that
-              belongs to us.
-
-              autoVerify NEEDS /.well-known/assetlinks.json ON THAT DOMAIN,
-              listing this package and its release SHA-256. Firebase Hosting
-              serves that file for apps registered in the project with a
-              fingerprint. Until it does, Android 12+ silently opens the browser
-              instead and the flow never comes back to the app — which looks
-              exactly like "nothing happened when I tapped the email".
-              MainActivity.consumeEmailLink is what receives it.
+              UGP-C: the email sign-in LINK App Link filter that stood here is
+              gone. Email binding is a six-digit code typed into the app
+              (Settings → Add your email), so no https link ever has to be
+              routed back into MainActivity.
             -->
-            <intent-filter android:autoVerify="true">
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data
-                    android:scheme="https"
-                    android:host="zipper-83816.firebaseapp.com"
-                    android:pathPrefix="/__/auth/links" />
-                <data
-                    android:scheme="https"
-                    android:host="zipper-83816.firebaseapp.com"
-                    android:pathPrefix="/secure-account" />
-            </intent-filter>
         </activity>
 
         <!-- FCM Service -->

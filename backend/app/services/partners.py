@@ -29,7 +29,26 @@ class PartnerStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+    #: Temporary and operational. The business still exists, keeps its place
+    #: in the one-agency-per-human rule, and `reactivate_partner` restores it
+    #: exactly as it was. The CRM's "Deactivate" button writes this.
     SUSPENDED = "suspended"
+    #: The role has been taken away. The record stays as history, nothing
+    #: about its money or audit trail is touched, and it still counts for the
+    #: combination rules and holds its role-family slot (C1): the person asks
+    #: for it back with a reinstatement request, and only the Owner can restore
+    #: it — as this same record. `partner_ops.revoke_partner` is the only
+    #: writer. Distinct from suspending the person's account (moderation) and
+    #: from deleting anything (never).
+    REVOKED = "revoked"
+    #: Decision 15 (RC). APPROVED by the Owner, but the role has NOT started:
+    #: the login does not yet hold both a verified phone and a verified email
+    #: (`services/contact_verification`). No privilege, no dashboard, no money
+    #: path reads it as live — every check that requires `approved` refuses it
+    #: by construction. `partner_ops.activate_partner_if_verified` moves it to
+    #: APPROVED, audited, once both are verified. It holds its role-family slot
+    #: like a pending application does.
+    AWAITING_VERIFICATION = "awaiting_verification"
 
 
 class CreditStanding(StrEnum):

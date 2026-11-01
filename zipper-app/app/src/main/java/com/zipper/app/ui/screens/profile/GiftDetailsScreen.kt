@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.zipper.app.ui.components.EmptyState
+import com.zipper.app.ui.components.LoadingState
 import com.zipper.app.ui.components.TopBar
 import com.zipper.app.ui.components.ZipperScreen
 import com.zipper.app.ui.theme.Radius
@@ -41,6 +42,8 @@ fun GiftDetailsScreen(
     title: String,
     gifts: List<GiftSummaryItem>,
     onBack: () -> Unit,
+    /** B2: true until the first answer arrives — not "No gifts yet" while still asking. */
+    isLoading: Boolean = false,
 ) {
     val screenTitle = when {
         title.contains("receiv", ignoreCase = true) -> "Gifts received"
@@ -48,6 +51,10 @@ fun GiftDetailsScreen(
         else -> title
     }
     ZipperScreen(topBar = { TopBar(screenTitle, onBack = onBack) }) { _ ->
+        if (isLoading && gifts.isEmpty()) {
+            LoadingState()
+            return@ZipperScreen
+        }
         if (gifts.isEmpty()) {
             EmptyState(Icons.Outlined.CardGiftcard, "No gifts yet", "Go live or join a room to start sending and receiving gifts.")
             return@ZipperScreen

@@ -37,10 +37,17 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import admin from 'firebase-admin'
+import { guardKeyScript } from './_keyScriptGuard.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const dry = process.argv.includes('--dry')
 
+// P0-10 (OPS-C): this key reaches a REAL project — named, acknowledged and (for
+// a run that writes) confirmed before Firebase is initialised. See _keyScriptGuard.mjs.
+const GUARDED_PROJECT = guardKeyScript('seed-host-levels', {
+  keyPath: new URL('../../serviceAccountKey.json', import.meta.url),
+  writes: !process.argv.includes('--dry'),
+})
 admin.initializeApp({
   credential: admin.credential.cert(
     JSON.parse(readFileSync(resolve(here, '../../serviceAccountKey.json'), 'utf8')),

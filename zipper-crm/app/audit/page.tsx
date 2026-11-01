@@ -16,6 +16,9 @@ import {
 import api, { ApiError, type AuditEntry } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
+import { IdentityInline } from '@/components/ui/Identity'
+import { subjectTarget } from '@/lib/identity'
+import { useIdentities } from '@/lib/useIdentities'
 
 const ACTION_GROUPS: { label: string; actions: string[] }[] = [
   { label: 'Money',    actions: ['balance.credit', 'balance.debit', 'inventory.credit', 'inventory.debit', 'lending.issue', 'lending.repay', 'lending.recover', 'commission.pay', 'payout.execute', 'withdrawal.pay', 'refund'] },
@@ -95,6 +98,15 @@ export default function AuditLog() {
   const allowed = group === 'all'
     ? null
     : ACTION_GROUPS.find((g) => g.label === group)?.actions ?? []
+
+  // B1: name the subject of each entry this session was already given — the
+  // API scoped the list (all / team / self); nothing outside it is looked up.
+  // A uid subject is a person, a partner subject a partner record; any other
+  // subject (a card, an expense …) keeps its plain `type · id`. No contacts.
+  const subjects = useIdentities({
+    people: entries.filter((e) => subjectTarget(e.subject.type)?.lookup === 'person').map((e) => e.subject.id),
+    partners: entries.filter((e) => subjectTarget(e.subject.type)?.lookup === 'partner').map((e) => e.subject.id),
+  })
 
   const visible = entries.filter((e) => {
     if (allowed && !allowed.includes(e.action)) return false
@@ -213,7 +225,15 @@ export default function AuditLog() {
                   <p className="text-slate-400 text-sm mt-1">{e.reason}</p>
 
                   <p className="text-slate-600 text-xs mt-1">
-                    {e.subject.type} · {e.subject.id}
+                    {e.subject.type} ·{' '}
+                    {(() => {
+                      const target = subjectTarget(e.subject.type)
+                      if (!target) return e.subject.id
+                      const facts = target.lookup === 'person'
+                        ? subjects.people.get(e.subject.id)
+                        : subjects.partners.get(e.subject.id)
+                      return <IdentityInline facts={facts} id={e.subject.id} kind={target.kind} state={subjects.state} />
+                    })()}
                   </p>
 
                   {(e.before !== null || e.after !== null) && (

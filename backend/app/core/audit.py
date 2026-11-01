@@ -77,6 +77,17 @@ class Action:
     PARTNER_APPROVED = "partner.approved"
     PARTNER_REJECTED = "partner.rejected"
     PARTNER_DEACTIVATED = "partner.deactivated"
+    #: The role taken away. Not a deactivation (temporary, keeps the slot) and
+    #: not a rejection (never approved). The record stays as history; the
+    #: human's role-family slot is released. See `PartnerStatus.REVOKED`.
+    PARTNER_REVOKED = "partner.revoked"
+    #: An applicant filed for a partner role from the app, through the
+    #: application route — as opposed to a staff member registering them.
+    PARTNER_APPLIED = "partner.applied"
+    #: Sub-agencies and hosts moved from a revoked agency to a replacement, or
+    #: from a revoked sub-agency up to its parent. Written once per revocation
+    #: with the full list, so the move is reconstructable.
+    PARTNER_DEPENDENTS_TRANSFERRED = "partner.dependents_transferred"
 
     # Users
     #
@@ -107,6 +118,15 @@ class Action:
     USER_WARNED = "user.warned"
     HOST_GRANTED = "host.granted"
     HOST_REVOKED = "host.revoked"
+    #: UGP-B: a revoked Host role re-activated from the person's EXISTING
+    #: approved application, roster row and verification record — never a new
+    #: application. Its own action so a restoration and a first grant can be
+    #: told apart in a person's history.
+    HOST_RESTORED = "host.restored"
+    #: UGP-F (review): staff opened the signed links to an appeal's private
+    #: attachments. Screenshots and videos a locked-out person sent are read
+    #: only through these links, so who read them, and when, is on record.
+    APPEAL_EVIDENCE_VIEWED = "appeal.evidence_viewed"
     #: A host application approved or refused. Separate from `host.granted` and
     #: `host.revoked`, which are about the *account*: one application can be
     #: decided before anybody has redeemed the referral code, and a host can be
@@ -157,6 +177,16 @@ class Action:
     PARTNER_EMAIL_NORMALISED = "partner.email_normalised"
     SALE_RECORDED = "sale.recorded"
     SALE_APPROVED = "sale.approved"
+    # Manual recharge through a Coin Seller — the buyer-initiated request that
+    # staff verify before any diamond moves. One action per state change so
+    # the money trail reads in order: requested → approved|rejected →
+    # refund_requested → refunded|refund_rejected.
+    RECHARGE_REQUESTED = "recharge.requested"
+    RECHARGE_APPROVED = "recharge.approved"
+    RECHARGE_REJECTED = "recharge.rejected"
+    RECHARGE_REFUND_REQUESTED = "recharge.refund_requested"
+    RECHARGE_REFUNDED = "recharge.refunded"
+    RECHARGE_REFUND_REJECTED = "recharge.refund_rejected"
     SUBAGENCY_PAID_PARENT = "subagency.paid_parent"
     SUBAGENCY_PARENT_PAID_SUB = "subagency.parent_paid_sub"
 
@@ -168,6 +198,34 @@ class Action:
     STAFF_CREATED = "staff.created"
     STAFF_ROLE_CHANGED = "staff.role_changed"
     STAFF_DEACTIVATED = "staff.deactivated"
+    #: P1-B3 — staff access paused (reversible). Distinct from a deactivation.
+    STAFF_SUSPENDED = "staff.suspended"
+    #: P1-B2 — a suspended or deactivated staff member's access restored.
+    STAFF_REACTIVATED = "staff.reactivated"
+    #: P1-F — a notice (email / in-app) about an access change could not be delivered.
+    STAFF_NOTICE_FAILED = "staff.notice_failed"
+
+    # P1-D — ticket workflows, written by the server only (services/tickets.py).
+    TICKET_CREATED = "ticket.created"
+    TICKET_UPDATED = "ticket.updated"
+    TICKET_ROUTED = "ticket.routed"
+    #: The audit entry for a change was written and the Firestore write failed.
+    TICKET_UPDATE_FAILED = "ticket.update_failed"
+    #: P1-A3 — Owner multi-factor authentication. No entry carries a secret,
+    #: a code or a recovery code.
+    OWNER_MFA_ENROLLED = "owner_mfa.enrolled"
+    OWNER_MFA_VERIFIED = "owner_mfa.verified"
+    OWNER_MFA_FAILED = "owner_mfa.failed"
+    OWNER_MFA_LOCKED = "owner_mfa.locked"
+    OWNER_MFA_RECOVERY_USED = "owner_mfa.recovery_code_used"
+    OWNER_MFA_CODES_REGENERATED = "owner_mfa.recovery_codes_regenerated"
+    OWNER_MFA_RESET = "owner_mfa.reset"
+    #: P1-A3b — a Firebase sign-in bound to / released from an MFA-verified API
+    #: session (the Firestore/Storage Owner boundary). Never carries a token.
+    OWNER_MFA_MINTED = "owner_mfa.minted"
+    OWNER_MFA_BOUND = "owner_mfa.bound"
+    OWNER_MFA_BIND_FAILED = "owner_mfa.bind_failed"
+    OWNER_MFA_UNBOUND = "owner_mfa.unbound"
     #: Salary, employment id, joining date or field charge set on a staff record
     #: by an owner or a team admin. Separate from `staff.role_changed` because it
     #: changes no authority at all — and separate from nothing, because it is the

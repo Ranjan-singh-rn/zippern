@@ -2,11 +2,14 @@ package com.zipper.app.data.repository
 
 import android.net.Uri
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.Query
 import com.google.firebase.storage.FirebaseStorage
 import com.google.firebase.storage.StorageMetadata
+import com.zipper.app.util.AppealIds
 import com.zipper.app.util.DeviceKey
 import com.zipper.app.util.QuickLoginStore
 import kotlinx.coroutines.tasks.await
@@ -62,16 +65,49 @@ class AppealRepository @Inject constructor(
 ) {
 
     sealed interface Result {
-        data object Ok : Result
+        /**
+         * Filed. `evidenceDropped` counts screenshots that would not upload.
+         *
+         * The appeal is still sent — losing somebody's written account because
+         * a photograph failed is the wrong trade — but it is NOT silent any
+         * more. The upload catch below used to swallow the failure entirely,
+         * so a user watched their thumbnail appear, submitted, and never
+         * learned the reviewer would see nothing.
+         */
+        data class Ok(val evidenceDropped: Int = 0) : Result
         /** Already has one waiting. Filing a second does not make it go faster. */
         data object AlreadyPending : Result
         data class Failed(val message: String) : Result
     }
 
-    /** The statement has to actually say something. */
-    private companion object {
-        const val MIN_STATEMENT = 20
-        const val MAX_EVIDENCE = 3
+    // The statement rule — the minimum, the trimmed length, the message —
+    // lives in `AppealStatement`, which imports nothing and is therefore
+    // provable without a device. It used to be spelled out here AND on the
+    // Send button AND beside the character count; see that file for what
+    // three copies of one rule cost.
+
+    /**
+     * C9 (B26): which appeal this phone can actually send right now.
+     *
+     * Signed in → the ordinary form. Not signed in, but holding this device's
+     * quick-login credential AND its Keystore key → the same form, sent by
+     * [appealWithoutSession]. Neither → the web appeal. The screen used to ask
+     * only "is anybody signed in", so the device-key route below was never
+     * offered to the people it exists for: a quick-login ban or suspension
+     * issues no session at all. The decision itself is the pure
+     * [com.zipper.app.util.AppealRoute.decide].
+     */
+    suspend fun appealRoute(): com.zipper.app.util.AppealRoute.Route {
+        if (auth.currentUser != null) {
+            return com.zipper.app.util.AppealRoute.decide(
+                signedIn = true, hasQuickLoginCredential = false, hasDeviceKey = false,
+            )
+        }
+        val credential = try { quickLogin.load() != null } catch (_: Exception) { false }
+        val key = try { deviceKey.hasKey() } catch (_: Exception) { false }
+        return com.zipper.app.util.AppealRoute.decide(
+            signedIn = false, hasQuickLoginCredential = credential, hasDeviceKey = key,
+        )
     }
 
     /**
@@ -85,13 +121,20 @@ class AppealRepository @Inject constructor(
     suspend fun pendingAppeal(): Boolean {
         val uid = auth.currentUser?.uid ?: return false
         return try {
-            !firestore.collection("appeals")
+            firestore.collection("appeals")
                 .whereEqualTo("subjectUid", uid)
                 .whereEqualTo("status", "pending")
-                .limit(1)
+                // Room for public-web filings (filtered out below) not to
+                // crowd out the owner's own.
+                .limit(20)
                 .get()
                 .await()
-                .isEmpty
+                .documents
+                // UGP review: an appeal filed on the PUBLIC web form proves
+                // nothing about who filed it, so it does not stop the signed-in
+                // owner from filing their own (the server's device-key path
+                // applies the same rule).
+                .any { it.getString("source") != PUBLIC_WEB_SOURCE }
         } catch (_: Exception) {
             // A read that failed is not a "no". Returning false here shows the
             // form, and a duplicate appeal is a far smaller problem than
@@ -110,11 +153,8 @@ class AppealRepository @Inject constructor(
      */
     suspend fun appealMyBan(statement: String, evidence: List<Uri>): Result {
         val text = statement.trim()
-        if (text.length < MIN_STATEMENT) {
-            return Result.Failed(
-                "Tell us what happened, in at least $MIN_STATEMENT characters. " +
-                "This is what a person reads when they look at your account."
-            )
+        if (!AppealStatement.isSendable(statement)) {
+            return Result.Failed(AppealStatement.TOO_SHORT)
         }
 
         // No session — the ordinary case for a ban now. Checked before anything
@@ -125,8 +165,36 @@ class AppealRepository @Inject constructor(
         if (pendingAppeal()) return Result.AlreadyPending
 
         return try {
+            // FX-13 (RF-19): where this appeal goes — the restriction's
+            // deterministic slot — found BEFORE any evidence is uploaded, so a
+            // second filing for the same restriction stops here.
+            val account = try {
+                firestore.collection("users").document(uid).get().await()
+            } catch (_: Exception) {
+                null
+            }
+            val key = AppealIds.restrictionKey(
+                isSuspended = account?.getBoolean("isSuspended") == true,
+                isBanned = account?.getBoolean("isBanned") == true,
+                accountState = account?.getString("accountState"),
+                suspendedAtMs = account?.getTimestamp("suspendedAt")?.toDate()?.time,
+                bannedAtMs = account?.getTimestamp("bannedAt")?.toDate()?.time,
+            )
+            val placement = freeAppealSlot(uid, key) ?: return Result.AlreadyPending
+            val slot = placement.ref
+            // RC (confirmed): "another appeal after a decision only with new
+            // evidence or a valid reason". Repeating the decided statement with
+            // no new evidence is refused here, before anything is uploaded —
+            // the rules refuse it anyway (`reappealOk` in firestore.rules).
+            if (placement.decidedStatement != null && evidence.isEmpty() &&
+                AppealStatement.normalise(text) == AppealStatement.normalise(placement.decidedStatement)
+            ) {
+                return Result.Failed(AppealStatement.REAPPEAL_NEEDS_SOMETHING_NEW)
+            }
+
             val urls = mutableListOf<String>()
-            evidence.take(MAX_EVIDENCE).forEachIndexed { i, uri ->
+            var dropped = 0
+            evidence.take(AppealStatement.MAX_EVIDENCE).forEachIndexed { i, uri ->
                 try {
                     val ref = storage.reference.child(
                         "appealEvidence/$uid/${System.currentTimeMillis()}_$i.jpg"
@@ -137,41 +205,89 @@ class AppealRepository @Inject constructor(
                     ).await()
                     urls += ref.downloadUrl.await().toString()
                 } catch (_: Exception) {
-                    /* One unusable file must not cost them the appeal. */
+                    // One unusable file must not cost them the appeal — but
+                    // the count is carried back so the screen can say so.
+                    // The common cause is the 5 MB cap in storage.rules
+                    // against an un-resized gallery photograph.
+                    dropped += 1
                 }
             }
 
-            val name = try {
-                firestore.collection("users").document(uid).get().await()
-                    .getString("name").orEmpty()
-            } catch (_: Exception) {
-                ""
-            }
+            val name = account?.getString("name").orEmpty()
 
             // The key set here must match `appealFields()` in firestore.rules
             // exactly — the rule uses `hasOnly`, so one extra key is a refusal
             // of the whole write.
-            firestore.collection("appeals").add(
-                mapOf(
-                    "subjectUid" to uid,
-                    "subjectName" to name,
-                    "raisedByUid" to uid,
-                    "raisedByName" to name,
-                    "raisedByRole" to "self",
-                    "agencyId" to "",
-                    "kind" to "ban",
-                    "reportId" to "",
-                    "statement" to text,
-                    "evidenceUrls" to urls,
-                    "status" to "pending",
-                    "createdAt" to FieldValue.serverTimestamp(),
-                    "originalDecidedBy" to "",
-                )
-            ).await()
-            Result.Ok
+            val appeal = mapOf(
+                "subjectUid" to uid,
+                "subjectName" to name,
+                "raisedByUid" to uid,
+                "raisedByName" to name,
+                "raisedByRole" to "self",
+                "agencyId" to "",
+                "kind" to "ban",
+                "reportId" to "",
+                "statement" to text,
+                "evidenceUrls" to urls,
+                "status" to "pending",
+                "createdAt" to FieldValue.serverTimestamp(),
+                "originalDecidedBy" to "",
+            )
+            // CREATE semantics: the rules allow no update on `appeals`, so if
+            // the other path (or another device) filed at this id in the
+            // meantime, this write is refused — and that is "already pending".
+            try {
+                slot.set(appeal).await()
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED && slotTaken(slot)) {
+                    return Result.AlreadyPending
+                }
+                throw e
+            }
+            Result.Ok(dropped)
         } catch (e: Exception) {
             Result.Failed(e.message ?: "Your appeal could not be sent. Try again.")
         }
+    }
+
+    /** The free slot, and the statement of the decided appeal just before it (null at slot 1). */
+    private data class Placement(val ref: DocumentReference, val decidedStatement: String?)
+
+    /**
+     * FX-13: the first slot for this restriction that is free, stepping past
+     * DECIDED appeals; null when one is still pending. Reading a slot that
+     * does not exist is refused by the rules (nobody may read an appeal that
+     * is not theirs, and an absent one is nobody's) — here that means "free".
+     * RC: every slot decided → null too. The rules accept only the pinned ids,
+     * so there is nowhere left to file (no automatic-id fallback any more).
+     *
+     * The walk itself is `AppealIds.chooseSlot` (pure, run by `AppealIdsTest`);
+     * this only reads each slot for it.
+     */
+    private suspend fun freeAppealSlot(uid: String, key: String): Placement? {
+        val col = firestore.collection("appeals")
+        val choice = AppealIds.chooseSlot { n ->
+            val snap = try {
+                col.document(AppealIds.selfAppealId(uid, key, n)).get().await()
+            } catch (e: FirebaseFirestoreException) {
+                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) null else throw e
+            }
+            if (snap == null || !snap.exists()) {
+                AppealIds.SlotRead(exists = false)
+            } else {
+                AppealIds.SlotRead(exists = true, status = snap.getString("status"), statement = snap.getString("statement"))
+            }
+        }
+        // Pending, or every slot decided: nothing is filed (an automatic id is refused).
+        val free = choice as? AppealIds.SlotChoice.Free ?: return null
+        return Placement(col.document(AppealIds.selfAppealId(uid, key, free.slot)), free.decidedStatement)
+    }
+
+    /** Is there now an appeal at this slot (filed by the other path meanwhile)? */
+    private suspend fun slotTaken(ref: DocumentReference): Boolean = try {
+        ref.get().await().exists()
+    } catch (_: Exception) {
+        false
     }
 
     /**
@@ -233,7 +349,9 @@ class AppealRepository @Inject constructor(
                 // `already_pending` is not a failure. Filing a second does not
                 // make the first go faster, and the screen says so.
                 if (res.value.status == "already_pending") Result.AlreadyPending
-                else Result.Ok
+                // The session-less path carries no evidence — the callable
+                // takes a statement only — so nothing can have been dropped.
+                else Result.Ok()
 
             is MoneyFunctions.Result.Failed -> Result.Failed(res.userMessage)
         }
@@ -246,13 +364,21 @@ class AppealRepository @Inject constructor(
             firestore.collection("appeals")
                 .whereEqualTo("subjectUid", uid)
                 .orderBy("createdAt", Query.Direction.DESCENDING)
-                .limit(5)
+                .limit(20)
                 .get()
                 .await()
                 .documents
+                // Not a public-web appeal: anybody can file one naming this
+                // account, and its outcome is not "your last appeal".
+                .filter { it.getString("source") != PUBLIC_WEB_SOURCE }
                 .map { it.data.orEmpty() }
         } catch (_: Exception) {
             emptyList()
         }
+    }
+
+    private companion object {
+        /** `appeals.source` of one filed on the public web form (backend `public_appeals.SOURCE`). */
+        const val PUBLIC_WEB_SOURCE = "public_web"
     }
 }

@@ -90,6 +90,7 @@ import { getAgency, updateOwnAgencyProfile, type Agency } from '@/lib/agencies'
 import { getSeller, updateOwnSellerProfile, type Seller } from '@/lib/sellers'
 import { labelOf, type Proposer } from '@/lib/pendingChanges'
 import { inrExact } from '@/lib/apiPartners'
+import PhoneInput from '@/components/PhoneInput'
 
 // Same idiom as app/app-config/payment-creds — one place for the two classes
 // that repeat, so an added field cannot drift out of the house style.
@@ -794,12 +795,12 @@ export default function ProfilePage() {
             <label className={labelCls} htmlFor="phone">
               Phone
             </label>
-            <input
+            <PhoneInput
               id="phone"
               value={form.phone}
-              onChange={set('phone')}
+              onChange={(v) => { setForm((f) => ({ ...f, phone: v })); setSaved(false); setSaveError('') }}
               className={inputCls}
-              placeholder="+91 9XXXXXXXXX"
+              placeholder="Mobile number"
             />
           </div>
 

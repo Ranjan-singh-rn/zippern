@@ -42,6 +42,7 @@
 import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
+import { assertActiveSession } from './mobileSession'
 
 const db = admin.firestore()
 
@@ -338,6 +339,7 @@ export const createPartyRoom = functions
     context,
   ) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'createPartyRoom', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const userSnap = await requireUser(uid)
 
     const mode = modeOf(data?.mode)
@@ -449,6 +451,7 @@ export const updatePartyRoom = functions
     context,
   ) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'updatePartyRoom', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
 
@@ -593,6 +596,7 @@ export const joinPartyRoom = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; password?: string }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'joinPartyRoom', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
 
@@ -774,6 +778,7 @@ export const takePartySeat = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; seatIndex?: number }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'takePartySeat', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const seatIndex = Number(data?.seatIndex)
     if (!roomId || !Number.isInteger(seatIndex)) {
@@ -903,6 +908,7 @@ export const requestPartySeat = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; seatIndex?: number }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'requestPartySeat', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const seatIndex = Number(data?.seatIndex)
     if (!roomId || !Number.isInteger(seatIndex)) {
@@ -958,6 +964,7 @@ export const decidePartySeatRequest = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; targetUid?: string; approve?: boolean }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'decidePartySeatRequest', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const targetUid = String(data?.targetUid ?? '')
     if (!roomId || !targetUid) {
@@ -1009,6 +1016,7 @@ export const invitePartySeat = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; targetUid?: string; seatIndex?: number }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'invitePartySeat', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const targetUid = String(data?.targetUid ?? '')
     const seatIndex = Number(data?.seatIndex)
@@ -1051,6 +1059,7 @@ export const respondPartySeatInvite = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; accept?: boolean }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'respondPartySeatInvite', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
 
@@ -1192,6 +1201,7 @@ export const setPartySeatMute = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; seatIndex?: number; muted?: boolean }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'setPartySeatMute', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const seatIndex = Number(data?.seatIndex)
     if (!roomId || !Number.isInteger(seatIndex)) {
@@ -1258,6 +1268,7 @@ export const setPartySeatLock = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; seatIndex?: number; locked?: boolean }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'setPartySeatLock', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const seatIndex = Number(data?.seatIndex)
     if (!roomId || !Number.isInteger(seatIndex)) {
@@ -1297,6 +1308,7 @@ export const setPartyAdmin = functions
   .region('asia-south1')
   .https.onCall(async (data: { roomId?: string; targetUid?: string; isAdmin?: boolean }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'setPartyAdmin', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
     const targetUid = String(data?.targetUid ?? '')
     if (!roomId || !targetUid) {

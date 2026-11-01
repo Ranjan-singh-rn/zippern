@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.data.work.WorkCoreTest" tests="18" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:21.862Z" hostname="CW253.local" time="0.015">
+  <properties/>
+  <testcase name="templates fill from the row, the params and the session" classname="com.zipper.app.data.work.WorkCoreTest" time="0.006"/>
+  <testcase name="missing keys read as the narrowest session" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="the observer never writes, even with a permission listed" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="structured and validation details are readable" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="a template with a missing value is not sent" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="json parses objects, arrays, numbers, escapes" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="a partner is scoped to its own ids and holds no staff power" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="the body is typed, nested, and leaves out blanks and query inputs" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="rows come from a bare array, a key, or nowhere" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="json writes what it reads" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="iso instants from the api" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="validation mirrors the route's own constraints" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="caps read the server's own table" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="values read in the kind they are" classname="com.zipper.app.data.work.WorkCoreTest" time="0.002"/>
+  <testcase name="money is paise in and Indian-grouped out" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="secrets never reach the screen, bank numbers are masked" classname="com.zipper.app.data.work.WorkCoreTest" time="0.001"/>
+  <testcase name="json refuses trailing junk" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <testcase name="the server's sentence is kept" classname="com.zipper.app.data.work.WorkCoreTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

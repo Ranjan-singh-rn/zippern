@@ -13,6 +13,7 @@ import {
 import { db } from '@/lib/firebase'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
+import api, { ApiError } from '@/lib/api'
 import { Timestamp } from 'firebase/firestore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -33,6 +34,9 @@ interface SalaryRequest {
   paidAt?: Timestamp
   distributedAt?: Timestamp
   utrNumber?: string
+  /** P0-7: written by the server when the card that pays this request executes. */
+  paymentRef?: string
+  cardId?: string
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -82,9 +86,10 @@ export default function SalaryManagementClient() {
   const [filter, setFilter] = useState<'all' | SalaryRequest['status']>('all')
   const [actionId, setActionId] = useState<string | null>(null)
   const [showPayModal, setShowPayModal] = useState<SalaryRequest | null>(null)
-  const [utr, setUtr] = useState('')
+  const [reason, setReason] = useState('')
   const [payErr, setPayErr] = useState('')
   const [paySaving, setPaySaving] = useState(false)
+  const [payDone, setPayDone] = useState('')
   const [loadError, setLoadError] = useState('')
 
   async function loadData() {
@@ -121,20 +126,39 @@ export default function SalaryManagementClient() {
     finally { setActionId(null) }
   }
 
-  async function handleMarkPaid() {
+  /*
+   * P0-7 (FIN-5): there is no "Mark paid". This wrote `status: 'paid'` and a
+   * UTR straight onto the request — no bean debit, no ledger row — so the host's
+   * earnings stayed convertible and withdrawable after the business had paid
+   * them out. A salary request is a host's beans paid out through their agency,
+   * so it is paid the same way as a host withdrawal: a host-withdrawal card is
+   * raised FOR this request, an owner signs it on /board, and executing it on
+   * /finance/withdrawals debits the wallet, writes the ledger row and marks
+   * this request paid in one transaction. `firestore.rules` refuses `paid` from
+   * any browser.
+   */
+  async function handleRaiseCard() {
     if (!showPayModal) return
-    if (!utr.trim()) { setPayErr('Enter UTR / transaction reference.'); return }
+    if (reason.trim().length < 3) { setPayErr('Enter a reason — it goes on the card and into the audit log.'); return }
+    const beans = Math.trunc(Number(showPayModal.beansEarned) || 0)
+    if (beans <= 0) { setPayErr('This request names no beans, so no card can be raised for it.'); return }
     setPaySaving(true); setPayErr('')
     try {
-      await updateDoc(doc(db, 'salaryRequests', showPayModal.id), {
-        status: 'paid', paidAt: serverTimestamp(), utrNumber: utr.trim(),
+      await api.partnerOps.requestHostWithdrawal(showPayModal.hostUid, {
+        beans,
+        reason: reason.trim(),
+        request_collection: 'salaryRequests',
+        request_id: showPayModal.id,
       })
-      setRequests(prev => prev.map(r =>
-        r.id === showPayModal.id ? { ...r, status: 'paid', utrNumber: utr.trim() } : r
-      ))
-      setShowPayModal(null); setUtr('')
-    } catch (e: any) { setPayErr(e.message ?? 'Failed.') }
-    finally { setPaySaving(false) }
+      setPayDone(
+        `Card raised for ${beans.toLocaleString('en-IN')} beans. Nothing has moved — an owner `
+        + 'signs it on the money board, then it is executed on Finance → Withdrawals with the '
+        + 'bank reference, which marks this request paid.',
+      )
+      setShowPayModal(null); setReason('')
+    } catch (e: unknown) {
+      setPayErr(e instanceof ApiError ? e.message : 'The card was not raised.')
+    } finally { setPaySaving(false) }
   }
 
   async function handleReject(req: SalaryRequest) {
@@ -280,7 +304,7 @@ export default function SalaryManagementClient() {
                     </td>
                     <td className="px-4 py-3 text-slate-400 max-w-[140px] truncate text-xs">
                       {req.notes || '—'}
-                      {req.utrNumber && <span className="block text-blue-400 font-mono">UTR: {req.utrNumber}</span>}
+                      {(req.paymentRef || req.utrNumber) && <span className="block text-blue-400 font-mono">Ref: {req.paymentRef || req.utrNumber}</span>}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap"><StatusBadge status={req.status} /></td>
                     <td className="px-4 py-3 text-slate-500 text-xs whitespace-nowrap">{fmtDate(req.createdAt)}</td>
@@ -299,20 +323,10 @@ export default function SalaryManagementClient() {
                           )}
                           {req.status === 'approved' && (
                             <button
-                              onClick={() => { setShowPayModal(req); setUtr('') }}
+                              onClick={() => { setShowPayModal(req); setReason(''); setPayErr('') }}
                               className="flex items-center gap-1 px-2.5 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 border border-blue-500/30 rounded text-xs font-medium transition-colors"
                             >
-                              <Banknote size={11} />Mark Paid
-                            </button>
-                          )}
-                          {req.status === 'paid' && (
-                            <button
-                              onClick={() => handleReject(req)}
-                              disabled={actionId === req.id + '-reject'}
-                              className="flex items-center gap-1 px-2.5 py-1.5 bg-purple-500/20 hover:bg-purple-500/30 text-purple-400 border border-purple-500/30 rounded text-xs font-medium transition-colors disabled:opacity-50"
-                            >
-                              {actionId === req.id + '-reject' ? <Loader2 size={11} className="animate-spin" /> : <CheckCircle2 size={11} />}
-                              Distributed
+                              <Banknote size={11} />Raise payout card
                             </button>
                           )}
                         </div>
@@ -326,12 +340,19 @@ export default function SalaryManagementClient() {
         )}
       </div>
 
-      {/* Pay Modal */}
+      {payDone && (
+        <div className="fixed bottom-6 right-6 z-40 max-w-md bg-slate-800 border border-green-500/40 rounded-xl p-4 text-sm text-green-300 shadow-2xl">
+          {payDone}
+          <button onClick={() => setPayDone('')} className="block mt-2 text-xs text-slate-400 hover:text-white">Dismiss</button>
+        </div>
+      )}
+
+      {/* Raise a payout card for this request (P0-7) */}
       {showPayModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
           <div className="bg-slate-800 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-white font-semibold text-lg">Mark as Paid</h3>
+              <h3 className="text-white font-semibold text-lg">Raise a payout card</h3>
               <button onClick={() => setShowPayModal(null)} className="text-slate-400 hover:text-white">
                 <XCircle size={18} />
               </button>
@@ -342,7 +363,11 @@ export default function SalaryManagementClient() {
                 <span className="text-white font-medium">{showPayModal.hostName}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-400">Amount</span>
+                <span className="text-slate-400">Beans</span>
+                <span className="text-white font-medium">{Number(showPayModal.beansEarned || 0).toLocaleString('en-IN')}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Amount requested</span>
                 <span className="text-green-400 font-bold">{fmtInr(showPayModal.amountInr)}</span>
               </div>
               <div className="flex justify-between">
@@ -352,21 +377,26 @@ export default function SalaryManagementClient() {
             </div>
             <div className="mb-4">
               <label className="block text-slate-400 text-xs mb-1.5 font-medium uppercase tracking-wide">
-                UTR / Transaction Reference *
+                Reason * (goes on the card and into the audit log)
               </label>
-              <input
-                value={utr}
-                onChange={e => setUtr(e.target.value)}
-                placeholder="e.g. HDFC1234567890 or UPI ref"
-                className="w-full px-3 py-2.5 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm font-mono placeholder-slate-500 focus:outline-none focus:border-pink-500"
+              <textarea
+                rows={3}
+                value={reason}
+                onChange={e => setReason(e.target.value)}
+                placeholder="e.g. Salary for the period above, verified against the agency's request."
+                className="w-full px-3 py-2.5 bg-slate-700 border border-slate-600 rounded-lg text-white text-sm placeholder-slate-500 focus:outline-none focus:border-pink-500 resize-none"
               />
             </div>
+            <p className="text-slate-500 text-xs mb-4 leading-relaxed">
+              Raising moves nothing. An owner signs the card, and executing it debits the host&rsquo;s
+              beans, writes the ledger row and marks this request paid.
+            </p>
             {payErr && <p className="text-red-400 text-sm mb-3">⚠ {payErr}</p>}
             <div className="flex gap-3">
-              <button onClick={handleMarkPaid} disabled={paySaving}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white rounded-lg font-medium transition-colors">
+              <button onClick={handleRaiseCard} disabled={paySaving}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white rounded-lg font-medium transition-colors">
                 {paySaving ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-                Confirm Payment
+                Raise card
               </button>
               <button onClick={() => setShowPayModal(null)}
                 className="px-4 py-2.5 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-lg font-medium transition-colors">

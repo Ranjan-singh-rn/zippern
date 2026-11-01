@@ -1,0 +1,911 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ══════════════════════════════════════════════════════════════
+    // HELPERS
+    // ══════════════════════════════════════════════════════════════
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // WHO IS ASKING — the role claim
+    // ══════════════════════════════════════════════════════════════
+    //
+    // Storage Rules cannot read Firestore, so the `crmUsers/{uid}` lookup that
+    // makes `firestore.rules` correct has no equivalent here. This file used
+    // to paper over that with `isCrmUser()`, which was
+    //
+    //     return request.auth != null;
+    //
+    // — a predicate named after staff that answered yes for everybody. Every
+    // `allow read: if isCrmUser()` below therefore published KYC documents,
+    // identity proofs and bank slips to any holder of any token, and since
+    // anonymous sign-in is enabled for Continue-as-guest and the web config
+    // ships in the public CRM bundle, "any token" meant a stranger with a
+    // script and no account at all.
+    //
+    // `request.auth.token.role` is a custom claim, so it cannot be set by the
+    // client under any circumstances — only the Admin SDK writes one. It
+    // carries a `backend/app/core/roles.py` Role value. Two authorities
+    // provision it, and the split is a security property rather than an
+    // accident of architecture:
+    //
+    //   internal roles  ← the API, from the Mongo `staff` row
+    //                     (backend/app/services/storage_claims.py)
+    //   agency, seller  ← a Firestore trigger on crmUsers
+    //                     (functions/src/storageClaims.ts)
+    //
+    // Partner `crmUsers` documents are written BY THE CLIENT. A single trigger
+    // mirroring `role` would therefore let a stranger write themselves
+    // `role: 'owner'` and collect the whole bucket. The trigger can emit
+    // 'agency' and 'seller' and nothing else, by construction — the internal
+    // vocabulary is not reachable from anything a browser can write.
+    //
+    // `'role' in request.auth.token` before reading it: a token with no claim
+    // — every app user, every guest — must evaluate to '' rather than error
+    // out, because an error denies the whole request and would have masked a
+    // missing grant as a working deny.
+    function roleClaim() {
+      return request.auth != null && 'role' in request.auth.token
+           ? request.auth.token.role
+           : '';
+    }
+
+    // The agency a partner login is scoped to. '' for everyone else.
+    function agencyClaim() {
+      return request.auth != null && 'aid' in request.auth.token
+           ? request.auth.token.aid
+           : '';
+    }
+
+    // ── The internal tiers ──────────────────────────────────────────────────
+    //
+    // Three of them, and the membership of each is taken from the CRM page
+    // that already gates the same documents — not invented here. An internal
+    // role absent from a tier is a real denial: tech and marketing never see
+    // KYC, and nobody outside finance sees money evidence.
+    //
+    // `owner` holds everything, matching `has_permission`, where an owner is
+    // "the role the permission list does not apply to". `observer` is
+    // read-only by design (Role 1.1) and appears in every READ tier and no
+    // write clause.
+
+    // Owner and observer. Present in every tier below.
+    function isGovernance() {
+      return roleClaim() in ['owner', 'observer'];
+    }
+
+    // May review identity documents: KYC, ID proofs, host applications.
+    //
+    // This is exactly the set holding `CAN_VIEW_AGENCIES` / `CAN_VIEW_SELLERS`
+    // in `backend/app/core/roles.py`, plus the governance pair. Taken from the
+    // permission table rather than from the CRM's page gates, because the
+    // table is what the API enforces and the two had drifted: `/hosts` admits
+    // `app_member` client-side, while `app_member` holds no permission at all
+    // server-side. Matching the table keeps these rules and
+    // `services/documents._may_see` answering the same question.
+    //
+    // NOT `CAN_APPROVE_KYC`: that is owner and ops_admin alone — the right
+    // gate for DECIDING a KYC case and far too narrow for looking at one.
+    //
+    // Excludes tech_*, support_*, marketing_* and app_member, none of whom
+    // hold a view capability over a partner record.
+    function isKycReviewer() {
+      return isGovernance()
+          || roleClaim() in [
+               'app_admin',
+               'ops_admin', 'ops_member',
+               'finance_admin', 'finance_member',
+             ];
+    }
+
+    // May see money evidence: payment proofs, bank slips, payout records.
+    // From the /finance and /coin-purchases gates — finance only.
+    function isFinance() {
+      return isGovernance()
+          || roleClaim() in ['finance_admin', 'finance_member'];
+    }
+
+    // May see what a user attached to a support ticket.
+    // From the /feedback and /operations/feedback gates.
+    function isSupport() {
+      return isGovernance()
+          || roleClaim() in [
+               'app_admin', 'app_member',
+               'ops_admin', 'ops_member',
+               'support_admin', 'support_member',
+               'tech_admin',
+             ];
+    }
+
+    // Anyone the API or the trigger has stamped. Used only where the act is
+    // "a member of the business did this", e.g. publishing content assets.
+    function isInternal() {
+      return isKycReviewer() || isFinance() || isSupport();
+    }
+
+    // Anybody the business has stamped with a role — staff, agency or seller.
+    //
+    // For the one thing all of them legitimately do regardless of tier: set
+    // their own picture on /profile. `firestore.rules` already records that
+    // /profile serves "every person in the CRM — staff, agency and coin
+    // seller", so narrowing this to `isInternal()` would have locked every
+    // partner out of their own avatar. Not for documents: this says "has a
+    // CRM login of some kind", which is exactly the question `isCrmUser()`
+    // was wrongly used to answer everywhere else.
+    function hasRoleClaim() {
+      return roleClaim() != '';
+    }
+
+    // This exact agency login, scoped by its own claim. Never another's.
+    function isAgencyFor(agencyId) {
+      return roleClaim() == 'agency'
+          && agencyClaim() != ''
+          && agencyClaim() == agencyId;
+    }
+
+    // This exact seller login. A seller record is keyed on the uid.
+    function isSellerFor(sellerId) {
+      return roleClaim() == 'seller' && request.auth.uid == sellerId;
+    }
+
+    // Any signed-in user of the mobile app, INCLUDING an anonymous guest.
+    // Correct for what it is used for — a guest can host a room, file feedback
+    // and appeal a ban — and used for nothing that touches a document.
+    function isAppUser() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // A signed-in person who is NOT an anonymous guest. `isOwner` alone admits
+    // a guest writing under their own uid — correct for a room thumbnail,
+    // wrong for an identity document or a payment proof, which must belong to
+    // an account that can be traced to somebody. Read null-safely: a token
+    // without the `firebase` map (custom tokens in tests, malformed ones) is
+    // treated as not-a-person rather than raising.
+    function isNonGuest() {
+      return request.auth != null
+          && request.auth.token.get('firebase', {}).get('sign_in_provider', '') != ''
+          && request.auth.token.get('firebase', {}).get('sign_in_provider', '') != 'anonymous';
+    }
+
+    // Owner of this uid path AND not a guest. Used only where the object is
+    // evidence a decision is made on (self-filed KYC, recharge proofs).
+    function isOwnerPerson(uid) {
+      return isOwner(uid) && isNonGuest();
+    }
+
+    // `request.resource` is null on a delete and on reads; these helpers are
+    // reached from `allow write` arms that also cover delete, where the bare
+    // field access raised `Null value error` (an EvaluationException that
+    // denies, but noisily). Null-guarded so they simply answer false.
+    function isImage() {
+      return request.resource != null
+          && request.resource.contentType.matches('image/.*');
+    }
+
+    function isVideo() {
+      return request.resource != null
+          && request.resource.contentType.matches('video/.*');
+    }
+
+    function isImageOrVideo() {
+      return isImage() || isVideo();
+    }
+
+    function isDocument() {
+      return request.resource != null && request.resource.contentType in [
+        'application/pdf',
+        'image/jpeg',
+        'image/png',
+        'image/jpg'
+      ];
+    }
+
+    function maxSize(mb) {
+      return request.resource != null && request.resource.size <= mb * 1024 * 1024;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST VERIFICATION CAPTURES
+    // /hostVerification/{uid}/capture.jpg
+    //
+    // A photograph of the host's face, taken live in the app. Biometric data
+    // under the DPDP Act: the host writes it, only they can read it back, and
+    // review happens through the CRM against a signed URL the backend mints —
+    // not by granting staff blanket read access to a bucket of faces.
+    //
+    // Capped hard at 4MB. A liveness capture is a single JPEG; anything larger
+    // is either a mistake or someone using the path as free storage.
+    // ══════════════════════════════════════════════════════════════
+    match /hostVerification/{uid}/{fileName} {
+      // GOV B24: `fileName != 'attempts'` keeps the server-only folder below
+      // out of this block. Without it the owner's `read` (= get + list) would
+      // also cover `attempts` itself, i.e. a listing of the folder, and the
+      // owner could park an object at that exact name. `capture.jpg` and
+      // every other file name are unchanged.
+      allow read:  if isOwner(uid) && fileName != 'attempts';
+      allow write: if isOwner(uid) && fileName != 'attempts' && isImage() && maxSize(4);
+    }
+
+    // GOV B24: the ATTEMPTS a decision is made on are SERVER-ONLY.
+    //
+    // `capture.jpg` above is the host's scratch slot: the app overwrites it on
+    // every try, which is exactly why it cannot be what a reviewer decides on —
+    // `submitHostCapture` trusted a client-sent URL to it, and the file could
+    // be replaced after the comparison ran. Anything under `attempts/` is the
+    // server's: the immutable copy of a submitted capture, written through the
+    // Admin SDK (which these rules do not govern). No client — the host,
+    // staff, an Owner — writes, replaces, deletes or reads it here; review
+    // goes through a backend signed URL, as for the capture.
+    //
+    // Explicit rather than left to the catch-all below: the `{fileName}` block
+    // above does not match a deeper path today, and this keeps it so if that
+    // block is ever widened to `{allPaths=**}`.
+    match /hostVerification/{uid}/attempts/{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // APPEAL EVIDENCE
+    // /appealEvidence/{uid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    //
+    // Screenshots somebody attaches when they say a ban or a report decision
+    // was wrong. Written by an account that is BANNED — which is the point:
+    // `isBanned` gates the product, not the session, and a wrongly banned
+    // person with no way to show what actually happened is the case this whole
+    // path exists for.
+    //
+    // `isCrmUser()` on read because the reviewer has to open them, and unlike a
+    // face capture these are not biometric data: they are screenshots of chats
+    // and rooms, so they do not need the signed-URL treatment
+    // `hostVerification` gets. Nobody but the uploader and staff can read them.
+    match /appealEvidence/{uid}/{fileName} {
+      allow read:  if isOwner(uid) || isSupport();
+      allow write: if isOwner(uid) && isImage() && maxSize(5);
+      // Kept. An appeal decided on evidence that was later deleted cannot be
+      // reviewed again, and an appeal is exactly the thing that gets reviewed
+      // again.
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // USER PROFILE MEDIA
+    // /profileMedia/{uid}/avatar.jpg
+    // /profileMedia/{uid}/cover.jpg
+    // ══════════════════════════════════════════════════════════════
+    // Also gallery_{ts}_{n}.{ext} — the profile gallery holds short videos too.
+    //
+    // `read` stays open to any signed-in user: avatars and covers are shown
+    // beside every message, gift and room tile, so this one is public by
+    // design within the app.
+    //
+    // WRITE AND DELETE ARE THE OWNER'S ALONE. They used to also accept
+    // `isCrmUser()`, which — since that predicate cannot see Firestore and so
+    // means "anybody signed in" — let any account overwrite or delete any
+    // other account's avatar, cover and whole gallery. Nothing legitimate was
+    // using it: no file under zipper-crm/ references profileMedia at all, and
+    // the one server-side deletion, `accounts.ts` wiping
+    // `profileMedia/{uid}/` when an account is removed, runs through the
+    // Admin SDK, which bypasses these rules by design. So removing the clause
+    // costs nothing and closes a defacement route against every host on the
+    // platform.
+    match /profileMedia/{uid}/{fileName} {
+      allow read:  if isSignedIn();
+      allow write: if isOwner(uid)
+                   && ((isImage() && maxSize(5)) || (isVideo() && maxSize(50)));
+      allow delete: if isOwner(uid);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PUBLIC AGENCY SELF-SIGNUP KYC UPLOADS (no auth required)
+    // /kyc/agencies/signup/{fileName}
+    //
+    // Aadhaar, PAN and a bank passbook, uploaded at /agency-signup step 2.
+    // The uploader has no account yet — `agency-signup` creates the Firebase
+    // user at SUBMIT, after these files are already up — so there is no uid to
+    // bind to and `request.auth` is null throughout. That is why this path is
+    // open at all, and it is the narrowest set of grants that still works.
+    //
+    // ── WHAT CHANGED, AND WHY EACH LINE ─────────────────────────────────────
+    //
+    // `allow read: if true` used to grant get AND list together: in rules v2
+    // `read` is shorthand for both. So the bucket prefix was enumerable by
+    // anyone, and the old comment here — "filenames include timestamps, not
+    // guessable by outsiders" — was answering the wrong question. Nobody
+    // needed to guess; they could ask for the listing. The filenames are also
+    // `doc1_<epoch-ms>`, which is guessable on its own.
+    //
+    // `get` stays public because ONE caller needs it: the uploader's own
+    // getDownloadURL() immediately after the upload, which is how the
+    // tokenised URL stored in `kycDocUrls` is minted in the first place. Staff
+    // review does NOT need it — the CRM renders those stored
+    // `?alt=media&token=` URLs, and a tokenised download URL bypasses these
+    // rules entirely, so tightening here does not touch the review screens.
+    //
+    // `create` carries `resource == null`, which is the write-once control.
+    // Note that `update` would NOT have done this job: for Storage, `create`
+    // covers writes to file CONTENTS and `update` only covers metadata on an
+    // existing object, so an overwrite of a submitted Aadhaar arrives as a
+    // `create`. Without the null check any stranger could replace a pending
+    // applicant's documents with their own.
+    //
+    // ── WHAT IS STILL OPEN, DELIBERATELY ────────────────────────────────────
+    //
+    // Anonymous upload of a ≤10 MB document is still possible, and
+    // `isDocument()` reads `request.resource.contentType`, which the client
+    // asserts — so it is a shape check, not a content guarantee. Closing that
+    // needs the signup page to create its Firebase user BEFORE step 2 so the
+    // path can be bound to a uid. That is a CRM change and is reported rather
+    // than made here.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/agencies/signup/{fileName} {
+      allow get:    if true;
+      allow list:   if false;
+      allow create: if resource == null && isDocument() && maxSize(10);
+      allow update: if false;
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // STAFF REGISTERING AN AGENCY ON SOMEONE'S BEHALF
+    // /kyc/agencies/temp/{fileName}
+    //
+    // Three upload paths in the CRM had NO rule matching them at all, so every
+    // one failed with storage/unauthorized. They are three segments deep
+    // (kyc / <something> / file) and the only KYC rules that existed were the
+    // four-segment /kyc/{agencyId}/{hostUid}/{fileName} and the public signup
+    // path — neither of which a three-segment path can match. A Storage rule
+    // matches an EXACT depth unless it uses {name=**}.
+    //
+    // 'temp' because the documents are uploaded before the agency record
+    // exists, so there is no id to file them under yet. Staff only: this is
+    // /agencies/register, which already refuses anyone who is not a superadmin
+    // or app_admin.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/agencies/temp/{fileName} {
+      allow get:    if isKycReviewer();
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write:  if isKycReviewer() && isDocument() && maxSize(10);
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // A PARENT AGENCY CREATING A SUB-AGENCY
+    // /kyc/sub-agencies/{fileName}
+    //
+    // Written from the agency's own dashboard, before the sub-agency record
+    // exists — same reason as 'temp' above. The uploader is the signed-in
+    // parent agency, not staff.
+    // ══════════════════════════════════════════════════════════════
+    match /kyc/sub-agencies/{fileName} {
+      allow get:    if isKycReviewer();
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write:  if isKycReviewer() && isDocument() && maxSize(10);
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // AN AGENCY SUBMITTING ITS OWN KYC AFTER APPROVAL
+    // /kyc/{agencyId}/applications/{fileName}  and  /kyc/{agencyId}/{ts}/{f}
+    //
+    // Both are four segments and already match the host rule below, which is
+    // why they work. Left documented here so the next person reading this file
+    // does not conclude they are missing too.
+    // ══════════════════════════════════════════════════════════════
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST / AGENCY KYC DOCUMENTS
+    // /kyc/{agencyId}/{hostUid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    // ── THIS PATTERN ALSO MATCHES THE PUBLIC SIGNUP PREFIX ──────────────────
+    //
+    // `kyc/agencies/signup/doc1_…` is four segments, so it matches BOTH the
+    // public signup block above AND this one, with agencyId='agencies' and
+    // hostUid='signup'. Security Rules are a permissive union — one `allow`
+    // anywhere is enough — so this block's `write` was quietly re-granting
+    // what the signup block's `resource == null` had just taken away, and any
+    // signed-in account could overwrite a pending applicant's Aadhaar.
+    //
+    // The exclusion below hands that prefix back to the block that reasons
+    // about it. Scoped to write only: `get` is public there by design, and
+    // `delete` is staff-only in both blocks, so neither needs excluding.
+    //
+    // Nothing legitimate writes under kyc/agencies/signup/ except the
+    // unauthenticated signup form, which this does not touch.
+    // ── THE AGENCY SCOPE, AND WHY IT TAKES THREE CLAUSES ────────────────────
+    //
+    // This one pattern carries four different real paths, because every KYC
+    // upload in the CRM is four segments by construction — the comment in
+    // `agency-dashboard/page.tsx` records that a fifth segment matches no rule
+    // at all, so the timestamp was folded into the filename instead. The four:
+    //
+    //   kyc/{agencyId}/applications/{ts}_docN   a host invite, by that agency
+    //   kyc/agencies/{agencyId}/{ts}_docN       that agency's OWN KYC
+    //   kyc/agencies/signup/doc1_{ts}           the public form (other block)
+    //   kyc/sub-agencies/{ts}/doc1_aadhaar      a parent creating a child
+    //
+    // So "the agency that owns this" is in a different position depending on
+    // the path, which is why `isAgencyFor` is asked twice with two different
+    // wildcards rather than once. A sub-agency submitting its own KYC later
+    // uses the second form with its OWN id — `crmUser.agencyId` is the child's
+    // document id, written when the parent created the login — so a
+    // sub-agency never reaches its parent's prefix and inherits nothing.
+    //
+    // The third case cannot be scoped: at `kyc/sub-agencies/{ts}` the child
+    // does not exist yet, so `{ts}` is a timestamp rather than anybody's id.
+    // It is create-only and write-once for that reason — an agency may file a
+    // new sub-agency application and may not touch one already filed.
+    match /kyc/{agencyId}/{hostUid}/{fileName} {
+      allow get:    if isKycReviewer()
+                    // kyc/{ownAgencyId}/applications/… — a host they invited
+                    || isAgencyFor(agencyId)
+                    // kyc/agencies/{ownAgencyId}/… — their own KYC
+                    || (agencyId == 'agencies' && isAgencyFor(hostUid));
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+
+      // `!(agencies/signup)`: that prefix is four segments too, so it matches
+      // here as well, and Security Rules are a permissive union — without the
+      // exclusion this clause would re-grant the overwrite that the signup
+      // block's `resource == null` exists to prevent, and any staff or agency
+      // login could replace a pending applicant's Aadhaar.
+      // `applicants` is excluded for the same reason: `kyc/applicants/{uid}/…`
+      // is a person's own self-filed host application, owner-written and
+      // create-only in its block below, and without the exclusion this arm
+      // would let any KYC reviewer overwrite it. Reviewers READ it (the get
+      // arm above grants them that) and may delete it; they do not write it.
+      allow write: if !(agencyId == 'agencies' && hostUid == 'signup')
+                   && agencyId != 'applicants'
+                   && isDocument()
+                   && maxSize(10)
+                   && (isKycReviewer()
+                       || isAgencyFor(agencyId)
+                       || (agencyId == 'agencies' && isAgencyFor(hostUid))
+                       // A parent filing a NEW sub-agency application. Not
+                       // scopeable — see above — so create-only.
+                       || (agencyId == 'sub-agencies'
+                           && roleClaim() == 'agency'
+                           && resource == null));
+
+      // Staff only. An agency deleting its own submitted KYC would destroy the
+      // evidence its approval was granted on.
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PAYOUT SCREENSHOTS (agency submits proof to finance)
+    // /payoutScreenshots/{reportId}/{agencyId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /payoutScreenshots/{reportId}/{agencyId}/{fileName} {
+      // Agency owner uploads their screenshot
+      allow read:  if isFinance()
+                   || (isAppUser() && request.auth.uid == agencyId);
+      // Phase 1A (AUTH-002): a guest is not an agency owner.
+      allow write: if (isOwnerPerson(agencyId)
+                       && isImage()
+                       && maxSize(10))
+                   || isFinance();
+      allow delete: if isFinance();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // PUBLIC SELLER SELF-SIGNUP ID PROOF UPLOADS (no auth required)
+    // /sellerDocs/signup/{fileName}
+    //
+    // A government ID proof, from /seller-signup. Same situation as the agency
+    // signup path above and fixed the same way — see that block for the full
+    // reasoning on get-vs-list, on why staff review is unaffected, and on why
+    // the write-once control has to be `resource == null` rather than
+    // `allow update: if false`.
+    //
+    // One difference: the filename here is `<epoch-ms>_<original file name>`,
+    // so it leaked the applicant's own file name as well. Denying `list`
+    // stops that being readable off the prefix.
+    // ══════════════════════════════════════════════════════════════
+    match /sellerDocs/signup/{fileName} {
+      allow get:    if true;
+      allow list:   if false;
+      allow create: if resource == null && isDocument() && maxSize(10);
+      allow update: if false;
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CRM ADMIN SELLER DOC UPLOADS (superadmin creating sellers via CRM)
+    // /sellerDocs/crm/{fileName}
+    // Seller doc isn't created yet when uploading, so sellerId isn't known.
+    // ══════════════════════════════════════════════════════════════
+    match /sellerDocs/crm/{fileName} {
+      allow get:    if isKycReviewer();
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write: if isKycReviewer() && isDocument() && maxSize(10);
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER PAYMENT PROOFS (CRM admin uploads when loading initial coins)
+    // /sellerPaymentProofs/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    // `isKycReviewer`, not `isFinance`. This is written by /sellers/register
+    // during onboarding, and that page is gated to
+    // superadmin|app_admin|ops_admin|ops_member — not one of which is a
+    // finance role. Scoping this to finance would have refused every person
+    // who actually registers a seller. Finance is inside isKycReviewer, so
+    // nothing is lost on the review side.
+    match /sellerPaymentProofs/{fileName} {
+      allow get:    if isKycReviewer();
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write: if isKycReviewer() && isDocument() && maxSize(10);
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // COIN SELLER DOCS (ID proof, payment QR codes)
+    // /sellerDocs/{sellerId}/{fileName}
+    // /sellerQr/{sellerId}/qr.png
+    // ══════════════════════════════════════════════════════════════
+    // ── SAME OVERLAP AS THE KYC TREE ────────────────────────────────────────
+    //
+    // `sellerDocs/signup/<file>` and `sellerDocs/crm/<file>` are both three
+    // segments, so they match this pattern too, with sellerId='signup' or
+    // 'crm'. Since rules are a permissive union, this block's `write` was
+    // re-granting overwrite rights on the public signup prefix that the
+    // signup block's `resource == null` had just removed. `isOwner('signup')`
+    // is false for everyone, so the clause that actually fired was
+    // `isCrmUser()` — i.e. any signed-in account.
+    //
+    // Excluded on write only. `get` is public on the signup prefix by design
+    // and `delete` is staff-only in both blocks. 'crm' needs no exclusion:
+    // that block is staff-only in both directions already.
+    //
+    // `isSellerFor` rather than `isOwner`: both compare the uid, but the
+    // former also requires the seller role claim, so a host whose uid happened
+    // to collide with a seller record id — or an app account that wrote its
+    // own uid into a `sellers` document during signup — does not reach this
+    // through uid alone.
+    match /sellerDocs/{sellerId}/{fileName} {
+      allow get:   if isKycReviewer()
+                   || isSellerFor(sellerId);
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:  if false;
+      allow write: if (isSellerFor(sellerId) || isKycReviewer())
+                   && sellerId != 'signup'
+                   && isDocument()
+                   && maxSize(10);
+      allow delete: if isSellerFor(sellerId) || isKycReviewer();
+    }
+
+    match /sellerQr/{sellerId}/{fileName} {
+      allow read:  if isSignedIn();   // buyers scan QR code
+      // Phase 1A (AUTH-002): a payment QR belongs to a traceable person.
+      allow write: if isOwnerPerson(sellerId)
+                   && isImage()
+                   && maxSize(2);
+      allow delete: if isOwner(sellerId) || isFinance();
+    }
+
+    // Recharge proof (buyer/seller uploads payment screenshot)
+    // /rechargeScreenshots/{reqId}/{fileName}
+    //
+    // ── DEAD PATH, CLOSED RATHER THAN LEFT OPEN ─────────────────────────────
+    //
+    // Nothing writes here. A sweep of all four codebases for this prefix
+    // returns this rule and nothing else — no Kotlin, no CRM, no function, no
+    // script. It is a rule for a flow that was replaced by
+    // `coinPurchaseProofs/` and `coinPurchases/`.
+    //
+    // It nonetheless carried `read: if isSignedIn()` and `write: if
+    // isAppUser()`, so any account — including an anonymous guest — could read
+    // every payment screenshot left here by the old flow, and write new ones
+    // into any request id. A dead path with live grants is the worst of both:
+    // nobody is watching it and everybody can reach it.
+    //
+    // Reads are now staff-only so legacy objects stay reachable for finance;
+    // writes and deletes are closed. If this flow is ever revived, the clause
+    // to restore is an owner-scoped one, not the two that were here.
+    match /rechargeScreenshots/{reqId}/{fileName} {
+      allow get:    if isFinance();
+      allow list:   if false;
+      allow write:  if false;
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // COIN PURCHASE PROOFS (seller pays Zippern to top up coin inventory)
+    // /coinPurchaseProofs/{sellerUid}/{fileName}
+    // Seller is authenticated in the seller app when they submit.
+    // ══════════════════════════════════════════════════════════════
+    match /coinPurchaseProofs/{sellerUid}/{fileName} {
+      allow read:  if isFinance() || isOwner(sellerUid);
+      // Phase 1A (AUTH-002): payment evidence must come from a non-guest.
+      allow write: if isOwnerPerson(sellerUid)
+                   && isImage()
+                   && maxSize(10);
+      allow delete: if isFinance();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER COIN PURCHASE REQUEST PROOFS (CRM seller dashboard)
+    // /coinPurchases/{sellerId}/{fileName}
+    // Uploaded by the seller's CRM agent (isCrmUser) from seller-dashboard.
+    // ══════════════════════════════════════════════════════════════
+    // The seller uploads this one themselves — /seller-dashboard is an
+    // external surface (`apiUser.role === 'seller' || 'agency'`), and
+    // BuyInventoryDialog writes here under their own seller id. A
+    // finance-only clause would have broken buying inventory outright.
+    match /coinPurchases/{sellerId}/{fileName} {
+      allow get:   if isFinance() || isSellerFor(sellerId);
+      allow list:  if false;
+      allow write: if (isFinance() || isSellerFor(sellerId))
+                   && isImage() && maxSize(10);
+      allow delete: if isFinance();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELLER SEND-DIAMONDS PAYMENT PROOFS (CRM seller dashboard)
+    // /recharges/{sellerId}/{fileName}
+    // Uploaded by the seller's CRM agent from seller-dashboard.
+    // ══════════════════════════════════════════════════════════════
+    match /recharges/{sellerId}/{fileName} {
+      allow read:  if isFinance();
+      allow write: if isFinance() && isImage() && maxSize(10);
+      allow delete: if isFinance();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DYNAMIC CONTENT ASSETS (tech team manages)
+    // /contentAssets/gifts/thumbnails/{file}
+    // /contentAssets/gifts/lottie/{file}
+    // /contentAssets/levels/badges/{file}
+    // /contentAssets/levels/entries/{file}
+    // /contentAssets/levels/levelup/{file}
+    // /contentAssets/profileCards/{file}
+    // /contentAssets/banners/{file}
+    // Uses {allPaths=**} to allow any depth under contentAssets/
+    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
+    // APP BUILDS — the APKs the in-app updater installs
+    // /appBuilds/{channel}/{fileName}
+    //
+    // `channel` is `debug` or `release`, and the split is not organisational.
+    // A debug APK is signed with the debug keystore and a release APK with
+    // zipper-release.jks; Android refuses an update signed with a different key
+    // (INSTALL_FAILED_UPDATE_INCOMPATIBLE), and both share the applicationId
+    // com.zipper.app. Serving the wrong one fails at the final step, after a
+    // 130 MB download, with an OS error the person cannot act on.
+    //
+    // ── READ IS PUBLIC, AND HAS TO BE ────────────────────────────────────────
+    //
+    // The download runs through Android's `DownloadManager`, an OS service that
+    // carries none of the app's Firebase credentials — so an authenticated read
+    // is not available to it at any price. A `?alt=media&token=` download URL
+    // bypasses these rules anyway, which is the mechanism the publish script
+    // uses; this clause makes the SDK path agree with it rather than leaving a
+    // rule that says something the system does not enforce.
+    //
+    // Nothing is given away by it. This is the application binary, handed to
+    // anybody who installs the app, and the updater verifies a SHA-256 recorded
+    // in `appConfig/androidUpdate` before installing — so a substituted file is
+    // caught by the hash, not by the ACL.
+    //
+    // ── WRITE IS NOBODY ──────────────────────────────────────────────────────
+    //
+    // `if false` is the whole rule. `backend/scripts/publish_apk.py` uploads
+    // through the Admin SDK, which bypasses security rules by design, so there
+    // is no client — staff included — that has any business putting an
+    // executable here. A CRM account able to upload an APK is a CRM account
+    // able to ship code to every phone on the platform.
+    // `{path=**}` rather than `{channel}/{fileName}`: the layout is
+    // `appBuilds/{channel}/{abi}/{file}` since the APK was split per
+    // architecture, and a two-segment pattern silently stops matching a
+    // three-segment path — which would leave the objects governed by the
+    // catch-all deny at the bottom of this file and every download 403ing.
+    match /appBuilds/{path=**} {
+      allow read:   if true;
+      allow write:  if false;
+      allow delete: if false;
+    }
+
+    match /contentAssets/{allPaths=**} {
+      allow read:  if isSignedIn();
+      // Images, Lottie JSON, and video. Video is here because an entrance is a
+      // video now: the image-sequence Lotties these replaced were 22 MB of
+      // base64 frames, and the H.264 re-encode of the same clip is under 2 MB.
+      // Refusing the small one while admitting the enormous one would have been
+      // exactly backwards.
+      allow write: if isInternal()
+                   && (isImage()
+                       || isVideo()
+                       || request.resource.contentType == 'application/json'
+                       || request.resource.contentType == 'text/plain')
+                   && maxSize(30);
+      allow delete: if isInternal();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // MONEY EVIDENCE — proof attached to a payment
+    // /evidence/{kind}/{fileName}
+    //
+    // A payment screenshot, a bank slip, an invoice. The CRM used to ask for a
+    // URL and nothing else, which meant whoever was filling the form had to get
+    // the file onto some public host first — in practice a Drive link that only
+    // opens while its owner is signed in, so the "evidence" behind a payout was
+    // a link that shows an auditor a login page.
+    //
+    // Staff only, in both directions. These carry bank references and account
+    // holders' names, so an app user must not be able to read them, and only
+    // somebody with a CRM account can write one.
+    //
+    // No delete, for anyone. Evidence that can be removed is not evidence — a
+    // correction is a new upload beside the old one, which is why UploadField
+    // prefixes every file name with a timestamp rather than overwriting.
+    // ══════════════════════════════════════════════════════════════
+    match /evidence/{kind}/{fileName} {
+      allow get:    if isFinance();
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write:  if isFinance()
+                    && (isImage() || request.resource.contentType == 'application/pdf')
+                    && maxSize(10);
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CRM PROFILE PHOTOS — a staff or partner account's own picture
+    // /crmProfilePhotos/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    match /crmProfilePhotos/{fileName} {
+      allow read:  if isSignedIn();
+      // `hasRoleClaim`, not `isInternal`: /profile serves agencies and coin
+      // sellers as well as staff, and narrowing this to the internal tiers
+      // would have locked every partner out of setting their own picture.
+      allow write: if hasRoleClaim() && isImage() && maxSize(5);
+      allow delete: if hasRoleClaim();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // FEEDBACK ATTACHMENTS (users upload images of issues)
+    // /feedbackAttachments/{uid}/{fileName}
+    //
+    // The wildcard was named `{ticketId}`, but FeedbackScreen.kt writes
+    // `feedbackAttachments/$uid/<millis>_<n>.<ext>` — the segment is the
+    // uploader's uid and always has been. Naming it `ticketId` is what made
+    // the old `isAppUser()` write clause look reasonable: it reads as "any app
+    // user may attach to a ticket", when what it actually permitted was any
+    // app user writing into ANY OTHER user's folder. Renamed and bound to the
+    // owner, which is what the client already does.
+    // ══════════════════════════════════════════════════════════════
+    match /feedbackAttachments/{uid}/{fileName} {
+      allow read:  if isSupport();
+      allow write: if isOwner(uid)
+                   && isImageOrVideo()
+                   && maxSize(50);   // allow video clips (other-phone recordings)
+      allow delete: if isSupport();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // LIVE ROOM / CALL THUMBNAILS
+    // /roomThumbs/{roomId}/thumb.jpg
+    // ══════════════════════════════════════════════════════════════
+    // ── DEAD PATH, CLOSED. THE ASSESSMENT, BECAUSE IT IS NOT OBVIOUS ────────
+    //
+    // WHAT IT CONTAINS: nothing. A grep for `roomThumbs` across all four
+    // codebases — Android, CRM, Functions, backend, and every script —
+    // returns this rule and nothing else. No code writes a thumbnail here and
+    // no code reads one. The live-room thumbnail feature it was written for
+    // does not exist.
+    //
+    // WAS IT EXPLOITABLE? Yes, though not as a data leak — there is no data.
+    // `isAppUser()` is `request.auth != null`, which an anonymous guest
+    // satisfies, and `{roomId}` was unconstrained. So any stranger could
+    // create a guest session and write 2 MB images to arbitrary paths under
+    // this prefix, and every signed-in user could read them. That is free
+    // hosting for arbitrary content on the company's bucket, attributable to
+    // Zipper and reachable by anyone — the abuse case, not the exfiltration
+    // one. `allow delete: if isAppUser()` compounded it: one guest could
+    // delete another's.
+    //
+    // WHO SHOULD OWN IT IF IT RETURNS: the room's host. A thumbnail is media
+    // about one broadcast, so the write clause should bind `{roomId}` to the
+    // account hosting that room — which this pattern cannot express, because
+    // a room id is not a uid. The path would need to become
+    // `roomThumbs/{hostUid}/{roomId}.jpg` so `isOwner(hostUid)` can hold.
+    // That is a design note for whoever builds the feature, not a change to
+    // make now for a feature with no code.
+    //
+    // CLOSED rather than tightened, for the same reason as
+    // `rechargeScreenshots` above: a live grant with nothing behind it is
+    // reachable by everyone and watched by no one. Closing breaks nothing —
+    // proven by the grep, not assumed.
+    match /roomThumbs/{roomId}/{fileName} {
+      allow read:   if false;
+      allow write:  if false;
+      allow delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // HOST PROFILE PHOTOS (uploaded by agency when inviting a host)
+    // /hostPhotos/{agencyId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    // Scoped to the agency named in the path. This is the comparison
+    // photograph a host's live capture is matched against during verification,
+    // so it is identity data about a third party — the host — held under the
+    // recruiting agency's id. An agency has no business reading another
+    // agency's roster photographs, and before the claim existed every one of
+    // them could.
+    match /hostPhotos/{agencyId}/{fileName} {
+      allow get:    if isKycReviewer() || isAgencyFor(agencyId);
+      // Nothing in the app, CRM, functions or backend calls listAll();
+      // denying it stops a signed-in account enumerating this prefix.
+      allow list:   if false;
+      allow write: if (isKycReviewer() || isAgencyFor(agencyId))
+                   && isImage() && maxSize(10);
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // SELF-APPLICATION KYC — a user applying as a Host from the app
+    // /kyc/applicants/{uid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    //
+    // The agency Invite Host form uploads a host's documents under
+    // `kyc/{agencyId}/…` with the agency's claim. A person applying for
+    // themselves holds no partner claim and no agency id yet, so they need a
+    // prefix of their own, scoped to their uid. Create-only: a submitted
+    // document is evidence a decision is made on and may not be replaced by
+    // the applicant afterwards. Readable by the applicant and by KYC
+    // reviewers; the `kyc/{agencyId}/{hostUid}/…` block above also matches
+    // this path and grants reviewers and agencies nothing wider than that.
+    match /kyc/applicants/{uid}/{fileName} {
+      allow get:    if isOwnerPerson(uid) || isKycReviewer();
+      allow list:   if false;
+      allow create: if isOwnerPerson(uid) && resource == null && isDocument() && maxSize(10);
+      allow update: if false;
+      allow delete: if isKycReviewer();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // RECHARGE PROOFS — a buyer's screenshot of paying a Coin Seller
+    // /rechargeProofs/{buyerUid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    //
+    // The old `rechargeScreenshots/{reqId}` prefix was keyed on a request id
+    // the client chose, readable by any signed-in account, and is closed
+    // above. This one is keyed on the BUYER, create-only, and readable by the
+    // buyer and by the staff who verify recharges on /recharges.
+    match /rechargeProofs/{buyerUid}/{fileName} {
+      allow get:    if isOwnerPerson(buyerUid) || isFinance() || isKycReviewer();
+      allow list:   if false;
+      allow create: if isOwnerPerson(buyerUid) && resource == null && isImage() && maxSize(10);
+      allow update: if false;
+      allow delete: if isFinance();
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // DENY EVERYTHING ELSE
+    // ══════════════════════════════════════════════════════════════
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# PROPOSED — not applied. Base: pre-P1 copy (P1 stage 1 backup)
+# Base confidence: UNCERTAIN: pre-P1 copy, but the file may have changed between 20 Oct and P1; needs the downloaded source
+# Note: backfillPublicProfiles requires a live Owner binding.
+--- a/functions/src/profiles.ts
++++ b/functions/src/profiles.ts
+@@ -1,6 +1,7 @@
+ import * as functions from 'firebase-functions'
+ import * as admin from 'firebase-admin'
+ import { normaliseCrmRole, OWNER_ROLE } from './crmRoles'
++import { ownerMfaVerified, type OwnerMfaToken } from './ownerMfa'
+ 
+ const db = admin.firestore()
+ 
+@@ -314,6 +315,12 @@
+     if (normaliseCrmRole(crmSnap.get('role')) !== OWNER_ROLE) {
+       throw new functions.https.HttpsError('permission-denied', 'Owners only.')
+     }
++    // P1-A3b: the role alone is true for a password-only sign-in. The Owner's
++    // CURRENT Firebase sign-in must be bound to an MFA-verified API session.
++    if (!(await ownerMfaVerified(db, uid, context.auth?.token as OwnerMfaToken | undefined))) {
++      throw new functions.https.HttpsError('permission-denied',
++        'Finish two-step sign-in in the CRM first, then try again.')
++    }
+ 
+     let written = 0
+     let cursor: admin.firestore.QueryDocumentSnapshot | null = null

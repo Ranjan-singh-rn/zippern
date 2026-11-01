@@ -13,6 +13,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+/** B2: shown instead of "No calls yet" when the history could not be read. */
+const val CALL_HISTORY_LOAD_FAILED = "Couldn't load your call history. Check your connection and try again."
+
 data class CallHistoryUiState(
     val calls: List<CallRecord> = emptyList(),
     val isLoading: Boolean = true,
@@ -36,8 +39,11 @@ class CallHistoryViewModel @Inject constructor(
         val myUid = auth.currentUser?.uid ?: return
         _state.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
-            val records = callRepo.getCallHistory(myUid)
-            _state.update { it.copy(calls = records, isLoading = false) }
+            callRepo.loadCallHistory(myUid).fold(
+                onSuccess = { records -> _state.update { it.copy(calls = records, isLoading = false, error = null) } },
+                // B2: say the read failed (and offer a retry) rather than "No calls yet".
+                onFailure = { _state.update { it.copy(isLoading = false, error = CALL_HISTORY_LOAD_FAILED) } },
+            )
         }
     }
 }

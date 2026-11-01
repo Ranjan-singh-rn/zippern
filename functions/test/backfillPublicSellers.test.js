@@ -157,7 +157,8 @@ function plan(sellers, publicNow) {
   for (const [id, pub] of shouldPublish) {
     const now = publicNow[id]
     if (!now) toCreate.push(id)
-    else if (PUBLIC_FIELDS.some((f) => now[f] !== pub[f]) || now.sellerId !== pub.sellerId) toUpdate.push(id)
+    // Mirrors the script: structural, because `paymentMethods` is an array.
+    else if (PUBLIC_FIELDS.some((f) => JSON.stringify(now[f]) !== JSON.stringify(pub[f])) || now.sellerId !== pub.sellerId) toUpdate.push(id)
     else unchanged.push(id)
   }
   const toDelete = Object.keys(publicNow).filter((id) => !shouldPublish.has(id))
@@ -257,7 +258,7 @@ describe('nothing private can reach the public collection', () => {
       for (const forbidden of NEVER_PUBLIC) {
         expect(Object.keys(pub).includes(forbidden)).toBe(false)
       }
-      expect(Object.keys(pub).length).toBe(7)
+      expect(Object.keys(pub).length).toBe(11)
     }
     expect(JSON.stringify(after).includes('Aadhaar')).toBe(false)
     expect(JSON.stringify(after).includes('ABCDE1234F')).toBe(false)

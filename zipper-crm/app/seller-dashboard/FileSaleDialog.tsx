@@ -25,11 +25,9 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { collection, getDocs, limit as fsLimit, orderBy, query } from 'firebase/firestore'
 import {
   AlertTriangle, CheckCircle2, Gem, Loader2, Search, Send, X,
 } from 'lucide-react'
-import { db } from '@/lib/firebase'
 import api, { ApiError, type Sale } from '@/lib/api'
 import { inr } from '@/lib/apiPartners'
 import { attempt, type ReadFailure, type ReadResult } from '@/lib/readState'
@@ -44,19 +42,17 @@ interface Buyer {
   email: string
 }
 
-async function loadBuyers(): Promise<Buyer[]> {
-  const snap = await getDocs(
-    query(collection(db, 'users'), orderBy('name'), fsLimit(100)),
-  )
-  return snap.docs.map((d) => {
-    const data = d.data() as { name?: string; displayName?: string; phone?: string; email?: string }
-    return {
-      uid: d.id,
-      name: data.name || data.displayName || 'Unnamed',
-      phone: data.phone ?? '',
-      email: data.email ?? '',
-    }
-  })
+/**
+ * The buyer, found by the API from an EXACT uid, email or phone number.
+ *
+ * It used to list `users` straight from Firestore, which the rules refuse to
+ * anyone but staff — correctly, it is everyone's contact details — so every
+ * seller saw "The buyer list could not be read". The API resolves the one
+ * person the seller names and returns their contact details masked.
+ */
+async function loadBuyers(term: string): Promise<Buyer[]> {
+  if (term.trim().length < 3) return []
+  return api.partnerOps.lookupBuyers(term.trim())
 }
 
 export default function FileSaleDialog({
@@ -98,25 +94,16 @@ export default function FileSaleDialog({
 
   useEffect(() => {
     let live = true
-    attempt(loadBuyers(), 'buyers').then((r) => { if (live) setBuyers(r) })
-    return () => { live = false }
-  }, [])
+    const t = term.trim()
+    if (t.length < 3) { setBuyers({ ok: true, value: [] } as ReadResult<Buyer[]>); return }
+    setBuyers(null)
+    const timer = setTimeout(() => {
+      attempt(loadBuyers(t), 'buyers').then((r) => { if (live) setBuyers(r) })
+    }, 400)
+    return () => { live = false; clearTimeout(timer) }
+  }, [term])
 
-  const visible = useMemo(() => {
-    if (!buyers?.ok) return []
-    const t = term.trim().toLowerCase()
-    const list = buyers.value
-    if (!t) return list.slice(0, 25)
-    return list
-      .filter(
-        (b) =>
-          b.name.toLowerCase().includes(t) ||
-          b.email.toLowerCase().includes(t) ||
-          b.phone.includes(t) ||
-          b.uid.toLowerCase().includes(t),
-      )
-      .slice(0, 25)
-  }, [buyers, term])
+  const visible = useMemo(() => (buyers?.ok ? buyers.value : []), [buyers])
 
   const buyerUid = buyer?.uid ?? manualUid.trim()
   const diamondsNum = Math.round(Number(diamonds)) || 0
@@ -227,7 +214,7 @@ export default function FileSaleDialog({
                       <input
                         value={term}
                         onChange={(e) => setTerm(e.target.value)}
-                        placeholder="Search by name, email, phone or uid"
+                        placeholder="Buyer's exact email, phone number or uid"
                         className={`${inputClass} pl-9`}
                       />
                     </div>
@@ -239,8 +226,8 @@ export default function FileSaleDialog({
                     ) : !buyers.ok ? (
                       <div className="mt-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2">
                         <p className="text-yellow-300 text-xs font-medium">
-                          The buyer list could not be read. This is not
-                          &ldquo;no buyers&rdquo;.
+                          The buyer could not be looked up. This is not
+                          &ldquo;no such buyer&rdquo;.
                         </p>
                         <p className="text-slate-400 text-xs mt-1">{buyers.reason}</p>
                         <p className="text-slate-500 text-xs mt-1">
@@ -249,7 +236,9 @@ export default function FileSaleDialog({
                       </div>
                     ) : visible.length === 0 ? (
                       <p className="text-slate-500 text-xs mt-2">
-                        {term ? 'No buyer matches that.' : 'No buyers were returned.'}
+                        {term.trim().length < 3
+                          ? 'Type the buyer’s full email, phone number or uid.'
+                          : 'No account has exactly that email, phone or uid.'}
                       </p>
                     ) : (
                       <div className="mt-2 space-y-1.5 max-h-52 overflow-y-auto">

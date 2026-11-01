@@ -10,6 +10,7 @@ import {
   where,
   orderBy,
   limit,
+  documentId,
   Timestamp,
 } from 'firebase/firestore'
 import {
@@ -18,6 +19,7 @@ import {
   type SubmitResult,
 } from '@/lib/pendingChanges'
 import { fromSettled, type ReadFailure } from '@/lib/readState'
+import { mergeAgencyRoster, type RosterMember } from '@/lib/agencyRoster'
 
 export interface Agency {
   id: string
@@ -129,6 +131,55 @@ export async function getAgency(id: string, crmId?: string): Promise<Agency | nu
   return hit ? ({ id: hit.id, ...hit.data() } as Agency) : null
 }
 
+/**
+ * The CURRENT name of each of these agencies, keyed by document id (GOV B20).
+ *
+ * The name copied onto a host application — and the Mongo name behind the
+ * applicant's agency picker — is set once and never follows a rename, which
+ * lands only here, on the agency document. So a screen that names a Host's
+ * agency resolves `users.agencyId` through this and keeps the copy as a
+ * fallback (`resolveAgencyName` in lib/hostRows.ts).
+ *
+ * Never rejects. `where(documentId(), 'in', …)` takes at most 30 ids, so the
+ * ids go in chunks; a refused chunk is reported in `failure` and its ids are
+ * simply absent from `names`, which every caller already treats as "show the
+ * id / the stored copy". The rules admit `isAdmin()` to list agencies, so a
+ * department MEMBER gets the failure and the copy — never a blank.
+ */
+export async function getAgencyNames(
+  ids: readonly string[],
+): Promise<{ names: Map<string, string>; failure: ReadFailure | null }> {
+  // A document id never contains '/', and one that did would make the whole
+  // query throw while it is being built — so it is simply not looked up.
+  const unique = Array.from(new Set(
+    ids.map((i) => String(i ?? '').trim()).filter((i) => i !== '' && !i.includes('/')),
+  ))
+  const names = new Map<string, string>()
+  if (unique.length === 0) return { names, failure: null }
+  const chunks: string[][] = []
+  for (let i = 0; i < unique.length; i += 30) chunks.push(unique.slice(i, i + 30))
+  const results = await Promise.allSettled(
+    // `async`, so anything thrown while the query is built is a rejection that
+    // `allSettled` records, not an exception out of this function.
+    chunks.map(async (chunk) =>
+      getDocs(query(collection(db, 'agencies'), where(documentId(), 'in', chunk))),
+    ),
+  )
+  let failure: ReadFailure | null = null
+  results.forEach((res, i) => {
+    const read = fromSettled(res, `agencies/names#${i}`)
+    if (!read.ok) {
+      failure = failure ?? read
+      return
+    }
+    read.value.docs.forEach((d) => {
+      const name = (d.data() as Record<string, unknown>).agencyName
+      if (typeof name === 'string' && name.trim()) names.set(d.id, name.trim())
+    })
+  })
+  return { names, failure }
+}
+
 export async function getSubAgencies(parentId: string): Promise<Agency[]> {
   // Avoid compound query (where + orderBy) — requires composite index.
   // Filter by parentAgencyId only, sort client-side.
@@ -204,7 +255,12 @@ export async function getAgencyHosts(agencyId: string, max: number = AGENCY_HOST
  *
  * The two are joined on `activatedByUid`, which is the field the Android app
  * writes when the code is redeemed, so a host with both a user document and an
- * application is ONE person and not two.
+ * application is ONE person and not two. GOV B08: and on `applicantUid` while
+ * that person is a current host here — a SELF-application never carries
+ * `activatedByUid`, and the join above listed an approved one as a second,
+ * "awaiting" person (`linkedPersonUid` in lib/hostRows.ts). An invitation
+ * nobody has redeemed that carries a current host's own phone or email is
+ * flagged on its row (`sameContactAs`) and not counted.
  *
  * ── WHY NOT `agencies/{id}/agencyHosts` ──────────────────────────────────────
  *
@@ -255,25 +311,7 @@ export async function getAgencyHosts(agencyId: string, max: number = AGENCY_HOST
  *              `isHost` would be read as "not a host" and would quietly delete
  *              real hosts from the count, which is the bug this is inside.
  */
-export type RosterState = 'active' | 'awaiting' | 'pending' | 'former'
-
-export interface RosterMember {
-  /** App account uid. Empty on an invitation nobody has redeemed. */
-  uid: string
-  name: string
-  phone: string
-  state: RosterState
-  /** The invitation this person came from, where there is one. */
-  applicationId: string
-  /** The referral code, on a row that is waiting for it to be entered. */
-  referralCode: string
-  /** Agreed beans per minute. `null` when no rate is on record either side. */
-  callRateBeans: number | null
-  /** Lifetime beans on the user document. `null` when there is no account. */
-  beans: number | null
-  isVerifiedHost: boolean
-  isBanned: boolean
-}
+export type { RosterState, RosterMember } from '@/lib/agencyRoster'
 
 export interface AgencyRoster {
   /**
@@ -287,6 +325,12 @@ export interface AgencyRoster {
   awaiting: number
   pending: number
   former: number
+  /**
+   * Invitation rows flagged as an existing host's contact (`sameContactAs`).
+   * Listed, and in none of the counts above — they are a person already
+   * counted.
+   */
+  flagged: number
   /**
    * Set when that read did not complete. A count taken over a refused read is
    * not a count, and `rosterCountOf` returns `null` rather than a number when
@@ -305,24 +349,6 @@ export interface AgencyRoster {
  */
 export const AGENCY_ROSTER_LIMIT = 500
 
-function textField(raw: Record<string, unknown>, ...keys: string[]): string {
-  for (const k of keys) {
-    const v = raw[k]
-    if (typeof v === 'string' && v.trim()) return v.trim()
-    if (typeof v === 'number') return String(v)
-  }
-  return ''
-}
-
-function intField(raw: Record<string, unknown>, ...keys: string[]): number | null {
-  for (const k of keys) {
-    const v = raw[k]
-    if (typeof v === 'number' && Number.isFinite(v)) return v
-    if (typeof v === 'string' && v.trim() && Number.isFinite(Number(v))) return Number(v)
-  }
-  return null
-}
-
 /**
  * One agency's roster, from the two collections that actually hold it.
  *
@@ -337,7 +363,7 @@ export async function getAgencyRoster(
 ): Promise<AgencyRoster> {
   if (!agencyId) {
     return {
-      members: [], total: 0, active: 0, awaiting: 0, pending: 0, former: 0,
+      members: [], total: 0, active: 0, awaiting: 0, pending: 0, former: 0, flagged: 0,
       usersFailure: null, applicationsFailure: null, capped: false,
     }
   }
@@ -352,100 +378,24 @@ export async function getAgencyRoster(
   const usersRead = fromSettled(usersRes, `agencies/${agencyId}/roster-users`)
   const appsRead = fromSettled(appsRes, `agencies/${agencyId}/roster-invitations`)
 
-  /** Keyed on uid for the activated half, and on application id for the rest. */
-  const byKey = new Map<string, RosterMember>()
-
-  if (usersRead.ok) {
-    usersRead.value.docs.forEach((d) => {
-      const raw = d.data() as Record<string, unknown>
-      byKey.set(d.id, {
-        uid: d.id,
-        // `phoneNumber` is what a user document spells it. There is no `phone`
-        // field on a user — see the note on `Host` in app/agency-dashboard.
-        name: textField(raw, 'name', 'displayName') || d.id,
-        phone: textField(raw, 'phoneNumber'),
-        // Explicit `false` only. See `RosterState` — a missing `isHost` must
-        // never be read as "not a host".
-        state: raw.isHost === false ? 'former' : 'active',
-        applicationId: '',
-        referralCode: '',
-        callRateBeans: intField(raw, 'callRateBeans'),
-        beans: intField(raw, 'beans') ?? 0,
-        isVerifiedHost: raw.isVerifiedHost === true,
-        isBanned: raw.isBanned === true,
-      })
-    })
-  }
-
-  if (appsRead.ok) {
-    appsRead.value.docs.forEach((d) => {
-      const raw = d.data() as Record<string, unknown>
-      const status = textField(raw, 'status').toLowerCase()
-      // A refused invitation is not on the roster. The agency's own screen shows
-      // it with the reason so they do not resubmit the same application, but it
-      // is nobody's host and counting it would overstate every agency that has
-      // ever had one turned down.
-      if (status === 'rejected') return
-
-      const uid = textField(raw, 'activatedByUid')
-      const rate = intField(raw, 'callRate')
-      const existing = uid ? byKey.get(uid) : undefined
-      if (existing) {
-        // The same person, seen from the other side. Fill in what the invitation
-        // knows and the user document does not, and add no second row: a host
-        // counted twice is the mirror image of the bug being fixed here.
-        existing.applicationId = d.id
-        if (!existing.phone) existing.phone = textField(raw, 'applicantPhone', 'phone')
-        if (existing.callRateBeans === null) existing.callRateBeans = rate
-        return
-      }
-
-      byKey.set(`app:${d.id}`, {
-        uid,
-        name: textField(raw, 'hostName', 'name', 'displayName') || 'Unnamed host',
-        phone: textField(raw, 'applicantPhone', 'phone'),
-        // `isActivated` with no user document of ours means the host redeemed
-        // the code and their `users.agencyId` points somewhere else, or was
-        // never written. It is still an activation, and saying so is how the
-        // discrepancy becomes visible instead of silently rounding to a count.
-        state:
-          raw.isActivated === true || uid
-            ? 'active'
-            : status === 'approved'
-              ? 'awaiting'
-              : 'pending',
-        applicationId: d.id,
-        referralCode: textField(raw, 'referralCode'),
-        callRateBeans: rate,
-        beans: null,
-        isVerifiedHost: false,
-        isBanned: false,
-      })
-    })
-  }
-
-  // Activated first — they are the part of the roster somebody is being paid
-  // for — then alphabetically, which is how the agency's own screen reads.
-  // Former hosts last: they are history, not work.
-  const STATE_RANK: Record<RosterState, number> = {
-    active: 0, awaiting: 1, pending: 2, former: 3,
-  }
-  const members = Array.from(byKey.values()).sort(
-    (a, b) => STATE_RANK[a.state] - STATE_RANK[b.state] || a.name.localeCompare(b.name),
+  // The merge itself is pure, and specified on its own: lib/agencyRoster.ts.
+  const merged = mergeAgencyRoster(
+    usersRead.ok
+      ? {
+          docs: usersRead.value.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, unknown> })),
+          capped: usersRead.value.size >= max,
+        }
+      : null,
+    appsRead.ok
+      ? {
+          docs: appsRead.value.docs.map((d) => ({ id: d.id, data: d.data() as Record<string, unknown> })),
+          capped: appsRead.value.size >= max,
+        }
+      : null,
   )
 
-  const count = (s: RosterState) => members.filter((m) => m.state === s).length
-  const active = count('active')
-  const awaiting = count('awaiting')
-  const pending = count('pending')
-
   return {
-    members,
-    total: active + awaiting + pending,
-    active,
-    awaiting,
-    pending,
-    former: count('former'),
+    ...merged,
     usersFailure: usersRead.ok ? null : usersRead,
     applicationsFailure: appsRead.ok ? null : appsRead,
     capped:
@@ -593,27 +543,18 @@ export async function updateAgency(
   updates: Partial<Pick<Agency,
     'agencyName' | 'ownerName' | 'ownerPhone' | 'ownerEmail' | 'address' |
     'bankName' | 'accountNumber' | 'ifscCode' | 'accountHolderName' | 'branch' | 'upiId' |
-    'paymentType' | 'country' | 'binanceUid' | 'coinSellerUid' | 'referralCode'
+    'paymentType' | 'country' | 'binanceUid' | 'coinSellerUid'
   >>
 ): Promise<void> {
   await updateDoc(doc(db, 'agencies', id), { ...updates, updatedAt: serverTimestamp() })
 }
 
-export async function disableAgency(id: string): Promise<void> {
-  // Deactivate the agency doc
-  const agencyRef = doc(db, 'agencies', id)
-  await updateDoc(agencyRef, { isActive: false })
-  // Also deactivate the agency owner's CRM login — triggers real-time auto-logout
-  const agencySnap = await getDoc(agencyRef)
-  const crmUid = agencySnap.data()?.crmUid as string | undefined
-  if (crmUid) {
-    await updateDoc(doc(db, 'crmUsers', crmUid), { isActive: false })
-  }
-}
-
-export async function enableAgency(id: string): Promise<void> {
-  await updateDoc(doc(db, 'agencies', id), { isActive: true })
-}
+/*
+ * disableAgency / enableAgency — REMOVED (Phase 1A, SECURITY-003/005).
+ * They had no callers and wrote `agencies.isActive` and `crmUsers.isActive`
+ * straight from the browser. Partner lifecycle goes through the partner-ops API
+ * (`/partner-ops/partners/{id}/suspend|reactivate`), which the rules now require.
+ */
 
 export async function setAgencyCommissionRate(id: string, rate: number): Promise<void> {
   if (rate < 0 || rate > 100) throw new Error('Rate must be between 0 and 100.')

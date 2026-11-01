@@ -35,11 +35,22 @@
  */
 import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
+import {
+  nextValidAfter, restrictionVerdict, ACCOUNT_RESTRICTED, SESSION_DISPLACED, DISPLACED_MESSAGE,
+  assertActiveSession,
+} from './mobileSession'
 import * as crypto from 'crypto'
-import { STATE_ACTIVE, STATE_PERMANENTLY_DEACTIVATED } from './accounts'
-import { normaliseCrmRole } from './crmRoles'
+import { STATE_ACTIVE, STATE_PERMANENTLY_DEACTIVATED, STATE_RECOVERY_PENDING, recoveryExpired } from './accounts'
+import { normaliseCrmRole, deriveRoleFlags, PARTNER_ROLES } from './crmRoles'
 import { bindingPayload, decideGuestClaim, GuestClaimStatus } from './guestBinding'
-import { legacyPhoneKey, phoneE164Key, sameNumberStrict } from './phone'
+import { AdoptionCandidate, decideEmailAdoption } from './emailAdoption'
+
+/**
+ * AUTH-001 reverse index: guest uid → the one device it belongs to. Written only
+ * by `claimGuestIdentity` inside the binding transaction; closed to clients.
+ */
+export const GUEST_UID_BINDINGS = 'guestUidBindings'
+import { legacyPhoneKey, phoneE164Key, sameNumber, sameNumberStrict } from './phone'
 
 const db = admin.firestore()
 
@@ -62,6 +73,11 @@ const db = admin.firestore()
  * token for it.
  */
 const OBSERVER_EMAIL = (process.env.OBSERVER_EMAIL || '314zipper@gmail.com').toLowerCase()
+
+/** UGP-C: the same refusal for the email one-time code (`emailOtp.ts`). */
+export function isObserverEmail(email: string): boolean {
+  return String(email ?? '').trim().toLowerCase() === OBSERVER_EMAIL
+}
 
 function requireAuth(context: functions.https.CallableContext): string {
   if (!context.auth) {
@@ -109,7 +125,18 @@ export async function isGuestAccount(
   if (provider !== 'anonymous' && provider !== 'custom') return false
   try {
     const rec = await admin.auth().getUser(uid)
-    if ((rec.providerData ?? []).length === 0) return true
+    /*
+     * UGP-C: an email bound by one-time code is set on the Auth record by the
+     * server (`updateUser({email, emailVerified: true})`) and attaches NO
+     * provider — so `providerData` stays empty for it, and reading only that
+     * would call the person a guest for ever. A verified email or a phone on
+     * the record counts as "something attached"; the document below still has
+     * to say it was actually bound.
+     */
+    const verifiedOnRecord =
+      String(rec.phoneNumber ?? '').trim() !== '' ||
+      (emailKey(rec.email) !== '' && rec.emailVerified === true)
+    if ((rec.providerData ?? []).length === 0 && !verifiedOnRecord) return true
 
     /*
      * A provider is attached — but is anything BOUND?
@@ -392,6 +419,41 @@ export const claimGuestIdentity = functions
 
       const createdAt = snap.get('createdAt') as admin.firestore.Timestamp | undefined
 
+      /*
+       * AUTH-001 reverse index: `guestUidBindings/{uid}` → the device it is the
+       * guest of. Read inside the transaction so two devices racing to bind the
+       * same uid cannot both win. A reverse entry only counts while the device
+       * binding it names still points back at this uid; otherwise it is stale.
+       */
+      let wantedBoundElsewhere = false
+      if (wanted !== '' && wanted !== boundUid) {
+        const rev = await tx.get(db.collection(GUEST_UID_BINDINGS).doc(wanted))
+        const otherDevice = rev.exists ? String(rev.get('deviceId') ?? '') : ''
+        if (otherDevice !== '' && otherDevice !== deviceId) {
+          const other = await tx.get(db.collection('guestDeviceBindings').doc(otherDevice))
+          wantedBoundElsewhere = other.exists && String(other.get('uid') ?? '') === wanted
+        }
+      }
+
+      const callerUid = context.auth?.uid ?? ''
+
+      /*
+       * P0-9 (AUTH-001-R): a CUSTOM-token session proves nothing about who owns
+       * this binding. This very function mints custom tokens from the device
+       * secret — so a binding written by an attacker before Phase 1A yields the
+       * attacker a custom-token session for the victim's uid, and counting that
+       * session as "signed in as the bound uid" let it promote its own binding
+       * to owner-verified, re-key the secret, and open an upgraded account.
+       * Only a session the account began itself (anonymous, phone, Google,
+       * email) counts.
+       */
+      const callerProvider = String(
+        (context.auth?.token as { firebase?: { sign_in_provider?: string } } | undefined)
+          ?.firebase?.sign_in_provider ?? '',
+      )
+      const callerOwnsBoundUid = boundUid !== '' && context.auth?.uid === boundUid
+        && callerProvider !== 'custom'
+
       const decision = decideGuestClaim({
         deviceBanned: deviceBanReason !== '',
         boundUid,
@@ -405,9 +467,45 @@ export const claimGuestIdentity = functions
         wantedIsUpgraded,
         // Verified by Firebase before this function ran. The call is otherwise
         // unauthenticated by design — the caller has no session yet, which is
-        // what it is asking for — so this is empty on most paths.
-        callerIsBoundUid: boundUid !== '' && context.auth?.uid === boundUid,
+        // what it is asking for — so this is empty on most paths. P0-9: and a
+        // custom-token session does not count (see `callerOwnsBoundUid`).
+        callerIsBoundUid: callerOwnsBoundUid,
+        callerUid,
+        wantedBoundElsewhere,
+        bindingVerified: snap.get('ownerVerified') === true,
       })
+
+      /*
+       * P0-9 (AUTH-001-R): before a token is issued for an existing binding,
+       * the reverse index has to agree that this device is the uid's ONE
+       * device. Read here, before any write, as a transaction requires.
+       *
+       *   quarantined entry          → no token (a person resolves it);
+       *   entry names another device → if any other binding still points at
+       *                                the uid, it is bound twice: quarantine,
+       *                                no token. Otherwise the entry is stale or
+       *                                missing (a legacy binding) and is pointed
+       *                                at this device.
+       *
+       * `scripts/migrate-guest-bindings.mjs` builds the index for every legacy
+       * binding ahead of this; this is the backstop for any it has not seen.
+       */
+      let tokenRefusal: '' | 'quarantined' | 'multi_device' = ''
+      let otherDevices: string[] = []
+      let indexThisDevice = false
+      if (decision.status === 'existing_guest' && decision.write === 'touch') {
+        const rev = await tx.get(db.collection(GUEST_UID_BINDINGS).doc(boundUid))
+        if (rev.exists && rev.get('quarantined') === true) {
+          tokenRefusal = 'quarantined'
+        } else if (!rev.exists || String(rev.get('deviceId') ?? '') !== deviceId) {
+          const sameUid = await tx.get(
+            db.collection('guestDeviceBindings').where('uid', '==', boundUid),
+          )
+          otherDevices = sameUid.docs.map((d) => d.id).filter((id) => id !== deviceId)
+          if (otherDevices.length > 0) tokenRefusal = 'multi_device'
+          else indexThisDevice = true
+        }
+      }
 
       if (decision.write === 'bind') {
         /*
@@ -430,22 +528,54 @@ export const claimGuestIdentity = functions
           ...bindingPayload(decision, boundUid),
           secretHash,
           deviceId,
+          // AUTH-001: `decideGuestClaim` only returns `bind` for a caller signed
+          // in as this very uid, so this binding is owner-proven.
+          ownerVerified: true,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
+        tx.set(db.collection(GUEST_UID_BINDINGS).doc(decision.uid), {
+          deviceId,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
         })
       } else if (decision.write === 'rekey') {
         // The uid is untouched. Only the proof changes, and only for a caller
         // that already holds a verified session for this exact account.
         tx.update(ref, {
           secretHash,
+          ownerVerified: true,
           rekeyedAt: admin.firestore.FieldValue.serverTimestamp(),
           lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
         })
+        tx.set(db.collection(GUEST_UID_BINDINGS).doc(decision.uid), {
+          deviceId,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
       } else if (decision.write === 'touch') {
-        tx.update(ref, { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
+        // A caller signed in as the bound uid upgrades a pre-Phase-1A binding to
+        // owner-proven on the way past; nobody else can. P0-9: "signed in as"
+        // excludes a custom-token session (`callerOwnsBoundUid`).
+        const proven = callerOwnsBoundUid
+        tx.update(ref, {
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+          ...(proven && tokenRefusal === '' ? { ownerVerified: true } : {}),
+        })
+        if (tokenRefusal === 'multi_device') {
+          tx.set(db.collection(GUEST_UID_BINDINGS).doc(boundUid), {
+            quarantined: true,
+            quarantineReason: 'bound_on_multiple_devices',
+            quarantinedDeviceIds: [deviceId, ...otherDevices],
+            quarantinedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true })
+        } else if (tokenRefusal === '' && (proven || indexThisDevice)) {
+          tx.set(db.collection(GUEST_UID_BINDINGS).doc(boundUid), {
+            deviceId,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true })
+        }
       }
 
-      return decision
+      return { ...decision, tokenRefusal }
     })
 
     if (result.status === 'device_banned') {
@@ -463,6 +593,16 @@ export const claimGuestIdentity = functions
     }
     if (result.status !== 'existing_guest') {
       return { status: result.status, uid: result.uid }
+    }
+
+    if (result.tokenRefusal !== '') {
+      // P0-9: logged because, like a conflict, it is undiagnosable from the
+      // handset — and a quarantined uid needs a person to decide which device
+      // keeps it.
+      functions.logger.warn('guest token refused by the reverse index', {
+        deviceId, uid: result.uid, reason: result.tokenRefusal,
+      })
+      return { status: 'unrecoverable' as GuestClaimStatus, uid: result.uid }
     }
 
     if (result.write === 'rekey') {
@@ -584,6 +724,11 @@ export function emailKey(raw: unknown): string {
   return String(raw ?? '').trim().toLowerCase()
 }
 
+/** P0-5 (AUTHN-2): the token's address, only once Firebase has seen it confirmed. */
+export function tokenEmailVerified(token: Record<string, unknown> | undefined): boolean {
+  return emailKey(token?.['email']) !== '' && token?.['email_verified'] === true
+}
+
 /*
  * A note on Gmail dot-folding, deliberately not done.
  *
@@ -666,7 +811,11 @@ export const findExistingAccount = functions
      */
     const token = (context.auth?.token ?? {}) as Record<string, unknown>
     const provedPhone = phone !== '' && phoneKey(token['phone_number']) === phone
-    const provedEmail = email !== '' && emailKey(token['email']) === email
+    // P0-5 (AUTHN-2): an address proves nothing until Firebase has seen it
+    // confirmed — an email/password sign-up can put any unclaimed address on
+    // a token.
+    const provedEmail = email !== '' && tokenEmailVerified(token) &&
+      emailKey(token['email']) === email
     if (!provedPhone && !provedEmail) {
       throw new functions.https.HttpsError(
         'permission-denied',
@@ -846,114 +995,322 @@ export const bindVerifiedIdentity = functions
         'Verify that number before binding it.',
       )
     }
-    if (email && emailKey(token['email']) !== email) {
+    if (email && (emailKey(token['email']) !== email || !tokenEmailVerified(token))) {
       throw new functions.https.HttpsError(
         'failed-precondition',
         'Verify that address before binding it.',
       )
     }
 
-    const holders: Array<admin.firestore.QueryDocumentSnapshot> = []
-    if (phone) {
-      holders.push(...(await holdersOfPhone(phone, data?.phone)))
-    }
-    if (email) {
-      const byEmail = await db.collection('users').where('email', '==', email).limit(5).get()
-      holders.push(...byEmail.docs)
-    }
+    const result = await bindContactCore(uid, { phone, rawPhone: data?.phone, email }, token)
 
-    const others = holders.filter((d) => d.id !== uid)
+    // UGP (D21): a session that began anonymously keeps saying so — see
+    // `sameUidSessionToken` — so it is handed a token for the SAME uid.
+    //
+    // ONLY for a session that is current. The bind itself stays ungated, as it
+    // always was; the token is not. A minted token is a brand-new sign-in with a
+    // fresh `auth_time`, so handing one to a displaced device (whose ID token
+    // stays valid for up to an hour) or to a restricted account would let a
+    // re-bind of an already-bound number walk straight past the session cut-off.
+    let sessionCurrent = true
+    try {
+      await assertActiveSession(uid, data, 'bindVerifiedIdentity', context.auth?.token)
+    } catch {
+      sessionCurrent = false
+    }
+    const customToken = sessionCurrent ? await sameUidSessionToken(uid, token) : ''
+    return customToken ? { ...result, customToken } : result
+  })
 
-    const stillHeld = others.filter(
-      (d) => d.get('accountState') !== STATE_PERMANENTLY_DEACTIVATED,
+/**
+ * The binding itself — every rule after "the caller has proven this contact".
+ *
+ * UGP-C: extracted unchanged from `bindVerifiedIdentity` so that the email
+ * one-time code (`emailOtp.ts`) binds through EXACTLY the same rules as the
+ * phone path: no replacement of a contact already on the account, a refusal
+ * for a live or recoverable holder, release only from permanently deactivated
+ * holders, the same records. Two copies of these rules would be two identity
+ * systems; there is one.
+ *
+ * Throws `HttpsError` on every refusal and writes nothing in that case.
+ *
+ * @param rawPhone the number as the caller sent it (for the legacy-key check)
+ * @param token    the caller's verified token, used for the stored number's
+ *                 spelling and recorded on a refusal
+ */
+export async function bindContactCore(
+  uid: string,
+  contact: { phone?: string; rawPhone?: unknown; email?: string },
+  token: Record<string, unknown>,
+): Promise<{ bound: true; releasedFrom: string[] }> {
+  const phone = contact.phone ?? ''
+  const rawPhone = contact.rawPhone
+  const email = contact.email ?? ''
+  /*
+   * P0-5 (AUTHN-3, interim): a contact already on this account is never
+   * REPLACED here. Binding the same one again (or the same number in another
+   * spelling) is fine. Changing it is a decision for the contact-change
+   * workflow (D1/D2), which does not exist yet; until it does the attempt is
+   * refused and recorded, and nothing is written.
+   */
+  const own = await db.collection('users').doc(uid).get()
+  const ownPhone = own.exists ? (own.get('phoneNumber') ?? own.get('phone') ?? '') : ''
+  const ownEmail = own.exists ? emailKey(own.get('email')) : ''
+  const replacing: string[] = []
+  if (phone && phoneKey(ownPhone) !== '' && phoneKey(ownPhone) !== phone &&
+      !sameNumber(ownPhone, token['phone_number'])) {
+    replacing.push('phone')
+  }
+  if (email && ownEmail !== '' && ownEmail !== email) replacing.push('email')
+  if (replacing.length > 0) {
+    await db.collection('identityChangeRefusals').add({
+      uid,
+      fields: replacing,
+      reason: 'contact_replacement_refused',
+      signInProvider: String((token['firebase'] as { sign_in_provider?: string } | undefined)
+        ?.sign_in_provider ?? ''),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+    throw new functions.https.HttpsError(
+      'failed-precondition',
+      replacing.includes('phone')
+        ? 'This account already has a phone number. Changing it needs support — contact us.'
+        : 'This account already has an email address. Changing it needs support — contact us.',
+      { reason: 'contact_replacement_refused' },
+    )
+  }
+
+  const holders: Array<admin.firestore.QueryDocumentSnapshot> = []
+  if (phone) {
+    holders.push(...(await holdersOfPhone(phone, rawPhone)))
+  }
+  if (email) {
+    const byEmail = await db.collection('users').where('email', '==', email).limit(5).get()
+    holders.push(...byEmail.docs)
+  }
+
+  const others = holders.filter((d) => d.id !== uid)
+
+  const stillHeld = others.filter(
+    (d) => d.get('accountState') !== STATE_PERMANENTLY_DEACTIVATED,
+  )
+
+  /*
+   * CASE C-recoverable — the holder is DELETED but still inside its window.
+   *
+   * Split out of the blanket refusal below. Both answers are "no", but they
+   * are different noes and the person can act on only one of them. "Already
+   * used by another Zipper account. Sign in to that account instead." is
+   * false comfort when the account in question is their own, deleted last
+   * week, and sitting in a 30-day recovery window — they read it as somebody
+   * else having taken their number and have no idea the way back is to sign
+   * in with it.
+   *
+   * Nothing is released and nothing is bound. The recovery flow is the
+   * existing one: signing in with this identity reaches `resolveIdentity`,
+   * which answers `deleted_recoverable`, and the app offers Recover Account.
+   * This only makes the refusal point at it.
+   */
+  const recoverable = stillHeld.find((d) => d.get('isDeleted') === true)
+  if (recoverable) {
+    const dueAt = recoverable.get('deletionDueAt') as
+      | admin.firestore.Timestamp
+      | null
+      | undefined
+    throw new functions.https.HttpsError(
+      'already-exists',
+      phone
+        ? 'This phone number belongs to a Zipper account that was deleted and ' +
+          'can still be recovered. Sign in with this number to restore it.'
+        : 'This email belongs to a Zipper account that was deleted and can ' +
+          'still be recovered. Sign in with this address to restore it.',
+      {
+        reason: 'deleted_recoverable',
+        deletionDueAtMs: dueAt ? dueAt.toMillis() : 0,
+      },
+    )
+  }
+
+  // CASE B — an account that is still somebody's. Refuse and change nothing.
+  if (stillHeld.length > 0) {
+    throw new functions.https.HttpsError(
+      'already-exists',
+      phone
+        ? 'This phone number is already used by another Zipper account. ' +
+          'Sign in to that account instead.'
+        : 'This email is already used by another Zipper account. ' +
+          'Sign in to that account instead.',
+      { reason: 'active_holder' },
+    )
+  }
+
+  // CASE C — only permanently deactivated accounts hold it. Release and bind.
+  const released: string[] = []
+  for (const stale of others) {
+    /*
+     * Cleared on the OLD document, not moved to the new one.
+     *
+     * The old account keeps every transaction, every warning and every gift
+     * it ever had — see accounts.ts. What it loses is the claim on this phone
+     * number, which is the only thing standing between the caller and an
+     * identity nobody is using.
+     */
+    await stale.ref.set({ phoneKey: '', phoneNumber: '', email: '' }, { merge: true })
+    released.push(stale.id)
+  }
+
+  const patch: Record<string, any> = {}
+  if (phone) {
+    patch.phoneKey = phone
+    patch.phoneNumber = String(token['phone_number'] ?? rawPhone ?? '')
+  }
+  if (email) patch.email = email
+  await db.collection('users').doc(uid).set(patch, { merge: true })
+
+  if (released.length > 0) {
+    // A released identity is worth a record. Support will be asked about it:
+    // "my old number signs into somebody else's account now".
+    await db.collection('identityReleases').add({
+      boundTo: uid,
+      releasedFrom: released,
+      phoneKey: phone,
+      email,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+  }
+
+  return { bound: true, releasedFrom: released }
+}
+
+/**
+ * UGP (D21): a same-uid custom token for a session that began ANONYMOUSLY.
+ *
+ * `sign_in_provider` records how a session began and does not change when a
+ * contact is bound mid-session (see `isGuestAccount`). Two checks read it
+ * rather than the account: Storage `isNonGuest()` (a host applicant's own KYC
+ * upload) and Functions `guestRefusal` (redeeming a host invitation). So a
+ * guest who has just bound a phone or an email was still refused both until
+ * they happened to sign in again.
+ *
+ * Signing in with a custom token for the SAME uid ends the anonymous session
+ * without touching the account: same uid, same data, no new identity — the
+ * token is minted only for the caller, only for their own uid. It is what
+ * `claimGuestIdentity` already does for every returning guest. Best effort:
+ * no token means the old session simply carries on, as it did before.
+ */
+export async function sameUidSessionToken(
+  uid: string,
+  token: Record<string, unknown>,
+): Promise<string> {
+  const provider = String((token['firebase'] as { sign_in_provider?: string } | undefined)
+    ?.sign_in_provider ?? '')
+  if (provider !== 'anonymous') return ''
+  try {
+    return await admin.auth().createCustomToken(uid)
+  } catch (err) {
+    functions.logger.warn('same-uid session token not minted', { err: String(err) })
+    return ''
+  }
+}
+
+// ── Google sign-in for an email that already has an account ──────────────────
+
+/**
+ * Called by the app right after a Google sign-in CREATED a new uid.
+ *
+ * If exactly one other live account already holds that address as a verified
+ * email (a guest that bound it with a one-time code, say), the new empty uid is
+ * removed, Google is linked onto the existing account, and a custom token for
+ * that account is returned. The rule — and why it is email-only — is in
+ * ./emailAdoption. Anything that does not qualify returns `none` and the app
+ * carries on with the new account exactly as before.
+ */
+export const adoptEmailAccount = functions
+  .region('asia-south1')
+  .https.onCall(async (_data: unknown, context) => {
+    const callerUid = requireAuth(context)
+    const token = (context.auth?.token ?? {}) as Record<string, any>
+    const email = emailKey(token['email'])
+    if (email === '' || email === OBSERVER_EMAIL) return { status: 'none', reason: 'no_email' }
+
+    const callerRec = await admin.auth().getUser(callerUid)
+    const callerDoc = await db.collection('users').doc(callerUid).get()
+    const created = Date.parse(callerRec.metadata.creationTime ?? '')
+    const callerHasData = callerDoc.exists && (
+      callerDoc.get('isProfileComplete') === true ||
+      Number(callerDoc.get('diamonds') ?? 0) > 0 ||
+      Number(callerDoc.get('beans') ?? 0) > 0
     )
 
-    /*
-     * CASE C-recoverable — the holder is DELETED but still inside its window.
-     *
-     * Split out of the blanket refusal below. Both answers are "no", but they
-     * are different noes and the person can act on only one of them. "Already
-     * used by another Zipper account. Sign in to that account instead." is
-     * false comfort when the account in question is their own, deleted last
-     * week, and sitting in a 30-day recovery window — they read it as somebody
-     * else having taken their number and have no idea the way back is to sign
-     * in with it.
-     *
-     * Nothing is released and nothing is bound. The recovery flow is the
-     * existing one: signing in with this identity reaches `resolveIdentity`,
-     * which answers `deleted_recoverable`, and the app offers Recover Account.
-     * This only makes the refusal point at it.
-     */
-    const recoverable = stillHeld.find((d) => d.get('isDeleted') === true)
-    if (recoverable) {
-      const dueAt = recoverable.get('deletionDueAt') as
-        | admin.firestore.Timestamp
-        | null
-        | undefined
-      throw new functions.https.HttpsError(
-        'already-exists',
-        phone
-          ? 'This phone number belongs to a Zipper account that was deleted and ' +
-            'can still be recovered. Sign in with this number to restore it.'
-          : 'This email belongs to a Zipper account that was deleted and can ' +
-            'still be recovered. Sign in with this address to restore it.',
-        {
-          reason: 'deleted_recoverable',
-          deletionDueAtMs: dueAt ? dueAt.toMillis() : 0,
-        },
-      )
+    const candidates: AdoptionCandidate[] = []
+    const byEmail = await db.collection('users').where('email', '==', email).limit(5).get()
+    for (const d of byEmail.docs) {
+      if (d.id === callerUid) continue
+      try {
+        const r = await admin.auth().getUser(d.id)
+        candidates.push({
+          uid: d.id,
+          authEmail: emailKey(r.email),
+          authEmailVerified: r.emailVerified === true,
+          disabled: r.disabled === true,
+          accountState: String(d.get('accountState') ?? STATE_ACTIVE),
+        })
+      } catch (_err) {
+        // No Auth record behind the document: not an account anybody can use.
+      }
     }
 
-    // CASE B — an account that is still somebody's. Refuse and change nothing.
-    if (stillHeld.length > 0) {
-      throw new functions.https.HttpsError(
-        'already-exists',
-        phone
-          ? 'This phone number is already used by another Zipper account. ' +
-            'Sign in to that account instead.'
-          : 'This email is already used by another Zipper account. ' +
-            'Sign in to that account instead.',
-        { reason: 'active_holder' },
-      )
+    const decision = decideEmailAdoption({
+      callerUid,
+      signInProvider: String(token['firebase']?.['sign_in_provider'] ?? ''),
+      email,
+      emailVerified: token['email_verified'] === true,
+      callerProviders: callerRec.providerData.map((p) => p.providerId),
+      callerAgeMs: Number.isFinite(created) ? Date.now() - created : Number.MAX_SAFE_INTEGER,
+      callerHasData,
+      // FX-08: a Google-only login with no users document is adoptable at any
+      // age (see emailAdoption.ts).
+      callerHasDocument: callerDoc.exists,
+      candidates,
+    })
+    if (decision.action !== 'adopt') return { status: 'none', reason: decision.reason }
+
+    const target = decision.targetUid
+    const google = callerRec.providerData.find((p) => p.providerId === 'google.com')
+
+    // The duplicate goes first: a provider uid can belong to one account only,
+    // so Google cannot be linked to the target while the new uid still holds it.
+    await db.collection('users').doc(callerUid).delete().catch(() => undefined)
+    await db.collection('publicProfiles').doc(callerUid).delete().catch(() => undefined)
+    await admin.auth().deleteUser(callerUid)
+
+    let linked = false
+    if (google) {
+      try {
+        await admin.auth().updateUser(target, {
+          providerToLink: {
+            providerId: 'google.com',
+            uid: google.uid,
+            email,
+            displayName: google.displayName,
+            photoURL: google.photoURL,
+          },
+        })
+        linked = true
+      } catch (err) {
+        // The person still gets their account; Google simply is not attached
+        // yet and this path runs again next time.
+        functions.logger.warn('adoptEmailAccount: could not link Google', { target, err })
+      }
     }
 
-    // CASE C — only permanently deactivated accounts hold it. Release and bind.
-    const released: string[] = []
-    for (const stale of others) {
-      /*
-       * Cleared on the OLD document, not moved to the new one.
-       *
-       * The old account keeps every transaction, every warning and every gift
-       * it ever had — see accounts.ts. What it loses is the claim on this phone
-       * number, which is the only thing standing between the caller and an
-       * identity nobody is using.
-       */
-      await stale.ref.set({ phoneKey: '', phoneNumber: '', email: '' }, { merge: true })
-      released.push(stale.id)
-    }
-
-    const patch: Record<string, any> = {}
-    if (phone) {
-      patch.phoneKey = phone
-      patch.phoneNumber = String(token['phone_number'] ?? data?.phone ?? '')
-    }
-    if (email) patch.email = email
-    await db.collection('users').doc(uid).set(patch, { merge: true })
-
-    if (released.length > 0) {
-      // A released identity is worth a record. Support will be asked about it:
-      // "my old number signs into somebody else's account now".
-      await db.collection('identityReleases').add({
-        boundTo: uid,
-        releasedFrom: released,
-        phoneKey: phone,
-        email,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      })
-    }
-
-    return { bound: true, releasedFrom: released }
+    functions.logger.info('adoptEmailAccount: Google sign-in resolved to existing account', {
+      discarded: callerUid, target, linked,
+    })
+    const customToken = await admin.auth().createCustomToken(target)
+    return { status: 'adopted', uid: target, customToken, linked }
   })
+
 // ── The CRM and the app, as one account ──────────────────────────────────────
 
 /*
@@ -1098,9 +1455,51 @@ type Decision =
  * recovery rather than quietly replaced. Then the role, because the role
  * decides what is still missing. Then what is missing.
  */
+/**
+ * D18 (staged rollout) — which build an account runs.
+ *
+ * The restrictive rules (pinned appeal ids) refuse what builds older than the
+ * RC send, so they ship only once enough of the active population runs a
+ * build that pins. Nothing reported the running build, so adoption could not
+ * be measured. The app now sends its installed `versionCode` to this gate,
+ * which runs on every cold start and every sign-in, and it is kept as
+ * `appBuildReports/{uid} = { versionCode, seenAt }` — that and nothing else: no
+ * device, no name, no contact. `backend/scripts/d18_adoption_report.py`
+ * turns it into COUNTS per versionCode; an active account with no recent
+ * record is running a build older than the first that reports.
+ *
+ * Server-only (no rule matches `appBuildReports`, so every client read and write is
+ * refused), a separate collection so no `users/{uid}` trigger or listener
+ * fires on it, and best-effort: it never changes a decision, and a failed
+ * write is only logged.
+ */
+export const APP_BUILD_REPORTS = 'appBuildReports'
+
+/** The record to keep for a reported versionCode, or null when the report is unusable. */
+export function appBuildRecord(reported: unknown): { versionCode: number } | null {
+  const code = typeof reported === 'number' ? reported
+    : typeof reported === 'string' && /^\d+$/.test(reported.trim()) ? Number(reported.trim())
+      : NaN
+  if (!Number.isInteger(code) || code <= 0 || code > 1_000_000) return null
+  return { versionCode: code }
+}
+
+async function recordAppBuild(uid: string, reported: unknown): Promise<void> {
+  const record = appBuildRecord(reported)
+  if (record === null) return
+  try {
+    await db.collection(APP_BUILD_REPORTS).doc(uid).set({
+      ...record,
+      seenAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+  } catch (err) {
+    functions.logger.warn('could not record the app build', { uid, err: String(err) })
+  }
+}
+
 export const resolveIdentity = functions
   .region('asia-south1')
-  .https.onCall(async (data: { deviceId?: string }, context) => {
+  .https.onCall(async (data: { deviceId?: string; appVersionCode?: number }, context) => {
     const uid = requireAuth(context)
     const token = (context.auth?.token ?? {}) as Record<string, unknown>
 
@@ -1141,6 +1540,11 @@ export const resolveIdentity = functions
       return { decision: 'observer_denied' as Decision, uid }
     }
 
+    // D18: the build this account runs — whatever the decision below, because
+    // a restricted account on an old build is exactly who the appeal-id cutoff
+    // affects. Best-effort; see `recordAppBuild`.
+    if (userSnap.exists) await recordAppBuild(uid, data?.appVersionCode)
+
     // ── 2. Is this DEVICE barred, whoever is holding it ──────────────────────
     //
     // Asked before anything about the account, because a banned device is
@@ -1175,12 +1579,13 @@ export const resolveIdentity = functions
      */
     const deviceId = String(data?.deviceId ?? '').slice(0, 128)
     if (deviceId !== '') {
-      const devSnap = await db.collection('bannedDevices').doc(deviceId).get()
-      if (devSnap.exists && devSnap.get('isActive') !== false) {
+      // The same reading `startMobileSession` refuses on (C6) — see `barredDeviceReason`.
+      const barred = await barredDeviceReason(deviceId)
+      if (barred !== null) {
         return {
           decision: 'device_banned' as Decision,
           uid,
-          reason: String(devSnap.get('reason') ?? 'This device has been barred.'),
+          reason: barred,
         }
       }
     }
@@ -1202,10 +1607,20 @@ export const resolveIdentity = functions
      *
      * Done here, with the Admin SDK, on the device actually being used.
      */
-    const banned = exists && userSnap.get('isBanned') === true
-    const suspended = exists && userSnap.get('isSuspended') === true
+    /*
+     * RF-27: ONE precedence for every reader — `restrictionVerdict`, the
+     * backend's `restriction_of` order (`accountState` when it names a
+     * moderation state, then `isSuspended`, then `isBanned`). This read the two
+     * flags alone, so an account whose `accountState` said suspended or banned
+     * without the flags walked straight in, a stale `isSuspended` beside a ban
+     * showed the suspension screen (and never barred the handset), and a stale
+     * `isBanned` beside a suspension barred the handset for a suspension.
+     */
+    const verdict = exists ? restrictionVerdict((field) => userSnap.get(field)) : ''
+    const banned = verdict === 'banned'
+    const suspended = verdict === 'suspended'
 
-    if (banned && !suspended) {
+    if (banned) {
       if (deviceId !== '') await barDevice(deviceId, uid, userSnap)
       return {
         decision: 'banned' as Decision,
@@ -1232,7 +1647,11 @@ export const resolveIdentity = functions
     }
 
     let decision: Decision = 'allow'
-    if (isDeleted) {
+    // RF-27: a deletion state without `isDeleted` (no current writer produces
+    // one, but every other reader treats it as deleting) is deleting here too.
+    const deleting = isDeleted ||
+      verdict === 'deletion_requested' || verdict === STATE_RECOVERY_PENDING || verdict === STATE_PERMANENTLY_DEACTIVATED
+    if (deleting) {
       /*
        * Recoverable, or permanently gone?
        *
@@ -1242,8 +1661,9 @@ export const resolveIdentity = functions
        * Offering recovery there would promise something `recoverAccount` then
        * refuses.
        */
-      const past = state === STATE_PERMANENTLY_DEACTIVATED ||
-        (dueAt != null && dueAt.toMillis() <= Date.now())
+      // `recoveryExpired` is the test `recoverAccount` refuses on (C8), so the
+      // two cannot disagree about the boundary: due exactly now is past.
+      const past = state === STATE_PERMANENTLY_DEACTIVATED || recoveryExpired(dueAt, Date.now())
       decision = past ? 'deleted_permanent' : 'deleted_recoverable'
     }
 
@@ -1254,15 +1674,32 @@ export const resolveIdentity = functions
     // staff is asked for whichever one their sign-in method could not supply,
     // because the business needs both to reach them and to pay them.
     const isHost = exists && userSnap.get('isHost') === true
-    const isPartner = crmRole === 'agency' || crmRole === 'seller' ||
-      (exists && (userSnap.get('isAgent') === true || userSnap.get('isSeller') === true))
-    const isStaff = crmRole !== '' && !isPartner
+    /*
+     * C7 (B14): a partner owes us both contacts only while a capability is
+     * APPROVED. This read the raw `crmUsers.role` (and the `isAgent`/`isSeller`
+     * copies on the user document), so a pending, rejected or revoked Agency
+     * or Seller was asked for a phone and an email it had no use for. It is
+     * now `deriveRoleFlags` over the same document, exactly as `syncMyRoles`
+     * reads it. Hosts and staff are unchanged: staff is any CRM role that is
+     * not a partner capability, whatever that capability's status.
+     */
+    const partner = deriveRoleFlags(
+      crmSnap.get('role'),
+      crmSnap.get('roles'),
+      crmSnap.get('isActive') !== false,
+      crmSnap.exists,
+      crmSnap.get('roleStatus'),
+      crmSnap.get('status'),
+    )
+    const isPartner = partner.isAgent || partner.isSeller
+    const isStaff = crmRole !== '' && !PARTNER_ROLES.has(crmRole)
 
     const needsBoth = isHost || isPartner || isStaff
 
     const hasPhone = tokenPhone !== '' ||
       (exists && phoneKey(userSnap.get('phoneNumber') ?? userSnap.get('phone')) !== '')
-    const hasEmail = tokenEmail !== '' ||
+    // P0-5 (AUTHN-2): the token's address counts once it is confirmed.
+    const hasEmail = (tokenEmail !== '' && tokenEmailVerified(token)) ||
       (exists && emailKey(userSnap.get('email')) !== '')
 
     return {
@@ -1343,6 +1780,28 @@ export const startMobileSession = functions
     const platform = String(data?.platform ?? 'android').slice(0, 32)
     const deviceName = String(data?.deviceName ?? '').slice(0, 64)
 
+    /*
+     * ── C6 (B31): NO SESSION ON AN UNNAMED OR A BARRED DEVICE ────────────────
+     *
+     * A device ban was advisory: `resolveIdentity` skips the check for an
+     * empty id, and nothing here checked at all — so a client that skipped the
+     * gate, or sent no id, held the account's one session on a barred handset.
+     * Both are refused here, from the same `bannedDevices` record
+     * `resolveIdentity` reads, before the device is recorded or the session
+     * and cut-off are written.
+     */
+    if (deviceId.trim() === '') {
+      throw new functions.https.HttpsError(
+        'failed-precondition',
+        'This device could not be identified, so a session cannot be started on it.',
+        { code: DEVICE_BARRED, reason: 'missing_device_id' },
+      )
+    }
+    const barred = await barredDeviceReason(deviceId)
+    if (barred !== null) {
+      throw new functions.https.HttpsError('failed-precondition', barred, { code: DEVICE_BARRED, reason: 'barred' })
+    }
+
     // Every device this account has been seen on, so a ban can bar all of them.
     await rememberDevice(uid, deviceId, platform, deviceName)
 
@@ -1399,16 +1858,31 @@ export const startMobileSession = functions
     const callerAuthTime = Number(
       (context.auth?.token as Record<string, unknown> | undefined)?.auth_time ?? 0,
     )
-    const validAfter = Number.isFinite(callerAuthTime) && callerAuthTime > 0
-      ? callerAuthTime
-      // No `auth_time` on the token at all — a shape we do not expect. Fall back
-      // to a conservative stamp rather than to zero, which would disable the
-      // gate for this account entirely.
-      : Math.floor(now.toMillis() / 1000) - 5
-
     const previous = await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref)
       const prior = snap.get('activeMobileSession') as Record<string, unknown> | undefined
+
+      // Phase 1A (SESSION-002/003): never LOWER the cut-off, and never start a
+      // session for a restricted account. See `nextValidAfter`.
+      const restricted = restrictionVerdict((f) => snap.get(f))
+      if (restricted === 'banned' || restricted === 'suspended') {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'This account is restricted and cannot sign in right now.',
+          { code: ACCOUNT_RESTRICTED, state: restricted },
+        )
+      }
+      const next = nextValidAfter(
+        snap.get('credentialsValidAfter'), callerAuthTime, Math.floor(now.toMillis() / 1000),
+      )
+      if (!next.ok) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          DISPLACED_MESSAGE,
+          { code: SESSION_DISPLACED },
+        )
+      }
+      const stamped = next.value
 
       tx.set(
         ref,
@@ -1421,7 +1895,7 @@ export const startMobileSession = functions
             createdAt: now,
             lastActiveAt: now,
           },
-          credentialsValidAfter: validAfter,
+          credentialsValidAfter: stamped,
           sessionToken: sessionId,
         },
         { merge: true },
@@ -1512,6 +1986,24 @@ export const endMobileSession = functions
     )
     return { ended: true }
   })
+
+/** `HttpsError.details.code` when a session is refused for the device (C6). */
+export const DEVICE_BARRED = 'DEVICE_BARRED'
+
+/**
+ * Is this device barred? The reason to show, or null when it is not.
+ *
+ * The ONE reading of `bannedDevices`, shared by `resolveIdentity` and
+ * `startMobileSession` so the two cannot disagree: a record that exists and
+ * has not been switched off (`isActive: false`) bars the device.
+ */
+async function barredDeviceReason(deviceId: string): Promise<string | null> {
+  const devSnap = await db.collection('bannedDevices').doc(deviceId).get()
+  if (devSnap.exists && devSnap.get('isActive') !== false) {
+    return String(devSnap.get('reason') ?? 'This device has been barred.')
+  }
+  return null
+}
 
 /**
  * Bar a device because the account using it is banned.

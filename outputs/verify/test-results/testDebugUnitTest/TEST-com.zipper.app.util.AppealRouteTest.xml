@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.util.AppealRouteTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.073Z" hostname="CW253.local" time="0.001">
+  <properties/>
+  <testcase name="the restriction screens follow the route, not just the session" classname="com.zipper.app.util.AppealRouteTest" time="0.0"/>
+  <testcase name="no session but a saved credential and a device key shows the device-key form" classname="com.zipper.app.util.AppealRouteTest" time="0.001"/>
+  <testcase name="signed in uses the ordinary form, with screenshots" classname="com.zipper.app.util.AppealRouteTest" time="0.0"/>
+  <testcase name="one half of the proof is not enough — the web appeal, as before" classname="com.zipper.app.util.AppealRouteTest" time="0.0"/>
+  <testcase name="a suspension is never read as a ban" classname="com.zipper.app.util.AppealRouteTest" time="0.0"/>
+  <testcase name="quick-login outcomes map to the right screen" classname="com.zipper.app.util.AppealRouteTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

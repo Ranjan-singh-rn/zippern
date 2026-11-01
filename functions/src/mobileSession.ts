@@ -136,20 +136,142 @@ export function sessionVerdict(
  *
  * Costs one document read, and only on callables that opt in.
  */
+/**
+ * Phase 1A (SESSION-002): the next `credentialsValidAfter`, MONOTONIC.
+ *
+ * `startMobileSession` used to write the caller's `auth_time` unconditionally.
+ * A displaced phone holding an OLDER token could call it and LOWER the cut-off
+ * to its own `auth_time` — re-admitting itself and every other stale token, and
+ * undoing a revocation stamped by suspension or a deletion request.
+ *
+ * Now: a caller whose credential predates the current cut-off is refused (it
+ * must sign in again), and the stored value only ever moves forward.
+ */
+export function nextValidAfter(
+  prior: unknown,
+  callerAuthTime: unknown,
+  nowSec: number,
+): { ok: true; value: number } | { ok: false } {
+  const p = Number(prior)
+  const priorOk = Number.isFinite(p) && p > 0 ? p : 0
+  const c = Number(callerAuthTime)
+  const caller = Number.isFinite(c) && c > 0 ? c : nowSec - 5
+  if (priorOk > 0 && caller < priorOk) return { ok: false }
+  return { ok: true, value: Math.max(priorOk, caller) }
+}
+
+/**
+ * Phase 1A (SESSION-003): why this account may not perform protected operations, or ''.
+ *
+ * C9 (B25): SUSPENSION BEFORE BAN. A suspension writes `isBanned: true` too
+ * (the app's one gate), so checking `isBanned` first labelled every suspended
+ * account `banned` — and the label is what the app routes on. The order is the
+ * backend's `restriction_of`: `accountState` when it names a moderation state,
+ * then `isSuspended`, then `isBanned`. Every one of these still refuses; only
+ * the label changes.
+ */
+export function restrictionVerdict(get: (field: string) => unknown): string {
+  const state = String(get('accountState') ?? 'active')
+  if (state === 'suspended' || state === 'banned') return state
+  if (get('isSuspended') === true) return 'suspended'
+  if (get('isBanned') === true) return 'banned'
+  if (get('isDeleted') === true) return 'deletion_requested'
+  if (['recovery_pending', 'permanently_deactivated'].includes(state)) return state
+  return ''
+}
+
+export const ACCOUNT_RESTRICTED = 'ACCOUNT_RESTRICTED'
+
+/**
+ * How far ahead of this server's clock an `auth_time` may be before it counts
+ * as "in the future". Firebase Auth and Cloud Functions keep separate clocks.
+ * Same value as `accounts.ts` (which imports this module, so it cannot be
+ * imported from there).
+ */
+export const CUTOFF_CLOCK_SKEW_SECONDS = 60
+
+/**
+ * P0-1 (N4): does the sign-in behind this token predate the account's cut-off?
+ *
+ * `credentialsValidAfter` is stamped by `startMobileSession` with the new
+ * device's own `auth_time`, and moved forward by suspension and deletion. A
+ * token whose `auth_time` is older belongs to a sign-in the account has moved
+ * past: the displaced phone, or a stolen token. The rules' `sessionCurrent()`
+ * has always refused such a token's direct writes; this is the same test for
+ * the callables.
+ *
+ * No cut-off recorded → nothing to compare (an account that never started a
+ * mobile session). A cut-off recorded and NO usable `auth_time` → refused:
+ * an ID token always carries one, so its absence is not a reason to wave the
+ * call through. Equal passes: that is the device that set the cut-off.
+ */
+export function signInPredatesCutoff(
+  validAfterRaw: unknown,
+  authTimeRaw: unknown,
+  nowSec: number,
+): boolean {
+  const validAfter = Number(validAfterRaw ?? 0)
+  if (!Number.isFinite(validAfter) || validAfter <= 0) return false
+  const authTime = typeof authTimeRaw === 'number' ? authTimeRaw : Number.NaN
+  if (!Number.isFinite(authTime) || authTime <= 0) return true
+  if (authTime > nowSec + CUTOFF_CLOCK_SKEW_SECONDS) return true
+  return authTime < validAfter
+}
+
+/** The part of a decoded ID token the gate reads. */
+export type SessionToken = { auth_time?: unknown; [claim: string]: unknown }
+
 export async function assertActiveSession(
   uid: string,
   data: unknown,
   operation: string,
+  // Required on purpose: every gated callable must hand over the token it was
+  // called with, so a new call site cannot silently skip the cut-off check.
+  token: SessionToken | undefined,
 ): Promise<void> {
   const presented = presentedSessionId(data)
   const enforcing = enforcingPresentedSession()
+
+  // Phase 1A (SESSION-003): the account's restriction state is checked on EVERY
+  // protected operation, whether or not a session id was presented. A
+  // suspended account, or one with a deletion request, kept spending and
+  // calling with its still-valid ID token; the rules stopped its direct
+  // writes but these callables use the Admin SDK and never asked.
+  const snap = await store().collection('users').doc(uid).get()
+  const restricted = restrictionVerdict((f) => snap.get(f))
+  if (restricted) {
+    functions.logger.warn('restricted account refused', { uid, operation, restricted })
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      'This account is restricted and cannot do that right now.',
+      { code: ACCOUNT_RESTRICTED, state: restricted },
+    )
+  }
+
+  // P0-1 (N4): a sign-in older than the account's cut-off is refused whether
+  // or not a session id is presented. Leaving the id out used to be enough to
+  // keep a displaced device working while `ENFORCE_MOBILE_SESSION` is off.
+  if (signInPredatesCutoff(
+    snap.get('credentialsValidAfter'), token?.auth_time, Math.floor(Date.now() / 1000),
+  )) {
+    functions.logger.warn('stale sign-in refused', {
+      uid,
+      operation,
+      // Whether a time was present, never the token itself.
+      hasAuthTime: typeof token?.auth_time === 'number',
+    })
+    throw new functions.https.HttpsError(
+      'permission-denied',
+      DISPLACED_MESSAGE,
+      { code: SESSION_DISPLACED },
+    )
+  }
 
   if (presented === '' && !enforcing) {
     functions.logger.info('mobile session not presented', { uid, operation })
     return
   }
 
-  const snap = await store().collection('users').doc(uid).get()
   const recorded = String(
     (snap.get('activeMobileSession') as Record<string, unknown> | undefined)?.sessionId ?? '',
   )
@@ -171,4 +293,46 @@ export async function assertActiveSession(
     DISPLACED_MESSAGE,
     { code: SESSION_DISPLACED },
   )
+}
+
+/**
+ * Phase 1A (SESSION-002, Quick Login): may this caller mint a quick sign-in
+ * credential? Returns '' to allow, or the reason it is refused.
+ *
+ * A displaced device used to be able to mint a fresh credential on its way out
+ * and tap straight back in — "one device at a time, whoever taps last wins".
+ * For an ordinary (provider-backed) account that is now refused: a device whose
+ * token predates the session cut-off, or that presents a session id that is no
+ * longer the active one, gets nothing; nor does a banned or suspended account.
+ *
+ * GUESTS ARE DELIBERATELY UNCHANGED. A guest's anonymous credential cannot be
+ * re-obtained by any other means, so refusing the mint on displacement would
+ * destroy the guest account. How a displaced guest recovers is an open product
+ * decision (see the Phase 1A report); until it is made, guest behaviour is
+ * preserved exactly.
+ */
+export function quickLoginMintRefusal(p: {
+  token: Record<string, unknown> | undefined
+  get: (field: string) => unknown
+  presented: string
+}): '' | 'restricted' | 'displaced' {
+  const firebase = (p.token?.firebase ?? {}) as Record<string, unknown>
+  const provider = String(firebase.sign_in_provider ?? '')
+  const hasPhone = String(p.token?.phone_number ?? '').trim() !== ''
+  const hasEmail = String(p.token?.email ?? '').trim() !== ''
+  const isGuest = provider === 'anonymous' || (!hasPhone && !hasEmail)
+  if (isGuest) return ''
+
+  const restricted = restrictionVerdict(p.get)
+  if (restricted === 'banned' || restricted === 'suspended') return 'restricted'
+
+  const validAfter = Number(p.get('credentialsValidAfter') ?? 0)
+  const authTime = Number(p.token?.auth_time ?? 0)
+  if (validAfter > 0 && authTime > 0 && authTime < validAfter) return 'displaced'
+
+  const recorded = String(
+    ((p.get('activeMobileSession') ?? {}) as Record<string, unknown>).sessionId ?? '',
+  )
+  if (p.presented !== '' && recorded !== '' && p.presented !== recorded) return 'displaced'
+  return ''
 }

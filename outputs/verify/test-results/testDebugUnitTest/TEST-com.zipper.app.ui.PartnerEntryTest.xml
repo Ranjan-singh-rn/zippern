@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.zipper.app.ui.PartnerEntryTest" tests="15" skipped="0" failures="0" errors="0" timestamp="2026-10-24T21:42:22.012Z" hostname="CW253.local" time="0.031">
+  <properties/>
+  <testcase name="sign out and forget this device is gone, log out and switch account stay" classname="com.zipper.app.ui.PartnerEntryTest" time="0.001"/>
+  <testcase name="the email deep link is gone end to end" classname="com.zipper.app.ui.PartnerEntryTest" time="0.012"/>
+  <testcase name="profile setup phone has a country code picker, not a fixed +91" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="a new Google uid asks the server for the existing email account BEFORE creating a profile" classname="com.zipper.app.ui.PartnerEntryTest" time="0.001"/>
+  <testcase name="the hub shows no choices to an internal caller" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="every account can add the contact it lacks, by code, and email is not a sign-in" classname="com.zipper.app.ui.PartnerEntryTest" time="0.001"/>
+  <testcase name="a verification opened from the partner flow returns to it, not to Settings" classname="com.zipper.app.ui.PartnerEntryTest" time="0.001"/>
+  <testcase name="the JoinAgency screen and route are gone" classname="com.zipper.app.ui.PartnerEntryTest" time="0.013"/>
+  <testcase name="a finished binding lands on Settings" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="the guest button never hands back a Google, email or phone account when the binding check fails" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="Splash restarts an unfinished sign-in instead of creating the profile document" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="the agency dashboard reads the OWN agency, not the host agency (B4)" classname="com.zipper.app.ui.PartnerEntryTest" time="0.001"/>
+  <testcase name="no agency-code entry anywhere in the partner flow" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="the hub and the form explain a missing contact and open the verification flows" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <testcase name="staff never see the Become a partner card, and a guest without a verified contact is told what comes first" classname="com.zipper.app.ui.PartnerEntryTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

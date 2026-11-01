@@ -1,0 +1,13 @@
+# PROPOSED — not applied. Base: production source (Cloud Run archive 1792484712.297548-...zip#1792484713419277, sha256 36227060...)
+# Base confidence: EXACT: the deployed text itself (retrieved from production)
+--- a/backend/tests/harness.py
++++ b/backend/tests/harness.py
+@@ -63,6 +63,8 @@
+         super().__init__(detail)
+         self.status_code = status_code
+         self.detail = detail
++        #: P1-A3 — the MFA refusal carries a header the CRM reads.
++        self.headers = _k.get("headers")
+ 
+ 
+ class _Status:
