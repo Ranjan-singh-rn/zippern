@@ -625,7 +625,14 @@ check(
     True,
 )
 check("the API record is inactive anyway", api_door_open(DEV)["is_active"], False)
-ok("and the caller is told the CRM half did not follow", crm.REPAIR_COMMAND in message)
+ok("and the caller is told the CRM half did not follow", "CRM directory entry was NOT switched off" in message)
+ok("and given the fix that works for it: run the deactivation again (revision 4; the repair "
+   "script does not correct an entry that exists)", "run the deactivation again" in message
+   and "Nothing else was changed" not in message)
+ok("and the repair command is still named, for the case where the entry is missing",
+   crm.REPAIR_COMMAND in message)
+ok("revision 4 (R1): the failed attempt leaves the row marked for a retry",
+   bool(api_door_open(DEV).get(svc.OUTSTANDING_FIELD)))
 
 crm_users.clear_failures()
 

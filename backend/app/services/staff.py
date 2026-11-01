@@ -34,7 +34,7 @@ import logging
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from firebase_admin import auth as fb_auth
 
@@ -270,13 +270,20 @@ async def _carry_to_crm(
             meta={"email": email, "error": str(exc), "repair": crm.REPAIR_COMMAND},
         )
         log.error("crmUsers write failed for %s during %s: %s", email, what, exc)
+        # MFA release, revision 4 (R2): this used to end "Nothing else was changed", which
+        # was wrong for every caller — each of them has already written the API
+        # record, and some have revoked sessions too. And the repair script only
+        # writes a MISSING directory entry; it does not correct one that exists
+        # but is out of date, so it is named only for that case.
         raise StaffError(
             f"{what} was saved to the API record for {email}, and the CRM "
             f"directory entry the sign-in screen reads was not written. "
             f"Until that is repaired this account will not behave correctly in "
-            f"the CRM. Nothing else was changed.\n\n"
+            f"the CRM. Steps of this operation that ran before this one have not "
+            f"been undone.\n\n"
             f"Reason: {exc}\n\n"
-            f"Repair it with:  {crm.REPAIR_COMMAND}"
+            f"If the directory entry is missing, repair it with:  {crm.REPAIR_COMMAND}  "
+            f"(that does not correct an entry that exists but is out of date)."
         ) from exc
 
 
@@ -929,11 +936,11 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
 
     # Existing sessions carry the old role in their token, so they are revoked.
     await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
-    if str(old_role) == str(Role.OWNER):
-        # P1-A3b: an Owner MFA binding must not outlive the Owner role.
-        from app.services import owner_mfa
-
-        await owner_mfa.clear_all_bindings(uid, "Role changed away from Owner", actor=actor)
+    # P1-A3b: an Owner MFA binding must not outlive the Owner role. Unreachable in
+    # this release (an Owner's role is refused above); kept as defence in depth and,
+    # since MFA release revision 4, it reports a failure instead of ignoring it
+    # (see the end).
+    owner_bindings_problem = await _clear_owner_bindings_on_role_change(uid, str(old_role), actor)
 
     # And the CRM directory, or the shell shows one role while the API enforces
     # another — a `finance_admin` demoted to `finance_member` would keep the
@@ -989,7 +996,105 @@ async def change_role(uid: str, new_role: Role, actor: dict, reason: str) -> dic
         person=person, change="role_changed", actor=actor,
         audit_id=str(role_audit_id or ""), new_role=str(new_role),
     )
+
+    if owner_bindings_problem is not None:
+        person["owner_mfa_bindings"] = "NOT CLEARED"
+        raise StaffError(
+            f"The role change of {person.get('email') or uid} was saved, but {owner_bindings_problem}. "
+            "Until they are removed a bound Firebase session may still pass the Owner checks: "
+            "the Observer must reset this account's MFA."
+        )
     return person
+
+
+async def _clear_owner_bindings_on_role_change(uid: str, old_role: str, actor: dict) -> str | None:
+    """Remove every MFA binding of a former Owner. None when done (or not an Owner); else what failed.
+
+    Never raises: the role change has been written by the time this runs, so the
+    caller reports what is outstanding at the end instead of stopping half-way.
+    """
+    if old_role != str(Role.OWNER):
+        return None
+    from app.services import owner_mfa
+
+    if not await owner_mfa.clear_all_bindings(uid, "Role changed away from Owner"):
+        try:
+            await audit.record(actor=actor, action=audit.Action.OWNER_MFA_UNBIND_FAILED, subject_type="auth.mfa",
+                               subject_id=uid, reason="Role changed away from Owner, and the MFA bindings "
+                               "could not be removed", meta={"all": True})
+        except Exception:  # noqa: BLE001 — the failure is still reported to the caller
+            log.exception("role change of %s: the unbind-failure audit entry was not written", uid)
+        return "the former Owner's MFA bindings were NOT removed"
+    try:
+        await audit.record(actor=actor, action=audit.Action.OWNER_MFA_UNBOUND, subject_type="auth.mfa",
+                           subject_id=uid, reason="Role changed away from Owner", meta={"all": True})
+    except Exception:  # noqa: BLE001
+        log.exception("role change of %s: the binding-removal audit entry was not written", uid)
+        return "the removal of the former Owner's MFA bindings could not be recorded in the audit log"
+    return None
+
+
+#: R3 (MFA release, revision 4): Owner deactivations are serialised by a lease.
+#:
+#: "Is this the last active Owner?" and the write that changes the answer used to
+#: be two separate steps, so two simultaneous deactivations of the last two active
+#: Owners could both pass the check and leave none. The lease is one document with a
+#: fixed `_id` — Mongo's own unique `_id` index is the mutex — held from the count to
+#: the `is_active` write and given back in a `finally`. A process that dies holding
+#: it leaves it for at most `_OWNER_LEASE_SECONDS`; the next deactivation then takes
+#: it over, conditionally, so two of them cannot both take over the same stale lease.
+#: Only Owner targets take it: no other deactivation changes the number of Owners.
+#: In this tree a SUSPENSION of an Owner changes that number too (P1-B3), so it
+#: takes the same lease.
+STAFF_LOCKS = "staff_locks"
+_OWNER_LEASE_ID = "owner-deactivation"
+_OWNER_LEASE_SECONDS = 60
+#: How long a second Owner deactivation waits for the first: step seconds × attempts.
+_OWNER_LEASE_WAIT = (0.2, 25)
+
+
+def _as_utc(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None
+
+
+async def _take_owner_lease(db) -> str | None:
+    """Hold the Owner-deactivation lease; None if somebody else held it for the whole wait."""
+    from pymongo.errors import DuplicateKeyError
+
+    token = secrets.token_hex(16)
+    step, attempts = _OWNER_LEASE_WAIT
+    for _ in range(attempts):
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=_OWNER_LEASE_SECONDS)
+        try:
+            await db[STAFF_LOCKS].insert_one(
+                {"_id": _OWNER_LEASE_ID, "holder": token, "expires_at": expires}
+            )
+            return token
+        except DuplicateKeyError:
+            held = await db[STAFF_LOCKS].find_one({"_id": _OWNER_LEASE_ID})
+            until = _as_utc((held or {}).get("expires_at"))
+            if held is not None and (until is None or until <= now):
+                # Left over by a process that died. Taken over only if nobody has
+                # just done the same: the update matches the stale holder exactly.
+                taken = await db[STAFF_LOCKS].update_one(
+                    {"_id": _OWNER_LEASE_ID, "holder": held.get("holder")},
+                    {"$set": {"holder": token, "expires_at": expires}},
+                )
+                if getattr(taken, "modified_count", 0) == 1:
+                    return token
+        await asyncio.sleep(step)
+    return None
+
+
+async def _give_back_owner_lease(db, token: str) -> None:
+    try:
+        await db[STAFF_LOCKS].delete_one({"_id": _OWNER_LEASE_ID, "holder": token})
+    except Exception:  # noqa: BLE001 — it expires by itself
+        log.exception("the Owner-deactivation lease could not be released; it expires within %ss",
+                      _OWNER_LEASE_SECONDS)
 
 
 async def deactivate(uid: str, actor: dict, reason: str) -> dict:
@@ -1009,18 +1114,37 @@ async def deactivate(uid: str, actor: dict, reason: str) -> dict:
         guard reads the Mongo row: `account_state.assert_may_act`, sign-in and
         renewal in `security.py`, and `require_permission` in `deps.py`, so an
         enabled personal login cannot mint or keep a staff session);
+      * an Owner's Firestore/Storage MFA bindings removed (P1-A3b);
       * `crmUsers.isActive` → false, which turns off every Firestore staff grant
         (`isCrmUser()` reads it), and the CRM shell refuses the login;
       * the Storage role claim cleared. An ID token minted earlier keeps the
         claim until it expires (at most an hour) — the residual window is
         documented in the Phase 1 report; revoking the refresh token would sign
         the person out of the app, which decision 1 rules out.
+
+    ── MFA release, revision 4 (R1–R4) ────────────────────────────────────────
+    The caller is told a deactivation is done ONLY when all of it is done. Every
+    step still runs whatever happened to the steps before it — API sessions, the
+    Owner's MFA bindings, the staff record, the CRM directory entry, the storage
+    claim and the audit trail — and anything that did not happen is named in one
+    StaffError (HTTP 400), raised after the last step and audited as
+    `staff.revocation_incomplete`. Nothing is undone; the row is marked
+    `revocation_outstanding`, which is what lets the SAME transition be run
+    again (an ordinary repeat of a complete deactivation is still refused as
+    "already deactivated"), and running it again finishes it. A 200 therefore
+    always means `fully_revoked: true`. Owner deactivations are serialised by a
+    lease (R3) so the last-active-Owner count and the write it protects cannot
+    race. The personal Firebase login is never part of this (decision 1), so it
+    is never on the outstanding list.
     """
     return await _change_status(uid, actor, reason, STATUS_DEACTIVATED)
 
 
 async def suspend(uid: str, actor: dict, reason: str) -> dict:
-    """Pause staff access, reversibly. P1-B3. Same authority as deactivation."""
+    """Pause staff access, reversibly. P1-B3. Same authority as deactivation,
+    and — since it revokes the same things — the same revision 4 guarantees:
+    reported as done only when all of it is done, and finishable by running it
+    again."""
     return await _change_status(uid, actor, reason, STATUS_SUSPENDED)
 
 
@@ -1049,14 +1173,50 @@ _DONE = {
     STATUS_SUSPENDED: "suspended",
     STATUS_ACTIVE: "reactivated",
 }
+#: The operation as a noun — what the error messages and the audit trail call it.
+_NOUN = {
+    STATUS_DEACTIVATED: "deactivation",
+    STATUS_SUSPENDED: "suspension",
+    STATUS_ACTIVE: "reactivation",
+}
 _ACTION = {
     STATUS_DEACTIVATED: audit.Action.STAFF_DEACTIVATED,
     STATUS_SUSPENDED: audit.Action.STAFF_SUSPENDED,
     STATUS_ACTIVE: audit.Action.STAFF_REACTIVATED,
 }
+#: The reason on an Owner's binding-removal audit entry, per revocation.
+_BINDING_REASON = {
+    STATUS_DEACTIVATED: "Owner deactivated",
+    STATUS_SUSPENDED: "Owner suspended",
+}
+
+#: R1: the staff-row field that names what an incomplete revocation left undone.
+#: Written by the attempt that could not finish, removed by the one that does
+#: (or by a reactivation). Its presence is what allows the same transition to
+#: be run again; without it a repeat is refused as "already deactivated".
+OUTSTANDING_FIELD = "revocation_outstanding"
+
+
+def _transition(person: Mapping, to_status: str) -> bool:
+    """Refuse an impossible transition with a sentence.
+
+    Returns True when this is a RETRY of an incomplete revocation (R1): the row
+    is already in `to_status` and carries `revocation_outstanding`, so the
+    revocation steps run again to finish it.
+    """
+    current = status_of(person)
+    if to_status in TRANSITIONS[current]:
+        return False
+    if current == to_status:
+        if to_status != STATUS_ACTIVE and person.get(OUTSTANDING_FIELD):
+            return True
+        raise StaffError(f"This account is already {current}.")
+    raise StaffError(f"A {current} account cannot be {_DONE[to_status]}.")
 
 
 async def _change_status(uid: str, actor: dict, reason: str, to_status: str) -> dict:
+    """The shared gate of suspend / deactivate / reactivate: the reason, the
+    target, the transition and the authority. Then the direction decides."""
     verb = _VERB[to_status]
     if not reason.strip():
         raise StaffError("A reason is required.")
@@ -1075,130 +1235,345 @@ async def _change_status(uid: str, actor: dict, reason: str, to_status: str) -> 
     if target_role == Role.OBSERVER:
         raise StaffError(f"The observer cannot be {_DONE[to_status]}.")
 
-    current = status_of(person)
-    if to_status not in TRANSITIONS[current]:
-        if current == to_status:
-            raise StaffError(f"This account is already {current}.")
-        raise StaffError(f"A {current} account cannot be {_DONE[to_status]}.")
+    retry = _transition(person, to_status)
 
-    if R.is_owner(target_role):
-        # Owners are managed by the observer only (Phase 1A STAFF-001/003).
-        if not R.is_observer(actor["role"]):
-            raise StaffError(f"Only the observer can {verb} an owner.")
-        if to_status != STATUS_ACTIVE:
+    is_owner = R.is_owner(target_role)
+    if is_owner and not R.is_observer(actor["role"]):
+        # Owners are managed by the observer only (Phase 1A STAFF-001/003); and
+        # never the last active one — counted under the lease, in `_revoke_access`.
+        raise StaffError(f"Only the observer can {verb} an owner.")
+    if not manages(actor, person):
+        raise StaffError(f"You can only {verb} members of your own department.")
+
+    if to_status == STATUS_ACTIVE:
+        return await _restore_access(db, person, actor, reason, target_role)
+    return await _revoke_access(db, person, actor, reason, to_status, target_role, retry=retry)
+
+
+def _audit_collector(noun: str, uid: str, audit_failures: list[tuple[str, Exception]]):
+    """`record(what, **entry)`: an audit write that is logged and COLLECTED when it
+    fails, never raised (R1). A failed write must not stop a revocation half-way
+    (account still active, CRM directory still open), so the caller raises once
+    every revocation step has run — and is never told that a revocation missing
+    an audit entry is complete; running it again records the entry."""
+
+    async def record(what: str, **entry):
+        try:
+            return await audit.record(**entry)
+        except Exception as exc:  # noqa: BLE001 — raised by the caller, never dropped
+            log.exception("%s of %s: the %s audit entry was not written", noun, uid, what)
+            audit_failures.append((what, exc))
+            return None
+
+    return record
+
+
+async def _revoke_access(db, person: dict, actor: dict, reason: str, to_status: str,
+                         target_role: Role, *, retry: bool) -> dict:
+    """Suspend or deactivate: every step runs, and what did not happen is reported.
+
+    `retry` (R1): the row is already in `to_status` with `revocation_outstanding`
+    set by an attempt that could not finish; the steps run again to finish it.
+
+    Order: lease (Owners) → last-active-Owner count → API sessions → the Owner's
+    MFA bindings → the staff record (`is_active` + `status`) → lease given back →
+    audit → storage claim → CRM directory entry → notice. The personal Firebase
+    login is never touched (decision 1).
+    """
+    uid = str(person["uid"])
+    email = str(person.get("email", ""))
+    verb, noun = _VERB[to_status], _NOUN[to_status]
+    is_owner = R.is_owner(target_role)
+
+    lease = None
+    if is_owner:
+        lease = await _take_owner_lease(db)
+        if lease is None:
+            raise StaffError(
+                "Another owner deactivation or suspension is in progress. Nothing was changed. "
+                "Try again in a moment."
+            )
+
+    #: Audit entries that could not be written (R1): raised at the end, never dropped.
+    audit_failures: list[tuple[str, Exception]] = []
+    #: The parts of the revocation that did not happen, in words, and why.
+    not_done: list[str] = []
+    errors: list[Exception] = []
+    record = _audit_collector(noun, uid, audit_failures)
+
+    mfa_bindings_cleared = True
+    active_written = True
+    now = datetime.now(timezone.utc)
+    try:
+        if is_owner:
+            # Read again under the lease: a deactivation that has just finished may
+            # have changed both this record and the count.
+            person = await db[C.STAFF].find_one({"uid": uid}) or person
             active_owners = await db[C.STAFF].count_documents(
                 {"role": str(Role.OWNER), "is_active": True}
             )
-            if active_owners <= 1:
+            # An Owner already marked inactive (the revocation run again after a
+            # partial failure) is not one of them, so it is not subtracted: running
+            # again can never remove the last active Owner.
+            if active_owners - (1 if person.get("is_active", True) else 0) < 1:
                 raise StaffError(
                     "This is the last active owner. Provision another owner before "
                     f"you {verb} this one."
                 )
-    if not manages(actor, person):
-        raise StaffError(f"You can only {verb} members of your own department.")
+            # And the transition again, on what the lease protects: a parallel run
+            # that has just completed this one is refused as "already …".
+            retry = _transition(person, to_status)
+        current = status_of(person)
+        #: A marker left by an earlier attempt (also on an ordinary transition away
+        #: from a state that was never fully revoked): cleared by a complete run.
+        had_marker = bool(person.get(OUTSTANDING_FIELD))
 
-    now = datetime.now(timezone.utc)
-    if to_status != STATUS_ACTIVE:
-        # Sessions first: whatever fails below, the live token stops working.
+        # Sessions first. Whatever else fails below, the live token stops working —
+        # a revocation that gets halfway should get the most valuable half done.
         await db[C.SESSIONS].update_many({"uid": uid}, {"$set": {"revoked": True}})
-        if str(person.get("role")) == str(Role.OWNER):
-            # P1-A3b: and every Firestore/Storage MFA binding of the Owner.
+
+        # P1-A3b: an Owner's Firestore/Storage MFA bindings end with the Owner's
+        # access. A binding is what lets a custom-token Firebase session act as an
+        # Owner in the rules. Removed here, early, so that a failure further down
+        # cannot leave one standing, and deleted rather than flagged, so that a
+        # reactivation cannot bring one back. `clear_all_bindings` never raises: a
+        # Firestore failure comes back as False, is audited as
+        # `owner_mfa.unbind_failed`, and makes the revocation incomplete. Its audit
+        # entries go through `record` like the rest (no actor is passed to it).
+        if is_owner:
             from app.services import owner_mfa
 
-            await owner_mfa.clear_all_bindings(uid, f"Owner {to_status}", actor=actor)
+            mfa_bindings_cleared = await owner_mfa.clear_all_bindings(uid, _BINDING_REASON[to_status])
+            if mfa_bindings_cleared:
+                await record(
+                    "Owner MFA binding removal",
+                    actor=actor,
+                    action=audit.Action.OWNER_MFA_UNBOUND,
+                    subject_type="auth.mfa",
+                    subject_id=uid,
+                    reason=_BINDING_REASON[to_status],
+                    meta={"all": True},
+                )
+            else:
+                not_done.append("the Owner's MFA bindings were NOT removed (Firestore write failed)")
+                await record(
+                    "Owner MFA binding removal failure",
+                    actor=actor,
+                    action=audit.Action.OWNER_MFA_UNBIND_FAILED,
+                    subject_type="auth.mfa",
+                    subject_id=uid,
+                    reason=f"{_BINDING_REASON[to_status]}, and the MFA bindings could not be removed",
+                    meta={"all": True},
+                )
 
-    # Compare-and-set on the state we read, so two operators cannot race a
-    # transition into a combination nobody chose.
-    res = await db[C.STAFF].update_one(
-        {"uid": uid, "is_active": bool(person.get("is_active", True))},
-        {"$set": {**status_patch(to_status), "updated_at": now,
-                  "status_changed_at": now,
-                  "status_changed_by": {"uid": actor["uid"], "name": actor.get("name", "")},
-                  "status_reason": reason.strip()}},
-    )
-    if getattr(res, "matched_count", 1) == 0:
-        raise StaffError("This account changed while you were deciding. Reload it and try again.")
+        # The record. Compare-and-set on the state we read, so two operators cannot
+        # race a transition into a combination nobody chose. A retry re-writes the
+        # same state and keeps the first attempt's reason and timestamps.
+        patch: dict = {**status_patch(to_status), "updated_at": now}
+        if not retry:
+            patch.update({
+                "status_changed_at": now,
+                "status_changed_by": {"uid": actor["uid"], "name": actor.get("name", "")},
+                "status_reason": reason.strip(),
+            })
+        # R4 (revision 4): a failed write here no longer stops the revocation with a
+        # 500. The claim below is still cleared and the CRM entry switched off, and
+        # the failure is reported at the end; the row still says active, so the
+        # retry is an ordinary transition.
+        try:
+            res = await db[C.STAFF].update_one(
+                {"uid": uid, "is_active": bool(person.get("is_active", True))},
+                {"$set": patch},
+            )
+        except Exception as exc:  # noqa: BLE001 — reported below, never dropped
+            log.exception("%s of %s: the staff record was not marked inactive", noun, uid)
+            active_written = False
+            not_done.append(f"the staff record was NOT marked inactive ({type(exc).__name__})")
+            errors.append(exc)
+        else:
+            if getattr(res, "matched_count", 1) == 0:
+                raise StaffError("This account changed while you were deciding. Reload it and try again.")
+    finally:
+        if lease is not None:
+            await _give_back_owner_lease(db, lease)
 
-    audit_id = await audit.record(
+    audit_id = await record(
+        noun,
         actor=actor,
         action=_ACTION[to_status],
         subject_type="staff",
         subject_id=uid,
         reason=reason.strip(),
         before={"status": current, "is_active": current == STATUS_ACTIVE},
-        after={"status": to_status, "is_active": to_status == STATUS_ACTIVE},
-        meta={"role": str(target_role), "personal_app_account": "unchanged"},
+        after={
+            "status": to_status if active_written else "NOT WRITTEN",
+            "is_active": False if active_written else "NOT WRITTEN",
+        },
+        meta={"role": str(target_role), "personal_app_account": "unchanged",
+              **({"retry": True} if retry else {})},
     )
 
-    # The Storage claim and the CRM directory follow the record. On the way OUT
-    # the claim is cleared BEFORE the directory write, so a directory failure
-    # (which raises, loudly, with the repair command) cannot leave the claim
-    # behind. On the way back IN the whole document is re-mirrored (role,
-    # permissions, isActive) so a document that drifted while the account was
-    # out is put right, and the claim is re-granted after it.
-    mirror_error: StaffError | None = None
-    if to_status == STATUS_ACTIVE:
-        try:
-            mirrored = await _carry_to_crm(
-                actor=actor,
-                what=f"The reactivation of {person.get('email', uid)}",
-                reason=reason,
-                uid=uid,
-                email=str(person.get("email", "")),
-                call=lambda: crm.amirror(
-                    uid=uid,
-                    email=str(person.get("email", "")),
-                    name=str(person.get("name", "")),
-                    role=target_role,
-                    created_by=actor["uid"],
-                    phone=str(person.get("phone", "") or ""),
-                    field_charge=person.get("field_charge"),
-                    reports_to=person.get("reports_to"),
-                    is_active=True,
-                ),
-            )
-        except StaffError as exc:
-            mirror_error = exc
-        claim_problem = await asyncio.to_thread(storage_claims.apply_for_role, uid, target_role)
-    else:
-        claim_problem = await asyncio.to_thread(storage_claims.clear, uid)
-        try:
-            mirrored = await _carry_to_crm(
-                actor=actor,
-                what=f"The {verb} of {person.get('email', uid)}'s access",
-                reason=reason,
-                uid=uid,
-                email=str(person.get("email", "")),
-                call=lambda: crm.aset_active(
-                    uid=uid,
-                    email=str(person.get("email", "")),
-                    role=target_role,
-                    is_active=False,
-                ),
-            )
-        except StaffError as exc:
-            mirror_error = exc
+    # ── The Storage claim and the CRM directory follow the record ────────────
+    #
+    # The claim is cleared BEFORE the directory write, so a directory failure
+    # cannot leave the claim behind (R2: no step stops the ones after it). An ID
+    # token already minted carries the claim until it expires; clearing it is
+    # what keeps a later reactivation from handing the old access straight back
+    # without re-granting it.
+    claim_problem = await asyncio.to_thread(storage_claims.clear, uid)
     if claim_problem:
-        log.warning("storage claim not updated for %s: %s", uid, claim_problem)
+        log.warning("storage claim not cleared for %s: %s", uid, claim_problem)
+        not_done.append(f"the storage role claim was NOT cleared ({claim_problem})")
 
-    # Told after the authoritative change, whatever a mirror did: the person's
-    # access HAS changed at the API either way.
-    notified = await notify_access_change(
-        person=person, change=to_status, actor=actor, audit_id=str(audit_id or ""),
-    )
-    if mirror_error is not None:
-        raise mirror_error
+    # Revoking the API session is not revoking access. `crmSignIn` reads
+    # `crmUsers.isActive`, and while that still says true the person can open
+    # the shell and use every Firestore-backed screen on it. Both halves, or the
+    # account is only partly gone.
+    #
+    # R2 (revision 4): a CRM failure no longer ends the revocation here. It is
+    # reported at the end with the step that fixes it — running the operation
+    # again, which switches the entry off. (`scripts/repair_staff_accounts.py`
+    # treats an existing entry as healthy, so it is not the fix for a stale
+    # `isActive: true`; it is named only for a MISSING entry.)
+    crm_document = "not changed"
+    try:
+        mirrored = await _carry_to_crm(
+            actor=actor,
+            what=f"The {noun} of {email or uid}'s access",
+            reason=reason,
+            uid=uid,
+            email=email,
+            call=lambda: crm.aset_active(
+                uid=uid,
+                email=email,
+                role=target_role,
+                is_active=False,
+            ),
+        )
+        crm_document = mirrored.action
+    except StaffError as exc:
+        # `_carry_to_crm` has already audited it (`staff.mirror_failed`) and logged it.
+        crm_document = "NOT switched off"
+        not_done.append(
+            f"the CRM directory entry was NOT switched off ({exc.__cause__ or 'directory write failed'})"
+        )
+        errors.append(exc)
+    except Exception as exc:  # noqa: BLE001 — e.g. the CRM write failed AND its audit entry did too
+        log.exception("%s of %s: the CRM directory step failed", noun, uid)
+        crm_document = "NOT switched off"
+        not_done.append(f"the CRM directory entry was NOT switched off ({type(exc).__name__})")
+        errors.append(exc)
 
-    person.update(status_patch(to_status))
+    # P1-F: told after the authoritative change, whatever a mirror did — the
+    # person's access HAS changed at the API either way. Not again when an earlier
+    # attempt already told them (keyed on its audit entry).
+    if retry or had_marker:
+        notified = {"in_app": False, "email": False, "note": "told by the first attempt"}
+    else:
+        notified = await notify_access_change(
+            person=person, change=to_status, actor=actor, audit_id=str(audit_id or ""),
+        )
+
+    if active_written:
+        person.update(status_patch(to_status))
     person.pop("_id", None)
-    person["crm_user_document"] = mirrored.action
-    person["storage_role_claim"] = claim_problem or ("granted" if to_status == STATUS_ACTIVE else "cleared")
+    person.pop(OUTSTANDING_FIELD, None)
+    person["crm_user_document"] = crm_document
+    person["storage_role_claim"] = claim_problem or "cleared"
     person["personal_app_account"] = "unchanged"
-    person["fully_applied"] = not claim_problem
+    person["owner_mfa_bindings"] = (
+        ("cleared" if mfa_bindings_cleared else f"NOT CLEARED - {verb} again to retry")
+        if is_owner else "n/a"
+    )
     person["notified"] = notified
-    if to_status == STATUS_ACTIVE:
-        person["personal_login_disabled"] = await asyncio.to_thread(_login_disabled, uid)
+    # Reported, never hidden: a revocation with any part outstanding is not a
+    # completed revocation, and the one thing that must never happen is the caller
+    # being told it is done while the person can still get in.
+    person["fully_revoked"] = not (not_done or audit_failures)
+    person["fully_applied"] = person["fully_revoked"]
+    if not_done:
+        # One searchable entry per incomplete revocation, so an operator can list
+        # every revocation still outstanding.
+        await record(
+            "incomplete revocation",
+            actor=actor,
+            action=audit.Action.STAFF_REVOCATION_INCOMPLETE,
+            subject_type="staff",
+            subject_id=uid,
+            reason=f"{noun.capitalize()} not complete: " + "; ".join(not_done),
+            meta={"not_done": list(not_done)},
+        )
+    # The retry marker: what the next run has to finish, or nothing.
+    marker_problem = await _note_outstanding(db, uid, noun, not_done, audit_failures,
+                                             had=had_marker or retry)
+    if not_done or audit_failures:
+        cause = errors[0] if errors else (audit_failures[0][1] if audit_failures else None)
+        raise StaffError(
+            _incomplete(person, uid, noun, not_done, audit_failures, is_owner) + marker_problem
+        ) from cause
     return person
+
+
+async def _note_outstanding(db, uid: str, noun: str, not_done: list[str],
+                            audit_failures: list[tuple[str, Exception]], *, had: bool) -> str:
+    """Write (or remove) `revocation_outstanding` on the staff row. Best effort:
+    returns "" or the sentence to append to the error when the write failed."""
+    outstanding = list(not_done) + [
+        f"audit entry not recorded: {what} ({type(exc).__name__})" for what, exc in audit_failures
+    ]
+    try:
+        if outstanding:
+            await db[C.STAFF].update_one({"uid": uid}, {"$set": {OUTSTANDING_FIELD: outstanding}})
+        elif had:
+            await db[C.STAFF].update_one({"uid": uid}, {"$unset": {OUTSTANDING_FIELD: ""}})
+        return ""
+    except Exception as exc:  # noqa: BLE001 — the error already names everything outstanding
+        log.exception("%s of %s: the revocation_outstanding marker was not written", noun, uid)
+        if not outstanding:
+            return ""
+        return (
+            f" (The retry marker could not be written either: {type(exc).__name__}. If running the "
+            f"{noun} again is refused as already done, reactivate the account and run it once more.)"
+        )
+
+
+def _incomplete(person: dict, uid: str, noun: str, not_done: list[str],
+                audit_failures: list[tuple[str, Exception]], is_owner: bool) -> str:
+    """What the caller is told when any part of a revocation did not happen."""
+    done = ["API sessions ended"]
+    if is_owner and str(person.get("owner_mfa_bindings")) == "cleared":
+        done.append("Owner MFA bindings removed")
+    if person.get("is_active") is False:
+        done.append(f"staff record marked {person.get('status') or 'inactive'}")
+    crm_document = str(person.get("crm_user_document", ""))
+    if not crm_document.startswith("NOT"):
+        done.append(f"CRM directory entry {crm_document}")
+    if person.get("storage_role_claim") == "cleared":
+        done.append("storage role claim cleared")
+    text = f"The {noun} of {person.get('email') or uid} is NOT complete."
+    if not_done:
+        text += " Not done: " + "; ".join(not_done) + "."
+    text += " Done: " + ", ".join(done) + "."
+    if crm_document.startswith("NOT"):
+        text += (f" If the CRM directory entry is missing, repair it with:  {crm.REPAIR_COMMAND}  "
+                 f"(that does not correct an entry that exists but is out of date).")
+    if audit_failures:
+        text += " " + _unrecorded(noun, audit_failures)
+    else:
+        text += (f" Nothing has been undone: run the {noun} again to finish it. "
+                 "Repeating it is safe.")
+    text += " The person's personal Zipper app account was not touched."
+    return text
+
+
+def _unrecorded(noun: str, failures: list[tuple[str, Exception]]) -> str:
+    """The sentence a caller gets when part of a revocation's audit trail is missing."""
+    return (
+        "The audit log could not record: "
+        + ", ".join(f"{what} ({type(exc).__name__})" for what, exc in failures)
+        + f". Nothing has been undone and the {noun} is NOT complete until it is "
+        f"recorded: run the {noun} again."
+    )
 
 
 def _login_disabled(uid: str) -> bool:
@@ -1208,6 +1583,105 @@ def _login_disabled(uid: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return bool(getattr(user, "disabled", False))
+
+
+async def team_overview(actor: dict) -> list[dict]:
+    """Headcount per department. Spec 1.3.4."""
+    if not R.can_read_all(actor["role"]):
+        return []
+
+    pipeline = [
+        {"$match": {"is_active": True}},
+        {"$group": {"_id": "$team", "count": {"$sum": 1},
+                    "roles": {"$addToSet": "$role"}}},
+        {"$sort": {"_id": 1}},
+    ]
+    out = []
+    async for row in get_db()[C.STAFF].aggregate(pipeline):
+        out.append(
+            {"team": row["_id"] or "no team", "headcount": row["count"],
+             "roles": sorted(row["roles"])}
+        )
+    return out
+
+
+async def _restore_access(db, person: dict, actor: dict, reason: str, target_role: Role) -> dict:
+    """Reactivate (P1-B2): the record first, then the whole CRM document is
+    re-mirrored (role, permissions, isActive) so a document that drifted while
+    the account was out is put right, and the claim is re-granted after it."""
+    uid = str(person["uid"])
+    current = status_of(person)
+    now = datetime.now(timezone.utc)
+
+    # Compare-and-set on the state we read, so two operators cannot race a
+    # transition into a combination nobody chose. A reactivated account has no
+    # outstanding revocation: the marker goes with it.
+    res = await db[C.STAFF].update_one(
+        {"uid": uid, "is_active": bool(person.get("is_active", True))},
+        {"$set": {**status_patch(STATUS_ACTIVE), "updated_at": now,
+                  "status_changed_at": now,
+                  "status_changed_by": {"uid": actor["uid"], "name": actor.get("name", "")},
+                  "status_reason": reason.strip()},
+         "$unset": {OUTSTANDING_FIELD: ""}},
+    )
+    if getattr(res, "matched_count", 1) == 0:
+        raise StaffError("This account changed while you were deciding. Reload it and try again.")
+
+    audit_id = await audit.record(
+        actor=actor,
+        action=audit.Action.STAFF_REACTIVATED,
+        subject_type="staff",
+        subject_id=uid,
+        reason=reason.strip(),
+        before={"status": current, "is_active": False},
+        after={"status": STATUS_ACTIVE, "is_active": True},
+        meta={"role": str(target_role), "personal_app_account": "unchanged"},
+    )
+
+    mirror_error: StaffError | None = None
+    try:
+        mirrored = await _carry_to_crm(
+            actor=actor,
+            what=f"The reactivation of {person.get('email', uid)}",
+            reason=reason,
+            uid=uid,
+            email=str(person.get("email", "")),
+            call=lambda: crm.amirror(
+                uid=uid,
+                email=str(person.get("email", "")),
+                name=str(person.get("name", "")),
+                role=target_role,
+                created_by=actor["uid"],
+                phone=str(person.get("phone", "") or ""),
+                field_charge=person.get("field_charge"),
+                reports_to=person.get("reports_to"),
+                is_active=True,
+            ),
+        )
+    except StaffError as exc:
+        mirror_error = exc
+    claim_problem = await asyncio.to_thread(storage_claims.apply_for_role, uid, target_role)
+    if claim_problem:
+        log.warning("storage claim not updated for %s: %s", uid, claim_problem)
+
+    # Told after the authoritative change, whatever a mirror did: the person's
+    # access HAS changed at the API either way.
+    notified = await notify_access_change(
+        person=person, change=STATUS_ACTIVE, actor=actor, audit_id=str(audit_id or ""),
+    )
+    if mirror_error is not None:
+        raise mirror_error
+
+    person.update(status_patch(STATUS_ACTIVE))
+    person.pop("_id", None)
+    person.pop(OUTSTANDING_FIELD, None)
+    person["crm_user_document"] = mirrored.action
+    person["storage_role_claim"] = claim_problem or "granted"
+    person["personal_app_account"] = "unchanged"
+    person["fully_applied"] = not claim_problem
+    person["notified"] = notified
+    person["personal_login_disabled"] = await asyncio.to_thread(_login_disabled, uid)
+    return person
 
 
 # ── P1-F: telling the person ──────────────────────────────────────────────────
@@ -1275,23 +1749,3 @@ async def notify_access_change(*, person: Mapping, change: str, actor: dict, aud
         except Exception:  # noqa: BLE001
             log.exception("could not audit a failed staff notice for %s", uid)
     return {"in_app": in_app, "email": mailed}
-
-
-async def team_overview(actor: dict) -> list[dict]:
-    """Headcount per department. Spec 1.3.4."""
-    if not R.can_read_all(actor["role"]):
-        return []
-
-    pipeline = [
-        {"$match": {"is_active": True}},
-        {"$group": {"_id": "$team", "count": {"$sum": 1},
-                    "roles": {"$addToSet": "$role"}}},
-        {"$sort": {"_id": 1}},
-    ]
-    out = []
-    async for row in get_db()[C.STAFF].aggregate(pipeline):
-        out.append(
-            {"team": row["_id"] or "no team", "headcount": row["count"],
-             "roles": sorted(row["roles"])}
-        )
-    return out

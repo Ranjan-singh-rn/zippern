@@ -173,6 +173,9 @@ async def disconnect() -> None:
 # refused as a duplicate. A partial index on "reference is a non-empty string"
 # indexes exactly the requests that carry a real reference, which is the rule.
 RECHARGE_REFERENCE_KEY = [("seller_id", ASCENDING), ("reference", ASCENDING)]
+#: MFA release, revision 4 — see `ensure_indexes`.
+OWNER_MFA_UID_INDEX = "owner_mfa_uid_unique"
+
 RECHARGE_REFERENCE_INDEX = "recharges_seller_reference_unique"
 RECHARGE_REFERENCE_FILTER = {"reference": {"$gt": ""}}
 
@@ -277,6 +280,19 @@ async def ensure_indexes() -> None:
 
     await db[C.SESSIONS].create_index([("jti", ASCENDING)], unique=True)
     await db[C.SESSIONS].create_index("expires_at", expireAfterSeconds=0)
+
+    # P1-A3 (MFA release, revision 4): one enrolment record per Owner.
+    # `owner_mfa.start_enrolment` upserts on `uid`; without a unique index two
+    # simultaneous first starts could each insert a row. With it, the losing upsert
+    # is retried by Mongo as an update. Created on an empty collection (stage 1 never
+    # writes it), so it is instant. A failure is logged at ERROR, never swallowed:
+    # the release checks the start-up log for this line before the key is attached.
+    try:
+        await db[C.OWNER_MFA].create_index(
+            [("uid", ASCENDING)], unique=True, name=OWNER_MFA_UID_INDEX
+        )
+    except Exception:  # noqa: BLE001 — start-up continues; enrolment is not yet possible without the key
+        log.exception("owner_mfa: the uid unique index could not be built")
 
     # Audit is append-only and queried by actor, subject and time.
     await db[C.AUDIT].create_index([("at", DESCENDING)])

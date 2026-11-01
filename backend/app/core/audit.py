@@ -226,6 +226,11 @@ class Action:
     OWNER_MFA_BOUND = "owner_mfa.bound"
     OWNER_MFA_BIND_FAILED = "owner_mfa.bind_failed"
     OWNER_MFA_UNBOUND = "owner_mfa.unbound"
+    #: MFA release, revision 4: an Owner's bindings could NOT be removed (a
+    #: Firestore failure during a deactivation, a suspension or a role change).
+    #: Until a retry removes them, a bound Firebase session may still pass the
+    #: rules' Owner check, so it is searchable rather than only logged.
+    OWNER_MFA_UNBIND_FAILED = "owner_mfa.unbind_failed"
     #: Salary, employment id, joining date or field charge set on a staff record
     #: by an owner or a team admin. Separate from `staff.role_changed` because it
     #: changes no authority at all — and separate from nothing, because it is the
@@ -253,6 +258,14 @@ class Action:
     #: that is still outstanding rather than relying on an error message that was
     #: shown once and dismissed.
     STAFF_FIREBASE_REVOKE_FAILED = "staff.firebase_revoke_failed"
+    #: MFA release, revision 4: a deactivation (or suspension) that did not
+    #: finish — any of the MFA bindings, the staff record, the CRM directory
+    #: entry or the storage claim left as it was. One entry per attempt, listing
+    #: what is outstanding (`meta.not_done`), so an operator can find every
+    #: revocation that still has to be run again. The caller got an error, never
+    #: a success. (P1 decision 1: the personal Firebase login is never part of a
+    #: staff revocation, so it is never on this list.)
+    STAFF_REVOCATION_INCOMPLETE = "staff.revocation_incomplete"
 
     #: A BAN was recorded but the Firebase credential behind it was not revoked.
     #:

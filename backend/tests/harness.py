@@ -583,6 +583,16 @@ class FakeCollection:
                 existing = []
             existing.append(_copy(value))
             _set_path(doc, path, existing)
+        # `$unset` removes the field (a missing field is simply absent, as in
+        # Mongo). `staff.reactivate` and a completed revocation retry use it to
+        # drop the `revocation_outstanding` marker (MFA release, revision 4 / R1).
+        for path in (update.get("$unset") or {}):
+            parts = str(path).split(".")
+            target: Any = doc
+            for part in parts[:-1]:
+                target = target.get(part) if isinstance(target, dict) else None
+            if isinstance(target, dict):
+                target.pop(parts[-1], None)
 
     async def update_one(self, query: Mapping, update: Mapping, upsert: bool = False,
                          session=None):

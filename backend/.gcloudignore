@@ -1,0 +1,14 @@
+# Added by the release candidate. gcloud uploads nothing listed here (including this file).
+.gcloudignore
+.git
+.gitignore
+.env
+.env.*
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+**/.DS_Store
+backups/

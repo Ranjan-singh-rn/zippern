@@ -29,6 +29,7 @@ import base64 as _b64
 import hashlib
 import hmac
 import json as _json
+import re
 import sys
 import time
 import types
@@ -352,7 +353,11 @@ ok("neither bind route is reachable by a pending session",
    ("POST", "/api/auth/mfa/bind") not in mfa.MFA_PENDING_ROUTES and ("POST", "/api/auth/mfa/bind/confirm") not in mfa.MFA_PENDING_ROUTES)
 ok("sign-out releases this session's binding", "owner_mfa.unbind_session(jti, actor=user)" in src)
 blob = repr(audit_log)
-ok("no audit entry carries a custom token or ID token", "CUSTOM-TOKEN" not in blob and "id-" not in blob and "t-crm-pw" not in blob)
+# Every Firebase ID token this test issued (fb_token/redeem register each one in FIREBASE), matched as a
+# whole token. A bare "id-" substring also matched the random 6-character binding tag now and then
+# (_sid_tag = sid[:6], e.g. 'Jid-uB') and failed about 1 run in 100 with nothing leaked.
+leaked = sorted(t for t in FIREBASE if re.search(r"(?<![A-Za-z0-9_-])" + re.escape(t) + r"(?![A-Za-z0-9_-])", blob))
+ok("no audit entry carries a custom token or ID token", "CUSTOM-TOKEN" not in blob and not leaked)
 ok("no audit entry carries a full sid", not any(s in blob for s in (crm_sid, twin_sid, and_sid, r_sid, first, second)))
 mfa_src = (ROOT / "app/services/owner_mfa.py").read_text()
 ok("the mint failure log names the exception type only (no token)", 'type(exc).__name__' in mfa_src)
