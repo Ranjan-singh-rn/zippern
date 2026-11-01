@@ -120,7 +120,8 @@ type OpeningOutcome =
  * times in production, and it must never be reported as a plain success.
  */
 type LoginOutcome =
-  | { kind: 'attached'; email: string }
+  /** C-17: `resetEmailSent` — the seller was emailed a set-password link (false = tell them to use "Forgot password"). */
+  | { kind: 'attached'; email: string; resetEmailSent: boolean }
   | { kind: 'failed'; email: string; message: string }
 
 /** The firebase-js-sdk error code, when there is one. */
@@ -173,8 +174,6 @@ export default function RegisterSellerPage() {
     email:           '',
     city:            '',
     description:     '',
-    password:        '',
-    confirmPassword: '',
   })
   // Flags an already-registered email / phone while it is being typed.
   const registered = useRegisteredCheck(form.email, form.phone)
@@ -312,12 +311,6 @@ export default function RegisterSellerPage() {
     if (!form.displayName.trim() || !form.phone.trim() || !form.email.trim()) {
       setError('Name, phone and email are required.'); return
     }
-    if (!form.password || form.password.length < 8) {
-      setError('Password must be at least 8 characters.'); return
-    }
-    if (form.password !== form.confirmPassword) {
-      setError('Passwords do not match.'); return
-    }
     if (hasInitialCoins) {
       if (!utrNumber.trim()) { setError('UTR / Transaction ID is required when adding initial balance.'); return }
       if (!transactionDate) { setError('Transaction date is required.'); return }
@@ -405,9 +398,10 @@ export default function RegisterSellerPage() {
       // retry this page invites would otherwise be refused on the address.
       let crmUid: string
       let createdSellerId = ''
+      let resetEmailSent = false
       try {
         const created = await createPartnerLoginThen(
-          { email: emailLower, password: form.password, kind: 'seller' },
+          { email: emailLower, kind: 'seller' },
           async (uid) => {
             if (isSuperAdmin) {
               // Superadmin: create directly, holding nothing.
@@ -473,6 +467,7 @@ export default function RegisterSellerPage() {
         )
         crmUid = created.uid
         createdSellerId = created.result
+        resetEmailSent = created.resetEmailSent
       } catch (authErr: unknown) {
         if (isRecordNotWritten(authErr)) {
           console.error('Seller record could not be written:', authErr.reason)
@@ -505,7 +500,7 @@ export default function RegisterSellerPage() {
             linkPartnerDoc: false,
           })
           await updateDoc(doc(db, 'sellers', createdSellerId), { crmUid })
-          setLogin({ kind: 'attached', email: emailLower })
+          setLogin({ kind: 'attached', email: emailLower, resetEmailSent })
         } catch (linkErr: unknown) {
           // The seller record is committed and is a real application, so it is
           // NOT deleted — somebody has to decide about it. But it has no login,
@@ -526,7 +521,7 @@ export default function RegisterSellerPage() {
 
         setSuccess(true)
       } else {
-        setLogin({ kind: 'attached', email: emailLower })
+        setLogin({ kind: 'attached', email: emailLower, resetEmailSent })
         setSubmittedForApproval(true)
       }
     } catch (err: unknown) {
@@ -562,12 +557,12 @@ export default function RegisterSellerPage() {
               A login for {login.email} exists already.
             </p>
             <p className="text-slate-400 text-sm mt-1">
-              It was created just now, from the password you typed. The password
-              itself is <span className="text-white font-semibold">not stored anywhere</span>{' '}
-              — not on this request, not on the seller record. Give it to the
-              seller now if they do not already have it; nobody, superadmin
-              included, can read it back afterwards, and a lost one is replaced
-              with &ldquo;forgot password&rdquo;, not looked up.
+              It was created just now with a random password that{' '}
+              <span className="text-white font-semibold">nobody knows</span> — not you, not the
+              superadmin, and it is stored nowhere.{' '}
+              {login.resetEmailSent
+                ? <>A set-password email has been sent to the seller; they choose their own password from the link in it.</>
+                : <>The set-password email could <span className="text-yellow-400 font-semibold">not</span> be sent just now — tell the seller to use &ldquo;Forgot password&rdquo; on the sign-in page, which sends the same link.</>}
             </p>
             <p className="text-slate-400 text-sm mt-2">
               The login opens nothing yet. Approving this request is what creates
@@ -654,6 +649,11 @@ export default function RegisterSellerPage() {
             <p className="text-slate-400 text-sm mt-1">
               It is <span className="text-yellow-400 font-semibold">pending</span> too
               and opens nothing until this seller is approved.
+            </p>
+            <p className="text-slate-400 text-sm mt-1">
+              {login.resetEmailSent
+                ? <>A set-password email has been sent to the seller; they choose their own password from it. Nobody here knows it.</>
+                : <>The set-password email could <span className="text-yellow-400 font-semibold">not</span> be sent just now — tell the seller to use &ldquo;Forgot password&rdquo; on the sign-in page.</>}
             </p>
           </div>
         )}
@@ -823,17 +823,16 @@ export default function RegisterSellerPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className={labelClass}><Shield className="w-3.5 h-3.5 inline mr-1 text-pink-400" />CRM Password *</label>
-              <input type="password" className={inputClass} placeholder="Min 8 characters"
-                value={form.password} onChange={e => set('password', e.target.value)} />
-            </div>
-            <div>
-              <label className={labelClass}><Shield className="w-3.5 h-3.5 inline mr-1 text-pink-400" />Confirm Password *</label>
-              <input type="password" className={inputClass} placeholder="Repeat password"
-                value={form.confirmPassword} onChange={e => set('confirmPassword', e.target.value)} />
-            </div>
+          {/* Audit C-17 / CRM-FLOW 2.1.3: staff never type the seller's
+              password. The login is created with a random one nobody sees and
+              the seller is emailed a link to set their own. */}
+          <div className="flex items-start gap-2 bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-3">
+            <Shield className="w-4 h-4 text-pink-400 mt-0.5 shrink-0" />
+            <p className="text-xs text-slate-400 leading-relaxed">
+              <span className="text-slate-200 font-medium">No password is typed here.</span> The CRM login is
+              created with a random password nobody sees, and a set-password email goes to the seller&rsquo;s
+              address above. They choose their own; you never know it.
+            </p>
           </div>
         </div>
 

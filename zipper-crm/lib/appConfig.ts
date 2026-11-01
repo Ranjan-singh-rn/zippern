@@ -3,6 +3,7 @@ import {
   doc, getDoc, setDoc, getDocs, deleteDoc,
   collection, serverTimestamp, Timestamp,
 } from 'firebase/firestore'
+import { nextVersion, validateLuckyConfig, type LuckyConfig } from '@/lib/luckyGiftsGuard'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CURRENCY SETTINGS
@@ -395,4 +396,49 @@ export async function seedHostLevels(): Promise<void> {
       setDoc(doc(db, 'levelConfig', 'host', 'levels', String(l.level)), l, { merge: true }),
     ),
   )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LUCKY GIFTS — the combos, the receiver share and the odds table
+// Firestore: appConfig/luckyGifts  (read by functions/src/luckyGifts.ts inside
+// the gift settlement transaction; the CRM is the only writer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The document as stored, plus the two audit fields. */
+export interface LuckyGiftsDoc extends LuckyConfig {
+  updatedAt?: Timestamp | null
+  updatedBy?: string
+}
+
+/** `null` when the document does not exist (lucky gifts run on the defaults, version 0). */
+export async function getLuckyGiftsConfig(): Promise<LuckyGiftsDoc | null> {
+  const snap = await getDoc(doc(db, 'appConfig', 'luckyGifts'))
+  if (!snap.exists()) return null
+  return snap.data() as LuckyGiftsDoc
+}
+
+/**
+ * Save a table — AFTER running the server's own guard on it. A table the
+ * server would refuse is never written. `version` is bumped past the server's
+ * current one (re-read here, not taken from the form), and the write names the
+ * signed-in actor, never a role word.
+ */
+export async function saveLuckyGiftsConfig(
+  draft: Pick<LuckyConfig, 'combos' | 'receiverPct' | 'odds'>,
+  actorUid: string,
+): Promise<{ version: number; expectedMultiplier: number; ceiling: number }> {
+  const current = await getLuckyGiftsConfig()
+  const version = nextVersion(current?.version)
+  const v = validateLuckyConfig({ ...draft, version })
+  if (!v.ok) throw new Error(v.reason)
+  if (!actorUid) throw new Error('No signed-in actor to record on the write.')
+  await setDoc(doc(db, 'appConfig', 'luckyGifts'), {
+    version: v.config.version,
+    combos: v.config.combos,
+    receiverPct: v.config.receiverPct,
+    odds: v.config.odds,
+    updatedAt: serverTimestamp(),
+    updatedBy: actorUid,
+  })
+  return { version: v.config.version, expectedMultiplier: v.expectedMultiplier, ceiling: v.ceiling }
 }

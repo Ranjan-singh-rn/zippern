@@ -52,7 +52,7 @@ import {
   getDiamondPacks, DEFAULT_DIAMOND_PACKS, type DiamondPack,
 } from '@/lib/appConfig'
 import {
-  getCoinPurchaseRequests, type CoinPurchaseRequest,
+  COIN_PURCHASE_LIST_LIMIT, getCoinPurchaseRequests, type CoinPurchaseRequest,
 } from '@/lib/coinPurchases'
 import { getRates, type Rates } from '@/lib/rates'
 import api, { ApiError } from '@/lib/api'
@@ -610,6 +610,13 @@ function SellerRequestQueue({
         />
       ) : (
         <div className="divide-y divide-slate-800">
+          {/* Audit C-15: the read is capped; say so rather than let the cap
+              read as "that is all of them". */}
+          {requests.length >= COIN_PURCHASE_LIST_LIMIT && (
+            <p className="px-4 py-2 text-amber-300/90 text-xs bg-amber-500/5">
+              Showing the first {COIN_PURCHASE_LIST_LIMIT} open requests, newest first — more exist beyond this list.
+            </p>
+          )}
           {requests.map((r) => (
             <SellerRequestRow
               key={r.id}

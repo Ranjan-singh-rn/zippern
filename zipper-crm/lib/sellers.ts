@@ -218,25 +218,26 @@ export async function updateOwnSellerProfile(
 
 // ── Recharge Request Helpers ──────────────────────────────────────────────────
 
-export async function getRechargeRequests(status?: string): Promise<RechargeRequest[]> {
-  const q = status
-    ? query(
-        collection(db, 'rechargeRequests'),
-        where('status', '==', status),
-        orderBy('createdAt', 'desc')
-      )
-    : query(collection(db, 'rechargeRequests'), orderBy('createdAt', 'desc'))
+/**
+ * Audit C-15: every list read here is bounded. A screen that shows one of
+ * these says "showing the first N" when `length === RECHARGE_LIST_LIMIT`.
+ */
+export const RECHARGE_LIST_LIMIT = 200
 
-  const snap = await getDocs(q)
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() } as RechargeRequest))
-}
+// `getRechargeRequests` (all requests, any seller) — REMOVED (audit C-15/C-16):
+// it had no caller and read the whole collection without a limit. Staff
+// decide recharges on /recharges through the API list, which is paged.
 
-export async function getSellerRechargeRequests(sellerUid: string): Promise<RechargeRequest[]> {
+export async function getSellerRechargeRequests(
+  sellerUid: string,
+  max: number = RECHARGE_LIST_LIMIT,
+): Promise<RechargeRequest[]> {
   const snap = await getDocs(
     query(
       collection(db, 'rechargeRequests'),
       where('sellerUid', '==', sellerUid),
-      orderBy('createdAt', 'desc')
+      orderBy('createdAt', 'desc'),
+      limit(max),
     )
   )
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as RechargeRequest))
@@ -248,10 +249,6 @@ export async function getSellerRechargeRequests(sellerUid: string): Promise<Rech
 // through the API (`lib/apiPartners.ts` → `recharges.approve / reject`), which
 // credits through the ledger exactly once. Removed rather than left to fail.
 
-// ── Update seller fields ───────────────────────────────────────────────────────
-export async function updateSeller(
-  id: string,
-  updates: Partial<Pick<Seller, 'displayName' | 'phone' | 'email'>>
-): Promise<void> {
-  await updateDoc(doc(db, 'sellers', id), updates)
-}
+// `updateSeller` — REMOVED (audit C-16): a dead browser write to a partner
+// record (0 callers). A seller edits their own profile with
+// `updateOwnSellerProfile` above; staff changes go through the API.

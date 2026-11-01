@@ -19,8 +19,6 @@ import {
   serverTimestamp,
 } from 'firebase/firestore'
 import type { DocumentData, Query, QueryDocumentSnapshot } from 'firebase/firestore'
-import type { Dept } from './auth'
-import { tickets as apiTickets } from './api'
 import { getPlatformRevenueDays, getPlatformStats } from './finance'
 import { getRates } from './rates'
 import { fromSettled, isOk, ok, toFailure, type ReadResult } from './readState'
@@ -527,16 +525,9 @@ export async function getUserBeanTransactions(uid: string): Promise<Transaction[
  */
 // setUserLevel — REMOVED (Phase 1A): `level` is server-derived and staff-protected in the rules.
 
-export async function warnUser(uid: string, reason: string): Promise<void> {
-  const userRef = doc(db, 'users', uid)
-  const snap = await getDoc(userRef)
-  if (!snap.exists()) throw new Error('User not found')
-  const current = snap.data().warnings ?? 0
-  await updateDoc(userRef, { warnings: current + 1 })
-  await addDoc(collection(db, 'users', uid, 'warnings'), {
-    reason, issuedAt: Timestamp.now(), issuedBy: 'Admin',
-  })
-}
+// warnUser — REMOVED (audit C-16): a dead browser write that recorded the
+// actor as the literal string 'Admin'. Warnings go through `api.users.warn`,
+// audited against the signed-in person and delivered to the user.
 
 // ── Withdrawal Requests ────────────────────────────────────────────────────
 
@@ -585,11 +576,20 @@ export async function getWithdrawalRequests(status?: string): Promise<Withdrawal
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as WithdrawalRequest))
 }
 
-export async function approveWithdrawal(id: string, notes?: string): Promise<void> {
+/**
+ * Approve a withdrawal request — a money-adjacent browser write.
+ *
+ * Audit C-8: `processedBy` used to be the literal string 'Admin', so the
+ * record could not say WHO approved it. It is now the signed-in actor's uid,
+ * required — the write is refused without one rather than falling back to a
+ * role word. The screen confirms before calling (`finance/withdrawals`).
+ */
+export async function approveWithdrawal(id: string, processedBy: string, notes?: string): Promise<void> {
+  if (!processedBy?.trim()) throw new Error('No signed-in actor to record on the approval.')
   await updateDoc(doc(db, 'withdrawalRequests', id), {
     status: 'approved',
     processedAt: Timestamp.now(),
-    processedBy: 'Admin',
+    processedBy: processedBy.trim(),
     ...(notes ? { notes } : {}),
   })
 }
@@ -607,12 +607,14 @@ export interface PaymentProof {
 // no bean debit and no ledger row. A request is paid only by executing the
 // host-withdrawal card raised for it — see `api.partnerOps.executeHostWithdrawal`.
 
-export async function rejectWithdrawal(id: string, reason: string): Promise<void> {
+/** Reject a withdrawal request. `processedBy` is the signed-in actor's uid (C-8). */
+export async function rejectWithdrawal(id: string, reason: string, processedBy: string): Promise<void> {
+  if (!processedBy?.trim()) throw new Error('No signed-in actor to record on the rejection.')
   await updateDoc(doc(db, 'withdrawalRequests', id), {
     status: 'rejected',
     rejectionReason: reason,
     processedAt: Timestamp.now(),
-    processedBy: 'Admin',
+    processedBy: processedBy.trim(),
   })
 }
 
@@ -756,174 +758,26 @@ export async function getLegacySellers(): Promise<SellerRecord[]> {
 
 // setSeller — REMOVED (Phase 1A): `users.isSeller` is a partner role; it is granted by the API, never from a browser.
 
-export async function setSellerOnlineStatus(uid: string, online: boolean): Promise<void> {
-  await updateDoc(doc(db, 'users', uid), { isOnline: online })
-}
+// setSellerOnlineStatus — REMOVED (audit C-16): a dead browser write (0
+// callers) of a field the app owns.
 
 // removeSeller — REMOVED (Phase 1A): seller revocation goes through the partner API.
 
-// ── Support Tickets ────────────────────────────────────────────────────────
-
-export type SupportTicketStatus   = 'open' | 'in_progress' | 'replied' | 'closed'
-export type SupportTicketPriority = 'critical' | 'high' | 'medium' | 'low'
-export type SupportTicketCategory =
-  | 'billing'
-  | 'ban_appeal'
-  | 'bug_report'
-  | 'account_issue'
-  | 'other'
-
-export interface SupportTicketRecord {
-  id: string
-  userId: string
-  userName: string
-  userPhotoUrl: string
-  subject: string
-  message: string
-  status: SupportTicketStatus
-  priority: SupportTicketPriority
-  category: SupportTicketCategory
-  adminReply: string
-  assignedTo: string        // uid of CRM staff member
-  assignedToName: string
-  escalatedToTech: boolean  // legacy flag — true when escalatedTeam === 'tech'
-  escalatedTeam: Dept | ''  // department this ticket was routed to (via Team Tickets)
-  escalatedAt: Timestamp | null
-  escalationNote: string
-  linkedTeamTicketId: string // id of the techTickets doc created by routing, if any
-  createdAt: Timestamp | null
-  repliedAt: Timestamp | null
-}
-
-function mapTicket(d: import('firebase/firestore').QueryDocumentSnapshot): SupportTicketRecord {
-  const data = d.data()
-  return {
-    id: d.id,
-    userId: data.userId ?? '',
-    userName: data.userName ?? '',
-    userPhotoUrl: data.userPhotoUrl ?? '',
-    subject: data.subject ?? data.title ?? '',
-    message: data.message ?? data.body ?? '',
-    status: data.status ?? 'open',
-    priority: data.priority ?? 'medium',
-    category: data.category ?? 'other',
-    adminReply: data.adminReply ?? '',
-    assignedTo: data.assignedTo ?? '',
-    assignedToName: data.assignedToName ?? '',
-    escalatedToTech: data.escalatedToTech ?? false,
-    escalatedTeam: data.escalatedTeam ?? (data.escalatedToTech ? 'tech' : ''),
-    escalatedAt: data.escalatedAt ?? null,
-    escalationNote: data.escalationNote ?? '',
-    linkedTeamTicketId: data.linkedTeamTicketId ?? '',
-    createdAt: data.createdAt ?? null,
-    repliedAt: data.repliedAt ?? null,
-  }
-}
-
-export async function getSupportTickets(): Promise<SupportTicketRecord[]> {
-  const q = query(
-    collection(db, 'supportTickets'),
-    orderBy('createdAt', 'desc'),
-    limit(200)
-  )
-  const snap = await getDocs(q)
-  return snap.docs.map(mapTicket)
-}
-
-export async function getSupportTicketsByAssignee(uid: string): Promise<SupportTicketRecord[]> {
-  const q = query(
-    collection(db, 'supportTickets'),
-    where('assignedTo', '==', uid),
-    orderBy('createdAt', 'desc'),
-    limit(200)
-  )
-  const snap = await getDocs(q)
-  return snap.docs.map(mapTicket)
-}
-
-/**
- * Answer a ticket, and make the answer reachable by the person who asked.
- *
- * Two fields beyond the reply itself are load-bearing and neither was written
- * before:
- *
- *   * `updatedAt`. The Android app's ticket list is
- *     `whereEqualTo("userId", …).orderBy("updatedAt", DESCENDING)`, and
- *     Firestore excludes a document that does not carry the field being ordered
- *     on. Nothing wrote it, so a replied ticket was not merely un-rendered —
- *     it was not in the query result at all.
- *   * the reply is read from `adminReply` by the app now. It used to read
- *     `statusMessage`, which nothing in the system has ever written.
- *
- * The notification row beside it is a separate matter and is left as it was:
- * `users/{uid}/notifications` has no reader in the Android app either. It is
- * written because removing it would lose the record, not because anything sees
- * it.
- */
+// ── Support Tickets — REMOVED (audit C-5) ──────────────────────────────────
 //
-// P1-D — every write below goes through the API (`/api/tickets/support/...`).
-// Firestore rules refuse client writes to `supportTickets` and `techTickets`.
-// The server records the actor from the session, writes the audit entry
-// before the ticket, stamps `updatedAt`, and sends the app user an in-app
-// notice on a reply (to the top-level `notifications` collection the app
-// reads — which replaces the `users/{uid}/notifications` row this used to
-// write and nothing ever read).
+// `getSupportTickets`, `getSupportTicketsByAssignee`, `respondToTicket`,
+// `setSupportTicketStatus`, `setSupportTicketPriority`, `assignSupportTicket`,
+// `routeSupportTicketToTeam` and `closeTicket` read and wrote `supportTickets`
+// — a collection NOTHING in the app writes (zipper-app ChatRepository.kt:29:
+// "`supportTickets`, which nothing in the app writes"). The /tickets screen
+// they fed was a permanently empty queue, and its reply once wrote a
+// `users/{uid}/notifications` row the rules refuse and the app never read.
 //
-// `userId` and `routedBy` are kept in the signatures so callers compile
-// unchanged; the server ignores who the client says it is.
-
-export async function respondToTicket(
-  ticketId: string,
-  _userId: string,
-  reply: string
-): Promise<void> {
-  await apiTickets.update('support', ticketId, { adminReply: reply })
-}
-
-/** Closing and reopening need a `reason`; the API refuses them without one. */
-export async function setSupportTicketStatus(
-  ticketId: string,
-  status: SupportTicketStatus,
-  reason = ''
-): Promise<void> {
-  await apiTickets.update('support', ticketId, { status }, reason)
-}
-
-export async function setSupportTicketPriority(
-  ticketId: string,
-  priority: SupportTicketPriority
-): Promise<void> {
-  await apiTickets.update('support', ticketId, { priority })
-}
-
-export async function assignSupportTicket(
-  ticketId: string,
-  assignedTo: string,
-  _assignedToName?: string
-): Promise<void> {
-  // The server sets the name from the assignee's staff record.
-  await apiTickets.update('support', ticketId, { assignedTo })
-}
-
-/**
- * Route a support ticket to a CRM department (and optionally a specific
- * person) — the server creates a linked Team Ticket tagged `source: 'app'`,
- * marks the support ticket escalated and links the two. A ticket routes once.
- * A note of at least 3 characters is required (it is the audit reason).
- */
-export async function routeSupportTicketToTeam(
-  ticket: SupportTicketRecord,
-  team: Dept,
-  note: string,
-  _routedBy?: { name: string },
-  assignTo?: { uid: string; name: string }
-): Promise<void> {
-  await apiTickets.routeSupport(ticket.id, team, note, assignTo?.uid ?? '')
-}
-
-export async function closeTicket(ticketId: string, reason: string): Promise<void> {
-  await apiTickets.update('support', ticketId, { status: 'closed' }, reason)
-}
+// App feedback and support live in `feedbackTickets` and are worked on
+// /feedback (support) and /operations/feedback (ops), through the API's
+// `feedback` ticket kind, which sends the person a top-level `notifications`
+// row — `{userId, type, title, body, createdAt, isRead}`, the shape
+// ChatRepository.kt:32 reads. /tickets now redirects there.
 
 // ── Broadcasts ─────────────────────────────────────────────────────────────
 //
@@ -1041,7 +895,9 @@ export async function getStats(): Promise<StatsResult> {
     countOf(query(usersRef, where('isSeller', '==', true))),
     countOf(query(collection(db, 'kycSubmissions'), where('status', '==', 'pending'))),
     countOf(query(collection(db, 'agencies'), where('status', '==', 'pending'))),
-    countOf(query(collection(db, 'supportTickets'), where('status', '==', 'open'))),
+    // Audit C-5: `feedbackTickets` is what the app writes; `supportTickets` was
+    // always empty, so this tile always read 0.
+    countOf(query(collection(db, 'feedbackTickets'), where('status', '==', 'open'))),
     countOf(query(usersRef, where('isBanned', '==', true))),
   ])
 

@@ -57,24 +57,23 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useAuth } from '@/components/AuthProvider'
 import { hasPermission } from '@/lib/auth'
-import { partnerOps } from '@/lib/apiPartners'
+import { partnerOps, roleAppeals } from '@/lib/apiPartners'
 import {
-  deductionProblem, deductionSummary, heldSummary, roleButtons,
-  type RoleButton, type UserRoles,
+  deductionProblem, deductionSummary, heldSummary, type UserRoles,
 } from '@/lib/userRoleActions'
+import { INTERNAL_CRM_ROLES, isOrdinaryTarget } from '@/lib/crmRoles'
 import {
-  INTERNAL_CRM_ROLES, isOrdinaryTarget, userRowActionKeys,
-  type UserRowActionKey,
-} from '@/lib/crmRoles'
-import { REVOKED_RESTORE_HINT } from '@/lib/governanceRequests'
+  accountActions, roleRows, type AccountAction, type RoleKind, type RoleRowAction,
+} from '@/lib/roleStateActions'
+import { roleAppealIsOpen } from '@/lib/governanceRequests'
 import { TransferRecommendation } from '@/components/TransferRecommendation'
 
 /**
- * The four actions whose visibility is decided by the shared policy rather
- * than by this file's own `states` gate. Everything else on this page —
- * warn, revoke host, remove seller flag, balance — has no counterpart on the
- * /users list, so there is nothing for it to drift against and it keeps the
- * local gate.
+ * The four actions whose visibility is decided by the shared policy
+ * (`lib/roleStateActions.accountActions` over `lib/crmRoles`) rather than by
+ * this file's own `states` gate. Everything else on this page — warn, balance
+ * — has no counterpart on the /users list, so there is nothing for it to
+ * drift against and it keeps the local gate.
  *
  * `grant_host` and `seller_on` are gone from this page altogether. A Host, an
  * Agency, a Sub-agency and a Coin Seller are obtained through an application
@@ -83,12 +82,16 @@ import { TransferRecommendation } from '@/components/TransferRecommendation'
  * `/seller-flag` with `is_seller: true` is 400). Pending applications for
  * this user are listed on the page with Review / Approve / Reject instead
  * (`PartnerApplications.tsx`).
+ *
+ * Spec §10: a BANNED account is not offered an ordinary Unban. The lift comes
+ * through an authorised appeal (decided on /operations/appeals) or an Owner's
+ * decision; everybody else sees the rule and the link.
  */
 const POLICY_KEYS = new Set<string>([
   'ban', 'unban', 'suspend', 'resume',
 ])
 import {
-  AlertTriangle, ArrowRight, BadgeCheck, Check, Coins, Loader2, PlayCircle,
+  AlertTriangle, ArrowRight, BadgeCheck, Check, Coins, ExternalLink, Loader2, PlayCircle,
   RotateCcw, ShieldOff, Smartphone, StarOff, Shield, AlertOctagon, X,
   type LucideIcon,
 } from 'lucide-react'
@@ -455,7 +458,14 @@ export function UserActions({
   // ── UGP-B: the role inventory, and the role action being confirmed ───────
   const [roles, setRoles] = useState<UserRoles | null>(null)
   const [rolesError, setRolesError] = useState<string | null>(null)
-  const [roleAction, setRoleAction] = useState<RoleButton | null>(null)
+  const [roleAction, setRoleAction] = useState<RoleRowAction | null>(null)
+  // Spec §10: open reinstatement requests by role (undefined = could not be
+  // read; the state machine then offers both Request and Review, safely).
+  const [openReinstatement, setOpenReinstatement] =
+    useState<Partial<Record<RoleKind, string>> | undefined>(undefined)
+  // Spec §10: the open appeal from this account, if any — a ban is lifted
+  // through it, not beside it.
+  const [openAppealId, setOpenAppealId] = useState<string | undefined>(undefined)
   // ── UGP-D: the optional deduction on a warning ───────────────────────────
   const [deduct, setDeduct] = useState(false)
   const [dedCurrency, setDedCurrency] = useState<UserCurrency>('diamonds')
@@ -491,9 +501,27 @@ export function UserActions({
       setRoles(null)
       setRolesError(err instanceof Error ? err.message : 'The roles could not be read.')
     }
+    // Both reads are best-effort: a member who may not list them simply gets
+    // the "unknown" rendering, never a broken panel.
+    try {
+      const open: Partial<Record<RoleKind, string>> = {}
+      for (const a of await roleAppeals.of(uid)) {
+        if (roleAppealIsOpen(a.status) && !open[a.kind]) open[a.kind] = a.id
+      }
+      setOpenReinstatement(open)
+    } catch {
+      setOpenReinstatement(undefined)
+    }
+    try {
+      const mine = (await api.users.appeals('pending', 200)).find((a) => a.subjectUid === uid)
+      setOpenAppealId(mine?.id)
+    } catch {
+      setOpenAppealId(undefined)
+    }
   }, [uid])
   useEffect(() => { void loadRoles() }, [loadRoles])
-  const roleButtonsList = roleButtons(roles)
+  // Spec §10: one row per role, each with its own state and its own actions.
+  const roleRowsList = roleRows(roles, { isOwner, openReinstatement })
   const allowedDeduction = (roles?.deduction_currencies ?? []).filter(
     (c): c is UserCurrency => c === 'diamonds' || c === 'beans',
   )
@@ -538,14 +566,16 @@ export function UserActions({
   // internal identity or the reviewer's own account: `isOrdinaryTarget`
   // governs the whole set, which is what the old `internal ? []` did and
   // what the list now does for self as well.
-  const allowed = userRowActionKeys(subject, actorUid)
+  const account = accountActions(subject, { actorUid, isOwner, openAppealId })
+  const accountByKey = new Map<string, AccountAction>(account.map((a) => [a.kind, a]))
   const visible = !isOrdinaryTarget(subject, actorUid)
     ? []
     : ACTIONS.filter((spec) => (
       POLICY_KEYS.has(spec.key)
-        ? allowed.includes(spec.key as UserRowActionKey)
+        ? accountByKey.has(spec.key)
         : !spec.states || spec.states.includes(restriction)
     ))
+  const reviewAppeal = accountByKey.get('review_appeal')
 
   function open(spec: ActionSpec) {
     setPending(spec)
@@ -564,21 +594,39 @@ export function UserActions({
     setSuccess(null)
   }
 
-  /** A per-role revoke or restore, confirmed in the same dialog (UGP-B). */
-  function openRole(button: RoleButton) {
+  /** A per-role action from the state machine, confirmed in the same dialog. */
+  function openRole(a: RoleRowAction) {
+    const taking = a.kind === 'revoke_role' || a.kind === 'reject' || a.kind === 'suspend_role'
+    const effect: Record<RoleRowAction['kind'], string> = {
+      review: '',
+      view: '',
+      approve: a.role === 'host'
+        ? 'Approves the host application: the applicant’s account becomes a Host attached to the inviting agency. Refused until they have redeemed their code in the app.'
+        : 'Approves the application. The role starts once both contacts on the login are verified; no money moves now.',
+      reject: 'The application is refused. The reason is stored on the record and shown to the applicant; they may apply again.',
+      check_and_start: 'Asks the API to re-read the login’s contact verification and start the approved role if both are verified. Never bypasses them.',
+      suspend_role: 'Only this role is paused. The account, its other roles, its balances and all history stay; the person is told, with your reason. Lifted with Resume.',
+      resume_role: 'Lifts the role-level suspension. The SAME record is re-activated — no new application.',
+      revoke_role: 'Only this role is taken away. The account, its other roles, its balances and all history stay. The person is told, with your reason. The way back is a reinstatement request the Owner decides.',
+      request_reinstatement: 'Files a reinstatement request for this revoked role on the person’s behalf. Reviewers recommend; only the Owner decides. Nothing is restored now.',
+      review_reinstatement: '',
+      reinstate: 'The Owner’s decision: the person’s EXISTING record is re-activated — no new application. The role table and the parent agency are re-checked first.',
+    }
     open({
       key: 'role',
-      label: button.label,
-      icon: button.kind === 'revoke' ? StarOff : RotateCcw,
-      tone: button.kind === 'revoke' ? 'slate' : 'green',
-      title: button.title,
-      effect: button.effect,
-      confirmLabel: button.confirmLabel,
-      reasonHint: button.kind === 'revoke'
-        ? 'Why this role is being taken away. The person is told, with these words.'
-        : 'Why this role is being restored.',
+      label: a.label,
+      icon: taking ? StarOff : RotateCcw,
+      tone: taking ? 'slate' : 'green',
+      title: a.label,
+      effect: effect[a.kind],
+      confirmLabel: a.label,
+      reasonHint: a.kind === 'request_reinstatement'
+        ? 'The statement on the request (at least 20 characters). What the reviewers and the Owner read.'
+        : taking
+          ? 'Why. The person is told, with these words.'
+          : 'Why. This is what the audit log keeps.',
     })
-    setRoleAction(button)
+    setRoleAction(a)
   }
 
   function close() {
@@ -646,20 +694,47 @@ export function UserActions({
       case 'role': {
         const b = roleAction
         if (!b) throw new Error('No role action selected.')
-        if (b.kind === 'revoke' && b.role === 'host') {
-          await api.users.revokeHost(uid, why)
-          return { text: 'Host role revoked. The account and its other roles are untouched.' }
+        const host = b.role === 'host'
+        switch (b.kind) {
+          case 'approve':
+            if (host) await api.users.decideHostApplication(b.applicationId, true, why)
+            else await partnerOps.approve(b.targetId, why)
+            return { text: `${b.label} — done. The role starts once both contacts are verified.` }
+          case 'reject':
+            if (host) await api.users.decideHostApplication(b.applicationId, false, why)
+            else await partnerOps.reject(b.targetId, why)
+            return { text: 'Application rejected. The reason is on the record.' }
+          case 'check_and_start': {
+            const out = await partnerOps.activate(b.targetId)
+            return { text: out.activated ? 'Both contacts are verified — the role has started.'
+              : out.already_active ? 'This role had already started.' : 'Checked — still waiting for a verified contact.' }
+          }
+          case 'suspend_role':
+            // TODO(B2 API): a Host's role suspension is a stub (lib/backendFeatures).
+            if (host) throw new ApiError('Suspending the Host role on its own is available after the next backend release.', 400)
+            await partnerOps.deactivate(b.targetId, why)
+            return { text: `${b.label.replace('Suspend ', '').replace(' role', '')} role suspended. The account and its other roles are untouched.` }
+          case 'resume_role':
+            if (host) throw new ApiError('Resuming the Host role on its own is available after the next backend release.', 400)
+            await partnerOps.reactivate(b.targetId, why)
+            return { text: 'Role-level suspension lifted — the same record, re-activated.' }
+          case 'revoke_role':
+            if (host) await api.users.revokeHost(uid, why)
+            else await partnerOps.revoke(b.targetId, why)
+            return { text: `${b.label.replace('Revoke ', '').replace(' role', '')} role revoked. The account and its other roles are untouched.` }
+          case 'request_reinstatement': {
+            const out = await roleAppeals.file({ uid, kind: b.role, statement: why })
+            return { text: out.existing
+              ? 'A reinstatement request for this role was already open — nothing was filed twice.'
+              : 'Reinstatement request filed. Reviewers recommend; the Owner decides on Reinstatement requests.' }
+          }
+          case 'reinstate':
+            if (host) await api.users.restoreHost(uid, why)
+            else await partnerOps.reactivate(b.targetId, why)
+            return { text: `${b.label.replace(/^Reinstate /, '').replace(/ \(Owner decision\)$/, '')} role reinstated — the same record, re-activated.` }
+          default:
+            throw new Error('That action opens a page rather than calling the API.')
         }
-        if (b.kind === 'restore' && b.role === 'host') {
-          await api.users.restoreHost(uid, why)
-          return { text: 'Host role restored from the existing application and agency.' }
-        }
-        if (b.kind === 'revoke') {
-          await partnerOps.revoke(b.targetId, why)
-          return { text: `${b.label.replace('Revoke ', '')} role revoked. The other roles are untouched.` }
-        }
-        await partnerOps.reactivate(b.targetId, why)
-        return { text: `${b.label.replace('Restore ', '')} role restored — the same record, re-activated.` }
       }
       case 'balance': {
         const n = Number(amount)
@@ -681,6 +756,12 @@ export function UserActions({
         message: `A reason of at least ${MIN_REASON} characters is required — it is what the audit log stores.`,
         isRule: true,
       })
+      return
+    }
+
+    // The server's `statement` minimum on a reinstatement request (20).
+    if (pending.key === 'role' && roleAction?.kind === 'request_reinstatement' && why.length < 20) {
+      setFailure({ message: 'A reinstatement request needs a statement of at least 20 characters.', isRule: true })
       return
     }
 
@@ -891,19 +972,47 @@ export function UserActions({
       )}
 
       <div className="flex flex-wrap gap-2">
-        {visible.map((spec) => (
-          <button
-            key={spec.key}
-            onClick={() => open(spec)}
-            className={`flex items-center gap-2 border rounded-lg px-3 py-2 text-sm font-medium transition-colors ${TONES[spec.tone]}`}
+        {visible.map((spec) => {
+          // Spec §10: the shared policy may offer a control DISABLED (a banned
+          // account's Unban, for anyone but the Owner) — shown with the rule,
+          // never silently dropped.
+          const gate = accountByKey.get(spec.key)
+          const blocked = !!gate?.disabled
+          return (
+            <button
+              key={spec.key}
+              onClick={() => { if (!blocked) open(spec) }}
+              disabled={blocked}
+              title={gate?.hint || undefined}
+              className={`flex items-center gap-2 border rounded-lg px-3 py-2 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${TONES[spec.tone]}`}
+            >
+              <spec.icon size={14} /> {gate?.label ?? spec.label}
+            </button>
+          )
+        })}
+        {reviewAppeal && (
+          <Link
+            href={reviewAppeal.href}
+            title={reviewAppeal.hint}
+            className={`flex items-center gap-2 border rounded-lg px-3 py-2 text-sm font-medium transition-colors ${TONES.blue}`}
           >
-            <spec.icon size={14} /> {spec.label}
-          </button>
-        ))}
+            <ExternalLink size={14} /> {reviewAppeal.label}
+          </Link>
+        )}
       </div>
+      {accountByKey.get('unban')?.disabled && (
+        <p className="text-slate-500 text-xs -mt-2">
+          {accountByKey.get('unban')?.hint}{' '}
+          <Link href="/operations/appeals" className="text-pink-400 hover:text-pink-300 underline underline-offset-2">
+            Appeals queue
+          </Link>
+          .
+        </p>
+      )}
 
-      {/* UGP-B: role actions, ONLY from the authoritative role inventory. No
-          role → no button; one role → no revoke (suspend the account instead). */}
+      {/* Spec §10 / UGP-B: one row per role, each with ITS OWN status and the
+          actions for that status — from the authoritative role inventory and
+          nothing else. A revoked Agency never hides an active Coin Seller. */}
       {isOrdinaryTarget(subject, actorUid) && (
         <div className="border-t border-slate-800 pt-4">
           <p className="text-slate-400 text-xs font-medium uppercase tracking-wide mb-2">Roles</p>
@@ -918,30 +1027,60 @@ export function UserActions({
           ) : (
             <>
               <p className="text-slate-300 text-sm">{heldSummary(roles)}</p>
-              {roleButtonsList.length > 0 && (
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {roleButtonsList.map((b) => {
-                    // GOV C2: a REVOKED role comes back by the Owner's decision
-                    // only — disabled for everybody else, with the way forward.
-                    const ownerGate = b.ownerOnly && !isOwner
-                    return (
-                      <button
-                        key={b.key}
-                        onClick={() => { if (!ownerGate) openRole(b) }}
-                        disabled={ownerGate}
-                        title={ownerGate ? REVOKED_RESTORE_HINT : undefined}
-                        className={`flex items-center gap-2 border rounded-lg px-3 py-2 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                          TONES[b.kind === 'revoke' ? 'slate' : 'green']}`}
-                      >
-                        {b.kind === 'revoke' ? <StarOff size={14} /> : <RotateCcw size={14} />} {b.label}
-                      </button>
-                    )
-                  })}
+              {roleRowsList.length > 0 && (
+                <div className="mt-2 divide-y divide-slate-800 border border-slate-800 rounded-lg">
+                  {roleRowsList.map((r) => (
+                    <div key={`${r.row.role}:${r.row.id ?? ''}`} className="flex flex-wrap items-center gap-2 px-3 py-2">
+                      <div className="min-w-[10rem]">
+                        <span className="text-white text-sm font-medium">{r.label}</span>
+                        {r.row.name && <span className="text-slate-500 text-xs ml-2">{r.row.name}</span>}
+                        <span className={`ml-2 text-[11px] px-1.5 py-0.5 rounded border ${
+                          r.state === 'approved' ? 'border-green-500/30 text-green-300'
+                          : r.state === 'suspended' ? 'border-yellow-500/30 text-yellow-300'
+                          : r.state === 'revoked' || r.state === 'rejected' ? 'border-red-500/30 text-red-300'
+                          : 'border-slate-600 text-slate-300'}`}>
+                          {r.stateLabel}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5 ml-auto">
+                        {/* A PENDING application is decided ONCE, in the Applications
+                            panel below (the same server call as /kyc). Here: Review. */}
+                        {r.state === 'pending' && (
+                          <span className="text-slate-500 text-xs">Approve / Reject in Applications below</span>
+                        )}
+                        {(r.state === 'pending' ? r.actions.filter((a) => a.via === 'link') : r.actions).map((a) => a.via === 'link' ? (
+                          <Link
+                            key={a.key}
+                            href={a.href}
+                            title={a.hint || undefined}
+                            className={`flex items-center gap-1.5 border rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${TONES.blue}`}
+                          >
+                            <ExternalLink size={12} /> {a.label}
+                          </Link>
+                        ) : (
+                          <button
+                            key={a.key}
+                            onClick={() => { if (!a.disabled) openRole(a) }}
+                            disabled={a.disabled}
+                            title={a.hint || undefined}
+                            className={`flex items-center gap-1.5 border rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                              TONES[a.kind === 'revoke_role' || a.kind === 'reject' || a.kind === 'suspend_role' ? 'slate' : 'green']}`}
+                          >
+                            {a.kind === 'revoke_role' || a.kind === 'reject' || a.kind === 'suspend_role'
+                              ? <StarOff size={12} /> : <RotateCcw size={12} />} {a.label}
+                            {/* TODO(B2 API): a stub waits for the next backend release. */}
+                            {a.via === 'stub' && <span className="text-[10px] text-slate-500 ml-1">(next release)</span>}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
-              {!isOwner && roleButtonsList.some((b) => b.ownerOnly) && (
+              {roleRowsList.some((r) => r.state === 'revoked') && (
                 <p className="text-slate-500 text-xs mt-2">
-                  {REVOKED_RESTORE_HINT}:{' '}
+                  A revoked role is never simply re-activated: it comes back through a reinstatement
+                  request the Owner decides on{' '}
                   <Link href="/role-appeals" className="text-pink-400 hover:text-pink-300 underline underline-offset-2">
                     Reinstatement requests
                   </Link>

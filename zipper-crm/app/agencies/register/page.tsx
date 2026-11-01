@@ -103,7 +103,8 @@ import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
  * how an agency ends up in the queue with nobody able to sign in as it.
  */
 type LoginOutcome =
-  | { kind: 'attached'; email: string }
+  /** C-17: `resetEmailSent` — the partner was emailed a set-password link (false = tell them to use "Forgot password"). */
+  | { kind: 'attached'; email: string; resetEmailSent: boolean }
   | { kind: 'failed'; email: string; message: string }
 
 /** The firebase-js-sdk error code, when there is one. */
@@ -164,8 +165,6 @@ export default function RegisterAgencyPage() {
     bankName:             '',
     branch:               '',
     upiId:                '',
-    password:             '',
-    confirmPassword:      '',
   })
   // Flags an already-registered email / phone while it is being typed.
   const registered = useRegisteredCheck(form.ownerEmail, form.ownerPhone)
@@ -295,8 +294,6 @@ export default function RegisterAgencyPage() {
         setError('Please fill in all required fields.')
         return
       }
-      if (!form.password || form.password.length < 8) { setError('Password must be at least 8 characters.'); return }
-      if (form.password !== form.confirmPassword) { setError('Passwords do not match.'); return }
       setStep(2)
     }
 
@@ -425,29 +422,17 @@ export default function RegisterAgencyPage() {
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-            <div>
-              <label className={labelClass}>
-                <span className="flex items-center gap-1.5">
-                  <Shield className="w-4 h-4 text-pink-400" />
-                  CRM Password *
-                </span>
-              </label>
-              <input type="password" className={inputClass} placeholder="Min 8 characters"
-                value={form.password} onChange={(e) => handleFormChange('password', e.target.value)} />
-            </div>
-            <div>
-              <label className={labelClass}>
-                <span className="flex items-center gap-1.5">
-                  <Shield className="w-4 h-4 text-pink-400" />
-                  Confirm Password *
-                </span>
-              </label>
-              <input type="password" className={inputClass} placeholder="Repeat password"
-                value={form.confirmPassword} onChange={(e) => handleFormChange('confirmPassword', e.target.value)} />
-            </div>
+          {/* Audit C-17 / CRM-FLOW 2.1.3: staff never type the partner's
+              password. The login is created with a random one nobody sees and
+              the owner is emailed a link to set their own. */}
+          <div className="flex items-start gap-2 bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-3">
+            <Shield className="w-4 h-4 text-pink-400 mt-0.5 shrink-0" />
+            <p className="text-xs text-slate-400 leading-relaxed">
+              <span className="text-slate-200 font-medium">No password is typed here.</span> The CRM login is
+              created with a random password nobody sees, and a set-password email goes to the owner&rsquo;s
+              address above. They choose their own; you never know it.
+            </p>
           </div>
-          <p className="text-xs text-slate-500 -mt-3">This password is for the agency's CRM login.</p>
         </div>
 
         {error && (
@@ -788,9 +773,10 @@ export default function RegisterAgencyPage() {
         // retry this page invites would otherwise be refused on the address.
         let crmUid: string
         let createdAgencyId = ''
+        let resetEmailSent = false
         try {
           const created = await createPartnerLoginThen(
-            { email: emailLower, password: form.password, kind: 'agency' },
+            { email: emailLower, kind: 'agency' },
             async (uid) => {
               if (isSuperAdmin) {
                 // ── Superadmin: create directly ─────────────────────────────
@@ -837,6 +823,7 @@ export default function RegisterAgencyPage() {
           )
           crmUid = created.uid
           createdAgencyId = created.result
+          resetEmailSent = created.resetEmailSent
         } catch (authErr: unknown) {
           if (isRecordNotWritten(authErr)) {
             console.error('Agency record could not be written:', authErr.reason)
@@ -868,7 +855,7 @@ export default function RegisterAgencyPage() {
               uid:       crmUid,
             })
             await updateDoc(doc(db, 'agencies', createdAgencyId), { crmUid })
-            setLogin({ kind: 'attached', email: emailLower })
+            setLogin({ kind: 'attached', email: emailLower, resetEmailSent })
           } catch (linkErr: unknown) {
             // The agency record is committed and is a real application, so it
             // is NOT deleted — somebody has to decide about it. But it has no
@@ -885,7 +872,7 @@ export default function RegisterAgencyPage() {
           setCreatedReferralCode(referralCode)
           setSubmittedForApproval(false)
         } else {
-          setLogin({ kind: 'attached', email: emailLower })
+          setLogin({ kind: 'attached', email: emailLower, resetEmailSent })
           setCreatedReferralCode(referralCode)
           setSubmittedForApproval(true)
         }
@@ -1221,12 +1208,12 @@ export default function RegisterAgencyPage() {
             A login for {login.email} exists already.
           </p>
           <p className="text-slate-400 text-sm mt-1">
-            It was created just now, from the password you typed. The password
-            itself is <span className="text-white font-semibold">not stored anywhere</span>{' '}
-            — not on this request, not on the agency record. Give it to the
-            owner now if they do not already have it; nobody, superadmin
-            included, can read it back afterwards, and a lost one is replaced
-            with &ldquo;forgot password&rdquo;, not looked up.
+            It was created just now with a random password that{' '}
+            <span className="text-white font-semibold">nobody knows</span> — not you, not the
+            superadmin, and it is stored nowhere.{' '}
+            {login.resetEmailSent
+              ? <>A set-password email has been sent to the owner; they choose their own password from the link in it.</>
+              : <>The set-password email could <span className="text-yellow-400 font-semibold">not</span> be sent just now — tell the owner to use &ldquo;Forgot password&rdquo; on the sign-in page, which sends the same link.</>}
           </p>
           <p className="text-slate-400 text-sm mt-2">
             The login opens nothing yet. Approving this request is what creates
@@ -1254,6 +1241,11 @@ export default function RegisterAgencyPage() {
           <p className="text-slate-400 text-sm mt-1">
             It is <span className="text-yellow-400 font-semibold">pending</span> and
             opens nothing until this agency is approved.
+          </p>
+          <p className="text-slate-400 text-sm mt-1">
+            {login.resetEmailSent
+              ? <>A set-password email has been sent to the owner; they choose their own password from it. Nobody here knows it.</>
+              : <>The set-password email could <span className="text-yellow-400 font-semibold">not</span> be sent just now — tell the owner to use &ldquo;Forgot password&rdquo; on the sign-in page.</>}
           </p>
         </div>
       )}
@@ -1330,7 +1322,7 @@ export default function RegisterAgencyPage() {
               agencyName: '', ownerName: '', ownerPhone: '', ownerEmail: '', address: '',
               paymentType: 'india', country: '', binanceUid: '',
               accountName: '', accountNumber: '', confirmAccountNumber: '', ifsc: '',
-              bankName: '', branch: '', upiId: '', password: '', confirmPassword: '',
+              bankName: '', branch: '', upiId: '',
             })
             setAadhaarUrl('')
             setPanUrl('')

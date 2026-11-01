@@ -15,6 +15,7 @@ import {
 } from '@/lib/auth'
 import { useAuth } from '@/components/AuthProvider'
 import api, { ApiError, firestoreBindingOf, getSessionToken, type FirestoreBinding, type OwnerMfaEnrolment } from '@/lib/api'
+import { OWNER_MFA_UNAVAILABLE_NOTICE, mfaUnavailable } from '@/lib/mfaAvailability'
 
 /** P1-A3: wait for AuthProvider's API session exchange rather than racing it. */
 async function waitForApiSession(ms = 15000): Promise<boolean> {
@@ -26,7 +27,12 @@ async function waitForApiSession(ms = 15000): Promise<boolean> {
   return !!getSessionToken()
 }
 
-type MfaStage = 'loading' | 'enrol' | 'verify' | 'codes' | 'blocked' | 'unbound'
+/**
+ * `unavailable` (audit C-3): the server answered 404 to `/auth/mfa/status` —
+ * it has no two-step sign-in yet. The Owner is let in as before, after a
+ * notice that says so. Not `blocked`: that stage is for a sign-in that FAILED.
+ */
+type MfaStage = 'loading' | 'enrol' | 'verify' | 'codes' | 'blocked' | 'unbound' | 'unavailable'
 
 export default function LoginPage() {
   const router = useRouter()
@@ -111,10 +117,15 @@ export default function LoginPage() {
   // P1-A3b: whether this browser's Firebase sign-in was bound (Firestore/Storage).
   const [binding, setBinding]         = useState<FirestoreBinding | undefined>(undefined)
 
-  /** Into the CRM — unless Firestore/Storage stayed locked, which is said, not hidden. */
+  /**
+   * Into the CRM — unless Firestore/Storage stayed locked, which is said, not hidden.
+   * Only a reported `bound` counts (CRM-FINDINGS F2): an answer with no binding
+   * result is not evidence that this sign-in was unlocked, so it is shown as
+   * locked too.
+   */
   function enterOrExplain(b: FirestoreBinding | undefined) {
     setBinding(b)
-    if (!b || b.state === 'bound') { setMfaStage(null); router.push('/'); return }
+    if (b?.state === 'bound') { setMfaStage(null); router.push('/'); return }
     setMfaStage('unbound')
   }
 
@@ -176,7 +187,23 @@ export default function LoginPage() {
         setMfaStage('blocked')
         return
       }
-      const st = await api.auth.mfaStatus()
+      // ── Audit C-3: a backend without the MFA routes ──────────────────────
+      // The revision serving production today has no `/auth/mfa/*`. A 404
+      // here is "not available yet", NOT a failed sign-in: proceed exactly as
+      // before two-step sign-in existed, after a notice that says so. Any
+      // other failure (5xx, network, 401/403) still blocks — an outage of the
+      // MFA service must not become a way around it.
+      let st
+      try {
+        st = await api.auth.mfaStatus()
+      } catch (e) {
+        if (mfaUnavailable(e)) {
+          setMfaError('')
+          setMfaStage('unavailable')
+          return
+        }
+        throw e
+      }
       if (st.verified) { router.push('/'); return }
       if (st.configured === false) {
         setMfaError('Two-step sign-in is not configured on the server yet. Ask whoever runs the deployment to set OWNER_MFA_ENCRYPTION_KEY.')
@@ -399,6 +426,7 @@ export default function LoginPage() {
       : mfaStage === 'verify' ? 'Two-step sign-in'
       : mfaStage === 'blocked' ? 'Cannot finish signing in'
       : mfaStage === 'unbound' ? 'Signed in — some screens are locked'
+      : mfaStage === 'unavailable' ? 'Signed in — without a second step'
       : 'Checking…'
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
@@ -438,6 +466,26 @@ export default function LoginPage() {
                 <a href={enrolment.otpauth_uri} className="block text-pink-400 text-xs underline">
                   On this phone? Open in your authenticator app
                 </a>
+              </>
+            )}
+
+            {mfaStage === 'unavailable' && (
+              <>
+                {/* Audit C-3: said, not hidden — nobody should mistake "the
+                    server has no second step" for "I passed the second step". */}
+                <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-4 py-3">
+                  <p className="text-amber-200 text-sm leading-relaxed">{OWNER_MFA_UNAVAILABLE_NOTICE}</p>
+                </div>
+                <div className="flex gap-3 pt-1">
+                  <button onClick={handleCancel}
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-3 text-sm transition-colors">
+                    Sign out
+                  </button>
+                  <button onClick={() => { setMfaStage(null); router.push('/') }}
+                    className="flex-1 bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg px-4 py-3 text-sm transition-colors">
+                    Continue to the CRM
+                  </button>
+                </div>
               </>
             )}
 
@@ -512,7 +560,7 @@ export default function LoginPage() {
               </div>
             )}
 
-            {mfaStage !== 'codes' && (
+            {mfaStage !== 'codes' && mfaStage !== 'unavailable' && (
               <div className="flex gap-3 pt-1">
                 <button
                   onClick={handleCancel}

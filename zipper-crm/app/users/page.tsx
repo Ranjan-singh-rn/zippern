@@ -34,7 +34,7 @@ import {
 } from 'lucide-react'
 import { db } from '@/lib/firebase'
 import { searchUsers, type UserRecord } from '@/lib/firestore'
-import { userRowActionKeys } from '@/lib/crmRoles'
+import { accountActions } from '@/lib/roleStateActions'
 import { downloadCsv } from '@/components/ui/DataTable'
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
@@ -230,8 +230,12 @@ function dedupe(rows: UserRecord[]): UserRecord[] {
 
 export default function UsersPage() {
   const router = useRouter()
-  const { crmUser, loading: authLoading } = useAuth()
+  const { crmUser, apiUser, loading: authLoading } = useAuth()
   const canView = canAccess(crmUser, VIEW_ROLES)
+  // Spec §10: a ban is lifted through an appeal or the Owner's decision. The
+  // list cannot see appeals, so for anyone but the Owner the Unban is shown
+  // disabled with the rule as its tooltip; the detail page knows the appeal.
+  const isOwner = apiUser?.role === 'owner'
 
   const [term, setTerm] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
@@ -392,9 +396,11 @@ export default function UsersPage() {
    * `app/users/[uid]/UserActions.tsx`, where this screen could not reach it.
    */
   const actionsFor = useCallback(
-    (u: UserRecord): ActionSpec[] =>
-      userRowActionKeys(u, crmUser?.uid).map((key) => ACTIONS[key]),
-    [crmUser?.uid],
+    (u: UserRecord): Array<ActionSpec & { disabled: boolean; hint: string }> =>
+      accountActions(u, { actorUid: crmUser?.uid, isOwner })
+        .filter((a) => a.via === 'api')
+        .map((a) => ({ ...ACTIONS[a.kind as ActionKey], disabled: a.disabled, hint: a.hint })),
+    [crmUser?.uid, isOwner],
   )
 
   const sortNote = useMemo(() => SORTS[sort], [sort])
@@ -643,8 +649,10 @@ export default function UsersPage() {
                         {actionsFor(u).map((spec) => (
                           <button
                             key={spec.key}
-                            onClick={() => { setNotice(''); setPending({ spec, user: u }) }}
-                            className={`inline-flex items-center gap-1.5 border rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${spec.className}`}
+                            onClick={() => { if (!spec.disabled) { setNotice(''); setPending({ spec, user: u }) } }}
+                            disabled={spec.disabled}
+                            title={spec.hint || undefined}
+                            className={`inline-flex items-center gap-1.5 border rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed ${spec.className}`}
                           >
                             <spec.icon size={12} /> {spec.label}
                           </button>

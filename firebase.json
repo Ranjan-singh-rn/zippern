@@ -61,12 +61,21 @@
       "//3": "IGNORE IS SPELLED OUT, and that is the whole point. Firebase Hosting's DEFAULT ignore list contains '**/.*', which matches every dotted path — including .well-known. Inheriting it would silently drop the one file this target exists to publish, deploy successfully, and leave a 404 with nothing in the log to explain it.",
       "target": "applinks",
       "public": "hosting/applinks",
-      "ignore": ["firebase.json", "**/node_modules/**", "README.md"],
+      "ignore": [
+        "firebase.json",
+        "**/node_modules/**",
+        "README.md"
+      ],
       "headers": [
         {
           "//": "Android will not accept the file without this content type. Firebase infers it from the extension here, but the file has no extension in the URL path people test with, so it is stated rather than assumed.",
           "source": "/.well-known/assetlinks.json",
-          "headers": [{ "key": "Content-Type", "value": "application/json" }]
+          "headers": [
+            {
+              "key": "Content-Type",
+              "value": "application/json"
+            }
+          ]
         }
       ]
     },
@@ -78,10 +87,70 @@
         "**/.*",
         "**/node_modules/**"
       ],
+      "headers": [
+        {
+          "//": "Audit C-7 / I-13: security headers on every response of the CRM site. `frame-ancestors 'none'` (and X-Frame-Options for older browsers) stops the CRM being framed; nosniff, Referrer-Policy and HSTS are the usual hardening. The CSP is CONSERVATIVE and every origin in it is derived from the code — see the //csp-origins note below. The /api/** rewrite is same-origin, so 'self' covers the Cloud Run API.",
+          "//csp-origins": [
+            "'self' — the static export, the /api/** Cloud Run rewrite (same origin), and locally-bundled Firebase SDK.",
+            "script-src 'unsafe-inline' — Next.js static export inlines its hydration/RSC payload scripts; a static host cannot mint nonces. 'wasm-unsafe-eval' — Agora RTC SDK processing modules on /live.",
+            "https://apis.google.com, https://www.gstatic.com, https://www.google.com — Firebase Auth Google sign-in (signInWithPopup loads gapi) and invisible reCAPTCHA for phone linking (components/ContactVerificationPanel.tsx).",
+            "https://download.agora.io — the Agora RTC SDK script for the moderation live player (components/LiveWatch.tsx AGORA_SDK_URL).",
+            "https://cdnjs.cloudflare.com — lottie-web (bodymovin) for gift/entrance previews (components/LottieThumb.tsx, AnimationThumb.tsx, public/lottie-test.html).",
+            "https://cdn.jsdelivr.net, https://unpkg.com — svgaplayerkit for SVGA previews (components/AnimationThumb.tsx, with unpkg as the fallback).",
+            "connect-src https://*.googleapis.com — Firebase Auth (identitytoolkit, securetoken), Firestore (firestore.googleapis.com), Storage (firebasestorage.googleapis.com), signed Storage URLs (storage.googleapis.com) and the Google people API behind Google sign-in.",
+            "connect-src https://*.firebaseio.com / wss://*.firebaseio.com — Firebase SDK realtime channel (kept for the SDK's own fallbacks; nothing in the CRM reads RTDB directly).",
+            "connect-src https://*.cloudfunctions.net — httpsCallable(getFunctions(app, 'asia-south1')) for generateAgoraToken and the email-code callables (components/LiveWatch.tsx, ContactVerificationPanel.tsx).",
+            "connect-src/frame-src https://zipper-83816.firebaseapp.com — the Firebase Auth domain (NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN): the sign-in popup handler and its hidden iframe. If the auth domain is ever changed, change it here too.",
+            "connect-src https://open.er-api.com — exchange rates for the local-prices preview (components/LocalPricesModal.tsx).",
+            "connect-src https://*.agora.io, wss://*.agora.io, https://*.sd-rtn.com, wss://*.sd-rtn.com — Agora RTC signalling and gateway for the live player.",
+            "connect-src https://cdnjs.cloudflare.com, https://cdn.jsdelivr.net, https://unpkg.com — the same CDNs, for source maps and fetch()-based loaders in the players.",
+            "img-src/media-src https://firebasestorage.googleapis.com, https://storage.googleapis.com — uploaded documents, proofs, gift artwork and entrance videos; img-src https://*.googleusercontent.com — Google account photos on profiles.",
+            "frame-src https://www.google.com, https://recaptcha.google.com, https://accounts.google.com — reCAPTCHA and Google sign-in frames.",
+            "NOT allowed on purpose: any other third-party origin, inline event handlers beyond what Next emits, eval. A new external origin must be added here with the file that needs it."
+          ],
+          "source": "**",
+          "headers": [
+            {
+              "key": "Content-Security-Policy",
+              "value": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self' blob:; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com https://www.gstatic.com https://www.google.com https://download.agora.io https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://firebasestorage.googleapis.com https://storage.googleapis.com https://*.googleusercontent.com; media-src 'self' blob: https://firebasestorage.googleapis.com https://storage.googleapis.com; font-src 'self' data:; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://*.cloudfunctions.net https://zipper-83816.firebaseapp.com https://open.er-api.com https://*.agora.io wss://*.agora.io https://*.sd-rtn.com wss://*.sd-rtn.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com; frame-src https://zipper-83816.firebaseapp.com https://www.google.com https://recaptcha.google.com https://accounts.google.com; upgrade-insecure-requests"
+            },
+            {
+              "key": "X-Frame-Options",
+              "value": "DENY"
+            },
+            {
+              "key": "X-Content-Type-Options",
+              "value": "nosniff"
+            },
+            {
+              "key": "Referrer-Policy",
+              "value": "strict-origin-when-cross-origin"
+            },
+            {
+              "key": "Strict-Transport-Security",
+              "value": "max-age=31536000; includeSubDomains"
+            },
+            {
+              "key": "Permissions-Policy",
+              "value": "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+            }
+          ]
+        },
+        {
+          "//": "Hashed Next.js assets are immutable; HTML is not (it names the hashes).",
+          "source": "/_next/static/**",
+          "headers": [
+            {
+              "key": "Cache-Control",
+              "value": "public, max-age=31536000, immutable"
+            }
+          ]
+        }
+      ],
       "rewrites": [
         {
           "//": "Python API on Cloud Run, served from the same origin so there is no CORS.",
-          "//2": "Must come first \u2014 anything under /api/ goes to the backend, not the SPA.",
+          "//2": "Must come first — anything under /api/ goes to the backend, not the SPA.",
           "source": "/api/**",
           "run": {
             "serviceId": "zipper-api",
@@ -89,7 +158,7 @@
           }
         },
         {
-          "/": "next.config.js sets trailingSlash: true, so the real path is /agencies/<id>/salary/ \u2014 a pattern ending at 'salary' never matched and fell through to /agencies/**, serving the agency detail page under the salary URL.",
+          "/": "next.config.js sets trailingSlash: true, so the real path is /agencies/<id>/salary/ — a pattern ending at 'salary' never matched and fell through to /agencies/**, serving the agency detail page under the salary URL.",
           "source": "/agencies/*/salary{,/**}",
           "destination": "/agencies/_/salary/index.html"
         },

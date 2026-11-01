@@ -24,6 +24,7 @@ import {
   type CommissionBand,
 } from '@/lib/apiPartners'
 import { CurrencyNote, FromTheServer, Section, Th } from './MoneyUI'
+import { effectiveRatePercent } from '@/lib/commission'
 import type { Period } from './MoneyUI'
 import type { RosterHost } from './HostEarnings'
 import { ID_LABEL } from '@/lib/identity'
@@ -242,16 +243,25 @@ export function CommissionDerivation({
         </Step>
 
         {/* ── Step 3: the band, and the arithmetic ────────────────────────── */}
-        <Step n={3} title="The band your billing selects, and the rate it pays">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Step n={3} title="The band your billing reaches, and what it actually earned">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
             <Figure
               label="Band"
               value={breakdown.band ? `Band ${breakdown.band.index + 1}` : 'No band — below the floor'}
             />
             <Figure
-              label="Rate"
+              label="Rate (top band)"
               value={`${breakdown.rate_percent}%`}
               tone={breakdown.matched ? 'text-white' : 'text-slate-500'}
+            />
+            {/* Audit C-10 / M-25: the rule is progressive, so the band rate
+                applies to the LAST slice only. This is the rate over the whole
+                figure — what the agency is actually paid — and it is always at
+                or below the band rate. */}
+            <Figure
+              label="Effective rate"
+              value={effectiveRatePercent(breakdown) ? `${effectiveRatePercent(breakdown)}%` : '—'}
+              tone={breakdown.matched ? 'text-green-300' : 'text-slate-500'}
             />
             <Figure
               label="Commission for the period"
@@ -259,6 +269,10 @@ export function CommissionDerivation({
               tone={breakdown.commission_minor > 0 ? 'text-green-300' : 'text-slate-500'}
             />
           </div>
+          <p className="text-slate-500 text-xs mt-2">
+            Each slice of billing is charged at its own band&rsquo;s rate (progressive, like income tax);
+            no single rate applies to the whole amount. The effective rate is commission ÷ billing.
+          </p>
           {breakdown.band && (
             <p className="text-slate-400 text-xs mt-2 font-mono">
               {breakdown.band.label}

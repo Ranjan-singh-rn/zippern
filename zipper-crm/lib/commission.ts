@@ -29,8 +29,8 @@
  *   * `describeBreakdown` — formats a breakdown the API returned. It explains a
  *     server figure; it does not produce one.
  *   * `previewCommission` — a labelled **estimate**, for the Economy screen's
- *     interactive slab illustration. It applies the same flat-rate-by-band rule
- *     in integer paise, but it is a teaching aid: it knows nothing about any
+ *     interactive slab illustration. It applies the same progressive-by-band
+ *     rule in integer paise, but it is a teaching aid: it knows nothing about any
  *     real agency's billing, and any screen showing it must say on screen that
  *     the API is authoritative. `PREVIEW_DISCLAIMER` is that sentence.
  */
@@ -107,10 +107,35 @@ export interface CommissionBreakdown {
   bands_considered?: CommissionBand[]
 }
 
-/** One row per fact, in the order an agency would ask for them. */
+/**
+ * The effective rate as text: `commission ÷ billing × 100`, two decimals.
+ *
+ * Audit C-10 / M-25: the server sends `effective_rate_percent`
+ * (`commission.py` — "always below the top band's rate", because the rule is
+ * progressive); an older server that does not is computed here from the two
+ * paise figures, so the figure is never missing. '' only when there is no
+ * billing to divide by.
+ */
+export function effectiveRatePercent(b: Pick<CommissionBreakdown, 'billing_minor' | 'commission_minor'> & { effective_rate_percent?: string }): string {
+  const sent = (b.effective_rate_percent ?? '').trim()
+  if (sent) return sent
+  if (!b.billing_minor || b.billing_minor <= 0) return ''
+  return ((b.commission_minor / b.billing_minor) * 100).toFixed(2)
+}
+
+/**
+ * One row per fact, in the order an agency would ask for them.
+ *
+ * "Rate" is the TOP band's rate — the one the last slice of billing was charged
+ * at. The rule is progressive (each slice at its own band's rate), so what the
+ * agency actually earned over the whole figure is the **effective rate**, which
+ * is always at or below it. Both are shown (audit C-10 / M-25): a partner who
+ * reads only the band rate reads a number higher than what they are paid.
+ */
 export function describeBreakdown(
   b: CommissionBreakdown,
 ): { label: string; value: string }[] {
+  const effective = effectiveRatePercent(b)
   return [
     { label: 'Billing for the period', value: fmtInrMinor(b.billing_minor) },
     {
@@ -119,7 +144,8 @@ export function describeBreakdown(
         ? b.band.label
         : `none — below the ${fmtInrMinor(b.floor_minor)} floor`,
     },
-    { label: 'Rate', value: `${b.rate_percent}%` },
+    { label: 'Rate (top band reached)', value: `${b.rate_percent}%` },
+    { label: 'Effective rate', value: effective ? `${effective}% of billing — progressive, each slice at its own band` : '—' },
     { label: 'Commission', value: fmtInrMinor(b.commission_minor) },
   ]
 }
@@ -138,7 +164,9 @@ export interface CommissionPreview {
 }
 
 /**
- * The flat-rate-by-band rule, for illustration only. Integer paise throughout.
+ * The progressive-by-band rule, for illustration only. Integer paise throughout.
+ * (It was "flat-rate-by-band" in name only — the arithmetic below has been
+ * progressive since the backend's was; the name was audit M-25's contradiction.)
  *
  * Bands are matched the way the backend matches them: sorted by `from`, each
  * band running up to the next band's `from` (so the paise between ₹75,000.00

@@ -16,7 +16,7 @@ import {
   getDiamondEconomy, getWeeklyBeansBreakdown, getCompanyRevenueSummary,
   type DiamondEconomy, type WeeklyBeansBreakdown, type CompanyRevenueSummary,
 } from '@/lib/finance'
-import { type Agency } from '@/lib/agencies'
+import { agencyCommissionInr, type Agency } from '@/lib/agencies'
 import { type Seller, getSellerRechargeRequests } from '@/lib/sellers'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, partnerRolesOf, type CrmRole } from '@/lib/auth'
@@ -238,7 +238,9 @@ function AgencyView({ uid, name }: { uid: string; name: string }) {
           { label: 'Sub-Agencies', value: agency.totalSubAgencies ?? 0, icon: <Building2 size={18} className="text-blue-300" />, bg: 'bg-blue-500/20' },
           {
             label: 'Commission Balance',
-            value: agency.currency === 'USD' ? `$${(agency.commissionBalance ?? 0).toFixed(2)}` : `₹${(agency.commissionBalance ?? 0).toLocaleString('en-IN')}`,
+            // M-15: `commissionBalance` is PAISE; `agencyCommissionInr` prefers the
+            // rupee mirror the API writes beside it and divides by 100 otherwise.
+            value: agency.currency === 'USD' ? `$${agencyCommissionInr(agency).toFixed(2)}` : `₹${agencyCommissionInr(agency).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`,
             icon: <DollarSign size={18} className="text-green-300" />,
             bg: 'bg-green-500/20',
           },
@@ -493,7 +495,7 @@ export default function DashboardPage() {
     const tickets = stats.openTickets
     if (kyc.ok && kyc.value > 0)        alerts.push({ text: `${kyc.value} KYC submission${kyc.value > 1 ? 's' : ''} awaiting review`, href: '/kyc' })
     if (agencies.ok && agencies.value > 0) alerts.push({ text: `${agencies.value} agency registration${agencies.value > 1 ? 's' : ''} pending approval`, href: '/agencies' })
-    if (tickets.ok && tickets.value > 3)   alerts.push({ text: `${tickets.value} open support tickets`, href: '/tickets' })
+    if (tickets.ok && tickets.value > 3)   alerts.push({ text: `${tickets.value} open support tickets`, href: '/feedback' })
   }
 
   // Typed `CrmRole[]` per entry rather than cast at the call site. The old
@@ -513,7 +515,7 @@ export default function DashboardPage() {
     { href: '/live',               label: 'Live Monitor',       icon: Radio,       desc: 'Active live rooms and viewer counts',          roles: ['superadmin','app_admin','app_member','ops_admin','ops_member','tech_admin','tech_member','support_admin'] },
     { href: '/analytics',          label: 'Analytics',          icon: BarChart3,   desc: 'Growth, retention, and revenue trends',        roles: ['superadmin','finance_admin','finance_member','ops_admin','ops_member'] },
     { href: '/broadcasts',         label: 'Broadcasts',         icon: Megaphone,   desc: 'Send announcements to all app users',          roles: ['superadmin','app_admin','app_member','ops_admin','ops_member'] },
-    { href: '/tickets',            label: 'Support Tickets',    icon: MessageSquare,desc: 'View and respond to user support requests',   roles: ['superadmin','support_admin','support_member','tech_admin','tech_member'] },
+    { href: '/feedback',           label: 'Feedback & Support', icon: MessageSquare,desc: 'View and respond to user support requests',   roles: ['superadmin','support_admin','support_member','tech_admin','tech_member'] },
     { href: '/operations/bans',    label: 'Device Bans',        icon: ShieldOff,   desc: 'Manage device-level bans',                    roles: ['superadmin','app_admin','app_member','ops_admin','ops_member'] },
     { href: '/tech',               label: 'Tech',               icon: Bug,         desc: 'System health and tech issues',               roles: ['superadmin','tech_admin','tech_member'] },
     { href: '/team',               label: 'Team',               icon: UserCog,     desc: 'Manage CRM users, roles, and permissions',    roles: ['superadmin'] },
@@ -644,7 +646,7 @@ export default function DashboardPage() {
               : 'pending agencies could not be read'}
             icon={<MessageSquare size={18} className={stats.openTickets.ok && stats.openTickets.value > 3 ? 'text-red-300' : 'text-purple-300'} />}
             bg={stats.openTickets.ok && stats.openTickets.value > 3 ? 'bg-red-500/20' : 'bg-purple-500/20'}
-            href="/tickets"
+            href="/feedback"
             urgent={stats.openTickets.ok && stats.openTickets.value > 3}
             failure={stats.openTickets.ok ? null : stats.openTickets}
           />

@@ -49,6 +49,10 @@ export interface HostPayout {
   weekStart: string
   weekEnd: string
   status: 'pending' | 'paid'
+  /** From the generator's subcollection rows (M-13). */
+  eligible?: boolean
+  /** Which collection the row was read from — see `getHostPayouts`. */
+  source?: 'report_subcollection' | 'top_level'
 }
 
 export interface RevenueRecord {
@@ -75,7 +79,27 @@ export async function getWeeklyPayoutReports(status?: string): Promise<WeeklyPay
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as WeeklyPayoutReport))
 }
 
+/**
+ * The per-host rows of one weekly report.
+ *
+ * ── Audit M-13: the rows live UNDER the report ──────────────────────────────
+ *
+ * `generateWeeklyPayoutReports` (functions/src/index.ts, `reportRef.collection(
+ * 'hostPayouts')`) writes one document per host at
+ * `weeklyPayoutReports/{reportId}/hostPayouts/{agencyId_hostUid}`, with the
+ * fields `weekBeans` and `hostPayoutInr`. This used to query the TOP-LEVEL
+ * `hostPayouts` collection by `reportId` — which the generator never writes —
+ * so Finance approved every report with "no per-host rows". The subcollection
+ * is read first and its field names mapped onto `HostPayout`; the top-level
+ * query is kept as the fallback for reports written by an older generator (and
+ * for a rules set that does not yet allow the subcollection read — the result
+ * is then the fallback's, never a crash).
+ *
+ * `source` says which was read, so the screen can say so.
+ */
 export async function getHostPayouts(reportId: string): Promise<HostPayout[]> {
+  const fromSubcollection = await readReportHostPayouts(reportId)
+  if (fromSubcollection !== null && fromSubcollection.length > 0) return fromSubcollection
   // One report ≈ one agency's hosts for one week; the cap is a safety net only.
   const q = query(
     collection(db, 'hostPayouts'),
@@ -83,7 +107,47 @@ export async function getHostPayouts(reportId: string): Promise<HostPayout[]> {
     limit(HOST_PAYOUT_LIMIT)
   )
   const snap = await getDocs(q)
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() } as HostPayout))
+  const legacy = snap.docs.map((d) => ({ id: d.id, ...d.data(), source: 'top_level' } as HostPayout))
+  if (legacy.length > 0 || fromSubcollection === null) return legacy
+  return fromSubcollection
+}
+
+/**
+ * `weeklyPayoutReports/{reportId}/hostPayouts`, mapped onto `HostPayout`.
+ * `null` when the read was refused (rules) or failed — distinct from an empty
+ * subcollection, so the caller can fall back without hiding the refusal.
+ */
+async function readReportHostPayouts(reportId: string): Promise<HostPayout[] | null> {
+  try {
+    const snap = await getDocs(query(
+      collection(db, 'weeklyPayoutReports', reportId, 'hostPayouts'),
+      limit(HOST_PAYOUT_LIMIT),
+    ))
+    return snap.docs.map((d) => {
+      const r = d.data() as Record<string, unknown>
+      const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+      const str = (v: unknown) => (typeof v === 'string' ? v : '')
+      return {
+        id: d.id,
+        reportId,
+        agencyId: str(r.agencyId),
+        hostUid: str(r.hostUid),
+        hostName: str(r.hostName) || str(r.hostUid) || d.id,
+        // The generator's names; the legacy top-level names are accepted too.
+        beansEarned: num(r.weekBeans ?? r.beansEarned),
+        payoutAmount: num(r.hostPayoutInr ?? r.payoutAmount),
+        transactionScreenshotUrl: str(r.transactionScreenshotUrl) || undefined,
+        agencyOwnerUid: str(r.agencyOwnerUid),
+        weekStart: str(r.weekStart) || str(r.weekLabel),
+        weekEnd: str(r.weekEnd),
+        status: r.status === 'paid' ? 'paid' : 'pending',
+        eligible: typeof r.eligible === 'boolean' ? r.eligible : undefined,
+        source: 'report_subcollection',
+      } as HostPayout
+    })
+  } catch {
+    return null
+  }
 }
 
 export async function approvePayoutReport(reportId: string, approvedByUid: string): Promise<void> {

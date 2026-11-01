@@ -261,12 +261,27 @@ function RowDerivation({ derivation }: { derivation: Record<string, unknown> }) 
           value={inrExact(number(derivation, 'agency_billing_minor'))}
         />
         <Cell
-          label="Band rate"
+          label="Band rate (top band)"
           value={
             text(derivation, 'rate_percent')
               ? `${text(derivation, 'rate_percent')}%`
               : '—'
           }
+        />
+        {/* Audit C-10 / M-25: the rule is progressive, so the band rate applies
+            to the last slice only. The effective rate — commission ÷ billing —
+            is what was actually earned over the whole figure; it is read from
+            the derivation when recorded and computed from its two paise
+            figures otherwise. */}
+        <Cell
+          label="Effective rate"
+          value={(() => {
+            const sent = text(derivation, 'effective_rate_percent')
+            if (sent) return `${sent}%`
+            const billing = number(derivation, 'agency_billing_minor')
+            const commission = number(derivation, 'agency_commission_minor')
+            return billing > 0 ? `${((commission / billing) * 100).toFixed(2)}%` : '—'
+          })()}
         />
         <Cell
           label="Floor"

@@ -52,6 +52,7 @@ import { ApiError } from '@/lib/api'
 import { nameOrReference, type IdentityFacts } from '@/lib/identity'
 import { useIdentities } from '@/lib/useIdentities'
 import { failureCode, ok, toFailure, type ReadFailure, type ReadResult } from '@/lib/readState'
+import { storageLink } from '@/lib/safeLink'
 import {
   statements, coins as coinText, inrExact, whenExact,
   type SellerHistory, type SellerHistoryRow,
@@ -397,16 +398,22 @@ function Row({ row, audience, buyer }: { row: SellerHistoryRow; audience: Audien
             {row.reference}
           </p>
         )}
-        {row.proof_url && (
-          <a
-            href={row.proof_url}
-            target="_blank"
-            rel="noreferrer"
-            className="text-pink-400 hover:text-pink-300 text-xs inline-flex items-center gap-1 mt-0.5"
-          >
-            Proof <ExternalLink size={10} />
-          </a>
-        )}
+        {/* Audit C-13: a link only on a Storage https URL; anything else is text. */}
+        {(() => {
+          const p = storageLink(row.proof_url)
+          if (p.kind === 'link') return (
+            <a
+              href={p.href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-pink-400 hover:text-pink-300 text-xs inline-flex items-center gap-1 mt-0.5"
+            >
+              Proof <ExternalLink size={10} />
+            </a>
+          )
+          if (p.kind === 'text') return <p className="text-slate-500 text-xs break-all mt-0.5" title="Not a Storage link — shown as text">{p.text}</p>
+          return null
+        })()}
       </td>
 
       <td className="px-3 sm:px-5 py-3 text-xs text-slate-500 hidden sm:table-cell whitespace-nowrap">

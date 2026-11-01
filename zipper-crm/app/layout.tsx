@@ -124,13 +124,9 @@ const topLevelLinks: NavLink[] = [
   { href: '/reports',       label: 'Reports',      icon: FileSpreadsheet, roles: OVERSIGHT_ROLES },
   { href: '/reports/weekly', label: 'Weekly Report', icon: ScrollText,    roles: OVERSIGHT_ROLES },
   { href: '/alerts',        label: 'Alerts',       icon: Siren,           roles: OVERSIGHT_ROLES },
-  // `tech_member` is NOT here, though the page's own PAGE_ROLES still lists
-  // them. This screen reads Firestore `supportTickets`, whose read rule is
-  // `isOps() || isAdmin() || isSupport()` (firestore.rules:926). A tech_member
-  // is none of those — `isTech()` is not on that clause — so the query comes
-  // back permission-denied and the page renders as an unexplained empty list.
-  // tech_admin stays because `isAdmin()` matches `.*_admin` (firestore.rules:77).
-  { href: '/tickets',       label: 'App Tickets',  icon: MessageSquare, roles: ['superadmin', 'support_admin', 'support_member', 'tech_admin'] },
+  // '/tickets' (App Tickets) is retired — audit C-5: it read `supportTickets`,
+  // which nothing in the app writes, so the queue was always empty. The route
+  // redirects to /feedback (the `feedbackTickets` the app actually files).
   { href: '/tech/tickets',  label: 'Team Tickets',  icon: KanbanSquare, roles: STAFF_ROLES },
   { href: '/throughput',    label: 'Team Throughput', icon: Activity,   roles: STAFF_ROLES },
 ]
@@ -311,6 +307,8 @@ const navGroups: NavGroup[] = [
       { href: '/app-config/profile-options', label: 'Profile Options', icon: UserCog,    roles: ['superadmin'] },
       { href: '/app-config/levels',          label: 'Levels',         icon: BarChart3,   roles: ['superadmin'] },
       { href: '/app-config/payment-creds',   label: 'Payment Creds',  icon: CreditCard,  roles: ['superadmin'] },
+      // Owner and Tech: what firestore.rules allows on appConfig/* (not paymentCredentials).
+      { href: '/app-config/lucky-gifts',     label: 'Lucky Gifts',    icon: Sparkles,    roles: ['superadmin', 'tech_admin', 'tech_member'] },
     ],
   },
   {

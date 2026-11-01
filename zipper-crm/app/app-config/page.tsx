@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { AppWindow, Package, ShoppingCart, Gift, User, BarChart3, ChevronRight } from 'lucide-react'
+import { AppWindow, Package, ShoppingCart, Gift, User, BarChart3, ChevronRight, Sparkles } from 'lucide-react'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
 
@@ -40,6 +40,13 @@ const sections = [
     title: 'Level Config',
     description: 'XP and bean thresholds for user levels (0–20) and host levels (0–10), including unlocked frames, entrances, and bonus rewards.',
     tag: 'levelConfig/user · levelConfig/host',
+  },
+  {
+    href: '/app-config/lucky-gifts',
+    icon: <Sparkles size={22} className="text-pink-400" />,
+    title: 'Lucky Gifts',
+    description: 'Combos, the receiver share and the odds table the server rolls over — saved only after the same payout guard the server runs.',
+    tag: 'appConfig/luckyGifts',
   },
   {
     href: '/app-config/payment-creds',

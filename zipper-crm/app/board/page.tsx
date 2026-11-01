@@ -85,6 +85,10 @@ export default function MoneyBoard() {
   const [error, setError] = useState('')
   const [selected, setSelected] = useState<Card | null>(null)
   const [checked, setChecked] = useState<Set<string>>(new Set())
+  // Audit C-9: bulk signing is confirmed with the count and the totals per
+  // currency — never one click.
+  const [confirmBulk, setConfirmBulk] = useState(false)
+  const [bulkBusy, setBulkBusy] = useState(false)
 
   const isOwner = me?.role === 'owner'
   const isObserver = me?.role === 'observer'
@@ -132,11 +136,20 @@ export default function MoneyBoard() {
     (c) => c.stage === 'approved' && BALANCE_CARD_TYPES.has(c.type),
   )
 
+  /** The cards about to be signed, and their totals by currency (C-9). */
+  const bulkCards = cards.filter((c) => checked.has(c.id))
+  const bulkTotals = bulkCards.reduce<Record<string, number>>((acc, c) => {
+    acc[c.currency] = (acc[c.currency] ?? 0) + (Number(c.amount) || 0)
+    return acc
+  }, {})
+
   async function bulkSign() {
     if (checked.size === 0) return
+    setBulkBusy(true)
     try {
       const res = await api.cards.signBulk(Array.from(checked))
       setChecked(new Set())
+      setConfirmBulk(false)
       await load()
       if (res.failed.length) {
         setError(
@@ -146,6 +159,8 @@ export default function MoneyBoard() {
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Bulk signing failed.')
+    } finally {
+      setBulkBusy(false)
     }
   }
 
@@ -179,10 +194,10 @@ export default function MoneyBoard() {
         <div className="flex items-center gap-2">
           {isOwner && checked.size > 0 && (
             <button
-              onClick={bulkSign}
+              onClick={() => setConfirmBulk(true)}
               className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white font-semibold rounded-lg px-4 py-2 text-sm transition-colors"
             >
-              <PenLine size={15} /> Sign {checked.size} card{checked.size > 1 ? 's' : ''}
+              <PenLine size={15} /> Sign {checked.size} card{checked.size > 1 ? 's' : ''}…
             </button>
           )}
           <button
@@ -193,6 +208,57 @@ export default function MoneyBoard() {
           </button>
         </div>
       </div>
+
+      {/* Audit C-9: the bulk signature names what it signs — count, each card,
+          and the total per currency — before anything is signed. */}
+      {confirmBulk && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => !bulkBusy && setConfirmBulk(false)} />
+          <div className="relative w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl max-h-[85vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-slate-800">
+              <h2 className="text-white font-semibold">Sign {bulkCards.length} card{bulkCards.length === 1 ? '' : 's'}?</h2>
+              <p className="text-slate-400 text-xs mt-1">
+                Your signature approves every card below. Each one then moves on its own execution — nothing moves from this dialog.
+              </p>
+            </div>
+            <div className="px-6 py-3 border-b border-slate-800 flex flex-wrap gap-2">
+              {Object.entries(bulkTotals).map(([currency, total]) => (
+                <span key={currency} className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white font-semibold">
+                  {money(total, currency)} <span className="text-slate-500 font-normal text-xs">{currency} total</span>
+                </span>
+              ))}
+            </div>
+            <div className="overflow-y-auto px-6 py-3 divide-y divide-slate-800/60">
+              {bulkCards.map((c) => (
+                <div key={c.id} className="py-2 flex items-start justify-between gap-3 text-sm">
+                  <div className="min-w-0">
+                    <p className="text-slate-200 truncate">{c.title}</p>
+                    <p className="text-slate-500 text-xs">{c.type.replace(/_/g, ' ')} · {c.team} · raised by {c.requested_by.name}</p>
+                  </div>
+                  <span className="text-white font-medium whitespace-nowrap">{money(c.amount, c.currency)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="px-6 py-4 border-t border-slate-800 flex gap-3">
+              <button
+                onClick={() => setConfirmBulk(false)}
+                disabled={bulkBusy}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg px-4 py-2.5 text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={bulkSign}
+                disabled={bulkBusy || bulkCards.length === 0}
+                className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-semibold rounded-lg px-4 py-2.5 text-sm flex items-center justify-center gap-2"
+              >
+                {bulkBusy ? <Loader2 size={14} className="animate-spin" /> : <PenLine size={14} />}
+                Sign {bulkCards.length} card{bulkCards.length === 1 ? '' : 's'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isObserver && (
         <div className="mb-5 flex items-center gap-2 bg-slate-800/60 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-300">

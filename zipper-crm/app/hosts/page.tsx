@@ -644,20 +644,11 @@ export default function HostsPage() {
     }
   }
 
-  async function handleUnban(uid: string) {
-    setActing(uid, true)
-    try {
-      // Same reason as the ban above. The API records who lifted it and why,
-      // and releases only the device bans this account's ban created.
-      await api.users.unban(uid, 'Unbanned from the hosts list.')
-      updateHost(uid, { isBanned: false })
-      flash({ type: 'success', text: 'Host unbanned.' })
-    } catch {
-      flash({ type: 'error', text: 'Failed to unban host.' })
-    } finally {
-      setActing(uid, false)
-    }
-  }
+  // `handleUnban` is gone (spec §10). A one-click Unban with a canned reason
+  // was an ordinary action on a banned account; a ban is lifted only through
+  // an authorised appeal (decided on /operations/appeals) or an Owner's
+  // decision, both of which live on the person's page with the account's
+  // real state (`isBanned` here is true for a suspension as well as a ban).
 
   /*
    * Phase 1A (SECURITY-004 / ROLE-001): host status is changed through the API
@@ -1069,14 +1060,13 @@ export default function HostsPage() {
                               <div className="flex items-center gap-1.5">
                                 {/* Ban / Unban */}
                                 {host.isBanned ? (
-                                  <button
-                                    onClick={() => handleUnban(host.uid)}
-                                    disabled={acting}
-                                    title="Unban"
-                                    className="p-1.5 rounded bg-green-500/10 border border-green-500/20 text-green-400 hover:bg-green-500/20 disabled:opacity-40 transition"
+                                  <Link
+                                    href={`/users/${host.uid}`}
+                                    title="Restricted. A ban is lifted only through an authorised appeal or an Owner's decision — on the person's page."
+                                    className="p-1.5 rounded bg-slate-700/40 border border-slate-600 text-slate-300 hover:bg-slate-700/70 transition"
                                   >
-                                    {acting ? <Loader2 size={13} className="animate-spin" /> : <Shield size={13} />}
-                                  </button>
+                                    <Shield size={13} />
+                                  </Link>
                                 ) : (
                                   <button
                                     onClick={() => { setBanInputUid(host.uid); setBanReason('') }}

@@ -622,7 +622,7 @@ export interface AgencyStatement {
   /** Null when the derivation could not be run — read the error, never zero. */
   commission_basis: CommissionBasis | null
   commission_basis_error: string | null
-  /** commission.RULE — the flat-rate-by-band rule, in plain English. */
+  /** commission.RULE — the progressive-by-band rule, in plain English. */
   commission_rule: string
 }
 
@@ -754,28 +754,13 @@ export const partnerOps = {
     get<import('@/lib/contactVerification').VerificationOverview>(
       `/partner-ops/applications/verification/${encodeURIComponent(uid)}`),
 
-  /**
-   * Give an existing partner their second capability — an agency that should
-   * also sell coins, or the reverse.
-   *
-   * **Not the same as creating one on `/agencies/register`.** That refuses an
-   * address that already holds a record, and otherwise builds a separate
-   * business with a separate login — so the partner's own login gains nothing
-   * and they keep being told they are under review. This attaches the new
-   * capability to the login they already have.
-   *
-   * Grants nothing. The record comes back `pending` and is approved through the
-   * ordinary queue, which is where somebody checks the documents and the bank
-   * account it will be paid into.
-   */
-  grantCapability: (
-    id: string,
-    body: { kind: 'agency' | 'seller'; name: string; phone: string; reason: string },
-  ) =>
-    post<Partner & { note?: string; warnings?: string[] }>(
-      `/partner-ops/partners/${encodeURIComponent(id)}/grant-capability`,
-      body,
-    ),
+  // `grantCapability` (`POST /partner-ops/partners/{id}/grant-capability`) is
+  // gone from the client (spec §4): staff filing a second-role record for a
+  // partner who never asked for one was a role-grant control, even though the
+  // record arrived pending. A second role begins with the PARTNER applying
+  // from their own dashboard (`components/SecondRoleCard`; staff bring that
+  // application into the queue with `requestSecondRole` below) and is then
+  // reviewed on /kyc. The server route still exists.
 
   /**
    * Issue an approved seller's permanent virtual account number. Spec 4.3.4.
@@ -1000,6 +985,27 @@ export const roleAppeals = {
       await get<unknown>(`/partner-ops/role-appeals${query({ status })}`),
       'appeals',
     ).map((a) => ({ ...a, id: idOf(a) })),
+
+  /**
+   * One person's reinstatement requests, newest first
+   * (`GET /partner-ops/role-appeals/of/{uid}`, a team admin or the apply
+   * service). Spec §10: a revoked role row shows "Review reinstatement" when
+   * one is open and "Request reinstatement" when none is.
+   */
+  of: async (uid: string): Promise<RoleAppeal[]> =>
+    listFrom<RoleAppeal>(
+      await get<unknown>(`/partner-ops/role-appeals/of/${encodeURIComponent(uid)}`),
+      'appeals',
+    ).map((a) => ({ ...a, id: idOf(a) })),
+
+  /**
+   * File a reinstatement request on the person's behalf
+   * (`POST /partner-ops/role-appeals` {uid, kind, statement ≥ 20}; a team
+   * admin may file for somebody). Idempotent on the server: an open request
+   * for the same role comes back unchanged with `existing: true`.
+   */
+  file: (body: { uid: string; kind: RoleKind; statement: string }) =>
+    post<{ appeal?: RoleAppeal; existing?: boolean; note?: string }>('/partner-ops/role-appeals', body),
 
   recommend: (id: string, outcome: RoleAppealOutcome, note: string) =>
     post<RoleAppealWrite>(

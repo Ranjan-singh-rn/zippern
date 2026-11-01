@@ -130,6 +130,10 @@ async function main(): Promise<void> {
     ok(`/${page}/register: the approval request is inside it`, writer.includes('await submitApproval('))
     ok(`/${page}/register: a RecordNotWritten is worded with recordNotWrittenMessage`,
       src.includes('recordNotWrittenMessage('))
+    // Audit C-17 / CRM-FLOW 2.1.3: staff never type the partner's password.
+    ok(`/${page}/register has no password field`, !src.includes('type="password"'))
+    ok(`/${page}/register passes no password to the login`, !/password:\s*form\.password/.test(src))
+    ok(`/${page}/register tells staff whether the set-password email went out`, src.includes('resetEmailSent'))
   }
   {
     const auth = fs.readFileSync(path.join(__dirname, '..', 'lib', 'auth.ts'), 'utf8')
@@ -138,6 +142,15 @@ async function main(): Promise<void> {
     ok('createPartnerLoginThen deletes the secondary session\'s own new user on failure',
       body.includes('const user = secondaryAuth.currentUser') && body.includes('await deleteUser(user)')
       && body.includes('runLoginThenRecord('))
+    // C-17: a generated password, thrown away, and a set-password email after the record.
+    ok('createPartnerLoginThen generates the initial password itself', body.includes('generateInitialPassword()'))
+    ok('…and takes none from the caller', !/params\.password/.test(body))
+    ok('…and sends the set-password email AFTER the record is written',
+      body.indexOf('await writeRecord(uid)') > 0
+      && body.indexOf('sendPasswordResetEmail(secondaryAuth, emailLower)') > body.indexOf('await writeRecord(uid)'))
+    const gen = auth.slice(auth.indexOf('export function generateInitialPassword'), auth.indexOf('export async function createPartnerLoginThen'))
+    ok('the generated password comes from crypto.getRandomValues, not Math.random',
+      gen.includes('getRandomValues') && !gen.includes('Math.random'))
   }
 
   if (failures.length) {

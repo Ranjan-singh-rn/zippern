@@ -546,10 +546,22 @@ export async function crmSignIn(email: string, password: string): Promise<CrmUse
 // "Continue with Google" resolves straight to it — in the CRM and, because it
 // is the same Firebase account, in the Android app too.
 
-/** The observer. CRM-only, by one-time code, and never a Firebase account. */
-const OBSERVER_EMAIL = (
-  process.env.NEXT_PUBLIC_OBSERVER_EMAIL || '314zipper@gmail.com'
-).toLowerCase()
+/**
+ * The observer. CRM-only, by one-time code, and never a Firebase account.
+ *
+ * Audit C-18: there is NO literal fallback. `NEXT_PUBLIC_OBSERVER_EMAIL` is
+ * required at build time (deploy-crm.command checks the key is set and
+ * verify-out checks no mailbox literal reached the bundle); when it is unset
+ * `isObserverAddress` matches nothing, so the Google and password doors treat
+ * every address as an ordinary one rather than guessing the mailbox.
+ */
+const OBSERVER_EMAIL = (process.env.NEXT_PUBLIC_OBSERVER_EMAIL ?? '').trim().toLowerCase()
+
+/** Is this the observer's address? Never true when the variable is unset. */
+function isObserverAddress(email: string | null | undefined): boolean {
+  const e = (email ?? '').trim().toLowerCase()
+  return OBSERVER_EMAIL !== '' && e === OBSERVER_EMAIL
+}
 
 /**
  * The Google credential that `auth/account-exists-with-different-credential`
@@ -760,7 +772,7 @@ export async function crmSignInWithGoogle(): Promise<GoogleSignInOutcome> {
         (err as { customData?: { email?: string } })?.customData?.email ?? '',
       ).toLowerCase()
 
-      if (claimed === OBSERVER_EMAIL) {
+      if (isObserverAddress(claimed)) {
         pendingGoogleCredential = null
         return {
           kind: 'refused',
@@ -793,7 +805,7 @@ export async function crmSignInWithGoogle(): Promise<GoogleSignInOutcome> {
   const signedInEmail = (cred.user.email ?? '').toLowerCase()
 
   // ── The observer never signs in here, and never gains an account ─────────
-  if (signedInEmail === OBSERVER_EMAIL) {
+  if (isObserverAddress(signedInEmail)) {
     await discardGoogleAccount(cred.user, isNew)
     return {
       kind: 'refused',
@@ -840,7 +852,7 @@ export async function completeGoogleLink(
   }
 
   const emailLower = email.trim().toLowerCase()
-  if (emailLower === OBSERVER_EMAIL) {
+  if (isObserverAddress(emailLower)) {
     pendingGoogleCredential = null
     throw new Error('The observer account signs in with a one-time code, not Google.')
   }
@@ -961,7 +973,7 @@ export async function connectGoogleToCurrentAccount(): Promise<void> {
   const linked = (result.user.email ?? '').toLowerCase()
   const googleEmail = result.user.providerData
     .find((p) => p.providerId === 'google.com')?.email?.toLowerCase() ?? linked
-  if (googleEmail === OBSERVER_EMAIL) {
+  if (isObserverAddress(googleEmail)) {
     // `unlink` is the standalone modular function, not a method on `User` —
     // `result.user.unlink(...)` compiles under the compat SDK and throws
     // TypeError under this one. That mattered more than a type error: the
@@ -1104,11 +1116,8 @@ export async function sendCrmPasswordReset(email: string): Promise<void> {
 // that needs the raw Firestore collection, including agency and seller records,
 // which never appear in `staff`.
 
-/** Owners only since P1-E — the rules refuse anyone else a full list. Unused. */
-export async function listCrmUsers(): Promise<CrmUser[]> {
-  const snap = await getDocs(collection(db, 'crmUsers'))
-  return snap.docs.map((d) => d.data() as CrmUser)
-}
+// listCrmUsers — REMOVED (audit C-16): unused, and an unbounded read of every
+// colleague's record. The team pages read `GET /staff` instead.
 
 // ── Permission check ─────────────────────────────────────────────────────────
 
@@ -1181,19 +1190,52 @@ export async function createPartnerLogin(params: {
  * Throws the login's own error (address in use…) when no login was made, and
  * `RecordNotWritten` (with `loginRemoved`) when the record failed.
  */
+/**
+ * Audit C-17 / CRM-FLOW 2.1.3: the inviter never sets a partner's password.
+ *
+ * A random, unguessable initial password (192 bits from `crypto.getRandomValues`)
+ * is used to create the login and then THROWN AWAY — nobody, the registering
+ * staff member included, ever knows it. The partner sets their own through the
+ * password-reset email sent right after the record is written.
+ */
+export function generateInitialPassword(): string {
+  const bytes = new Uint8Array(24)
+  globalThis.crypto.getRandomValues(bytes)
+  let out = ''
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0')
+  // Firebase accepts any string ≥ 6 chars; 48 hex characters is well beyond
+  // what the password-strength policy (if enabled) asks for, and it is never
+  // typed by anyone.
+  return `Z!${out}`
+}
+
 export async function createPartnerLoginThen<T>(
-  params: { email: string; password: string; kind: 'agency' | 'seller' },
+  params: { email: string; kind: 'agency' | 'seller' },
   writeRecord: (uid: string) => Promise<T>,
-): Promise<{ uid: string; result: T }> {
+): Promise<{ uid: string; result: T; resetEmailSent: boolean }> {
   const emailLower = params.email.trim().toLowerCase()
   const secondaryApp = initializeApp(firebaseConfig, `${params.kind}_${Date.now()}`)
   const secondaryAuth = getAuth(secondaryApp)
-  return runLoginThenRecord({
+  let resetEmailSent = false
+  const out = await runLoginThenRecord({
     createLogin: async () => {
-      const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, params.password)
+      // C-17: generated here, used once, never shown and never stored.
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, generateInitialPassword())
       return cred.user.uid
     },
-    writeRecord,
+    writeRecord: async (uid) => {
+      const result = await writeRecord(uid)
+      // The record exists, so the login stays. Hand the partner the means to
+      // choose their own password. A failure here must NOT undo the
+      // registration: the login page's "Forgot password" sends the same email.
+      try {
+        await sendPasswordResetEmail(secondaryAuth, emailLower)
+        resetEmailSent = true
+      } catch {
+        resetEmailSent = false
+      }
+      return result
+    },
     deleteLogin: async (uid) => {
       const user = secondaryAuth.currentUser
       if (!user || user.uid !== uid) throw new Error('The new login is no longer signed in, so it cannot be removed.')
@@ -1208,6 +1250,7 @@ export async function createPartnerLoginThen<T>(
       }
     },
   })
+  return { ...out, resetEmailSent }
 }
 
 // ── The same login, created by Google instead of by a password ───────────────
@@ -1274,7 +1317,7 @@ export async function partnerSignUpWithGoogle(): Promise<PartnerGoogleSignUp> {
       const claimed = String(
         (err as { customData?: { email?: string } })?.customData?.email ?? '',
       ).toLowerCase()
-      if (claimed === OBSERVER_EMAIL) {
+      if (isObserverAddress(claimed)) {
         return {
           kind: 'refused',
           message: 'The observer account signs in with a one-time code, not Google.',
@@ -1300,7 +1343,7 @@ export async function partnerSignUpWithGoogle(): Promise<PartnerGoogleSignUp> {
 
   // ── The observer never gains a Firebase account, and this is the one door
   // that would cheerfully create one ──────────────────────────────────────
-  if (email === OBSERVER_EMAIL) {
+  if (isObserverAddress(email)) {
     await discardGoogleAccount(cred.user, isNew)
     return {
       kind: 'refused',

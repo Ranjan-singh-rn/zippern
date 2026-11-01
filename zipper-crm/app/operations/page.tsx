@@ -160,7 +160,7 @@ export default function OperationsDashboardPage() {
           { href: '/operations/appeals',  label: 'Appeals',          desc: 'Somebody says we got it wrong',   icon: Scale,         color: 'text-pink-400'   },
           { href: '/operations/bans',     label: 'Device Bans',      desc: 'Manage banned device IDs',        icon: ShieldOff,     color: 'text-red-400'    },
           { href: '/operations/feedback', label: 'App Feedback',     desc: 'Monitor in-app feedback tickets', icon: MessageSquare, color: 'text-blue-400'   },
-          { href: '/tickets',             label: 'Support Tickets',  desc: 'General CRM tickets',             icon: FileText,      color: 'text-green-400'  },
+          { href: '/feedback',            label: 'Feedback & Support', desc: 'Answer what app users filed',   icon: FileText,      color: 'text-green-400'  },
         ].map(({ href, label, desc, icon: Icon, color }) => (
           <Link
             key={href}

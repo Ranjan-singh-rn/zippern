@@ -8,6 +8,7 @@ import {
   query,
   where,
   orderBy,
+  limit,
   Timestamp,
 } from 'firebase/firestore'
 
@@ -62,24 +63,38 @@ export interface CoinPurchaseRequest {
 
 // ── Firestore Helpers ─────────────────────────────────────────────────────────
 
-export async function getCoinPurchaseRequests(status?: string): Promise<CoinPurchaseRequest[]> {
+/**
+ * Audit C-15: every list read here is bounded. A screen that shows one of
+ * these says "showing the first N" when `length === COIN_PURCHASE_LIST_LIMIT`.
+ */
+export const COIN_PURCHASE_LIST_LIMIT = 200
+
+export async function getCoinPurchaseRequests(
+  status?: string,
+  max: number = COIN_PURCHASE_LIST_LIMIT,
+): Promise<CoinPurchaseRequest[]> {
   const q = status
     ? query(
         collection(db, 'coinPurchaseRequests'),
         where('status', '==', status),
-        orderBy('createdAt', 'desc')
+        orderBy('createdAt', 'desc'),
+        limit(max),
       )
-    : query(collection(db, 'coinPurchaseRequests'), orderBy('createdAt', 'desc'))
+    : query(collection(db, 'coinPurchaseRequests'), orderBy('createdAt', 'desc'), limit(max))
   const snap = await getDocs(q)
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as CoinPurchaseRequest))
 }
 
-export async function getSellerCoinPurchases(sellerUid: string): Promise<CoinPurchaseRequest[]> {
+export async function getSellerCoinPurchases(
+  sellerUid: string,
+  max: number = COIN_PURCHASE_LIST_LIMIT,
+): Promise<CoinPurchaseRequest[]> {
   const snap = await getDocs(
     query(
       collection(db, 'coinPurchaseRequests'),
       where('sellerUid', '==', sellerUid),
-      orderBy('createdAt', 'desc')
+      orderBy('createdAt', 'desc'),
+      limit(max),
     )
   )
   return snap.docs.map((d) => ({ id: d.id, ...d.data() } as CoinPurchaseRequest))

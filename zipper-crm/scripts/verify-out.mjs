@@ -65,6 +65,12 @@ function ok(claim, cond, detail = '') {
 // create proceeded. Deleted from both public signup pages.
 const MUST_BE_GONE = [
   'We could not check whether an application already exists under this',
+  // Audit C-8: the actor of a money-adjacent write was the literal 'Admin'.
+  "processedBy: 'Admin'",
+  // Spec §10: the hosts list's one-click Unban with a canned reason.
+  'Unbanned from the hosts list.',
+  // Audit C-17: staff typed the partner's initial password.
+  'CRM Password *',
 ]
 
 // ── Strings that must have ARRIVED ──────────────────────────────────────────
@@ -81,6 +87,15 @@ const MUST_BE_PRESENT = [
    'This account already holds both an agency and a coin seller, so '],
   ['second capability refused when the family is held',
    'one of each, so nothing was created.'],
+  // Audit C-3: a backend without /auth/mfa/status must not lock every Owner out.
+  ['Owner MFA degrades to a notice when the server has no second step',
+   'Two-step sign-in is not available on this server yet.'],
+  // Spec §10: a ban is lifted through an appeal or the Owner, never as an ordinary action.
+  ['banned → Unban only via an authorised appeal or the Owner',
+   'A ban is lifted only through an authorised appeal'],
+  // Lucky gifts: the server's payout guard runs in the browser before the save.
+  ['lucky-gift payout guard is in the bundle',
+   'exceeds the ceiling'],
 ]
 
 function walk(dir) {
@@ -520,6 +535,47 @@ for (const [label, html] of Object.entries(ROUTES)) {
     offenders.map((f) => relative(OUT, f)).join(', '))
 }
 
+// ── 7. Routes that must exist in the export ─────────────────────────────────
+//
+// Audit C-3 / C-12: the 20 Oct release lost `app/frozen-money/page.tsx` from
+// every reconstruction, so a static export built from those trees shipped a
+// site whose Owner-only "Frozen money" link led to a 404 — a silent regression
+// of a money screen. The route is asserted here by its emitted HTML, so a tree
+// that has lost the page cannot be verified, let alone deployed.
+console.log('7. Routes that must exist')
+
+const REQUIRED_ROUTES = [
+  ['Owner frozen-money screen (C-12)', 'frozen-money/index.html'],
+  ['Lucky gifts configuration (Owner/Tech)', 'app-config/lucky-gifts/index.html'],
+  ['Observer sign-in (emailed code + authenticator step)', 'observer/index.html'],
+  ['Retired /tickets redirect (C-5)', 'tickets/index.html'],
+  ['Feedback & support (what /tickets redirects to)', 'feedback/index.html'],
+  ['Reinstatement requests (revoked roles come back here)', 'role-appeals/index.html'],
+]
+for (const [what, html] of REQUIRED_ROUTES) {
+  ok(`${what} — ${html} is in the export`, existsSync(join(OUT, html)),
+    `missing: out/${html} — the page is absent from the tree that was built`)
+}
+
+// ── 8. Source guards for this release ───────────────────────────────────────
+//
+// Audit C-18: the observer's mailbox was a literal default in the bundle. The
+// variable is required; no `|| '<address>'` fallback may come back. Checked on
+// the source (the bundle cannot tell a configured address from a default).
+console.log('8. Source guards')
+{
+  const authSrc = readFileSync(join(ROOT, 'lib', 'auth.ts'), 'utf8')
+  ok('NEXT_PUBLIC_OBSERVER_EMAIL has no literal fallback (C-18)',
+    !/NEXT_PUBLIC_OBSERVER_EMAIL\s*(\?\?|\|\|)\s*['"][^'"]*@/.test(authSrc),
+    'lib/auth.ts falls back to a hard-coded mailbox — remove it')
+  ok('no @gmail.com literal reaches the auth module', !/@gmail\.com/.test(authSrc))
+  // Spec §4: no direct role grant survives in the API clients.
+  const apiSrc = readFileSync(join(ROOT, 'lib', 'api.ts'), 'utf8')
+  const partnersSrc = readFileSync(join(ROOT, 'lib', 'apiPartners.ts'), 'utf8')
+  ok('lib/api.ts offers no grantHost', !/grantHost:\s*\(/.test(apiSrc))
+  ok('lib/apiPartners.ts offers no grantCapability', !/grantCapability:\s*\(/.test(partnersSrc))
+}
+
 // ── Result ──────────────────────────────────────────────────────────────────
 console.log('\n' + '='.repeat(78))
 if (failures.length > 0) {
@@ -541,5 +597,7 @@ console.log('  · the shipped function was executed: 42 internal cases return []
 console.log('  · self guard holds; agency and seller keep ordinary actions')
 console.log('  · the agreed action policy holds in the shipped function')
 console.log('  · twelve distinct colour avatars reachable; no src="avatar:" anywhere')
+console.log('  · /frozen-money, /app-config/lucky-gifts, /observer, /tickets, /feedback, /role-appeals are in the export')
+console.log('  · no observer mailbox literal, no grantHost / grantCapability in the API clients')
 console.log(`  · tree sha256 ${treeHash.slice(0, 32)}…`)
 console.log('='.repeat(78) + '\n')

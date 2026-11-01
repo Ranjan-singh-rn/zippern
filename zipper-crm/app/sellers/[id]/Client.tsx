@@ -122,7 +122,14 @@ function ageOf(iso: string | null | undefined) {
   return `${Math.floor(hrs / 24)}d ago`
 }
 
-type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate' | 'grant_agency' | 'revoke'
+/**
+ * Spec §4 — the CRM is an approval system, not a role-grant tool. `grant_agency`
+ * ("Also an agency": staff filing a second-role record for a seller who never
+ * asked for one) is gone. A second role begins with the PARTNER applying from
+ * their own dashboard (`components/SecondRoleCard`), and is then reviewed on
+ * /kyc like any other application.
+ */
+type Decision = 'approve' | 'reject' | 'deactivate' | 'reactivate' | 'revoke'
 
 const DECISION_COPY: Record<
   Decision,
@@ -163,18 +170,6 @@ const DECISION_COPY: Record<
       'is temporary and keeps their place.',
     verb: 'Revoke role',
     tone: 'bg-red-700 hover:bg-red-600',
-  },
-  grant_agency: {
-    title: 'Also make them an agency',
-    hint:
-      'This attaches an agency to the login they already have — it is not the '
-      + 'same as creating one on Add agency, which would build a separate '
-      + 'business with a separate login and leave this person exactly where '
-      + 'they are. It grants nothing: the agency arrives pending and is '
-      + 'approved from the queue like any other, which is where you check the '
-      + 'bank account it will be paid into. Their identity documents carry over.',
-    verb: 'Create the agency',
-    tone: 'bg-indigo-600 hover:bg-indigo-500',
   },
 }
 
@@ -397,16 +392,17 @@ export default function SellerDetail() {
               <XCircle size={15} /> Reject
             </button>
           )}
-          {/* Only for an approved seller that does not already hold one. The
-              API refuses both cases anyway; this keeps the button off the
-              screen rather than offering something that will be refused. */}
+          {/* Spec §4: no "Also an agency" here. A second role is applied for by
+              the partner from their dashboard and reviewed on /kyc — this only
+              points at where such an application would be seen. */}
           {partner.status === 'approved' && !partner.linked_partner_id && (
-            <button
-              onClick={() => setDecision('grant_agency')}
-              className="flex items-center gap-2 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
+            <Link
+              href="/kyc"
+              title="A second role (Agency) is applied for by the partner from their dashboard; applications are reviewed on /kyc."
+              className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded-lg px-4 py-2.5 text-sm transition-colors"
             >
-              <Building2 size={15} /> Also an agency
-            </button>
+              <Building2 size={15} /> View applications
+            </Link>
           )}
           {partner.status === 'approved' && partner.is_active && (
             <button
@@ -793,24 +789,12 @@ export default function SellerDetail() {
             else if (decision === 'reject') await partnerOps.reject(id, reason)
             else if (decision === 'deactivate') await partnerOps.deactivate(id, reason)
             else if (decision === 'revoke') await partnerOps.revoke(id, reason)
-            else if (decision === 'grant_agency') {
-              await partnerOps.grantCapability(id, {
-                kind: 'agency',
-                name: profile?.displayName || partner.name || 'Agency',
-                phone: profile?.phone || '',
-                reason,
-              })
-            }
             else await partnerOps.reactivate(id, reason)
             setDecision(null)
             setNotice(
               decision === 'reject'
                 ? 'Rejected. The reason is on the record and is shown on this page.'
-                : decision === 'grant_agency'
-                  ? 'The agency was created against their existing login and is '
-                    + 'waiting in the queue. Approve it there — and check the bank '
-                    + 'account it will be paid into, because a seller record has none.'
-                  : 'Done. The reason is in the audit log.',
+                : 'Done. The reason is in the audit log.',
             )
             load()
           }}

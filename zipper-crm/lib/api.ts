@@ -339,8 +339,11 @@ async function request<T>(
     if (response.status === 401 && auth) reportUnauthorized({ message, path })
     // P1-A3: an Owner session that has not passed two-step sign-in. Not a
     // lost session — send the Owner to the step instead of an error screen.
+    // B3: the Observer's pending session is confined the same way, and its
+    // second step lives on /observer — never send the Observer to the Owner door.
     if (response.status === 403 && response.headers.get('X-Zipper-MFA-Required') === '1'
-        && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+        && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')
+        && !window.location.pathname.startsWith('/observer')) {
       window.location.assign('/login?mfa=1')
     }
     throw new ApiError(message, response.status, detail)
@@ -958,6 +961,40 @@ export const auth = {
     return adopt(await post<SessionResponse>('/auth/observer/verify-code', { code }, false))
   },
 
+  // ── Observer TOTP, after the emailed code (B3) ────────────────────────────
+  // The backend working tree serves the Observer on the SAME `/auth/mfa/*`
+  // routes as the Owner (`services/owner_mfa.py`: `MFA_ROLES = {OWNER,
+  // OBSERVER}`, the identity is the session's role) — there is no separate
+  // `/auth/observer/mfa/*` prefix. Shapes are the Owner's, with
+  // `firestore_binding.state === 'not_applicable'` (nothing to bind: the
+  // Observer has no Firebase account), which the Observer page ignores.
+  //
+  //   GET  /auth/mfa/status         → OwnerMfaStatus (required, enrolled, verified, locked_until…)
+  //   POST /auth/mfa/enrol/start    → OwnerMfaEnrolment (secret, otpauth_uri, …)
+  //   POST /auth/mfa/enrol/confirm  {code, client} → { recovery_codes, session }
+  //   POST /auth/mfa/verify         {code | recovery_code, client} → SessionResponse
+  //
+  // The backend revision serving production has none of these: the status
+  // call answers 404, which `lib/mfaAvailability` reads as "not available
+  // yet", and the Observer page proceeds on the emailed code alone, with a
+  // notice. Kept as separate client methods so the two screens can diverge
+  // (no Firebase token is sent for the Observer).
+
+  observerMfaStatus: () => get<OwnerMfaStatus>('/auth/mfa/status'),
+
+  observerMfaEnrolStart: () => post<OwnerMfaEnrolment>('/auth/mfa/enrol/start', {}),
+
+  async observerMfaEnrolConfirm(code: string): Promise<{ user: ApiUser; recoveryCodes: string[] }> {
+    const res = await post<{ recovery_codes: string[]; session: SessionResponse }>(
+      '/auth/mfa/enrol/confirm', { code, client: 'crm' })
+    return { user: adopt(res.session), recoveryCodes: res.recovery_codes }
+  },
+
+  async observerMfaVerify(input: { code?: string; recoveryCode?: string }): Promise<ApiUser> {
+    return adopt(await post<SessionResponse>('/auth/mfa/verify',
+      { code: input.code ?? '', recovery_code: input.recoveryCode ?? '', client: 'crm' }))
+  },
+
   me: fetchMe,
 
   // ── P1-A3: Owner two-step sign-in ──────────────────────────────────────────
@@ -1210,11 +1247,10 @@ export const users = {
   restoreHost: (uid: string, reason: string) =>
     post<ModerationResult>(`/users/${uid}/restore-host`, { reason }),
 
-  grantHost: (uid: string, reason: string, agencyId = '') =>
-    post<ModerationResult>(`/users/${uid}/grant-host`, {
-      reason,
-      agency_id: agencyId,
-    }),
+  // `grantHost` (`POST /users/{uid}/grant-host`) is gone: the route no longer
+  // exists on the server (404) and the CRM is an approval system, not a
+  // role-grant tool (spec §4). A Host comes from an application decided with
+  // `decideHostApplication` below.
 
   revokeHost: (uid: string, reason: string) =>
     post<ModerationResult>(`/users/${uid}/revoke-host`, { reason }),
@@ -1273,11 +1309,10 @@ export const users = {
       { approve, reason },
     ),
 
-  setSellerFlag: (uid: string, isSeller: boolean, reason: string) =>
-    post<ModerationResult>(`/users/${uid}/seller-flag`, {
-      is_seller: isSeller,
-      reason,
-    }),
+  // `setSellerFlag` (`POST /users/{uid}/seller-flag`) is gone from the client:
+  // it had no caller, and granting the flag is refused by the server (400) —
+  // the Coin Seller role comes from an application decided on /kyc, and the
+  // app badge follows the approved record.
 
   /** Raises a card. Nothing moves until an owner signs it. */
   requestBalanceChange: (

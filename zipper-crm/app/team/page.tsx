@@ -49,6 +49,7 @@ import {
   PauseCircle, RefreshCw, RotateCcw, Search, Shield, ShieldCheck, UserCog, UserX, X,
 } from 'lucide-react'
 import api, { ApiError, staffStatus, type ApiRole, type StaffMember } from '@/lib/api'
+import { BACKEND_FEATURES, NEXT_RELEASE_NOTE } from '@/lib/backendFeatures'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
 import { sendCrmPasswordReset } from '@/lib/auth'
@@ -369,6 +370,19 @@ export default function TeamPage() {
         <StatCard label="Departments" value={teamCount} />
         <StatCard label="Newest" value={newest?.name || newest?.email || '—'} />
       </div>
+
+      {/* TODO(B2 API): department vacancies (`GET /staff/vacancies`, see
+          lib/backendFeatures). Rendered as a stub until the route is released,
+          so the screen says what it will show rather than calling a 404. */}
+      {!BACKEND_FEATURES.departmentVacancy && (
+        <div className="mb-6 flex items-start gap-2 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
+          <AlertTriangle size={15} className="text-slate-500 mt-0.5 shrink-0" />
+          <p className="text-slate-400 text-sm">
+            <span className="text-slate-200 font-medium">Department vacancies</span> — departments
+            with no active admin, and since when. {NEXT_RELEASE_NOTE}
+          </p>
+        </div>
+      )}
 
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between gap-4">

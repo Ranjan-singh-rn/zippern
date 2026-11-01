@@ -37,6 +37,7 @@ import { nameOrReference } from '@/lib/identity'
 import { useIdentities } from '@/lib/useIdentities'
 import { ApiError } from '@/lib/api'
 import { recharges as rechargeApi, type Recharge, type RechargeStatus } from '@/lib/apiPartners'
+import { storageLink } from '@/lib/safeLink'
 
 const PAGE_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'finance_admin', 'finance_member',
@@ -249,12 +250,18 @@ export default function RechargesPage() {
         <span className="text-slate-400 text-xs">
           <span className="uppercase">{r.payment_method}</span>
           {r.reference ? <span className="font-mono"> · {r.reference}</span> : null}
-          {r.proof_url ? (
-            <a href={r.proof_url} target="_blank" rel="noreferrer"
-              className="inline-flex items-center gap-0.5 ml-2 text-pink-300 hover:underline">
-              proof <ExternalLink size={11} />
-            </a>
-          ) : null}
+          {/* Audit C-13: typed by an app user — a link only on a Storage https URL. */}
+          {(() => {
+            const p = storageLink(r.proof_url)
+            if (p.kind === 'link') return (
+              <a href={p.href} target="_blank" rel="noreferrer"
+                className="inline-flex items-center gap-0.5 ml-2 text-pink-300 hover:underline">
+                proof <ExternalLink size={11} />
+              </a>
+            )
+            if (p.kind === 'text') return <span className="ml-2 text-slate-500 break-all" title="Not a Storage link — shown as text">{p.text}</span>
+            return null
+          })()}
         </span>
       ),
     },
@@ -390,11 +397,16 @@ export default function RechargesPage() {
               <div><span className="text-slate-500">Seller</span> {acting.r.seller_name}</div>
               <div><span className="text-slate-500">Diamonds</span> {acting.r.diamonds.toLocaleString('en-IN')} · <span className="text-slate-500">Paid</span> {money(acting.r.amount_minor, acting.r.currency)} by <span className="uppercase">{acting.r.payment_method}</span></div>
               {acting.r.reference && <div><span className="text-slate-500">Reference</span> <span className="font-mono text-xs">{acting.r.reference}</span></div>}
-              {acting.r.proof_url && (
-                <a href={acting.r.proof_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-pink-300 hover:underline text-xs">
-                  Open the payment proof <ExternalLink size={11} />
-                </a>
-              )}
+              {(() => {
+                const p = storageLink(acting.r.proof_url)
+                if (p.kind === 'link') return (
+                  <a href={p.href} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-pink-300 hover:underline text-xs">
+                    Open the payment proof <ExternalLink size={11} />
+                  </a>
+                )
+                if (p.kind === 'text') return <div className="text-xs"><span className="text-slate-500">Proof (not a Storage link, shown as text)</span> <span className="break-all">{p.text}</span></div>
+                return null
+              })()}
             </div>
             <p className="text-slate-400 text-sm">{ACT_COPY[acting.act].hint}</p>
             <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}

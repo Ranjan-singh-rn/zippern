@@ -68,11 +68,33 @@ export interface Agency {
   // blocks below. The authoritative figure is `commission_outstanding` from
   // GET /api/partners/agencies/{id}/statement; this field is the Firestore
   // mirror the list views read so a 200-row table needs no round trip per row.
-  commissionBalance?: number   // cumulative INR/USD amount owed to agency (not yet paid)
+  /**
+   * PAISE, exactly as Mongo holds it (`money.Currency.COMMISSION`,
+   * `db/firebase.py::_FIELD_MAP`) — never render it as rupees (audit M-15:
+   * the dashboard showed it 100× too large). `commissionBalanceInr` is the
+   * rupee mirror the API writes beside it on every sync; prefer it, and fall
+   * back to ÷100. `commissionBalanceUnit` says 'paise' on documents written
+   * by the current API. Use `agencyCommissionInr()` below.
+   */
+  commissionBalance?: number
+  commissionBalanceInr?: number
+  commissionBalanceUnit?: string
   commissionPaidINR?: number   // total amount paid to agency as commission (lifetime, INR for India / USD for foreign)
   totalHosts: number
   totalSubAgencies: number
   createdAt: Timestamp
+}
+
+/**
+ * The agency's outstanding commission in RUPEES (or the display currency's
+ * major unit), from the Firestore mirror. M-15: `commissionBalance` is paise.
+ */
+export function agencyCommissionInr(a: Pick<Agency, 'commissionBalance' | 'commissionBalanceInr'>): number {
+  if (typeof a.commissionBalanceInr === 'number' && Number.isFinite(a.commissionBalanceInr)) {
+    return a.commissionBalanceInr
+  }
+  const paise = typeof a.commissionBalance === 'number' && Number.isFinite(a.commissionBalance) ? a.commissionBalance : 0
+  return paise / 100
 }
 
 export interface AgencySalaryRequest {
@@ -538,16 +560,11 @@ export async function updateOwnAgencyProfile(
 // function about a different thing. It approves a `crmUsers` login, not the
 // agency business record, and it is called.
 
-export async function updateAgency(
-  id: string,
-  updates: Partial<Pick<Agency,
-    'agencyName' | 'ownerName' | 'ownerPhone' | 'ownerEmail' | 'address' |
-    'bankName' | 'accountNumber' | 'ifscCode' | 'accountHolderName' | 'branch' | 'upiId' |
-    'paymentType' | 'country' | 'binanceUid' | 'coinSellerUid'
-  >>
-): Promise<void> {
-  await updateDoc(doc(db, 'agencies', id), { ...updates, updatedAt: serverTimestamp() })
-}
+// updateAgency — REMOVED (audit C-16): a dead browser write (0 callers) that
+// could rewrite an agency's bank account and contact details with no reason
+// and no audit entry. An agency edits its own profile with
+// `updateOwnAgencyProfile` above (bank and identity changes are parked in
+// `pendingChanges` for review); staff changes go through the API.
 
 /*
  * disableAgency / enableAgency — REMOVED (Phase 1A, SECURITY-003/005).
@@ -556,10 +573,9 @@ export async function updateAgency(
  * (`/partner-ops/partners/{id}/suspend|reactivate`), which the rules now require.
  */
 
-export async function setAgencyCommissionRate(id: string, rate: number): Promise<void> {
-  if (rate < 0 || rate > 100) throw new Error('Rate must be between 0 and 100.')
-  await updateDoc(doc(db, 'agencies', id), { commissionRate: rate })
-}
+// setAgencyCommissionRate — REMOVED (audit C-16): a dead browser write (0
+// callers) of a money rate. Commission is computed by the API from the slab
+// table in `appConfig/economy`; a per-agency rate is a `rate_change` card.
 
 export interface CommissionLedgerEntry {
   id: string
@@ -716,33 +732,7 @@ export async function getSubAgencyPayments(mainAgencyId: string): Promise<SubAge
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as SubAgencyPayment))
 }
 
-// ── Dual-role: link / unlink ──────────────────────────────────────────────────
-//
-// Bidirectional: sets isSeller + linkedSellerId on the agency doc,
-// and isAgency + linkedAgencyId on the seller doc simultaneously.
-
-export async function linkAgencyToSeller(agencyId: string, sellerId: string): Promise<void> {
-  await Promise.all([
-    updateDoc(doc(db, 'agencies', agencyId), {
-      isSeller: true,
-      linkedSellerId: sellerId,
-    }),
-    updateDoc(doc(db, 'sellers', sellerId), {
-      isAgency: true,
-      linkedAgencyId: agencyId,
-    }),
-  ])
-}
-
-export async function unlinkAgencyFromSeller(agencyId: string, sellerId: string): Promise<void> {
-  await Promise.all([
-    updateDoc(doc(db, 'agencies', agencyId), {
-      isSeller: false,
-      linkedSellerId: null,
-    }),
-    updateDoc(doc(db, 'sellers', sellerId), {
-      isAgency: false,
-      linkedAgencyId: null,
-    }),
-  ])
-}
+// linkAgencyToSeller / unlinkAgencyFromSeller — REMOVED (audit C-16, spec §4):
+// dead browser writes (0 callers) that flagged a partner as holding a second
+// role with no application behind it. A second role is applied for by the
+// partner and decided on /kyc; the API cross-links the two records.

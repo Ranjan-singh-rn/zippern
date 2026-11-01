@@ -272,7 +272,7 @@ function HostPayoutsModal({
           ) : payouts.length === 0 ? (
             <Empty
               title="No host payouts on this report"
-              hint="The report carries no per-host rows. If the agency listed hosts, they were not written to hostPayouts."
+              hint="Neither weeklyPayoutReports/{id}/hostPayouts (what the generator writes) nor the legacy top-level hostPayouts holds rows for this report. If the subcollection read was refused by the rules, that reads as empty here too — treat it as unknown."
             />
           ) : (
             <div className="overflow-x-auto">

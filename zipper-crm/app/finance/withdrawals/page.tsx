@@ -364,6 +364,9 @@ export default function WithdrawalsPage() {
   const [exportError, setExportError] = useState('')
 
   const [rejectTarget, setRejectTarget] = useState<WithdrawalRequest | null>(null)
+  // Audit C-8: approving is money-adjacent — it is confirmed, never one click,
+  // and the write names the signed-in actor.
+  const [approveTarget, setApproveTarget] = useState<WithdrawalRequest | null>(null)
   const [rejectReason, setRejectReason] = useState('')
   const [proofViewer, setProofViewer] = useState<WithdrawalRequest | null>(null)
   const [raiseTarget, setRaiseTarget] = useState<WithdrawalRequest | null>(null)
@@ -425,12 +428,15 @@ export default function WithdrawalsPage() {
   }
 
   async function doApprove(req: WithdrawalRequest) {
+    const actor = crmUser?.uid ?? ''
+    if (!actor) { setListError('No signed-in actor to record on the approval. Nothing was changed.'); return }
     setActingId(req.id)
     try {
-      await approveWithdrawal(req.id)
+      await approveWithdrawal(req.id, actor)
       patchRequest(req.id, { status: 'approved' })
+      setApproveTarget(null)
       setFlash(
-        `Approved ${formatNativeAmount(req.inrAmount, 'inr')} for ${req.hostName || req.uid}. The money has not moved yet — mark it paid once the transfer is done.`,
+        `Approved ${formatNativeAmount(req.inrAmount, 'inr')} for ${req.hostName || req.uid}, recorded against your account. The money has not moved yet — it is paid only by executing the host-withdrawal card.`,
       )
     } catch {
       setListError('The approval did not go through. Nothing was changed.')
@@ -443,7 +449,9 @@ export default function WithdrawalsPage() {
     if (!rejectTarget || !rejectReason.trim()) return
     setActingId(rejectTarget.id)
     try {
-      await rejectWithdrawal(rejectTarget.id, rejectReason.trim())
+      const actor = crmUser?.uid ?? ''
+      if (!actor) throw new Error('No signed-in actor to record on the rejection.')
+      await rejectWithdrawal(rejectTarget.id, rejectReason.trim(), actor)
       patchRequest(rejectTarget.id, {
         status: 'rejected',
         rejectionReason: rejectReason.trim(),
@@ -669,7 +677,7 @@ export default function WithdrawalsPage() {
           {r.status === 'pending' && canAct && (
             <>
               <button
-                onClick={(e) => { e.stopPropagation(); doApprove(r) }}
+                onClick={(e) => { e.stopPropagation(); setApproveTarget(r) }}
                 disabled={actingId === r.id}
                 className="flex items-center gap-1 text-green-400 hover:text-green-300 disabled:opacity-40 text-xs transition-colors"
               >
@@ -1039,6 +1047,53 @@ export default function WithdrawalsPage() {
             loadApi()
           }}
         />
+      )}
+
+      {/* Approve — confirmed (audit C-8) */}
+      {approveTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl">
+            <div className="flex items-start gap-4 mb-5">
+              <div className="w-10 h-10 rounded-full bg-green-500/20 flex items-center justify-center shrink-0">
+                <Check size={18} className="text-green-400" />
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">Approve this withdrawal?</h3>
+                <p className="text-slate-400 text-sm mt-1">
+                  {approveTarget.hostName || approveTarget.uid} ·{' '}
+                  <span className="text-white font-medium">
+                    {formatNativeAmount(approveTarget.inrAmount, 'inr')}
+                  </span>
+                  {approveTarget.beans ? <> · {approveTarget.beans.toLocaleString('en-IN')} beans</> : null}
+                </p>
+                <p className="text-slate-500 text-xs mt-2 leading-relaxed">
+                  Approval is recorded against your account. No money moves here — the request is paid
+                  only when an owner executes the host-withdrawal card raised for it.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setApproveTarget(null)}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => doApprove(approveTarget)}
+                disabled={actingId === approveTarget.id}
+                className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors flex items-center justify-center gap-2"
+              >
+                {actingId === approveTarget.id ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Check size={14} />
+                )}
+                Approve request
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Reject */}

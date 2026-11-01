@@ -86,6 +86,8 @@ export default function SalaryManagementClient() {
   const [filter, setFilter] = useState<'all' | SalaryRequest['status']>('all')
   const [actionId, setActionId] = useState<string | null>(null)
   const [showPayModal, setShowPayModal] = useState<SalaryRequest | null>(null)
+  // Audit C-8: approving is money-adjacent — confirmed, never one click.
+  const [approveTarget, setApproveTarget] = useState<SalaryRequest | null>(null)
   const [reason, setReason] = useState('')
   const [payErr, setPayErr] = useState('')
   const [paySaving, setPaySaving] = useState(false)
@@ -115,6 +117,16 @@ export default function SalaryManagementClient() {
 
   useEffect(() => { loadData() }, [agencyId, crmUser])
 
+  /*
+   * Audit C-8: confirmed from the dialog below, never from the row directly.
+   *
+   * The actor is NOT written here, and deliberately so: `firestore.rules`
+   * (`salaryRequests` update) allows only `status, approvedAt, rejectedAt,
+   * notes, rejectionReason` to change, so an `approvedBy` field would make the
+   * whole write fail. Until that key is added to the rule (or the approval
+   * moves behind an API card), the audit of WHO approved is the API session's
+   * `host_withdrawal` card that follows — raised and signed by named people.
+   */
   async function handleApprove(req: SalaryRequest) {
     setActionId(req.id)
     try {
@@ -122,6 +134,7 @@ export default function SalaryManagementClient() {
         status: 'approved', approvedAt: serverTimestamp(),
       })
       setRequests(prev => prev.map(r => r.id === req.id ? { ...r, status: 'approved' } : r))
+      setApproveTarget(null)
     } catch (e) { console.error(e) }
     finally { setActionId(null) }
   }
@@ -313,7 +326,7 @@ export default function SalaryManagementClient() {
                         <div className="flex items-center gap-1.5">
                           {req.status === 'pending' && (
                             <button
-                              onClick={() => handleApprove(req)}
+                              onClick={() => setApproveTarget(req)}
                               disabled={actionId === req.id}
                               className="flex items-center gap-1 px-2.5 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 rounded text-xs font-medium transition-colors disabled:opacity-50"
                             >
@@ -348,6 +361,39 @@ export default function SalaryManagementClient() {
       )}
 
       {/* Raise a payout card for this request (P0-7) */}
+      {/* Approve — confirmed (audit C-8) */}
+      {approveTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl space-y-4">
+            <h3 className="text-white font-semibold">Approve this salary request?</h3>
+            <p className="text-slate-300 text-sm">
+              {approveTarget.hostName || 'Host'} · {Math.trunc(Number(approveTarget.beansEarned) || 0).toLocaleString('en-IN')} beans ·{' '}
+              <span className="text-white font-medium">₹{(Number(approveTarget.amountInr) || 0).toLocaleString('en-IN')}</span>
+            </p>
+            <p className="text-slate-500 text-xs leading-relaxed">
+              Approval moves no money. The request is paid only by raising a host-withdrawal card that an
+              owner signs and Finance executes — that card names the people who approved it.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setApproveTarget(null)}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleApprove(approveTarget)}
+                disabled={actionId === approveTarget.id}
+                className="flex-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors flex items-center justify-center gap-2"
+              >
+                {actionId === approveTarget.id ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                Approve
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showPayModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
           <div className="bg-slate-800 border border-slate-700 rounded-xl p-6 w-full max-w-md shadow-2xl">
