@@ -1,5 +1,135 @@
 rules_version = '2';
 
+// ════════════════════════════════════════════════════════════════════════════
+// ZIPPER FIRESTORE RULES — RELEASE CANDIDATE 2 ("rules RC2", 2026-11-01)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Lineage: DEPLOYED text 17b8ffee… (ruleset b2104a12…, released 20 Oct 2026)
+//   → Owner-MFA candidate 93453763… (zipper-release/mfa-release-rc2-…/candidate)
+//   → working-tree P1-A1 / P1-D / P1-E hunks (26dac8f5…)
+//   → hotfix-1 hunks ported from hotfix/rules-20261101/ (deployable alone)
+//   → this file. The full diff against DEPLOYED and against hotfix-1, and the
+//   ordered deploy plan, are in hotfix/rules-20261101/RC2-DIFF.md.
+//
+// Tests: tests/firestore.rc2.rules.test.mjs (+ every older suite) through
+// tests/run-rc2-rules-tests.command. Emulator only, demo project, no deploy.
+//
+// EVERY CHANGE SINCE 17b8ffee, WITH WHAT IT DEPENDS ON. "none" = the rule can
+// be released on its own without breaking a live client. Deploy this file ONLY
+// when every "needs" below is already live; see RC2-DIFF.md for the order.
+//
+// ── A. Owner MFA boundary (P1-A3b / P1-A3, from the MFA candidate) ──────────
+//   A1 crmRole(): an Owner (`superadmin`) reads as 'superadmin_mfa_pending'
+//      unless ownerMfaOk() — a backend-minted custom-token session whose
+//      ownerMfaSessions/{uid}.bindings[mfa_sid] is active, matches auth_time
+//      and is unexpired. hasPerm() refuses the pending role explicitly.
+//        needs: backend rc2 key revision (owner_mfa routes, OWNER_MFA_ENCRYPTION_KEY)
+//               serving 100% AND the MFA CRM (replaces the Owner's Firebase
+//               sign-in after TOTP) live. Deployed earlier, every Owner is
+//               locked out of every staff grant.
+//   A2 ownerMfaSessions/{uid}: deny-all for clients.           needs: none.
+//   A3 crmUsers update: the Owner first-login `gateAnswers` arm is removed and
+//      `gateAnswers` joins the refused key list.                needs: MFA CRM
+//      (the old CRM's /login gate writes gateAnswers and would stall).
+//
+// ── B. Hotfix-1 hunks (hotfix/rules-20261101, deployable before RC2) ────────
+//   B1 A-1 ownerContactWriteOk(): an EMPTY email/phoneNumber written over an
+//      absent/empty one is "no change" (pre-19 app builds).     needs: none.
+//   B2 R-3 calls/{id} and callHistory/{id}: `allow write: if false` (Functions
+//      write them with the Admin SDK; `isAdmin()` is spelling-based). needs: none.
+//   B3 A-5 appConfig/androidUpdate: no client writer (publish_apk.py only).
+//                                                               needs: none.
+//   B4 R-2 coinPurchaseRequests list: a partner lists only queries constrained
+//      to its own seller record; admin/finance unchanged.       needs: none
+//      (the seller dashboard already filters on sellerUid).
+//   B5 R-5 techTickets read: isStaff() (partners refused) — superseded by C2
+//      for writes.                                              needs: none.
+//
+// ── C. Working-tree hunks (P1-A1 / P1-D / P1-E) ─────────────────────────────
+//   C1 staffRoster/{uid}: staff read, no client write; crmUsers read narrowed
+//      to self / Owner / same-department admin for a member (callerDept()).
+//        needs: backend roster backfill (`crm_directory.write_roster`) run
+//               AND the staffRoster(role, isActive) index deployed, AND the
+//               CRM that reads names from staffRoster (commit 64f9974).
+//   C2 techTickets: create/update `if false`; read isStaff(); delete Owner.
+//        needs: backend tickets API (`backend/app/routers/tickets.py`,
+//               POST /tickets/team, /tickets/{kind}/{id}/update,
+//               /tickets/support/{id}/route) live AND the CRM calling it
+//               (lib/tech.ts, lib/operations.ts in commit 64f9974).
+//   C3 feedbackTickets / supportTickets: an app user creates in its own name
+//      and reads its own; staff (ops / admins / support) read; staff UPDATE
+//      only through the tickets API (POST /tickets/{feedback|support}/{id}/
+//      update — CRM lib/operations.ts, APK-20 work hub), so client
+//      update/delete is `if false`.                             needs: as C2.
+//
+// ── D. This release (item 5 of the RC2 brief + audit §2) ────────────────────
+//   D1 weeklyPayoutReports/{reportId}/hostPayouts/{payoutId}: read for Finance
+//      and admins and for the report's agency owner on its own rows (the
+//      caller's crmUsers.agencyId == the row's `agencyId` — the generator
+//      writes agencyId + hostUid, never agencyOwnerUid); nobody else; write
+//      `if false` (weeklyPayoutReportGenerator, Admin SDK).
+//        needs: none (the CRM's finance.ts already reads this path and falls
+//               back silently; this rule makes the read succeed).
+//   D2 top-level hostPayouts: the agency `agencyOwnerUid` update arm (any
+//      field) is closed — R-11; nothing writes this legacy path. needs: none.
+//   D3 salaryRequests update: Finance/Owner may also write the actor key
+//      `approvedBy` (the key Client.tsx's C-8 note names and lib/finance.ts /
+//      lib/coinPurchases.ts already write), only as their own uid.
+//        needs: none (the old write without it still passes; the CRM can
+//               start writing it whenever it ships).
+//   D4 users: `banScope`, `banCategory`, `banEvidence`, `payoutHoldReason`,
+//      `payoutHoldAt` join ownerProtectedFields() and staffProtectedFields()
+//      (`credentialsValidAfter` already was). Backend writes them (Admin SDK).
+//                                                               needs: none.
+//   D5 users: `gender` is set once — the owner arm refuses a change once a
+//      non-empty value is stored (A-10; Edit Profile shows it locked).
+//                                                               needs: none.
+//   D6 notifications/{id}: read by the addressee only; no client write
+//      (backend notices.py and Functions write them).           needs: none
+//      (no CRM or app code writes or admin-reads this collection).
+//   D7 R-6 appConfig/paymentCredentials: readable by staff, by a CRM seller
+//      with a started seller role, and by an app seller with a verified
+//      contact and a started seller record — never by a guest or an ordinary
+//      user. Every other appConfig document reads as before.   needs: none
+//      (BuyCoinScreen and the CRM BuyInventoryDialog are the only readers).
+//   D8 R-8 hostKyc/{hostUid}: read by admins and the host only.  needs: none.
+//   D9 R-10 users/{uid}/followers/{followerUid}: the follower writes its own
+//      row; users/{uid}/giftsReceived create `if false`.         needs: none
+//      (ProfileRepository writes followers/{me}; nothing writes giftsReceived).
+//   D10 appConfig/luckyGifts: confirmed covered by the existing appConfig rule
+//      (signed-in read; Tech + Owner write). No change.
+//   D11 publicProfiles: no change (the projection omits hostLevel for non-hosts
+//      server-side).
+//   D12 rateLimits/{bucket}: explicit deny-all (functions/src/rateLimit.ts,
+//      Admin SDK). Same answer as the catch-all, stated.        needs: none.
+//   D13 partyRooms/{roomId}/private/{docId}: explicit deny-all — the room PIN
+//      secret functions/src/party.ts keeps at private/secret. No rule ever
+//      admitted it (the catch-all denies); stated.              needs: none.
+//
+// ── Indexes (firestore.indexes.json, additive; never accept a deletion) ─────
+//   staffRoster(role, isActive) — needed by C1. The Owner work hub (APK ≥ 20)
+//   needs salaryRequests / hostApplications / supportTickets / techTickets
+//   (status ASC, createdAt DESC). Also in the file: three publicProfiles feed
+//   indexes (isListed, [country,] isVerifiedHost, [languageCodes CONTAINS,]
+//   presenceRank DESC, lastSeen DESC) for DiscoverRepository.feed's filter
+//   combinations. Deploy indexes BEFORE (or with) this file and let them
+//   reach READY before the C1 CRM pickers are used.
+//
+// ── Storage (storage.rules, same release) ───────────────────────────────────
+//   Owner `role` claim gated by ownerMfaOk() through a cross-service Firestore
+//   read — needs the Storage service agent granted
+//   roles/firebaserules.firestoreServiceAgent BEFORE the Storage deploy, or
+//   every Owner Storage request fails closed. profileMedia images 15 MB (B).
+//
+// NOT in RC2: hotfix-1's withheld C-1 (self-signup logins born inactive) —
+// the CRM in this tree still writes `isActive: true` (lib/auth.ts
+// createAgencyAccount / createSellerAccount / createSubAgencyAccount) and
+// signs out inactive logins, so the hunk would break live self-signup.
+// R-1 (users/{uid} get for any signed-in account) needs the publicProfiles
+// migration in the app first. R-7 (public KYC signup prefixes) is a Storage
+// item, documented there.
+// ════════════════════════════════════════════════════════════════════════════
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -893,6 +1023,19 @@ service cloud.firestore {
       allow read, write: if false;
     }
     match /emailOtpRate/{key} {
+      allow read, write: if false;
+    }
+
+    // RC2 D12 (F-8): the abuse budgets of the unauthenticated callables
+    // (functions/src/rateLimit.ts — `rateLimits/{scope}:{kind}:{hash}:{window}`,
+    // swept by sweepQuickLoginTokens). Admin SDK only. A client that could read
+    // a bucket would learn how close a device or address is to its limit; one
+    // that could write it would reset its own budget between calls. The
+    // catch-all below already denies this path; it is spelled out so the
+    // intent is on record where the collection is named. (A `false` here does
+    // not override a broader rule added later — rules are a union — so never
+    // add a wildcard that matches it.)
+    match /rateLimits/{bucket} {
       allow read, write: if false;
     }
 
@@ -1963,6 +2106,18 @@ service cloud.firestore {
           'resumedBy', 'resumedByName', 'resumedByRole', 'resumedAt',
           'previousBanReason', 'warningCount',
           /*
+           * RC2 D4 (B1 moderation lifecycle). `ban_user` (services/users.py)
+           * now writes the ban's scope, category and evidence onto the
+           * account beside `banReason`, and the money freeze that travels
+           * with it writes `payoutHoldReason` / `payoutHoldAt` beside
+           * `payoutHold`. All of it is read as the decision (appeals.py reads
+           * banScope/banCategory/banEvidence back). Admin SDK only — a subject
+           * that could rewrite its own ban category or evidence would be
+           * editing the case against itself.
+           */
+          'banScope', 'banCategory', 'banEvidence',
+          'payoutHoldReason', 'payoutHoldAt',
+          /*
            * Phase 1A (CONTACT-001 / IDENTITY-002). Contact identity is moved
            * only by `bindVerifiedIdentity` and the server-side bind paths.
            * `email` and `phoneNumber` are NOT in this list, because the
@@ -2010,6 +2165,17 @@ service cloud.firestore {
        * interim, until D1/D2 decide the change workflow). Writing the same
        * value again is fine, and so is respelling the same phone number — a
        * legacy bare `9876543210` becoming the token's `+919876543210`.
+       *
+       * HOTFIX-1 A-1 (2026-11-01, old-client relief): an EMPTY value written
+       * over a contact the document does not hold (key absent, null or '')
+       * changes nothing, so it is accepted as "no change". App builds before
+       * 19 write `email: ""` / `phoneNumber: ""` on profile setup for every
+       * guest and phone user, and `changed()` reports the ADDED key, which
+       * sent the whole owner arm into the `!= ''` branch and refused the
+       * save. Only the empty-over-empty case is new: a NON-empty value still
+       * has to be the verified token value, and an existing non-empty contact
+       * is still never cleared or replaced — `'' over 'x'` falls through to
+       * the original branch, which requires the new value to be non-empty.
        */
       function ownerContactWriteOk() {
         let ch = changed();
@@ -2019,12 +2185,16 @@ service cloud.firestore {
         let oldDigits = string(oldPhone).replace('[^0-9]', '');
         let newDigits = string(request.resource.data.get('phoneNumber', '')).replace('[^0-9]', '');
         return (!ch.hasAny(['email'])
+                || (request.resource.data.get('email', '') == ''
+                    && (oldEmail == null || oldEmail == ''))
                 || (request.resource.data.get('email', '') != ''
                     && tokenEmailVerified()
                     && newEmail == request.auth.token.get('email', '').lower()
                     && (oldEmail == null || oldEmail == ''
                         || string(oldEmail).lower() == newEmail)))
             && (!ch.hasAny(['phoneNumber'])
+                || (request.resource.data.get('phoneNumber', '') == ''
+                    && (oldPhone == null || oldPhone == ''))
                 || (request.resource.data.get('phoneNumber', '') != ''
                     && request.resource.data.get('phoneNumber', '')
                          == request.auth.token.get('phone_number', '')
@@ -2113,6 +2283,13 @@ service cloud.firestore {
           'unbannedBy', 'unbannedByName', 'unbannedByRole', 'unbannedAt',
           'suspendedBy', 'suspendedByName', 'suspendedByRole', 'suspendedAt',
           'resumedBy', 'resumedByName', 'resumedByRole', 'resumedAt',
+          // RC2 D4: the ban's scope / category / evidence and the money
+          // freeze's reason / stamp — written by `ban_user` and
+          // `money_freeze.hold_fields` (Admin SDK), read by the appeal flow.
+          // A staff browser rewriting the evidence list is the same
+          // safeguard-free path as rewriting `isBanned`.
+          'banScope', 'banCategory', 'banEvidence',
+          'payoutHoldReason', 'payoutHoldAt',
 
           // The deletion state machine. `accountState` decides whether an
           // identity has been RELEASED, so a hand-written one can reclaim a
@@ -2209,10 +2386,27 @@ service cloud.firestore {
       // banned, suspended or deleting account that signed out of its only
       // phone would keep ringing that phone. Removal only: the field must
       // exist before, be absent after, and be the only key that moves.
+      //
+      // RC2 D5 (audit A-10): `gender` is set ONCE. Profile setup
+      // (`AuthRepository.saveUserProfile`) writes it onto the document
+      // `createUserDocument` made, which holds no gender yet; Edit Profile
+      // renders it as a locked row ("Gender is set once") and never writes
+      // it. So the owner arm accepts a `gender` change only while the stored
+      // value is absent, null or '' — the feed, the bag's gender-scoped
+      // items and the discover filters all key on it, and flipping it at
+      // will was a free re-ranking. Writing the SAME value again is not a
+      // change (`changed()` is a diff) and still passes; staff are governed
+      // by their own arm and no CRM screen writes it either way.
+      function genderWriteOk() {
+        return !changed().hasAny(['gender'])
+            || resource.data.get('gender', '') == null
+            || resource.data.get('gender', '') == '';
+      }
       allow update: if
           (isStaff() && !changed().hasAny(staffProtectedFields()))
           || (isOwner(uid) && notBanned() && !changed().hasAny(ownerProtectedFields())
-              && ownerContactWriteOk())
+              && ownerContactWriteOk()
+              && genderWriteOk())
           || (isOwner(uid)
               && changed().hasOnly(['fcmToken'])
               && resource.data.keys().hasAny(['fcmToken'])
@@ -2295,9 +2489,19 @@ service cloud.firestore {
       }
       // Following someone writes to THEIR followers list, so cross-user writes
       // are required here by design.
+      //
+      // RC2 D9 (audit R-10): required, but BOUND. `ProfileRepository.followUser`
+      // writes `users/{target}/followers/{me}` and `users/{me}/following/
+      // {target}` in one batch, and `unfollowUser` deletes the same pair —
+      // the follower's own uid is always the document id. `request.auth !=
+      // null` let any signed-in account plant or delete rows in anybody's
+      // followers list under any follower's name: forged follower counts,
+      // and a stranger unfollowing people on your behalf. The follower now
+      // writes only its own row; the subject's `following` rule below is
+      // unchanged.
       match /followers/{followerUid} {
         allow read:  if request.auth != null;
-        allow write: if request.auth != null;
+        allow write: if isOwner(followerUid);
       }
       match /following/{followedUid} {
         allow read:  if request.auth != null;
@@ -2371,7 +2575,13 @@ service cloud.firestore {
       match /giftsSent/{docId}     { allow read, write: if isOwner(uid) || isAdmin(); }
       match /giftsReceived/{docId} {
         allow read:           if request.auth != null;
-        allow create:         if request.auth != null;
+        // RC2 D9 (audit R-10): no client creates these. `create: if
+        // request.auth != null` let any account write a received-gift row
+        // under any user — forged gift history on a profile. Nothing in the
+        // app, the CRM or the Functions writes this subcollection (the
+        // profile's "Gifts received" strip reads `giftShowcase`, which
+        // `settleGift` maintains with the Admin SDK).
+        allow create:         if false;
         allow update, delete: if isOwner(uid) || isAdmin();
       }
     }
@@ -2395,18 +2605,22 @@ service cloud.firestore {
     // HOST KYC + BANK DETAILS (managed by agency on behalf of hosts)
     // ══════════════════════════════════════════════════════════════════════════
     match /hostKyc/{hostUid} {
-      // Host sees own; agency (ownerUid matches agencyId of host) + admin can read
-      allow read: if isAdmin()
-                  || isOwner(hostUid)
-                  || (request.auth != null
-                      && get(/databases/$(database)/documents/users/$(hostUid)).data.agencyId
-                         != null);
+      // Host sees own; admins see all.
+      //
+      // RC2 D8 (audit R-8): the third arm — "any signed-in account, whenever
+      // the host's user document carries an agencyId" — is gone. It was
+      // meant to be "the host's agency" and never checked that the caller
+      // was that agency, so every guest could read any agency host's bank
+      // and KYC details by uid. No app, CRM, Functions or backend code reads
+      // this collection as an agency (grep, 2026-11-01); if an agency screen
+      // ever needs it, the arm to add is `isAgencyCrmUser() &&
+      // crmUserAgencyId() == <the host's agencyId>`, not this.
+      allow read: if isAdmin() || isOwner(hostUid);
       // B3 (RULES-1, writes): staff admins only. The second arm admitted ANY
       // signed-in account — guests included — whenever the host's user
       // document had an `agencyId`, because it never checked that the caller
       // WAS that agency. No app, CRM, Functions or backend code writes this
-      // collection. The read arm above has the same flaw; B3 changes writes
-      // only, so it is deliberately left as it was and tracked separately.
+      // collection.
       allow write: if isAdmin();
     }
 
@@ -2532,6 +2746,15 @@ service cloud.firestore {
       // takes the reporter / actor from the session, audits before writing and
       // notifies the people affected. A browser write could set any reporter
       // name, skip the audit and bypass the close/route reason rules.
+      //
+      // RC2 C2 — DEPLOY ORDER. This form needs `backend/app/routers/tickets.py`
+      // (POST /tickets/team, POST /tickets/{kind}/{id}/update, POST
+      // /tickets/support/{id}/route) live AND the CRM that calls it
+      // (lib/tech.ts createTechTicket / lib/operations.ts, commit 64f9974)
+      // on Hosting. Against the OLD CRM, which files and moves tickets from
+      // the browser, this refuses the team board's writes — which is why
+      // hotfix-1 ships `create/update: if isStaff()` instead and RC2 waits
+      // for the backend + CRM release.
       allow read:   if isStaff();
       allow create, update: if false;
       allow delete: if isSuperAdmin();
@@ -2584,17 +2807,61 @@ service cloud.firestore {
                         && resource.data.status == 'generated'
                         && request.resource.data.status == 'submitted');
       allow delete: if isSuperAdmin();
+
+      /*
+       * RC2 D1 (audit R-11, CRM M-13) — THE PER-HOST ROWS OF A REPORT.
+       *
+       * `weeklyPayoutReportGenerator` (functions/src/index.ts) writes one
+       * document per eligible host at
+       * `weeklyPayoutReports/{weekLabel}/hostPayouts/{agencyId}_{hostUid}`:
+       * `{ agencyId, agencyName, hostUid, hostName, weekBeans, hostPayoutInr,
+       *    weekLabel, weekStart, weekEnd, status, eligible, createdAt }`.
+       * There was no rule for this path, so the catch-all denied it and the
+       * Finance payouts page showed every report with "no per-host rows";
+       * `lib/finance.ts` now reads this path first (falling back to the
+       * legacy top-level collection, below, when refused).
+       *
+       * Readers: Finance and admins (the payouts page), and the report's
+       * AGENCY OWNER for its own rows — bound through the CALLER's own login
+       * (`isAgencyCrmUser() && crmUserAgencyId()`), not through a field on
+       * the row, because the generator writes `agencyId`, never
+       * `agencyOwnerUid`, and a report covers EVERY agency, so there is no
+       * single owner uid on the report document either. An agency must query
+       * with `where('agencyId', '==', <its agency>)` — an unconstrained list
+       * over a report is refused for it. Nobody else: no app screen reads
+       * this path (grep, 2026-11-01), so the host-self arm of the legacy path
+       * below is deliberately not copied here.
+       *
+       * Writers: none. The generator writes with the Admin SDK; the CRM only
+       * reads; a browser row here would be a payout line nobody computed.
+       */
+      match /hostPayouts/{payoutId} {
+        // Direct field access on purpose (as `salaryRequests` and the legacy
+        // path below do): a list query is admitted only when its own filter
+        // proves the field, and a row without the field fails closed.
+        allow read:  if isFinance() || isAdmin()
+                     || (isAgencyCrmUser()
+                         && resource.data.agencyId != ''
+                         && resource.data.agencyId == crmUserAgencyId());
+        allow write: if false;
+      }
     }
 
-    // Individual host payout records within a weekly report
+    // Individual host payout records within a weekly report — the LEGACY
+    // top-level path. Nothing writes it any more (the generator writes the
+    // subcollection above; the CRM reads this only as a fallback).
+    //
+    // RC2 D2 (audit R-11): the agency update arm is closed. It let any account
+    // named as `agencyOwnerUid` rewrite ANY field of a payout row — amount,
+    // host, status — with no allowlist. No app, CRM, Functions or backend
+    // code updates this collection (grep, 2026-11-01). Finance/admin writes
+    // are left as they were; reads are unchanged.
     match /hostPayouts/{payoutId} {
       allow read: if isFinance() || isAdmin()
                   || (request.auth != null && resource.data.agencyOwnerUid == request.auth.uid)
                   || (request.auth != null && resource.data.hostUid == request.auth.uid);
       allow create: if isFinance() || isAdmin();
-      allow update: if isFinance() || isAdmin()
-                    || (request.auth != null
-                        && resource.data.agencyOwnerUid == request.auth.uid);
+      allow update: if isFinance() || isAdmin();
       allow delete: if isSuperAdmin();
     }
 
@@ -2972,7 +3239,13 @@ service cloud.firestore {
       // This is the record a payment gateway is shown when a user disputes a
       // recharge — "the diamonds were spent on this call, of this length, with
       // this account". A row either party could create or edit proves nothing.
-      allow write: if isAdmin();
+      //
+      // HOTFIX-1 R-3 (2026-11-01): no client writes it at all. `isAdmin()`
+      // matches any `*_admin` role by spelling, so a marketing or support admin
+      // could rewrite dispute evidence from a browser. The only writers are
+      // Cloud Functions (calls.ts) through the Admin SDK; neither the CRM nor
+      // the app writes this collection (grep, 2026-11-01).
+      allow write: if false;
     }
 
     // ── Host identity verification ──────────────────────────────────────────
@@ -3355,6 +3628,17 @@ service cloud.firestore {
         allow read:  if request.auth != null;
         allow write: if isOps();
       }
+
+      // RC2 D13 (F-7): the room's PIN secret — `private/secret`, a salted hash
+      // written and checked only by functions/src/party.ts (createPartyRoom,
+      // updatePartyRoom, joinPartyRoom; deleted by endPartyRoom) through the
+      // Admin SDK. Four digits are an offline puzzle for anyone who can read
+      // the hash, so NO client reads or writes it — not the host, not ops.
+      // Deny-all is already the catch-all's answer; this block only states it
+      // where a reader of the room rules will look.
+      match /private/{docId} {
+        allow read, write: if false;
+      }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -3589,7 +3873,13 @@ service cloud.firestore {
                         && (resource.data.callerId   == request.auth.uid
                          || resource.data.receiverId == request.auth.uid))
                     || isAdmin();
-      allow write:  if isAdmin();
+      // HOTFIX-1 R-3 (2026-11-01): no client writes the bill. `isAdmin()` is
+      // spelling-based (`.*_admin`), so any department admin could edit
+      // `tickIndex` and the rate from a browser. startCall / acceptCall /
+      // declineCall / tickCall / endCall and the watchdog write it with the
+      // Admin SDK; the app only reads and listens, and the CRM never touches
+      // it (grep, 2026-11-01). The in-call chat below is unchanged.
+      allow write:  if false;
 
       // In-call chat. Either party may read and post; a message names its
       // sender and nothing else about the bill is reachable from here.
@@ -3614,10 +3904,29 @@ service cloud.firestore {
       allow write: if isAdmin() || isMarketing();
     }
 
+    /*
+     * RC2 D6 — IN-APP NOTICES. One shape, one writer.
+     *
+     *   { userId, type, title, body, relatedId?, createdAt, read | isRead,
+     *     reason?, meta? }
+     *
+     * Written by the backend (`services/notices.py`, every ticket reply, ban,
+     * payout and partner decision) and by the Functions (the payout approval
+     * notice in index.ts) through the Admin SDK. The app (APK 20,
+     * `ChatRepository.myNotificationsFlow`) listens with
+     * `where('userId', '==', me) orderBy('createdAt', 'desc')` and accepts
+     * both spellings of the read flag and of the related id. No client
+     * writes one — not the app (nothing marks a notice read from the phone),
+     * not the CRM (its own notification writer is gone; every reply goes
+     * through the API). `allow write: if isAdmin()` therefore granted the
+     * server nothing and gave every `.*_admin` a browser write that could
+     * put any text in front of any user as "ZIPPER". The admin READ arm goes
+     * with it: no CRM screen lists another person's notices, and the backend
+     * reads them with the Admin SDK when it needs to.
+     */
     match /notifications/{notifId} {
-      allow read:  if (request.auth != null && resource.data.userId == request.auth.uid)
-                   || isAdmin();
-      allow write: if isAdmin();
+      allow read:  if request.auth != null && resource.data.userId == request.auth.uid;
+      allow write: if false;
     }
 
     match /appConfig/{docId} {
@@ -3644,8 +3953,34 @@ service cloud.firestore {
        * Scoped to the one document id rather than opening the collection.
        * `appConfig` also holds `paymentCredentials`: the company bank account
        * and Binance UID that every coin seller in the country pays into.
+       *
+       * ── RC2 D7 (audit R-6): `paymentCredentials` IS NOT FOR EVERY TOKEN ──
+       *
+       * `request.auth != null` is also true for an anonymous guest, so the
+       * company's bank account number, IFSC, holder and Binance UID were
+       * readable with the public web config — phishing material ("pay your
+       * recharge here") handed to anyone who could sign in anonymously.
+       *
+       * Who actually reads it: the CRM's own config page (Owner / Tech, via
+       * lib/appConfig.getPaymentCredentials), the CRM seller dashboard's
+       * BuyInventoryDialog (a CRM seller login buying inventory), and the
+       * app's BuyCoinScreen (an APP seller buying coins — it writes the
+       * purchase as `sellerUid = auth.uid`). So: staff; a CRM login whose
+       * seller role has STARTED (`sellerRoleApproved()`, the same test the
+       * coinPurchaseRequests create arm applies); and an app account with a
+       * verified contact on its token AND a started seller record
+       * (`hasContactIdentity() && appSellerRecordStarted()`, again the
+       * create arm's own binding). A guest, an ordinary user and a pending
+       * applicant get nothing — they cannot file a purchase either, so they
+       * have nothing to pay for. `luckyGifts`, `economy`, `control` and the
+       * rest read as before: any signed-in account.
        */
-      allow read:  if request.auth != null || docId == 'androidUpdate';
+      allow read:  if docId == 'androidUpdate'
+                   || (docId != 'paymentCredentials' && request.auth != null)
+                   || (docId == 'paymentCredentials'
+                       && (isStaff()
+                           || (isCrmUser() && sellerRoleApproved() && crmLoginUnrestricted())
+                           || (hasContactIdentity() && appSellerRecordStarted())));
 
       // paymentCredentials holds the company bank account / Binance UID that every
       // coin seller in the country pays into. Under the previous rule
@@ -3667,8 +4002,23 @@ service cloud.firestore {
       //
       // Tech and the owner. A department that cannot configure the economy from
       // the API should not be able to configure it from a browser.
-      allow write: if (docId == 'paymentCredentials' && isSuperAdmin())
-                    || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin()));
+      //
+      // HOTFIX-1 A-5 (2026-11-01): `androidUpdate` is written by no client.
+      // It is the fleet's update order — version code, mandatory flag, APK
+      // URL and hash — and one mistaken or hostile `tech_member` write shows
+      // every phone an inescapable "Update required". The only writer is
+      // backend/scripts/publish_apk.py through the Admin SDK, which these
+      // rules do not govern. Every other appConfig document is unchanged.
+      //
+      // RC2 D10: `luckyGifts` (the combos, receiver share and odds table that
+      // `functions/src/luckyGifts.ts` reads inside the gift settlement
+      // transaction) is written by the CRM's lucky-gifts page after the
+      // server's own guard (lib/luckyGiftsGuard.ts) — PAGE_ROLES superadmin /
+      // tech_admin / tech_member — and read by the app's gift sheet. That is
+      // exactly the `isTech() || isSuperAdmin()` arm below; no special case.
+      allow write: if docId != 'androidUpdate'
+                    && ((docId == 'paymentCredentials' && isSuperAdmin())
+                        || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin())));
     }
 
     match /announcements/{docId} {
@@ -3815,13 +4165,28 @@ service cloud.firestore {
       // `paid` in the same transaction as the debit. From a browser, Finance
       // may only approve or reject it; the agency may mark a PAID one
       // distributed.
+      //
+      // RC2 D3 (audit C-8): the decision may name its ACTOR — `approvedBy`, the
+      // key app/agencies/[id]/salary/Client.tsx names in its C-8 note ("an
+      // `approvedBy` field would make the whole write fail") and the one the
+      // CRM's other decisions already write (lib/finance.ts approvePayoutReport
+      // / rejectPayoutReport, lib/coinPurchases.ts: `approvedBy: <uid>`, on
+      // approve AND reject). When it moves it must be the caller's own uid: an
+      // actor field a browser can set to somebody else's uid is an audit trail
+      // that lies. No other actor spelling is admitted.
+      function salaryActorOk() {
+        return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['approvedBy'])
+            || request.resource.data.get('approvedBy', '') == request.auth.uid;
+      }
       allow update: if ((isFinance() || isSuperAdmin())
                         && ((resource.data.get('status', '') == 'pending'
                              && request.resource.data.get('status', '') == 'approved')
                             || (resource.data.get('status', '') in ['pending', 'approved']
                                 && request.resource.data.get('status', '') == 'rejected'))
                         && request.resource.data.diff(resource.data).affectedKeys()
-                             .hasOnly(['status', 'approvedAt', 'rejectedAt', 'notes', 'rejectionReason']))
+                             .hasOnly(['status', 'approvedAt', 'rejectedAt', 'notes', 'rejectionReason',
+                                       'approvedBy'])
+                        && salaryActorOk())
                     || (isAgencyCrmWriter()
                         && crmUserAgencyId() == resource.data.agencyId
                         && resource.data.get('status', '') == 'paid'

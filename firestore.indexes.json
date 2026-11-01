@@ -903,6 +903,144 @@
           "order": "DESCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "salaryRequests",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "hostApplications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "supportTickets",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "techTickets",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "publicProfiles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "isListed",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "country",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "isVerifiedHost",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "presenceRank",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "lastSeen",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "publicProfiles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "isListed",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "isVerifiedHost",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "languageCodes",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "presenceRank",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "lastSeen",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "publicProfiles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "isListed",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "country",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "isVerifiedHost",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "languageCodes",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "presenceRank",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "lastSeen",
+          "order": "DESCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": [

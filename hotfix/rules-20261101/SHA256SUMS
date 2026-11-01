@@ -5,5 +5,5 @@ e835f424ed75fbf5629b7702b4f18db65f9a4a0622e0f01db01ff741de2b2e5d  storage.rules.
 f12db369dc5553f21881231e68bec78af4aa02b4e2e93820d3f77f739a7f43fa  firestore.rules.C-1.NOT-APPLIED.patch
 82df7ef780df85df6f38d87bd7e2bb7bd2372ecdabdcc53d922b6dd40e200823  phase1a-known-failures.txt
 fa067dae3f71a7b678962562d85231c8d5c515ac3aa9f32e6339a21a5fd1084d  run-hotfix1-rules-tests.command
-ddcc101290ef5a6ed153ba8c47df56ee87b0d8ffee532f2cc51d3d57b105ca34  ../../tests/firestore.hotfix1.rules.test.mjs
+643f036f806144e4cd8d5a5601f114073182705aaf7b93ecac18232a59cd3709  ../../tests/firestore.hotfix1.rules.test.mjs
 d7019820248f9cee669eeab4ed1db90439b087bf6bf62b6ba4406c5a025cc808  ../../tests/storage.hotfix1.rules.test.mjs

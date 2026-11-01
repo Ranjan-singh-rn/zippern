@@ -11,6 +11,11 @@
  *        file and move tickets from the browser — the tickets API is not
  *        deployed, so the working tree's `create, update: if false` is NOT
  *        ported.
+ *        LINEAGE SWITCH (RC2, 2026-11-01): against the release-candidate-2
+ *        text (header "RELEASE CANDIDATE 2", or ZIPPER_RULES_LINEAGE=rc2)
+ *        the three staff browser-write checks flip to REFUSED — RC2 carries
+ *        the P1-D form because the tickets API ships with it. Every other
+ *        check in this suite holds on both lineages.
  *   R-2  `coinPurchaseRequests` list: admin / finance list everything; a
  *        seller lists only queries constrained to its own record; an agency,
  *        an unfiltered seller query, and every non-CRM login are refused.
@@ -53,6 +58,12 @@ console.log(`rules under test: ${RULES_PATH}`)
 // The exact bytes uploaded to the emulator below — the runner compares this
 // with the file it meant to test.
 console.log(`rules sha256: ${RULES_SHA256}`)
+// Lineage switch (see the header). RC2 is recognised by its own header line,
+// or forced with ZIPPER_RULES_LINEAGE=rc2 / hotfix1 by the runner.
+const LINEAGE = process.env.ZIPPER_RULES_LINEAGE
+  || (/ZIPPER FIRESTORE RULES — RELEASE CANDIDATE 2/.test(RULES) ? 'rc2' : 'hotfix1')
+const RC2 = LINEAGE === 'rc2'
+console.log(`rules lineage: ${LINEAGE} (staff browser writes to techTickets expected ${RC2 ? 'REFUSED' : 'allowed'})`)
 
 // ── The check harness ───────────────────────────────────────────────────────
 const tally = { checks: 0, failures: 0, ok_denied: 0, ok_error: 0, no_allowed: 0, no_error: 0 }
@@ -99,7 +110,7 @@ function printResult(aborted) {
   console.log(
     `HOTFIX1-RESULT checks=${tally.checks} failures=${tally.failures} ok_denied=${tally.ok_denied} ` +
     `ok_error=${tally.ok_error} no_allowed=${tally.no_allowed} no_error=${tally.no_error} ` +
-    `aborted=${aborted ? 1 : 0} rules_sha256=${RULES_SHA256}`,
+    `aborted=${aborted ? 1 : 0} lineage=${LINEAGE} rules_sha256=${RULES_SHA256}`,
   )
 }
 
@@ -186,11 +197,20 @@ async function main() {
     await ok(`R-5: ${who} reads an internal ticket`, () => getDoc(D(c, 'techTickets/T1')))
   }
   await ok('R-5: a staff member lists the board', () => getDocs(collection(fs(opsMember), 'techTickets')))
-  // Unchanged on purpose: the live CRM files and moves tickets from the
-  // browser (routeSupportTicketToTeam, the board). The tickets API is not deployed.
-  await ok('R-5: a staff member still files a ticket from the browser (tickets API not deployed)', () => setDoc(D(opsMember, 'techTickets/T_NEW'), TICKET))
-  await ok('R-5: a staff member still moves a ticket from the browser', () => updateDoc(D(techAdmin, 'techTickets/T1'), { status: 'in_progress' }))
-  await ok('R-5: a support member still routes an app ticket to a team (creates one)', () => setDoc(D(support, 'techTickets/T_ROUTED'), TICKET))
+  if (RC2) {
+    // RC2 C2 (P1-D): the tickets API (`backend/app/routers/tickets.py`) is the
+    // only writer; the CRM calls it. A browser write by staff is refused.
+    await seed('techTickets/T_NEW', TICKET)
+    await no('R-5 → RC2 C2: a staff member no longer files a ticket from the browser (tickets API)', () => setDoc(D(opsMember, 'techTickets/T_NEW2'), TICKET))
+    await no('R-5 → RC2 C2: a staff member no longer moves a ticket from the browser', () => updateDoc(D(techAdmin, 'techTickets/T1'), { status: 'in_progress' }))
+    await no('R-5 → RC2 C2: a support member no longer routes an app ticket from the browser', () => setDoc(D(support, 'techTickets/T_ROUTED'), TICKET))
+  } else {
+    // Unchanged on purpose: the live CRM files and moves tickets from the
+    // browser (routeSupportTicketToTeam, the board). The tickets API is not deployed.
+    await ok('R-5: a staff member still files a ticket from the browser (tickets API not deployed)', () => setDoc(D(opsMember, 'techTickets/T_NEW'), TICKET))
+    await ok('R-5: a staff member still moves a ticket from the browser', () => updateDoc(D(techAdmin, 'techTickets/T1'), { status: 'in_progress' }))
+    await ok('R-5: a support member still routes an app ticket to a team (creates one)', () => setDoc(D(support, 'techTickets/T_ROUTED'), TICKET))
+  }
 
   for (const [who, c] of [['an agency', agency], ['a coin seller', seller], ['a PENDING self-signup login (isActive: true)', pendingAg],
     ['a host', host], ['a normal user', user], ['a guest', guest], ['a signed-out caller', nobody], ['a deactivated staff login', gone]]) {

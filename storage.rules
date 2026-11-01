@@ -1,5 +1,47 @@
 rules_version = '2';
 
+// ════════════════════════════════════════════════════════════════════════════
+// ZIPPER STORAGE RULES — RELEASE CANDIDATE 2 ("rules RC2", 2026-11-01)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Lineage: DEPLOYED text 9899c24a… (ruleset 27a73af8…, released 20 Oct 2026)
+//   → Owner-MFA candidate 395693b0… (= the previous working tree)
+//   → hotfix-1 hunk from hotfix/rules-20261101/storage.rules
+//   → this file. Diff and deploy order: hotfix/rules-20261101/RC2-DIFF.md.
+// Tests: tests/storage.rc2.rules.test.mjs (+ storage.rules.test.mjs,
+// storage.p1mfa.rules.test.mjs, storage.hotfix1.rules.test.mjs) through
+// tests/run-rc2-rules-tests.command — Storage + Firestore emulators, demo
+// project, no deploy.
+//
+// EVERY CHANGE SINCE 9899c24a, WITH WHAT IT DEPENDS ON:
+//
+//   S1 (P1-A3b, from the MFA candidate) roleClaim(): an `owner` claim counts
+//      only when ownerMfaOk() — a cross-service `firestore.get` of
+//      ownerMfaSessions/{uid} finds an ACTIVE binding for this token's
+//      `mfa_sid` and auth_time, unexpired. Every other claim value is as
+//      before; app users and guests never evaluate it.
+//        needs (HARD, before this deploy): the Storage service agent
+//        `service-239458555881@gcp-sa-firebasestorage.iam.gserviceaccount.com`
+//        granted `roles/firebaserules.firestoreServiceAgent` on the project
+//        (G5 in RC2/production/APPROVAL-COMMANDS.txt). Without it every
+//        `firestore.get` errors and every Owner Storage request fails CLOSED.
+//        needs (ordering): the backend rc2 key revision at 100% and the MFA
+//        CRM live, same as firestore.rules — otherwise no Owner can bind and
+//        every Owner upload/read is refused.
+//   S2 (hotfix-1 A-1) profileMedia/{uid}/{fileName}: image cap 5 MB → 15 MB;
+//      videos stay at 50 MB; owner-only write and delete unchanged.
+//        needs: none (relief for build 19, which uploads the raw photo).
+//
+// DOCUMENTED, NOT CHANGED (audit R-7): /kyc/agencies/signup/{fileName} and
+// /sellerDocs/signup/{fileName} keep `allow get: if true` and an anonymous
+// write-once ≤ 10 MB `create`. The public signup pages upload BEFORE the
+// Firebase user exists, mint the download URL with their own getDownloadURL()
+// and store it on the application; closing `get` needs the CRM to create the
+// Firebase user before step 2 and bind the path to the uid (a CRM change,
+// tracked as R-7). The filenames are timestamp-based and the prefixes are not
+// listable (`list: if false`), which is the mitigation in place today.
+// ════════════════════════════════════════════════════════════════════════════
+
 service firebase.storage {
   match /b/{bucket}/o {
 
@@ -332,8 +374,16 @@ service firebase.storage {
     // platform.
     match /profileMedia/{uid}/{fileName} {
       allow read:  if isSignedIn();
+      // HOTFIX-1 A-1 (2026-11-01): the image cap is 15 MB, up from 5. The
+      // published app (build 19) uploads the raw gallery photo at profile
+      // setup without compressing it, and a 12–50 MP JPEG is routinely
+      // 4–10 MB, so the 5 MB cap refused the upload and the sign-up stalled
+      // on "User does not have permission to access this object". Videos
+      // stay at 50 MB. APK 20 compresses at signup (as Edit Profile already
+      // did) and records a failed upload instead of failing the save; the
+      // cap stays at 15 until every build below 20 is forced up.
       allow write: if isOwner(uid)
-                   && ((isImage() && maxSize(5)) || (isVideo() && maxSize(50)));
+                   && ((isImage() && maxSize(15)) || (isVideo() && maxSize(50)));
       allow delete: if isOwner(uid);
     }
 
