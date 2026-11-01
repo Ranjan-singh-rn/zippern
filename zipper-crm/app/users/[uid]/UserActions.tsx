@@ -67,6 +67,10 @@ import {
 } from '@/lib/roleStateActions'
 import { roleAppealIsOpen } from '@/lib/governanceRequests'
 import { TransferRecommendation } from '@/components/TransferRecommendation'
+import { BanDetailsFields } from '@/components/BanDetailsFields'
+import {
+  DEFAULT_BAN_DETAILS, banDetailsBody, banDetailsProblem, banDetailsSummary, type BanDetailsInput,
+} from '@/lib/banDetails'
 
 /**
  * The four actions whose visibility is decided by the shared policy
@@ -96,7 +100,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import api, {
-  ApiError, type Card, type ModerationResult, type UserCurrency, type WarnResult,
+  ApiError, type Card, type HostRoleResult, type ModerationResult, type UserCurrency, type WarnResult,
 } from '@/lib/api'
 import {
   DEFAULT_SUSPENSION, SuspendDuration, suspensionDays, suspensionProblem,
@@ -104,6 +108,11 @@ import {
 } from '@/components/SuspendDuration'
 
 const MIN_REASON = 3
+/**
+ * `POST /users/{uid}/suspend-host` asks for ten characters: the person and
+ * their agency are told, in these words.
+ */
+const MIN_HOST_SUSPENSION_REASON = 10
 
 type Tone = 'red' | 'green' | 'yellow' | 'blue' | 'purple' | 'slate'
 
@@ -329,9 +338,11 @@ const ACTIONS: ActionSpec[] = [
     effect: (
       <>
         The account is locked out of the app immediately — no owner signature is needed for
-        moderation — and <strong>every handset this account has ever been seen on is barred</strong>.
-        A barred handset locks out <em>every</em> account on it, so the person cannot sign in with a
-        different account on those phones, and neither can anybody else who shares one. It is lifted
+        moderation. By default <strong>every handset this account has ever been seen on is barred</strong>:
+        a barred handset locks out <em>every</em> account on it, so the person cannot sign in with a
+        different account on those phones, and neither can anybody else who shares one. Choose
+        &ldquo;Account only&rdquo; below to leave the handsets alone. The scope, category and evidence
+        are recorded with the ban and shown to whoever reviews an appeal against it. It is lifted
         with <strong>Unban</strong>.
       </>
     ),
@@ -443,16 +454,55 @@ function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? '' : 's'}`
 }
 
+/**
+ * What a Host-role suspension or resumption did, from the server's answer —
+ * its own sentence (`note`) first, then who was told, the live rooms it ended,
+ * and the money: frozen by a suspension, NOT released by a resume.
+ */
+function hostRoleOutcome(res: HostRoleResult, resumed: boolean): Success {
+  if (res.already) {
+    return {
+      text: 'This Host role was already suspended on these terms — nothing was changed or sent twice.',
+      note: res.note,
+    }
+  }
+  const untilRaw = res.host?.suspendedUntil ?? ''
+  const until = untilRaw ? new Date(untilRaw) : null
+  const when = until && !Number.isNaN(until.getTime()) ? ` until ${until.toLocaleString('en-IN')}` : ' with no end date'
+  const told = [res.notified?.host ? 'the host' : '', res.notified?.agency ? 'their agency' : ''].filter(Boolean)
+  const untold = [res.notified?.host ? '' : 'the host', res.notified?.agency ? '' : 'their agency'].filter(Boolean)
+  const ended = res.live_rooms_ended ?? []
+  const notEnded = res.live_rooms_not_ended ?? []
+  return {
+    text: resumed
+      ? `Host role resumed — status ${res.host?.status || 'active'}. The account itself was never touched.`
+      : `Host role suspended${when}. The account, its balances and its other roles are untouched.`,
+    note: [
+      res.note ?? '',
+      told.length ? `Told: ${told.join(' and ')}.` : '',
+      untold.length ? `Not told automatically: ${untold.join(' and ')}.` : '',
+      ended.length ? `${plural(ended.length, 'live room')} ended.` : '',
+      notEnded.length ? `${plural(notEnded.length, 'live room')} could not be ended — end ${notEnded.length === 1 ? 'it' : 'them'} from Live Monitor.` : '',
+      resumed && res.money_released === false ? 'Frozen host money stays frozen until the Owner decides it on Frozen money.' : '',
+    ].filter(Boolean).join(' '),
+  }
+}
+
 export function UserActions({
   uid, name, accountState, isBanned, isSuspended, isHost, isSeller, crmRole,
   actorUid, diamonds = 0, beansAvailable = 0, onDone,
 }: Props) {
   const { crmUser, apiUser } = useAuth()
   const canAdjustBalance = hasPermission(crmUser, 'can_adjust_balance')
+  // Suspending, resuming and revoking a Host cost `can_approve_kyc` on the
+  // server. Offered to whoever holds it; the server decides either way.
+  const canApproveKyc = hasPermission(crmUser, 'can_approve_kyc')
   // GOV C2: restoring a REVOKED role is the Owner's decision (403 otherwise).
   const isOwner = apiUser?.role === 'owner'
   const [pending, setPending] = useState<ActionSpec | null>(null)
   const [reason, setReason] = useState('')
+  // §5: what the ban reaches, its category and its evidence references.
+  const [banDetails, setBanDetails] = useState<BanDetailsInput>({ ...DEFAULT_BAN_DETAILS })
   const [currency, setCurrency] = useState<UserCurrency>('diamonds')
   const [amount, setAmount] = useState('')
   // ── UGP-B: the role inventory, and the role action being confirmed ───────
@@ -521,7 +571,7 @@ export function UserActions({
   }, [uid])
   useEffect(() => { void loadRoles() }, [loadRoles])
   // Spec §10: one row per role, each with its own state and its own actions.
-  const roleRowsList = roleRows(roles, { isOwner, openReinstatement })
+  const roleRowsList = roleRows(roles, { isOwner, openReinstatement, canManageHostRole: canApproveKyc })
   const allowedDeduction = (roles?.deduction_currencies ?? []).filter(
     (c): c is UserCurrency => c === 'diamonds' || c === 'beans',
   )
@@ -582,6 +632,7 @@ export function UserActions({
     setRoleAction(null)
     setReason('')
     setAmount('')
+    setBanDetails({ ...DEFAULT_BAN_DETAILS })
     setTerm(DEFAULT_SUSPENSION)
     setDeduct(false)
     setDedAmount('')
@@ -605,8 +656,12 @@ export function UserActions({
         : 'Approves the application. The role starts once both contacts on the login are verified; no money moves now.',
       reject: 'The application is refused. The reason is stored on the record and shown to the applicant; they may apply again.',
       check_and_start: 'Asks the API to re-read the login’s contact verification and start the approved role if both are verified. Never bypasses them.',
-      suspend_role: 'Only this role is paused. The account, its other roles, its balances and all history stay; the person is told, with your reason. Lifted with Resume.',
-      resume_role: 'Lifts the role-level suspension. The SAME record is re-activated — no new application.',
+      suspend_role: a.role === 'host'
+        ? 'Only the Host role is paused — the person cannot host while it lasts. The account, its other roles, its balances and all history stay; the host and their agency are told, with your reason. A timed suspension ends by itself; an indefinite one waits for Resume Host role.'
+        : 'Only this role is paused. The account, its other roles, its balances and all history stay; the person is told, with your reason. Lifted with Resume.',
+      resume_role: a.role === 'host'
+        ? 'Lifts the Host-role suspension — the same role, re-activated, with no new application. The host and their agency are told.'
+        : 'Lifts the role-level suspension. The SAME record is re-activated — no new application.',
       revoke_role: 'Only this role is taken away. The account, its other roles, its balances and all history stay. The person is told, with your reason. The way back is a reinstatement request the Owner decides.',
       request_reinstatement: 'Files a reinstatement request for this revoked role on the person’s behalf. Reviewers recommend; only the Owner decides. Nothing is restored now.',
       review_reinstatement: '',
@@ -622,12 +677,17 @@ export function UserActions({
       confirmLabel: a.label,
       reasonHint: a.kind === 'request_reinstatement'
         ? 'The statement on the request (at least 20 characters). What the reviewers and the Owner read.'
-        : taking
-          ? 'Why. The person is told, with these words.'
-          : 'Why. This is what the audit log keeps.',
+        : a.kind === 'suspend_role' && a.role === 'host'
+          ? `Why (at least ${MIN_HOST_SUSPENSION_REASON} characters). The host and their agency are told, with these words.`
+          : taking
+            ? 'Why. The person is told, with these words.'
+            : 'Why. This is what the audit log keeps.',
     })
     setRoleAction(a)
   }
+
+  /** The Host role on its own: suspended with a term (days or indefinite). */
+  const suspendingHost = pending?.key === 'role' && roleAction?.kind === 'suspend_role' && roleAction.role === 'host'
 
   function close() {
     setPending(null)
@@ -643,9 +703,9 @@ export function UserActions({
       // miss and it gets its own lines; saying it twice in two shapes is how a
       // reader ends up believing there were two of them.
       case 'ban': {
-        const res = (await api.users.ban(uid, why)) as BanOutcome
+        const res = (await api.users.ban(uid, why, banDetailsBody(banDetails))) as BanOutcome
         return {
-          text: `${who} is banned. They are locked out of the app now.`,
+          text: `${who} is banned. They are locked out of the app now. ${banDetailsSummary(banDetails)}`,
           note: res.note,
           barred: res.devices_barred ?? [],
           failures: res.device_failures ?? [],
@@ -710,12 +770,13 @@ export function UserActions({
               : out.already_active ? 'This role had already started.' : 'Checked — still waiting for a verified contact.' }
           }
           case 'suspend_role':
-            // TODO(B2 API): a Host's role suspension is a stub (lib/backendFeatures).
-            if (host) throw new ApiError('Suspending the Host role on its own is available after the next backend release.', 400)
+            // The Host role on its own — `POST /users/{uid}/suspend-host`.
+            if (host) return hostRoleOutcome(await api.users.suspendHost(uid, why, suspensionDays(term)), false)
             await partnerOps.deactivate(b.targetId, why)
             return { text: `${b.label.replace('Suspend ', '').replace(' role', '')} role suspended. The account and its other roles are untouched.` }
           case 'resume_role':
-            if (host) throw new ApiError('Resuming the Host role on its own is available after the next backend release.', 400)
+            // `POST /users/{uid}/resume-host` — the same Host role, re-activated.
+            if (host) return hostRoleOutcome(await api.users.resumeHost(uid, why), true)
             await partnerOps.reactivate(b.targetId, why)
             return { text: 'Role-level suspension lifted — the same record, re-activated.' }
           case 'revoke_role':
@@ -763,6 +824,32 @@ export function UserActions({
     if (pending.key === 'role' && roleAction?.kind === 'request_reinstatement' && why.length < 20) {
       setFailure({ message: 'A reinstatement request needs a statement of at least 20 characters.', isRule: true })
       return
+    }
+
+    // `suspend-host`: a reason of at least ten, and the same term bounds as an
+    // account suspension — both the server's.
+    if (suspendingHost) {
+      if (why.length < MIN_HOST_SUSPENSION_REASON) {
+        setFailure({
+          message: `Suspending the Host role needs a reason of at least ${MIN_HOST_SUSPENSION_REASON} characters — the host and their agency are told, in these words.`,
+          isRule: true,
+        })
+        return
+      }
+      const problem = suspensionProblem(term)
+      if (problem) {
+        setFailure({ message: problem, isRule: true })
+        return
+      }
+    }
+
+    // §5: the ban's scope, category and evidence, within the server's bounds.
+    if (pending.key === 'ban') {
+      const problem = banDetailsProblem(banDetails)
+      if (problem) {
+        setFailure({ message: problem, isRule: true })
+        return
+      }
     }
 
     // Checked here as well as on the server, because a refused suspension is a
@@ -1041,6 +1128,15 @@ export function UserActions({
                           : 'border-slate-600 text-slate-300'}`}>
                           {r.stateLabel}
                         </span>
+                        {/* A suspended Host role: its term and reason, as the server holds them. */}
+                        {r.row.role === 'host' && r.state === 'suspended' && (
+                          <p className="text-yellow-200/80 text-xs mt-1">
+                            {r.row.suspended_until
+                              ? `Until ${new Date(r.row.suspended_until).toLocaleString('en-IN')} — lifts itself`
+                              : 'Until somebody resumes it'}
+                            {r.row.suspension_reason ? ` · ${r.row.suspension_reason}` : ''}
+                          </p>
+                        )}
                       </div>
                       <div className="flex flex-wrap items-center gap-1.5 ml-auto">
                         {/* A PENDING application is decided ONCE, in the Applications
@@ -1068,7 +1164,7 @@ export function UserActions({
                           >
                             {a.kind === 'revoke_role' || a.kind === 'reject' || a.kind === 'suspend_role'
                               ? <StarOff size={12} /> : <RotateCcw size={12} />} {a.label}
-                            {/* TODO(B2 API): a stub waits for the next backend release. */}
+                            {/* A stub only appears if a backend flag is rolled back (lib/backendFeatures). */}
                             {a.via === 'stub' && <span className="text-[10px] text-slate-500 ml-1">(next release)</span>}
                           </button>
                         ))}
@@ -1125,8 +1221,12 @@ export function UserActions({
             <div className="px-6 py-5 space-y-4">
               <p className="text-slate-300 text-sm leading-relaxed">{pending.effect}</p>
 
-              {pending.key === 'suspend' && (
+              {(pending.key === 'suspend' || suspendingHost) && (
                 <SuspendDuration value={term} onChange={setTerm} />
+              )}
+
+              {pending.key === 'ban' && (
+                <BanDetailsFields value={banDetails} onChange={setBanDetails} />
               )}
 
               {pending.key === 'balance' && (
@@ -1229,8 +1329,8 @@ export function UserActions({
                   className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500 resize-none"
                 />
                 <p className="text-slate-600 text-xs mt-1">
-                  At least {MIN_REASON} characters. This is stored in the audit log and read back on
-                  the account history.
+                  At least {suspendingHost ? MIN_HOST_SUSPENSION_REASON : MIN_REASON} characters. This is
+                  stored in the audit log and read back on the account history.
                 </p>
               </div>
 

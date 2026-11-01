@@ -74,6 +74,8 @@ import {
   RotateCcw,
   ArrowRightLeft,
   Lock,
+  MonitorSmartphone,
+  ShieldCheck,
 } from 'lucide-react'
 
 // Every screen below reads an endpoint behind `_require_oversight` or
@@ -217,6 +219,11 @@ const navGroups: NavGroup[] = [
       // financial report, so a finance member keeps it.
       { href: '/lending',             label: 'Credit Book',   icon: HandCoins,  roles: ['superadmin', 'finance_admin', 'finance_member', 'ops_admin'] },
       { href: '/finance/reports',     label: 'Weekly Reports', icon: BarChart3, roles: ['superadmin', 'finance_admin'] },
+      // B1: held items of a revoked partner, replica drift and (Owner) the
+      // money notices not yet delivered. `can_process_payout` on the server —
+      // the Owner, Finance admin and Finance member; the page offers each
+      // section by the server's own gate (lib/moneyIntegrity).
+      { href: '/finance/integrity',   label: 'Money integrity', icon: ShieldCheck, roles: ['superadmin', 'finance_admin', 'finance_member'] },
     ],
   },
   {
@@ -318,6 +325,10 @@ const navGroups: NavGroup[] = [
       // Everybody has one, including partners — it is their own record, and
       // keeping your own phone number current should not need a request.
       { href: '/profile',     label: 'My Profile',  icon: UserCircle, roles: STAFF_ROLES },
+      // B3 / §13: this login's live sessions and "Sign out everywhere else".
+      // Self-scoped on the server, so every staff role has it; partners reach
+      // it from their switcher and the Observer from their own sidebar.
+      { href: '/sessions', label: 'Signed-in devices', icon: MonitorSmartphone, roles: STAFF_ROLES },
       { href: '/audit',       label: 'Audit Log',   icon: History, roles: STAFF_ROLES },
       { href: '/team-access', label: 'Team Access', icon: UserCog, roles: STAFF_ROLES },
       { href: '/policies',  label: 'Policies',  icon: BookOpen, roles: ['superadmin', 'app_admin'] },
@@ -694,9 +705,11 @@ function BootSplash() {
 // Note '/tech/email' and '/tech/jobs' are listed individually and '/tech' is
 // NOT. These match by prefix, so '/tech' would also open Content, Payments,
 // App Control and Team Tickets — none of which are read-only API screens.
+// '/sessions' is the Observer's own sessions (B3 / §13) — self-scoped on the
+// server, so seeing and ending them writes nothing about the business.
 const OBSERVER_ROUTES = [
   '/inbox', '/board', '/audit', '/team-access', '/partners', '/reports', '/finance',
-  '/alerts', '/tech/email', '/tech/jobs',
+  '/alerts', '/tech/email', '/tech/jobs', '/sessions',
 ]
 
 function ObserverShell({ children, pathname }: { children: React.ReactNode; pathname: string }) {
@@ -721,6 +734,7 @@ function ObserverShell({ children, pathname }: { children: React.ReactNode; path
           <NavItem href="/audit"  label="Audit Log"      icon={History}  isActive={pathname.startsWith('/audit')} />
           <NavItem href="/partners" label="Statements"  icon={Building2} isActive={pathname.startsWith('/partners')} />
           <NavItem href="/team-access" label="Team Access" icon={UserCog} isActive={pathname.startsWith('/team-access')} />
+          <NavItem href="/sessions" label="Signed-in devices" icon={MonitorSmartphone} isActive={pathname.startsWith('/sessions')} />
         </nav>
         <div className="px-4 py-4 border-t border-slate-800">
           <div className="flex items-center gap-3">

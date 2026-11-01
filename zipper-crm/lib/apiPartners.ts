@@ -1044,6 +1044,46 @@ export interface TransferRequest {
   requested_by: { uid: string; role: string; name?: string }
   requested_at: string
   decision: { by_uid: string; note: string; at: string; approve?: boolean } | null
+  /**
+   * §6: the request IS the Operations recommendation — who filed it, their
+   * note, when (`transfer_requests.view`). Shown under that name.
+   */
+  recommendation?: TransferRecommendationView | null
+  /**
+   * §6: the hold placed on the subject's unsettled earnings when the Owner
+   * approves — BEFORE the move — with cause `transfer_review` and settlement
+   * policy `OWNER_DECISION_PENDING`. Null until an approval placed one.
+   * Presented by `presentTransferHold` in `lib/governanceRequests.ts`.
+   */
+  hold?: TransferHold | null
+}
+
+export interface TransferRecommendationView {
+  by: { uid?: string; role?: string; name?: string }
+  note: string
+  at: string | null
+}
+
+export interface TransferHold {
+  /** `transfer_review`. */
+  cause: string
+  /** The frozen-money record the Owner decides (release / withhold / adjust). */
+  freeze_id: string
+  subject: { type: string; id: string }
+  status: string
+  /** `OWNER_DECISION_PENDING` — who keeps unsettled earnings is not decided yet. */
+  settlement_policy: string
+  /** `owner_or_finance`. */
+  review_by: string
+  at: string | null
+}
+
+/** What deciding a transfer answers (`transfer_requests.decide`). */
+export interface TransferDecisionResult {
+  request?: TransferRequest
+  moved?: Record<string, unknown> | null
+  hold?: TransferHold | null
+  notified?: unknown
 }
 
 export const transfers = {
@@ -1058,9 +1098,13 @@ export const transfers = {
   recommend: (body: { kind: TransferKind; subject_id: string; to_agency_id: string; note: string }) =>
     post<unknown>('/partner-ops/transfers', body),
 
-  /** Owner only. The server answers anybody else with 403. */
+  /**
+   * Owner only. The server answers anybody else with 403. An approval places
+   * the §6 hold on the subject's unsettled earnings before it moves anything,
+   * and answers with that hold.
+   */
   decide: (id: string, approve: boolean, note: string) =>
-    post<unknown>(
+    post<TransferDecisionResult>(
       `/partner-ops/transfers/${encodeURIComponent(id)}/decide`,
       { approve, note },
     ),

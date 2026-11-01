@@ -11,6 +11,12 @@
  * and only the Owner DECIDES it here. Approving re-validates both ends and runs
  * the existing move; no balance and no ledger row moves.
  *
+ * §6: each request shows its RECOMMENDATION (who filed it, their note, when)
+ * and, once approved, the HOLD the approval placed on the subject's unsettled
+ * earnings BEFORE the move — cause `transfer_review`, settlement policy
+ * `OWNER_DECISION_PENDING` — which the Owner releases, withholds or adjusts on
+ * Frozen money (`presentTransferHold` in lib/governanceRequests).
+ *
  *   GET  /api/partner-ops/transfers?status=open|all
  *   POST /api/partner-ops/transfers/{id}/decide   {approve, note} — Owner only
  */
@@ -18,14 +24,15 @@
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
-  AlertTriangle, ArrowRight, ArrowRightLeft, Check, Clock, Gavel, Loader2, ShieldCheck, X,
+  AlertTriangle, ArrowRight, ArrowRightLeft, Check, Clock, Gavel, Loader2, Lock, ShieldCheck, X,
 } from 'lucide-react'
 import { ApiError } from '@/lib/api'
 import { transfers, type TransferRequest } from '@/lib/apiPartners'
 import { getAgencyNames } from '@/lib/agencies'
 import {
-  MIN_NOTE, OWNER_DECIDES_TRANSFER,
-  noteProblem, presentTransferStatus, transferIsOpen,
+  APPROVAL_PLACES_HOLD, MIN_NOTE, OWNER_DECIDES_TRANSFER, TRANSFER_HOLD_EXPLAINED,
+  noteProblem, presentTransferHold, presentTransferRecommendation, presentTransferStatus, transferIsOpen,
+  type TransferHoldView,
 } from '@/lib/governanceRequests'
 import { Denied, Empty, ErrorState, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
@@ -38,6 +45,37 @@ import { useIdentities } from '@/lib/useIdentities'
 const VIEW_ROLES: CrmRole[] = ['superadmin', 'ops_admin']
 
 type Tab = 'open' | 'all'
+
+/** An ISO time for a reader; anything unreadable is shown as the server wrote it. */
+function whenIso(iso: string): string {
+  const t = Date.parse(iso)
+  return Number.isNaN(t) ? iso : new Date(t).toLocaleString('en-IN')
+}
+
+/**
+ * §6 — the hold an approval placed on the subject's unsettled earnings, in
+ * the server's words. The Owner decides it on Frozen money; Finance may read it.
+ */
+function HoldPanel({ hold, isOwner }: { hold: TransferHoldView; isOwner: boolean }) {
+  return (
+    <div className={`mt-3 rounded-lg px-3 py-2.5 border ${hold.frozen ? 'bg-sky-500/5 border-sky-500/30' : 'bg-slate-950 border-slate-800'}`}>
+      <p className="text-sky-200 text-sm font-medium flex items-center gap-1.5">
+        <Lock size={13} /> {hold.title}
+      </p>
+      <ul className="mt-1 space-y-0.5">
+        {hold.lines.map((l) => (
+          <li key={l} className="text-slate-400 text-xs">{l.startsWith('Placed: ') ? `Placed: ${whenIso(l.slice(8))}` : l}</li>
+        ))}
+      </ul>
+      {hold.frozen && <p className="text-slate-500 text-xs mt-1.5">{TRANSFER_HOLD_EXPLAINED}</p>}
+      {hold.frozen && isOwner && (
+        <Link href="/frozen-money" className="text-pink-400 hover:text-pink-300 text-xs underline underline-offset-2">
+          Decide it on Frozen money
+        </Link>
+      )}
+    </div>
+  )
+}
 
 function age(iso: string | null | undefined): string {
   if (!iso) return 'age unknown'
@@ -104,9 +142,13 @@ export default function TransfersPage() {
     setBusy(true)
     setFailure('')
     try {
-      await transfers.decide(target.id, approve, note.trim())
+      const res = await transfers.decide(target.id, approve, note.trim())
+      const hold = presentTransferHold(res?.hold ?? res?.request?.hold ?? null)
       setNotice(approve
-        ? 'Approved: the move has been carried out. No balance or ledger entry moved.'
+        ? 'Approved: the move has been carried out. No balance or ledger entry moved.' +
+          (hold
+            ? ` ${hold.title}${hold.freezeId ? ` (frozen-money record ${hold.freezeId})` : ''} — who keeps them is still the Owner’s decision.`
+            : ' The server reported no hold on unsettled earnings.')
         : 'Rejected: nothing was moved.')
       setTarget(null)
       await load()
@@ -202,6 +244,9 @@ export default function TransfersPage() {
           {rows.map((t) => {
             const status = presentTransferStatus(t.status)
             const openNow = transferIsOpen(t.status)
+            // §6: the request IS the recommendation; the hold, once approved.
+            const rec = presentTransferRecommendation(t)
+            const hold = presentTransferHold(t.hold)
             return (
               <div key={t.id || `${t.kind}:${t.subject_id}`} className="bg-slate-900 border border-slate-800 rounded-xl p-5">
                 <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
@@ -232,8 +277,7 @@ export default function TransfersPage() {
                       {agencyCell(t.to_agency_id)}
                     </p>
                     <p className="text-slate-500 text-xs mt-1">
-                      Recommended by {t.requested_by?.name || t.requested_by?.role || 'staff'}
-                      {t.requested_by?.uid ? <> · <span className="font-mono">{t.requested_by.uid}</span></> : null}
+                      {t.requested_by?.uid ? <>Filed by <span className="font-mono">{t.requested_by.uid}</span></> : 'Filer not recorded'}
                       {t.id ? <> · request <span className="font-mono">{t.id}</span></> : null}
                     </p>
                   </div>
@@ -245,9 +289,13 @@ export default function TransfersPage() {
                   </div>
                 </div>
 
-                <p className="text-slate-200 text-sm bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5 whitespace-pre-wrap">
-                  {t.note || 'No reason was given.'}
-                </p>
+                <div className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2.5">
+                  <p className="text-slate-500 text-xs mb-1">
+                    Recommendation — {rec.by}
+                    {rec.at ? ` · ${whenIso(rec.at)}` : ''}
+                  </p>
+                  <p className="text-slate-200 text-sm whitespace-pre-wrap">{rec.note || 'No reason was given.'}</p>
+                </div>
 
                 {t.decision && (
                   <p className="text-slate-400 text-sm mt-3 border-t border-slate-800 pt-3">
@@ -255,6 +303,8 @@ export default function TransfersPage() {
                     {t.decision.note || '—'}
                   </p>
                 )}
+
+                {hold && <HoldPanel hold={hold} isOwner={isOwner} />}
 
                 {openNow && (
                   <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -322,6 +372,11 @@ export default function TransfersPage() {
                   ? 'Both ends are re-checked, then the move is carried out with the existing helper and the partner is told. No balance and no ledger entry moves.'
                   : 'Nothing moves. The request is kept, with your note.'}
               </p>
+              {approve && (
+                <p className="text-sky-200/90 text-xs leading-relaxed flex items-start gap-1.5">
+                  <Lock size={12} className="mt-0.5 shrink-0" /> {APPROVAL_PLACES_HOLD}
+                </p>
+              )}
 
               <div>
                 <label className="block text-slate-400 text-xs font-medium mb-1.5">

@@ -106,8 +106,10 @@ export function roleButtons(roles: UserRoles | null | undefined): RoleButton[] {
 /** One line for the page: what the person holds, by role and status. */
 export function heldSummary(roles: UserRoles | null | undefined): string {
   if (!roles) return ''
+  // A SUSPENDED Host still holds the role (`user_roles.HELD_HOST_STATUSES`):
+  // the record and the slot are kept while it is paused, as for a partner.
   const held = roles.roles.filter((r) =>
-    r.role === 'host' ? r.status === 'active' : r.status === 'approved' || r.status === 'suspended')
+    r.role === 'host' ? r.status === 'active' || r.status === 'suspended' : r.status === 'approved' || r.status === 'suspended')
   if (held.length === 0) return 'No partner or host role.'
   const parts = held.map((r) => `${LABEL[r.role] ?? r.role}${r.status === 'suspended' ? ' (suspended)' : ''}`)
   return held.length === 1

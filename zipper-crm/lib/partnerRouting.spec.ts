@@ -402,6 +402,35 @@ check('nor a route that merely starts with the same letters',
 check('nor anything that merely mentions it',
   resolvePartnerRedirect(agencyApproved, '/team/profile'), '/agency-dashboard')
 
+// /sessions (B3 / §13) is the second shared screen: the sessions this login
+// holds and "Sign out everywhere else" — self-scoped on the server, so there
+// is nothing on it but the caller's own. Same rules as /profile.
+for (const user of [
+  agencyPending,
+  agencyApproved,
+  sellerApproved,
+  bothApproved,
+  bothPending,
+  agencyApprovedSellerPending,
+  agencyPendingSellerApproved,
+]) {
+  for (const path of ['/sessions', '/sessions/']) {
+    check(
+      `partner ${JSON.stringify(user.roleStatus ?? user.status)} may sit on ${path}`,
+      resolvePartnerRedirect(user, path),
+      null,
+    )
+  }
+}
+check('/sessions is not a capability path',
+  allowedPartnerPaths(bothApproved).includes('/sessions'), false)
+check('nobody is ever landed on /sessions',
+  [partnerLanding(bothPending), partnerLanding(agencyApproved), partnerLanding(agencyPendingSellerApproved)]
+    .includes('/sessions'),
+  false)
+check('a route that merely starts with the same letters is still refused',
+  resolvePartnerRedirect(agencyApproved, '/sessions-admin'), '/agency-dashboard')
+
 // ══════════════════════════════════════════════════════════════════════════════
 // 4. Every combination terminates
 // ══════════════════════════════════════════════════════════════════════════════

@@ -11,20 +11,31 @@
  * The server now refuses a non-Owner on both. This module decides what the
  * screens OFFER, so nobody is shown a button that was always going to 403.
  *
- * REAL: `lib/governanceRequests.ts`, imported and called.
+ * REAL: `lib/governanceRequests.ts`, imported and called. §6 adds the
+ * transfer's recommendation and the hold its approval places on unsettled
+ * earnings; those are compared with `backend/app/services/transfer_requests.py`
+ * when the backend sits beside this repo, and `/transfers` is checked on its
+ * source.
  *
  *   npm run test:govrequests
  */
 
+import * as fs from 'fs'
+import * as path from 'path'
 import {
+  APPROVAL_PLACES_HOLD,
   MIN_NOTE,
   OWNER_DECIDES_REINSTATEMENT,
   REVOKED_RESTORE_HINT,
+  SETTLEMENT_POLICY_PENDING,
+  TRANSFER_HOLD_CAUSE,
   canRecommendTransfer,
   idOf,
   listFrom,
   noteProblem,
   presentRoleAppealStatus,
+  presentTransferHold,
+  presentTransferRecommendation,
   presentTransferStatus,
   restoreGate,
   restoreNeedsOwner,
@@ -171,6 +182,54 @@ eq('the usual other wrappers', listFrom<number>({ items: [4] }, 'transfers'), [4
 eq('anything else is empty, never a crash', [listFrom(null, 'x'), listFrom('nope', 'x'), listFrom({ x: 'nope' }, 'x')], [[], [], []])
 eq('an id under either spelling', [idOf({ id: 'ra_1' }), idOf({ _id: 'tr_2' }), idOf(null)], ['ra_1', 'tr_2', ''])
 
+// ── 7. §6: the recommendation, and the hold on unsettled earnings ───────────
+console.log('7. A transfer shows its recommendation and its hold')
+{
+  const rec = presentTransferRecommendation({
+    recommendation: { by: { uid: 'u9', role: 'ops_admin', name: 'Neha' }, note: 'Host asked to move; both agencies agree.', at: '2026-10-30T10:00:00+00:00' },
+    requested_by: { uid: 'other', role: 'owner' }, note: 'ignored', requested_at: 'ignored',
+  })
+  eq('the recommendation is read from the server\'s own block', rec,
+    { by: 'Neha (ops admin)', note: 'Host asked to move; both agencies agree.', at: '2026-10-30T10:00:00+00:00' })
+  eq('an older server: the same facts from the request', presentTransferRecommendation({
+    requested_by: { uid: 'u9', role: 'ops_admin' }, note: 'Moving for payroll.', requested_at: '2026-10-29T00:00:00Z',
+  }), { by: 'u9 (ops admin)', note: 'Moving for payroll.', at: '2026-10-29T00:00:00Z' })
+  eq('nobody recorded → "staff", never a made-up name', presentTransferRecommendation({}).by, 'staff')
+
+  const hold = presentTransferHold({
+    cause: 'transfer_review', freeze_id: 'fz_1', subject: { type: 'user', id: 'host-1' }, status: 'frozen',
+    settlement_policy: 'OWNER_DECISION_PENDING', review_by: 'owner_or_finance', at: '2026-10-31T09:00:00+00:00',
+  })
+  ok('a hold is shown', hold !== null)
+  eq('…titled as held for review', hold?.title, 'Unsettled earnings held for review')
+  ok('…naming the cause', hold?.lines.includes('Cause: transfer review (transfer_review)') === true)
+  ok('…and the settlement policy as an Owner decision still pending',
+    hold?.lines.includes('Settlement policy: an Owner decision still to be made (OWNER_DECISION_PENDING)') === true)
+  ok('…who reviews it', hold?.lines.includes('Reviewed by: the Owner or Finance') === true)
+  eq('…frozen, policy pending, with its frozen-money record', [hold?.frozen, hold?.policyPending, hold?.freezeId], [true, true, 'fz_1'])
+  const released = presentTransferHold({ cause: 'transfer_review', status: 'released', settlement_policy: 'OWNER_DECISION_PENDING' })
+  eq('a released hold says so', [released?.title, released?.frozen], ['Unsettled earnings: released', false])
+  ok('an unknown cause is shown as written', presentTransferHold({ cause: 'audit' })?.lines.includes('Cause: audit') === true)
+  eq('no hold → null', [presentTransferHold(null), presentTransferHold(undefined), presentTransferHold('x')], [null, null, null])
+  ok('the decide dialog says the hold goes on first, and nothing moves without it',
+    /first places a hold/.test(APPROVAL_PLACES_HOLD) && /nothing is moved/.test(APPROVAL_PLACES_HOLD))
+
+  const svc = path.join(__dirname, '..', '..', 'backend', 'app', 'services', 'transfer_requests.py')
+  if (fs.existsSync(svc)) {
+    const s = fs.readFileSync(svc, 'utf8')
+    ok('server: the hold cause is transfer_review', s.includes(`HOLD_CAUSE = "${TRANSFER_HOLD_CAUSE}"`))
+    ok('server: the settlement policy is OWNER_DECISION_PENDING', s.includes(`"settlement_policy": "${SETTLEMENT_POLICY_PENDING}"`))
+    ok('server: the view carries the recommendation and the hold', s.includes('"recommendation": {') && s.includes('"hold": ({**hold'))
+  } else {
+    console.log('  (backend not beside this repo — the server comparison was skipped)')
+  }
+
+  const page = fs.readFileSync(path.join(__dirname, '..', 'app', 'transfers', 'page.tsx'), 'utf8')
+  ok('/transfers shows the recommendation', page.includes('presentTransferRecommendation('))
+  ok('/transfers shows the hold', page.includes('presentTransferHold('))
+  ok('/transfers says an approval places the hold first', page.includes('APPROVAL_PLACES_HOLD'))
+}
+
 if (failures.length) {
   console.error(`\n${failures.length} of ${checks} governance-request checks FAILED\n`)
   for (const f of failures) console.error('  ✗ ' + f)
@@ -181,3 +240,4 @@ console.log('  · reviewers recommend a reinstatement; only the Owner decides on
 console.log('  · a revoked role is restored by the Owner only — a suspended one as before')
 console.log('  · a transfer is offered only to a destination the server accepts')
 console.log('  · a revocation that moves dependents is explained as the Owner\'s decision')
+console.log('  · a transfer shows its recommendation and the hold (transfer_review, OWNER_DECISION_PENDING)')

@@ -45,11 +45,14 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import {
-  AlertTriangle, CheckCircle2, Info, KeyRound, Loader2, Mail, Plus,
+  AlertTriangle, Building, CheckCircle2, Info, KeyRound, Loader2, Mail, Plus,
   PauseCircle, RefreshCw, RotateCcw, Search, Shield, ShieldCheck, UserCog, UserX, X,
 } from 'lucide-react'
 import api, { ApiError, staffStatus, type ApiRole, type StaffMember } from '@/lib/api'
-import { BACKEND_FEATURES, NEXT_RELEASE_NOTE } from '@/lib/backendFeatures'
+import { BACKEND_FEATURES } from '@/lib/backendFeatures'
+import {
+  VACANCY_NOTE, adminNames, departmentsFrom, reportsToOf, type DepartmentRow,
+} from '@/lib/departments'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
 import { sendCrmPasswordReset } from '@/lib/auth'
@@ -155,6 +158,10 @@ export default function TeamPage() {
   const [rows, setRows] = useState<StaffMember[]>([])
   const [assignable, setAssignable] = useState<ApiRole[]>([])
   const [me, setMe] = useState<{ uid: string; role: ApiRole } | null>(null)
+  // §9: each department's Admin seat. Read on its own, so an unreadable
+  // department list never costs the roster — and is said, never shown as "none vacant".
+  const [departments, setDepartments] = useState<DepartmentRow[] | null>(null)
+  const [departmentsError, setDepartmentsError] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -167,10 +174,24 @@ export default function TeamPage() {
   const [accessAction, setAccessAction] = useState<{ member: StaffMember; mode: AccessMode } | null>(null)
   const [resettingUid, setResettingUid] = useState<string | null>(null)
 
+  const loadDepartments = useCallback(async () => {
+    if (!apiReady || !BACKEND_FEATURES.departmentVacancy) return
+    setDepartmentsError('')
+    try {
+      setDepartments(departmentsFrom(await api.staff.departments()))
+    } catch (err) {
+      setDepartments(null)
+      setDepartmentsError(saidWhy(err, 'The departments could not be read.'))
+    }
+  }, [apiReady])
+
   const load = useCallback(async () => {
     if (!apiReady) return
     setLoading(true)
     setError('')
+    // A role change, a suspension or a revocation can open or close a
+    // department's vacancy, so the seats are re-read with the roster.
+    void loadDepartments()
     try {
       const [list, roles, who] = await Promise.all([
         // Inactive people are shown deliberately. A revoked account that simply
@@ -189,7 +210,7 @@ export default function TeamPage() {
     } finally {
       setLoading(false)
     }
-  }, [apiReady])
+  }, [apiReady, loadDepartments])
 
   useEffect(() => { load() }, [load])
 
@@ -371,16 +392,59 @@ export default function TeamPage() {
         <StatCard label="Newest" value={newest?.name || newest?.email || '—'} />
       </div>
 
-      {/* TODO(B2 API): department vacancies (`GET /staff/vacancies`, see
-          lib/backendFeatures). Rendered as a stub until the route is released,
-          so the screen says what it will show rather than calling a 404. */}
-      {!BACKEND_FEATURES.departmentVacancy && (
-        <div className="mb-6 flex items-start gap-2 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
-          <AlertTriangle size={15} className="text-slate-500 mt-0.5 shrink-0" />
-          <p className="text-slate-400 text-sm">
-            <span className="text-slate-200 font-medium">Department vacancies</span> — departments
-            with no active admin, and since when. {NEXT_RELEASE_NOTE}
-          </p>
+      {/* §9: every department's Admin seat, from `GET /staff/departments`. A
+          vacant seat means its members report to the Owner until an Admin is
+          appointed — the server holds that state and says since when and why. */}
+      {BACKEND_FEATURES.departmentVacancy && (
+        <div className="mb-6 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+          <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between gap-3">
+            <h2 className="text-white font-semibold flex items-center gap-2">
+              <Building size={16} className="text-pink-400" /> Departments
+            </h2>
+            {departments && (
+              <span className="text-xs text-slate-500">
+                {departments.filter((d) => d.vacancy).length === 0
+                  ? 'Every department has an active Admin.'
+                  : `${departments.filter((d) => d.vacancy).length} without an active Admin`}
+              </span>
+            )}
+          </div>
+          {departmentsError ? (
+            <p className="px-5 py-3 text-amber-200 text-sm">
+              {departmentsError} Whether any seat is vacant is unknown — this is not &ldquo;none&rdquo;.
+            </p>
+          ) : departments === null ? (
+            <p className="px-5 py-3 text-slate-500 text-sm flex items-center gap-2">
+              <Loader2 size={13} className="animate-spin" /> Reading the departments…
+            </p>
+          ) : departments.length === 0 ? (
+            <p className="px-5 py-3 text-slate-500 text-sm">The server listed no departments for your account.</p>
+          ) : (
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 divide-y sm:divide-y-0 divide-slate-800">
+              {departments.map((d) => (
+                <div
+                  key={d.team}
+                  className={`px-5 py-3 border-slate-800 sm:border-r ${d.vacancy ? 'bg-amber-500/5' : ''}`}
+                >
+                  <p className="text-sm font-medium text-white">{d.label}</p>
+                  {d.vacancy ? (
+                    <>
+                      <p className="text-amber-300 text-xs mt-0.5">
+                        Admin seat vacant
+                        {d.vacancySinceMs !== null ? ` since ${new Date(d.vacancySinceMs).toLocaleString('en-IN')}` : ''}
+                        {d.vacancyCause ? ` — ${d.vacancyCause}` : ''}
+                      </p>
+                      <p className="text-slate-400 text-xs mt-0.5">{VACANCY_NOTE}</p>
+                    </>
+                  ) : (
+                    <p className="text-slate-400 text-xs mt-0.5">
+                      Admin: <span className="text-slate-200">{adminNames(d) || 'named on the roster'}</span>
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -442,6 +506,16 @@ export default function TeamPage() {
                       {m.phone ? ` · ${m.phone}` : ''}
                       {m.field_charge ? ` · ${m.field_charge}` : ''}
                     </p>
+                    {/* §9: from positions and the vacancy state, on the server —
+                        "Owner (vacancy)" while the department has no Admin. */}
+                    {(() => {
+                      const rt = reportsToOf(m)
+                      return rt.known ? (
+                        <p className={`text-xs truncate ${rt.vacancy ? 'text-amber-300' : 'text-slate-600'}`}>
+                          Reports to: {rt.label}
+                        </p>
+                      ) : null
+                    })()}
                   </div>
 
                   <span className={`text-xs px-2 py-1 rounded shrink-0 ${toneOf(m)}`}>

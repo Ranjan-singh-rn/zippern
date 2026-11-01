@@ -19,7 +19,7 @@
  */
 
 import Link from 'next/link'
-import { Building2, ShoppingBag, Clock, UserCircle } from 'lucide-react'
+import { Building2, ShoppingBag, Clock, UserCircle, MonitorSmartphone } from 'lucide-react'
 import {
   PARTNER_HOME,
   PARTNER_PENDING,
@@ -55,6 +55,7 @@ export function PartnerRoleSwitcher({
 
   const dual = isDualRolePartner(crmUser)
   const profileActive = pathname === '/profile' || pathname.startsWith('/profile/')
+  const sessionsActive = pathname === '/sessions' || pathname.startsWith('/sessions/')
 
   return (
     <div className="pb-2 mb-2 border-b border-slate-800">
@@ -91,6 +92,30 @@ export function PartnerRoleSwitcher({
             }`}
           >
             Your details and business name
+          </span>
+        </span>
+      </Link>
+
+      {/* B3 / §13: the sessions this login holds — a partner's own, like the
+          profile (`PARTNER_SHARED_PATHS`), and for every partner. */}
+      <Link
+        href="/sessions"
+        aria-current={sessionsActive ? 'page' : undefined}
+        className={`flex items-center gap-3 px-3 py-2 mb-2 rounded-lg text-sm font-medium transition-colors ${
+          sessionsActive
+            ? 'bg-pink-500 text-white'
+            : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+        }`}
+      >
+        <MonitorSmartphone size={17} className="flex-shrink-0" />
+        <span className="flex-1 min-w-0">
+          <span className="block truncate">Signed-in devices</span>
+          <span
+            className={`block text-[11px] truncate ${
+              sessionsActive ? 'text-pink-100' : 'text-slate-600'
+            }`}
+          >
+            Sign out everywhere else
           </span>
         </span>
       </Link>

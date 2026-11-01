@@ -5,17 +5,24 @@
  *
  *   Requested → Under Review → Awaiting Sign-off → Approved → Executed
  *
- * Teams verify, owners sign. The rules that matter — nobody verifies their own
- * card, nobody signs a card they raised or verified — are enforced by the API,
- * not here. This screen surfaces the refusal when it happens, which is the
- * point: the reason should be visible, not silently hidden by a disabled button.
+ * Teams verify, owners sign. The rules that matter are enforced by the API,
+ * not here: nobody but an Owner verifies a card they raised, and — under §8 —
+ * one Owner may raise, verify, sign and execute a card alone, except the card
+ * that pays them. This screen surfaces the refusal when it happens, which is
+ * the point: the reason should be visible, not silently hidden by a disabled
+ * button.
+ *
+ * §8 also means the OTHER Owners are told whenever money is signed or moves.
+ * After a signature, an execution, a bulk signature or the Owner fast path,
+ * the board says whether they were (`owner_notice`), and points at Money
+ * integrity → Owner notices when a notice is still pending.
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
-  AlertTriangle, ArrowRight, CheckCircle2, Clock, Coins, FileText, Loader2,
-  PenLine, RefreshCw, ShieldCheck, X, XCircle, Zap,
+  AlertTriangle, ArrowRight, Bell, CheckCircle2, Clock, Coins, FileText, Loader2,
+  PenLine, RefreshCw, Rocket, ShieldCheck, X, XCircle, Zap,
 } from 'lucide-react'
 import api, { ApiError, type Card, type Stage } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
@@ -23,6 +30,25 @@ import { ErrorState } from '@/components/ui/States'
 import { IdentityBlock } from '@/components/ui/Identity'
 import { subjectTarget } from '@/lib/identity'
 import { useIdentities } from '@/lib/useIdentities'
+import {
+  EXECUTABLE_TYPES, STAGE_LABEL, fastPathOutcome, fastPathPlan, fastPathProblem, ownerNoticeLine, ownerNoticeTally,
+  ownerSignBlock, type OwnerNoticeLine,
+} from '@/lib/ownerFastPath'
+
+/** What the board says after money was signed or moved: did the other Owners hear? */
+interface BoardNotice {
+  title: string
+  /** Extra lines — the stages a fast path ran, a bulk tally. */
+  lines: string[]
+  notice: OwnerNoticeLine | null
+}
+
+const NOTICE_TONE: Record<OwnerNoticeLine['tone'], string> = {
+  ok: 'text-green-200',
+  warn: 'text-amber-200',
+  error: 'text-red-200',
+  unknown: 'text-slate-300',
+}
 
 const MIN_REASON = 3
 
@@ -89,6 +115,8 @@ export default function MoneyBoard() {
   // currency — never one click.
   const [confirmBulk, setConfirmBulk] = useState(false)
   const [bulkBusy, setBulkBusy] = useState(false)
+  // §8: whether the other Owners were told, after a signature or an execution.
+  const [boardNotice, setBoardNotice] = useState<BoardNotice | null>(null)
 
   const isOwner = me?.role === 'owner'
   const isObserver = me?.role === 'observer'
@@ -122,15 +150,13 @@ export default function MoneyBoard() {
   /**
    * The cards this owner may actually sign.
    *
-   * Both rules, not one. This used to exclude only cards you raised, so a card
-   * you had *verified* stayed selectable — "Select all" then picked it up, the
-   * server refused that one alone, and the result came back as
-   * "12 signed. 1 refused: You verified this card." Correct, and a confusing
-   * way to find out.
+   * The server's rule, not a guess at it. It used to exclude cards you raised
+   * or verified — the two-person rule — and under §8 (`OWNER_ALONE`) an Owner
+   * signs those; what still needs ANOTHER Owner is the card that pays you
+   * (`ownerSignBlock`). A tick box offering a card the server will refuse is
+   * the bug this exists to prevent, in both directions.
    */
-  const signable = awaiting.filter(
-    (c) => c.requested_by.uid !== me?.uid && c.verified_by?.uid !== me?.uid,
-  )
+  const signable = awaiting.filter((c) => !ownerSignBlock(c, me?.uid ?? ''))
   const failed = cards.filter((c) => c.stage === 'failed')
   const unexecuted = cards.filter(
     (c) => c.stage === 'approved' && BALANCE_CARD_TYPES.has(c.type),
@@ -151,6 +177,13 @@ export default function MoneyBoard() {
       setChecked(new Set())
       setConfirmBulk(false)
       await load()
+      if (res.signed > 0) {
+        setBoardNotice({
+          title: `${res.signed} card${res.signed === 1 ? '' : 's'} signed.`,
+          lines: [ownerNoticeTally(res.cards)].filter(Boolean),
+          notice: null,
+        })
+      }
       if (res.failed.length) {
         setError(
           `${res.signed} signed. ${res.failed.length} refused: ` +
@@ -331,6 +364,35 @@ export default function MoneyBoard() {
         </div>
       )}
 
+      {/* §8: after money is signed or moved, whether the other Owners were
+          told — never assumed. A pending notice is retried by the sweep and
+          from Money integrity. */}
+      {boardNotice && (
+        <div className="mb-5 flex items-start justify-between gap-2 bg-slate-900 border border-slate-700 rounded-xl px-4 py-3">
+          <div className="flex items-start gap-2">
+            <Bell size={15} className="text-pink-300 mt-0.5 shrink-0" />
+            <div className="text-sm">
+              <p className="text-white font-medium">{boardNotice.title}</p>
+              {boardNotice.lines.map((l) => (
+                <p key={l} className="text-slate-300 text-xs mt-0.5">{l}</p>
+              ))}
+              {boardNotice.notice && (
+                <p className={`text-xs mt-1 ${NOTICE_TONE[boardNotice.notice.tone]}`}>{boardNotice.notice.text}</p>
+              )}
+              {(boardNotice.notice?.tone === 'warn' || boardNotice.notice?.tone === 'error'
+                || boardNotice.lines.some((l) => l.includes('not yet'))) && isOwner && (
+                <Link href="/finance/integrity" className="text-pink-400 hover:text-pink-300 text-xs underline underline-offset-2">
+                  Open Owner notices
+                </Link>
+              )}
+            </div>
+          </div>
+          <button onClick={() => setBoardNotice(null)} className="text-slate-500 hover:text-white">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* A board that failed to load rendered seven columns of "Nothing here"
           with a red banner above them — visually indistinguishable from a board
           on which genuinely nothing is pending. If the read failed and we hold
@@ -361,12 +423,11 @@ export default function MoneyBoard() {
                   >
                     <div className="flex items-start justify-between gap-2">
                       <p className="text-white text-sm font-medium leading-snug">{card.title}</p>
-                      {/* Same two rules as `signable` — a tick box offering a
-                          card the server will refuse is the bug this pair of
-                          conditions exists to prevent. */}
+                      {/* Same rule as `signable` — a tick box offering a card
+                          the server will refuse is the bug this exists to
+                          prevent. */}
                       {isOwner && card.stage === 'awaiting_signoff'
-                        && card.requested_by.uid !== me?.uid
-                        && card.verified_by?.uid !== me?.uid && (
+                        && !ownerSignBlock(card, me?.uid ?? '') && (
                         <input
                           type="checkbox"
                           checked={checked.has(card.id)}
@@ -416,6 +477,7 @@ export default function MoneyBoard() {
           onClose={() => setSelected(null)}
           onChanged={async () => { await load(); setSelected(null) }}
           onRefresh={load}
+          onNotice={setBoardNotice}
         />
       )}
     </div>
@@ -425,7 +487,7 @@ export default function MoneyBoard() {
 // ── Detail panel ──────────────────────────────────────────────────────────────
 
 function CardPanel({
-  card, canAct, isOwner, myUid, onClose, onChanged, onRefresh,
+  card, canAct, isOwner, myUid, onClose, onChanged, onRefresh, onNotice,
 }: {
   card: Card
   canAct: boolean
@@ -435,14 +497,16 @@ function CardPanel({
   onChanged: () => void
   /** Re-read the board without closing the panel. */
   onRefresh: () => Promise<void>
+  /** §8: tell the board whether the other Owners heard about it. */
+  onNotice: (n: BoardNotice) => void
 }) {
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
   const [confirmExecute, setConfirmExecute] = useState(false)
+  const [fastPathOpen, setFastPathOpen] = useState(false)
 
   const iRaisedIt = card.requested_by.uid === myUid
-  const iVerifiedIt = card.verified_by?.uid === myUid
 
   async function run(label: string, fn: () => Promise<unknown>) {
     setBusy(label)
@@ -462,26 +526,49 @@ function CardPanel({
   /**
    * Why signing may be refused, or empty if it will not be.
    *
-   * The API enforces separation of duties and always did — but the button was
-   * rendered green and enabled regardless, so the only way to discover the rule
-   * was to press it and read a refusal. The owner's report was "why sign not
-   * happening", which is exactly what an enabled control that does nothing
-   * looks like from the outside.
+   * The button used to be rendered green and enabled regardless, so the only
+   * way to discover a rule was to press it and read a refusal. An action that
+   * cannot succeed should not be offered — so this computes the rule the
+   * server checks (`services/cards.py::sign`) and puts the reason on screen
+   * *before* the click. The server still decides.
    *
-   * An action that cannot succeed should not be offered. This computes the same
-   * two rules the server checks (`services/cards.py::sign`) so the reason is on
-   * screen *before* the click. The server still decides; this only stops the
-   * CRM asking a question it already knows the answer to.
+   * Under §8 (`OWNER_ALONE`) an Owner signs a card they raised or verified; the
+   * one signature an Owner still cannot give alone is on the card that pays
+   * them (`SELF_SUBJECT_NEEDS_ANOTHER_OWNER`). `ownerSignBlock` is that rule.
    */
-  const signBlockedBecause = !isOwner
-    ? ''
-    : iRaisedIt
-      ? 'You raised this card. Another owner has to sign it — nobody signs their own request.'
-      : iVerifiedIt
-        ? 'You verified this card. Someone else has to sign it, so that two people have looked at every payment.'
-        : ''
+  const signBlockedBecause = !isOwner ? '' : ownerSignBlock(card, myUid)
 
   const canSign = canAct && isOwner && card.stage === 'awaiting_signoff'
+
+  /**
+   * §8 — the Owner fast path: on any card still before its signature, and on
+   * a signed card whose type the server can execute from here. A signed
+   * balance card keeps its own Execute button below; a signed card of a type
+   * with no executor is executed from its own screen, so nothing is offered.
+   */
+  const canFastPath = canAct && isOwner && (
+    ['requested', 'under_review', 'awaiting_signoff'].includes(card.stage)
+    || (card.stage === 'approved' && EXECUTABLE_TYPES.has(card.type) && !BALANCE_CARD_TYPES.has(card.type))
+  )
+
+  /** Sign, then say whether the other Owners were told. */
+  async function sign() {
+    setBusy('sign')
+    setErr('')
+    try {
+      const signed = await api.cards.sign(card.id, note)
+      onNotice({
+        title: `Signed: ${card.title} — ${money(card.amount, card.currency)}.`,
+        lines: [],
+        notice: ownerNoticeLine(signed.owner_notice),
+      })
+      onChanged()
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : 'That did not work.')
+    } finally {
+      setBusy('')
+    }
+  }
 
   const isBalanceCard = BALANCE_CARD_TYPES.has(card.type)
   const canExecute = canAct && isOwner && isBalanceCard && card.stage === 'approved'
@@ -498,7 +585,12 @@ function CardPanel({
     setBusy('execute')
     setErr('')
     try {
-      await api.users.executeBalanceCard(card.id)
+      const done = await api.users.executeBalanceCard(card.id)
+      onNotice({
+        title: `Executed: ${card.title} — ${money(card.amount, card.currency)} moved.`,
+        lines: [],
+        notice: ownerNoticeLine(done.owner_notice),
+      })
       onChanged()
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'The execution did not go through.')
@@ -694,7 +786,8 @@ function CardPanel({
                     <p className="text-amber-100/85 text-sm mt-1">
                       This card type is executed from its own screen — coin
                       purchases and credit from the seller record, payouts from
-                      the agency record. If it stays here, nobody has done it.
+                      the agency record{canFastPath ? ', or by you with the Owner fast path below' : ''}.
+                      If it stays here, nobody has done it.
                     </p>
                   )}
                 </div>
@@ -729,6 +822,28 @@ function CardPanel({
                   </button>
                 )
               )}
+            </div>
+          )}
+
+          {/* §8 — one Owner takes the card through every remaining stage. Each
+              stage is still written and audited on its own; the confirmation
+              lists them, with the amount, before anything is sent. */}
+          {canFastPath && (
+            <div className="bg-pink-500/5 border border-pink-500/25 rounded-lg px-4 py-3">
+              <p className="text-pink-200 text-xs font-medium uppercase tracking-wide mb-1 flex items-center gap-1.5">
+                <Rocket size={12} /> Owner fast path
+              </p>
+              <p className="text-slate-300 text-sm">
+                Run every remaining stage yourself — review, verification, signature and, where this card type
+                allows it, execution. Each stage is recorded on its own; the other Owners are told.
+              </p>
+              <button
+                onClick={() => setFastPathOpen(true)}
+                disabled={!!busy}
+                className="mt-2 flex items-center gap-2 bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-semibold rounded-lg px-4 py-2 text-sm transition-colors"
+              >
+                <Rocket size={14} /> Take it through every stage…
+              </button>
             </div>
           )}
 
@@ -816,7 +931,7 @@ function CardPanel({
 
             {canSign && (
               <button
-                onClick={() => run('sign', () => api.cards.sign(card.id, note))}
+                onClick={() => void sign()}
                 disabled={!!busy || !!signBlockedBecause}
                 title={signBlockedBecause || undefined}
                 className="flex-1 flex items-center justify-center gap-1.5 bg-green-600 hover:bg-green-500 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
@@ -828,6 +943,203 @@ function CardPanel({
             )}
           </div>
         )}
+      </div>
+
+      {fastPathOpen && (
+        <FastPathDialog
+          card={card}
+          myUid={myUid}
+          onCancel={() => setFastPathOpen(false)}
+          onDone={(n) => { setFastPathOpen(false); onNotice(n); onChanged() }}
+          onFailedPartway={async () => { await onRefresh() }}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * §8 — the confirmation for the Owner fast path.
+ *
+ * It lists every stage the server will run, from where the card stands now,
+ * and the amount, before anything is sent (`fastPathPlan`). Execution is
+ * offered only for a type with a registered executor — for any other type the
+ * server would sign and then refuse — and a payout's bank reference is asked
+ * for when the money will move. The card that pays the Owner is refused here,
+ * with the server's sentence, before a single stage runs.
+ *
+ * A stage that fails leaves the card at the stage it reached: the error is the
+ * server's, shown as written, and the board is re-read underneath so the card
+ * shows where it actually is.
+ */
+function FastPathDialog({
+  card, myUid, onCancel, onDone, onFailedPartway,
+}: {
+  card: Card
+  myUid: string
+  onCancel: () => void
+  onDone: (n: BoardNotice) => void
+  onFailedPartway: () => Promise<void>
+}) {
+  const [execute, setExecute] = useState(false)
+  const [verificationNote, setVerificationNote] = useState('')
+  const [signatureNote, setSignatureNote] = useState('')
+  const [paymentRef, setPaymentRef] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [failure, setFailure] = useState('')
+
+  const plan = fastPathPlan(card, { execute, myUid })
+  const problem = fastPathProblem(plan, { verificationNote, signatureNote, paymentRef })
+
+  async function run() {
+    if (problem) { setFailure(problem); return }
+    setBusy(true)
+    setFailure('')
+    try {
+      const res = await api.cards.ownerFastPath(card.id, {
+        verification_note: verificationNote.trim(),
+        signature_note: signatureNote.trim(),
+        execute: plan.executes,
+        payment_ref: plan.needsPaymentRef ? paymentRef.trim() : '',
+      })
+      const outcome = fastPathOutcome(res)
+      onDone({
+        title: `${card.title} — ${money(card.amount, card.currency)}: ` +
+          (outcome.executed ? 'signed and executed by you.' : 'signed by you. The money has NOT moved yet.'),
+        lines: [
+          outcome.ran.length ? `Stages run, each recorded on its own: ${outcome.ran.join(' → ')}.` : 'No stage needed running.',
+          ...(outcome.ran.includes(STAGE_LABEL.approved)
+            ? ['The fast path does not report the signature’s notice to the other Owners — any that has not reached everybody waits in Money integrity → Owner notices.']
+            : []),
+        ],
+        notice: outcome.notice,
+      })
+    } catch (e) {
+      setFailure(e instanceof ApiError ? e.message : 'The fast path did not finish.')
+      // A stage may have landed before the one that failed — show where the card is now.
+      await onFailedPartway()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => !busy && onCancel()} />
+      <div className="relative w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto">
+        <div className="px-6 py-4 border-b border-slate-800">
+          <h2 className="text-white font-semibold flex items-center gap-2"><Rocket size={16} className="text-pink-400" /> Owner fast path</h2>
+          <p className="text-slate-400 text-xs mt-0.5">{card.title} · now {STAGE_LABEL[card.stage]}</p>
+        </div>
+
+        <div className="px-6 py-5 space-y-4">
+          <div className="bg-slate-800/60 border border-slate-700 rounded-lg px-4 py-3">
+            <p className="text-slate-400 text-xs uppercase tracking-wide">Amount</p>
+            <p className="text-pink-300 text-2xl font-bold">{money(card.amount, card.currency)}</p>
+            <p className="text-slate-500 text-xs">{card.type.replace(/_/g, ' ')} · {card.team}</p>
+          </div>
+
+          {plan.refusal ? (
+            <p className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 text-amber-100 text-sm">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" /> {plan.refusal}
+            </p>
+          ) : (
+            <div>
+              <p className="text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+                You will run, in this order
+              </p>
+              <ol className="space-y-1">
+                {plan.steps.map((s, i) => (
+                  <li key={s.stage} className="flex items-start gap-2 text-sm">
+                    <span className="w-5 h-5 rounded-full bg-pink-500/20 text-pink-200 text-[11px] flex items-center justify-center shrink-0">{i + 1}</span>
+                    <span className={s.stage === 'executed' ? 'text-green-200 font-medium' : 'text-slate-200'}>
+                      {s.label} <span className="text-slate-500">→ {STAGE_LABEL[s.stage]}</span>
+                    </span>
+                  </li>
+                ))}
+              </ol>
+              {!plan.executes && (
+                <p className="text-amber-200/90 text-xs mt-2">The card stops at Approved: no money moves in this call.</p>
+              )}
+            </div>
+          )}
+
+          {plan.canExecute && (
+            <label className="flex items-start gap-2 text-slate-300 text-sm">
+              <input type="checkbox" checked={execute} onChange={(e) => setExecute(e.target.checked)} className="mt-0.5" />
+              <span>
+                Also execute — <strong>move {money(card.amount, card.currency)}</strong> after the signature.
+                It cannot be undone from here.
+              </span>
+            </label>
+          )}
+          {plan.note && <p className="text-slate-500 text-xs">{plan.note}</p>}
+
+          {!plan.refusal && (
+            <>
+              <div>
+                <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+                  What did you check? <span className="text-pink-400">(required — the verification note)</span>
+                </label>
+                <textarea
+                  value={verificationNote}
+                  onChange={(e) => setVerificationNote(e.target.value)}
+                  rows={3}
+                  autoFocus
+                  placeholder="Checked the UTR against the bank statement, amount matches…"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+                  Signature note (optional)
+                </label>
+                <input
+                  value={signatureNote}
+                  onChange={(e) => setSignatureNote(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-pink-500"
+                />
+              </div>
+              {plan.needsPaymentRef && (
+                <div>
+                  <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+                    Bank reference (UTR) <span className="text-pink-400">(required to execute)</span>
+                  </label>
+                  <input
+                    value={paymentRef}
+                    onChange={(e) => setPaymentRef(e.target.value)}
+                    placeholder="The reference of the transfer you made"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm font-mono focus:outline-none focus:border-pink-500"
+                  />
+                </div>
+              )}
+            </>
+          )}
+
+          {failure && (
+            <p className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-red-300 text-sm">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" /> {failure}
+            </p>
+          )}
+        </div>
+
+        <div className="px-6 py-4 border-t border-slate-800 flex gap-3">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => void run()}
+            disabled={busy || !!plan.refusal}
+            className="flex-1 flex items-center justify-center gap-2 bg-pink-500 hover:bg-pink-600 disabled:bg-slate-700 disabled:text-slate-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm"
+          >
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <Rocket size={14} />}
+            Run {plan.steps.length} stage{plan.steps.length === 1 ? '' : 's'} — {money(card.amount, card.currency)}
+          </button>
+        </div>
       </div>
     </div>
   )

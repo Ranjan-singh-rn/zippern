@@ -8,6 +8,21 @@
  * one where the decision is questioned, and it is the only queue where the row
  * at the top is a person currently locked out of the product.
  *
+ * ── §5: REVIEWERS RECOMMEND, THE OWNER DECIDES, FOUR EYES ALWAYS ─────────────
+ *
+ * A reviewer holding `can_ban_users` RECOMMENDS — uphold or overturn, with a
+ * written note of at least ten characters — and nothing is lifted by it: the
+ * appeal stays waiting and the Owners are told. Only the Owner DECIDES; the
+ * server answers anybody else with 403 and says to recommend instead. Neither
+ * may be done by whoever made the decision being appealed. Every one of those
+ * refusals is a sentence written to be shown, and it is shown verbatim; the
+ * controls offered are `appealReviewActions` (`lib/appealReview.ts`).
+ *
+ * Beside each appeal sits what the decision is about — the restriction the
+ * account is under now, who decided it, when and why, a ban's category,
+ * evidence and scope — and the recommendation, so whoever decides sees the
+ * original decision, the evidence and the notes side by side.
+ *
  * ── OLDEST FIRST, AND THAT IS NOT A PREFERENCE ───────────────────────────────
  *
  * The report queue is newest-first because a fresh report may still be in
@@ -32,7 +47,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
-  AlertTriangle, ArrowLeft, Check, Clock, Loader2, Scale, ShieldCheck, X,
+  AlertTriangle, ArrowLeft, Check, Clock, FileText, Gavel, Loader2, MessageSquareQuote, Scale, ShieldCheck, X,
 } from 'lucide-react'
 import api, {
   ApiError,
@@ -41,15 +56,20 @@ import api, {
 import {
   isActionable, isReviewerDecision, presentAppealStatus,
 } from '@/lib/appealStatus'
+import {
+  MIN_DECISION_REASON, MIN_RECOMMENDATION_NOTE, OUTCOME_LABEL, RECOMMENDATION_OUTCOMES,
+  appealReviewActions, decidedOnRecommendationLine, decisionReasonProblem, presentRecommendation,
+  presentRestriction, recommendationProblem, verdictFor,
+  type RecommendationOutcome, type RecommendationView, type RestrictionView,
+} from '@/lib/appealReview'
+import { storageLink } from '@/lib/safeLink'
 import { Denied, Empty, ErrorState, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
-import { canAccess, type CrmRole } from '@/lib/auth'
+import { canAccess, hasPermission, type CrmRole } from '@/lib/auth'
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'app_admin', 'app_member', 'support_admin',
 ]
-
-const MIN_REASON = 10
 
 type Tab = 'pending' | AppealStatus | 'all'
 
@@ -101,6 +121,10 @@ function age(value: Appeal['createdAt']): string {
   return hrs < 24 ? `${hrs}h` : `${Math.floor(hrs / 24)}d`
 }
 
+function when(ms: number | null): string {
+  return ms === null ? 'time not recorded' : new Date(ms).toLocaleString('en-IN')
+}
+
 /** Anything waiting longer than this is somebody locked out for too long. */
 const STALE_DAYS = 2
 
@@ -118,13 +142,20 @@ function isStale(a: Appeal): boolean {
 }
 
 export default function AppealsPage() {
-  const { crmUser, loading: authLoading } = useAuth()
+  const { crmUser, apiUser, loading: authLoading } = useAuth()
   const canView = canAccess(crmUser, VIEW_ROLES)
+  // The server's two tiers: `can_ban_users` recommends; the Owner decides.
+  const reviewer = {
+    isOwner: apiUser?.role === 'owner',
+    canBan: hasPermission(crmUser, 'can_ban_users'),
+    uid: apiUser?.uid ?? crmUser?.uid ?? '',
+  }
 
   const [tab, setTab] = useState<Tab>('pending')
   const [appeals, setAppeals] = useState<Appeal[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
 
   const [target, setTarget] = useState<Appeal | null>(null)
   const [verdict, setVerdict] = useState<AppealVerdict>('upheld')
@@ -133,6 +164,13 @@ export default function AppealsPage() {
   const [failure, setFailure] = useState('')
   const [outcome, setOutcome] = useState<AppealOutcome | null>(null)
   const [zoom, setZoom] = useState('')
+
+  // §5 — the reviewer's recommendation.
+  const [recTarget, setRecTarget] = useState<Appeal | null>(null)
+  const [recOutcome, setRecOutcome] = useState<RecommendationOutcome | ''>('')
+  const [recNote, setRecNote] = useState('')
+  const [recBusy, setRecBusy] = useState(false)
+  const [recFailure, setRecFailure] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -153,20 +191,26 @@ export default function AppealsPage() {
 
   function open(a: Appeal) {
     setTarget(a)
-    setVerdict('upheld')
+    // The Owner starts from what the reviewer argued for — and can change it.
+    setVerdict(verdictFor(a.recommendation?.outcome) ?? 'upheld')
     setReason('')
     setFailure('')
     setOutcome(null)
   }
 
+  function openRecommend(a: Appeal) {
+    setRecTarget(a)
+    setRecOutcome('')
+    setRecNote('')
+    setRecFailure('')
+  }
+
   async function submit() {
     if (!target) return
     const why = reason.trim()
-    if (why.length < MIN_REASON) {
-      setFailure(
-        `At least ${MIN_REASON} characters. This is shown to the person who ` +
-        'appealed — it is the whole answer they get.',
-      )
+    const problem = decisionReasonProblem(why)
+    if (problem) {
+      setFailure(problem)
       return
     }
     setBusy(true)
@@ -177,9 +221,38 @@ export default function AppealsPage() {
       setTarget(null)
       await load()
     } catch (err) {
+      // Verbatim: the Owner-only and four-eyes refusals say what to do instead.
       setFailure(err instanceof ApiError ? err.message : 'That did not go through.')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function recommend() {
+    if (!recTarget) return
+    const problem = recommendationProblem(recOutcome, recNote)
+    if (problem || !recOutcome) {
+      setRecFailure(problem || 'Choose: uphold the decision, or overturn it.')
+      return
+    }
+    setRecBusy(true)
+    setRecFailure('')
+    try {
+      const res = await api.users.recommendAppeal(recTarget.id, recOutcome, recNote.trim())
+      const sent = res.owner_notified?.email?.sent
+      setNotice(
+        `Recommendation recorded: ${recOutcome}. Nothing was lifted — the appeal waits for the Owner, ` +
+        (typeof sent === 'number'
+          ? `who ${sent === 1 ? 'was' : 'were'} told (${sent} email${sent === 1 ? '' : 's'} sent).`
+          : 'who are told.'),
+      )
+      setRecTarget(null)
+      await load()
+    } catch (err) {
+      // Verbatim — the four-eyes refusal names exactly why.
+      setRecFailure(err instanceof ApiError ? err.message : 'That did not go through.')
+    } finally {
+      setRecBusy(false)
     }
   }
 
@@ -204,10 +277,22 @@ export default function AppealsPage() {
           <p className="text-slate-400 text-sm mt-1 max-w-2xl">
             Somebody says a decision about them was wrong — raised by the account
             itself, or by the agency that recruited them. Oldest first: a waiting
-            appeal is a person still locked out.
+            appeal is a person still locked out. Reviewers recommend; only the
+            Owner decides, and never the person who made the original decision.
           </p>
         </div>
       </div>
+
+      {notice && (
+        <div className="mb-4 flex items-start justify-between gap-3 bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3">
+          <p className="text-blue-100 text-sm flex items-start gap-2">
+            <MessageSquareQuote size={15} className="text-blue-300 mt-0.5 shrink-0" /> {notice}
+          </p>
+          <button onClick={() => setNotice('')} className="text-blue-300/70 hover:text-blue-100">
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {outcome && (
         <div className="mb-4 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
@@ -239,6 +324,12 @@ export default function AppealsPage() {
                 ))}
               </ul>
             </div>
+          )}
+          {(outcome.also_resolved ?? []).length > 0 && (
+            <p className="text-slate-400 text-xs mt-2">
+              {outcome.also_resolved?.length} other waiting appeal(s) for this account were closed as resolved —
+              the restriction they were about is gone.
+            </p>
           )}
         </div>
       )}
@@ -273,7 +364,11 @@ export default function AppealsPage() {
         </div>
       ) : (
         <div className="space-y-3">
-          {appeals.map((a) => (
+          {appeals.map((a) => {
+            const actions = appealReviewActions(a, reviewer)
+            const restriction = presentRestriction(a.restriction)
+            const rec = presentRecommendation(a.recommendation)
+            return (
             <div
               key={a.id}
               className={`bg-slate-900 border rounded-xl p-5 ${
@@ -300,11 +395,12 @@ export default function AppealsPage() {
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
                   {a.source === 'public_web' && (
                     // UGP review: the public page identifies an account by its
-                    // id (or name + profile id) — details others can know. The
-                    // person who wrote this may not be the account's owner.
+                    // id (or name + profile id) and, since §5, the phone number
+                    // or email on it — details others can know. The person who
+                    // wrote this may not be the account's owner.
                     <span
                       className="text-xs px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300"
-                      title="Filed on the public web page without signing in. Anybody who knows the account id can file one — the writer is not verified as the account's owner."
+                      title="Filed on the public web page without signing in. It names the account's own phone or email, but anybody who knows those can file one — the writer is not verified as the account's owner."
                     >
                       Identity not verified
                     </span>
@@ -355,6 +451,20 @@ export default function AppealsPage() {
                 </div>
               )}
 
+              {/* §5: the decision under appeal, beside the appeal. */}
+              {isActionable(a.status) && (
+                restriction
+                  ? <RestrictionPanel r={restriction} />
+                  : (
+                    <p className="mt-3 text-slate-500 text-xs border border-slate-800 rounded-lg px-3 py-2">
+                      The account is under no restriction now, or it could not be read — there is nothing on
+                      it to show beside this appeal.
+                    </p>
+                  )
+              )}
+
+              {rec && <RecommendationPanel rec={rec} />}
+
               {/*
                 Three branches, not two. This used to be
                 `status === 'pending' ? decide : "A reviewer said: …"`, which
@@ -365,18 +475,38 @@ export default function AppealsPage() {
                 had read.
               */}
               {isActionable(a.status) ? (
-                <button
-                  onClick={() => open(a)}
-                  className="mt-4 flex items-center gap-1.5 bg-pink-500 hover:bg-pink-600 text-white font-medium rounded-lg px-4 py-2 text-sm transition-colors"
-                >
-                  <Scale size={14} /> Decide this
-                </button>
+                <div className="mt-4 flex flex-wrap items-center gap-2">
+                  {actions.decide && (
+                    <button
+                      onClick={() => open(a)}
+                      className="flex items-center gap-1.5 bg-pink-500 hover:bg-pink-600 text-white font-medium rounded-lg px-4 py-2 text-sm transition-colors"
+                    >
+                      <Gavel size={14} /> Decide (Owner)
+                    </button>
+                  )}
+                  {actions.recommend && (
+                    <button
+                      onClick={() => openRecommend(a)}
+                      className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg px-4 py-2 text-sm transition-colors"
+                    >
+                      <MessageSquareQuote size={14} /> {rec ? 'Replace the recommendation' : 'Recommend'}
+                    </button>
+                  )}
+                  {actions.hint && (
+                    <span className={`text-xs ${actions.ownDecision ? 'text-amber-300' : 'text-slate-500'}`}>
+                      {actions.hint}
+                    </span>
+                  )}
+                </div>
               ) : isReviewerDecision(a.status) ? (
                 <div className="mt-3 border-t border-slate-800 pt-3">
                   <p className="text-slate-400 text-sm">
                     <span className="text-slate-500">{a.decidedByName || 'A reviewer'} said:</span>{' '}
                     {a.decisionReason}
                   </p>
+                  {decidedOnRecommendationLine(a.decidedOnRecommendation) && (
+                    <p className="text-slate-500 text-xs mt-1">{decidedOnRecommendationLine(a.decidedOnRecommendation)}</p>
+                  )}
                   {(a.reversed ?? []).map((r) => (
                     <p key={r} className="text-green-300/90 text-xs mt-1">• {r}</p>
                   ))}
@@ -402,7 +532,8 @@ export default function AppealsPage() {
                 </div>
               )}
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
 
@@ -423,7 +554,7 @@ export default function AppealsPage() {
 
       {target && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl w-full max-w-md">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl w-full max-w-md max-h-[90vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-800">
               <div className="min-w-0">
                 <h2 className="text-white font-semibold">Decide this appeal</h2>
@@ -437,6 +568,12 @@ export default function AppealsPage() {
             </div>
 
             <div className="p-5 space-y-3">
+              {presentRecommendation(target.recommendation) ? (
+                <RecommendationPanel rec={presentRecommendation(target.recommendation) as RecommendationView} compact />
+              ) : (
+                <p className="text-slate-500 text-xs">No reviewer has recommended on this appeal. You may decide it without one.</p>
+              )}
+
               <div className="grid grid-cols-2 gap-2">
                 <button
                   onClick={() => setVerdict('upheld')}
@@ -479,7 +616,7 @@ export default function AppealsPage() {
                   className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500 resize-none"
                 />
                 <p className="text-slate-600 text-xs mt-1">
-                  At least {MIN_REASON} characters. Shown to the person who appealed,
+                  At least {MIN_DECISION_REASON} characters. Shown to the person who appealed,
                   and stored in the audit log.
                 </p>
               </div>
@@ -511,6 +648,156 @@ export default function AppealsPage() {
           </div>
         </div>
       )}
+
+      {recTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl w-full max-w-md">
+            <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-slate-800">
+              <div className="min-w-0">
+                <h2 className="text-white font-semibold">Recommend an outcome</h2>
+                <p className="text-slate-500 text-xs mt-0.5 truncate">
+                  {recTarget.subjectName || recTarget.subjectUid}
+                </p>
+              </div>
+              <button onClick={() => setRecTarget(null)} className="text-slate-500 hover:text-white shrink-0">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <p className="text-slate-300 text-sm leading-relaxed">
+                Your recommendation goes to the Owner, who decides. Nothing about the account changes
+                now, and the appeal keeps waiting. A second recommendation replaces the first; both stay
+                on the record.
+              </p>
+              <div className="grid grid-cols-1 gap-2">
+                {RECOMMENDATION_OUTCOMES.map((o) => (
+                  <button
+                    key={o}
+                    onClick={() => setRecOutcome(o)}
+                    aria-pressed={recOutcome === o}
+                    className={`rounded-lg border px-3 py-2 text-sm font-medium text-left transition-colors ${
+                      recOutcome === o
+                        ? o === 'overturn'
+                          ? 'bg-green-500/10 border-green-500/40 text-green-300'
+                          : 'bg-slate-700/40 border-slate-600 text-slate-100'
+                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600'
+                    }`}
+                  >
+                    {OUTCOME_LABEL[o]}
+                  </button>
+                ))}
+              </div>
+              <div>
+                <label className="block text-slate-400 text-xs font-medium mb-1.5">
+                  Your note for the Owner <span className="text-pink-400">(required)</span>
+                </label>
+                <textarea
+                  value={recNote}
+                  onChange={(e) => setRecNote(e.target.value)}
+                  rows={4}
+                  autoFocus
+                  placeholder="What you checked — the evidence, the account, the original decision…"
+                  className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500 resize-none"
+                />
+                <p className="text-slate-600 text-xs mt-1">
+                  At least {MIN_RECOMMENDATION_NOTE} characters. It is the record the Owner decides on.
+                </p>
+              </div>
+              {recFailure && (
+                <p className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-red-300 text-sm">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" /> {recFailure}
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-slate-800">
+              <button onClick={() => setRecTarget(null)} className="text-slate-400 hover:text-white text-sm px-4 py-2">
+                Cancel
+              </button>
+              <button
+                onClick={recommend}
+                disabled={recBusy}
+                className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-semibold rounded-lg px-5 py-2.5 text-sm transition-colors"
+              >
+                {recBusy ? <Loader2 size={14} className="animate-spin" /> : <MessageSquareQuote size={14} />}
+                Send the recommendation
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * §5 — the decision under appeal, read from the account now: who decided it,
+ * when, why, and a ban's category, evidence and scope. Evidence references are
+ * text; only an `https://` Storage link is rendered as a link (`safeLink`).
+ */
+function RestrictionPanel({ r }: { r: RestrictionView }) {
+  return (
+    <div className="mt-3 bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2.5 text-sm space-y-1">
+      <p className="text-slate-200 font-medium">
+        {r.stateLabel}
+        {!r.isBan && (r.untilMs !== null ? ` until ${when(r.untilMs)}` : ' — no end date')}
+      </p>
+      <p className="text-slate-400 text-xs">
+        Decided by <span className="text-slate-300">{r.decidedBy}</span> · {when(r.decidedAtMs)}
+      </p>
+      <p className="text-slate-300 text-xs">
+        <span className="text-slate-500">Reason:</span> {r.reason || 'none recorded'}
+      </p>
+      {r.isBan && (
+        <p className="text-slate-300 text-xs">
+          <span className="text-slate-500">Category:</span> {r.category}
+        </p>
+      )}
+      <p className="text-slate-300 text-xs">
+        <span className="text-slate-500">Scope:</span> {r.scope}
+      </p>
+      {r.isBan && (
+        r.evidence.length === 0 ? (
+          <p className="text-slate-500 text-xs">No evidence references were recorded with this ban.</p>
+        ) : (
+          <div className="text-xs">
+            <p className="text-slate-500">Evidence:</p>
+            <ul className="mt-0.5 space-y-0.5">
+              {r.evidence.map((e) => {
+                const link = storageLink(e)
+                return (
+                  <li key={e} className="flex items-start gap-1.5 text-slate-300">
+                    <FileText size={11} className="mt-0.5 shrink-0 text-slate-500" />
+                    {link.kind === 'link' ? (
+                      <a href={link.href} target="_blank" rel="noopener noreferrer" className="text-pink-300 underline underline-offset-2 break-all">
+                        {e}
+                      </a>
+                    ) : (
+                      <span className="font-mono break-all">{e}</span>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )
+      )}
+    </div>
+  )
+}
+
+/** §5 — the reviewer's recommendation, as the Owner reads it. */
+function RecommendationPanel({ rec, compact = false }: { rec: RecommendationView; compact?: boolean }) {
+  return (
+    <div className={`${compact ? '' : 'mt-3 '}bg-blue-500/5 border border-blue-500/25 rounded-lg px-3 py-2.5 text-sm`}>
+      <p className={`font-medium ${rec.outcome === 'overturn' ? 'text-green-300' : 'text-slate-200'}`}>
+        {rec.label}
+      </p>
+      <p className="text-slate-400 text-xs mt-0.5">
+        {rec.by} · {when(rec.atMs)}
+      </p>
+      {rec.note && <p className="text-slate-300 text-sm mt-1.5 whitespace-pre-wrap">{rec.note}</p>}
     </div>
   )
 }

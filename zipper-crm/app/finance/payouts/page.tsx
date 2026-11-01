@@ -48,6 +48,7 @@ import {
   formatInrMinorShort, formatNativeAmount, otherWarnings, provisionalNote,
   rateSummary, reports,
 } from '@/lib/apiReports'
+import { payoutPolicyLines, type PayoutPolicyView } from '@/lib/moneyIntegrity'
 
 /**
  * Who may see business-wide money.
@@ -345,6 +346,10 @@ export default function PayoutsPage() {
   const [payoutReport, setPayoutReport] = useState<PayoutReport | null>(null)
   const [stuck, setStuck] = useState<Card[] | null>(null)
   const [apiSideError, setApiSideError] = useState('')
+  // The hold between a week closing and its beans becoming withdrawable —
+  // read from the server, never restated here (`GET /reports/payout-policy`).
+  const [policy, setPolicy] = useState<PayoutPolicyView | null>(null)
+  const [policyError, setPolicyError] = useState('')
 
   const [hostModal, setHostModal] = useState<WeeklyPayoutReport | null>(null)
   const [approveTarget, setApproveTarget] = useState<WeeklyPayoutReport | null>(null)
@@ -399,8 +404,24 @@ export default function PayoutsPage() {
       })
   }, [allowed, apiReady, range])
 
+  const loadPolicy = useCallback(() => {
+    if (!allowed || !apiReady) return
+    setPolicyError('')
+    api.reports.payoutPolicy()
+      .then((p) => {
+        const view = payoutPolicyLines(p)
+        setPolicy(view)
+        if (!view) setPolicyError('The server answered without a payout policy.')
+      })
+      .catch((err: unknown) => {
+        setPolicy(null)
+        setPolicyError(err instanceof ApiError ? err.message : 'The payout policy could not be read.')
+      })
+  }, [allowed, apiReady])
+
   useEffect(() => { loadQueue() }, [loadQueue])
   useEffect(() => { loadApi() }, [loadApi])
+  useEffect(() => { loadPolicy() }, [loadPolicy])
 
   async function doApprove(report: WeeklyPayoutReport) {
     if (!crmUser) return
@@ -651,6 +672,33 @@ export default function PayoutsPage() {
 
       {apiReady && apiError && <Warning>{apiError}</Warning>}
       {apiSideError && <Warning onDismiss={() => setApiSideError('')}>{apiSideError}</Warning>}
+
+      {/* When a host's week becomes withdrawable — the server's figure, and
+          an Owner decision still pending. Shown so a payout question is
+          answered against the rule actually in force. */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl px-5 py-4">
+        <p className="text-slate-400 text-xs font-medium uppercase tracking-wide">Payout release policy</p>
+        {policy ? (
+          <>
+            <p className="text-white text-sm mt-1">{policy.headline}</p>
+            {policy.lines.map((l) => (
+              <p key={l} className="text-slate-400 text-xs mt-0.5">{l}</p>
+            ))}
+            {policy.pending && (
+              <p className="text-amber-300 text-xs mt-1.5">
+                The settlement policy is still an Owner decision. Until it is made, this is the behaviour in force.
+              </p>
+            )}
+          </>
+        ) : policyError ? (
+          <p className="text-amber-200 text-sm mt-1">
+            {policyError}{' '}
+            <button onClick={loadPolicy} className="text-pink-400 hover:text-pink-300 underline underline-offset-2">Try again</button>
+          </p>
+        ) : (
+          <p className="text-slate-500 text-sm mt-1">Reading the policy…</p>
+        )}
+      </div>
       {exportError && <Warning onDismiss={() => setExportError('')}>{exportError}</Warning>}
       {flash && (
         <div className="flex items-center justify-between gap-3 bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3">

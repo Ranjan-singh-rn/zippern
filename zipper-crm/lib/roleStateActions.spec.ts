@@ -12,7 +12,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import {
-  ONLY_ROLE_HINT, UNBAN_HINT, accountActions, roleRowActions, roleRows, roleStateOf,
+  HOST_ROLE_PERMISSION_HINT, ONLY_ROLE_HINT, UNBAN_HINT, accountActions, roleRowActions, roleRows, roleStateOf,
   type RoleRow,
 } from './roleStateActions'
 import { BACKEND_FEATURES, NEXT_RELEASE_NOTE } from './backendFeatures'
@@ -38,6 +38,7 @@ const owner = { isOwner: true }
 eq('host active → approved', roleStateOf({ role: 'host', status: 'active' }), 'approved')
 eq('host pending', roleStateOf({ role: 'host', status: 'pending' }), 'pending')
 eq('host revoked', roleStateOf({ role: 'host', status: 'revoked' }), 'revoked')
+eq('host suspended (the role on its own)', roleStateOf({ role: 'host', status: 'suspended' }), 'suspended')
 eq('host anything else → unknown', roleStateOf({ role: 'host', status: 'weird' }), 'unknown')
 eq('partner approved + is_active false → suspended (legacy records)',
   roleStateOf({ role: 'agency', id: 'a1', status: 'approved', is_active: false }), 'suspended')
@@ -79,16 +80,32 @@ for (const s of ['pending', 'awaiting_verification', 'suspended', 'revoked', 're
   eq('…with the one-role hint', one[1].hint, ONLY_ROLE_HINT)
 }
 
-// ── Host role suspension waits for the backend (TODO(B2 API) stub) ──────────
+// ── Host role suspension: POST /users/{uid}/suspend-host | resume-host ──────
 {
-  eq('the flag is off until the backend release', BACKEND_FEATURES.hostRoleSuspension, false)
+  eq('the flag is on — the routes have shipped', BACKEND_FEATURES.hostRoleSuspension, true)
   const h = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] }, staff)
-  eq('active host → suspend_role (stub), revoke_role', kinds(h), ['suspend_role', 'revoke_role'])
-  eq('…the suspend is a disabled stub that says when', [h[0].via, h[0].disabled, h[0].hint], ['stub', true, NEXT_RELEASE_NOTE])
-  eq('…revoke host is live today', [h[1].via, h[1].disabled], ['api', false])
-  const on = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] },
-    { isOwner: false, features: { hostRoleSuspension: true, departmentVacancy: false } })
-  eq('…and becomes an API call when the flag is on', [on[0].via, on[0].disabled], ['api', false])
+  eq('active host → suspend_role, revoke_role', kinds(h), ['suspend_role', 'revoke_role'])
+  eq('…the suspend is a live API call', [h[0].via, h[0].disabled], ['api', false])
+  ok('…and says the agency is told too', /agency are told/.test(h[0].hint))
+  eq('…revoke host is live as before', [h[1].via, h[1].disabled], ['api', false])
+
+  const suspended = roleRowActions({ role: 'host', status: 'suspended', actions: ['revoke'] }, staff)
+  eq('a suspended Host role reads as suspended', roleStateOf({ role: 'host', status: 'suspended' }), 'suspended')
+  eq('suspended host → resume_role, revoke_role', kinds(suspended), ['resume_role', 'revoke_role'])
+  eq('…the resume is a live API call', [suspended[0].via, suspended[0].disabled], ['api', false])
+
+  const noKyc = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] }, { ...staff, canManageHostRole: false })
+  eq('without can_approve_kyc → shown, disabled, with the reason', [noKyc[0].disabled, noKyc[0].hint],
+    [true, HOST_ROLE_PERMISSION_HINT])
+  const noKycResume = roleRowActions({ role: 'host', status: 'suspended', actions: [] }, { ...staff, canManageHostRole: false })
+  eq('…the same for Resume', [noKycResume[0].kind, noKycResume[0].disabled], ['resume_role', true])
+  eq('unknown permission → offered; the server answers', roleRowActions({ role: 'host', status: 'active' },
+    { ...staff, canManageHostRole: undefined })[0].disabled, false)
+
+  // A rolled-back backend: one line puts the stub back.
+  const off = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] },
+    { isOwner: false, features: { hostRoleSuspension: false, departmentVacancy: true } })
+  eq('flag off → the disabled stub that says when', [off[0].via, off[0].disabled, off[0].hint], ['stub', true, NEXT_RELEASE_NOTE])
 }
 
 // ── suspended → Resume role / Revoke role ────────────────────────────────────
@@ -193,6 +210,11 @@ for (const s of ['pending', 'awaiting_verification', 'suspended', 'revoked', 're
   ok('…and the account actions from it', detail.includes('accountActions('))
   ok('…reading the person\'s reinstatement requests', detail.includes('roleAppeals.of('))
   ok('…no grant-host or seller-flag call survives', !detail.includes('grantHost') && !detail.includes('setSellerFlag'))
+  ok('…Suspend / Resume Host role call the API', detail.includes('api.users.suspendHost(uid, why, ') && detail.includes('api.users.resumeHost(uid, why)'))
+  ok('…the "next backend release" refusal is gone', !detail.includes('available after the next backend release'))
+  ok('…and the KYC permission is passed to the state machine', detail.includes('canManageHostRole:'))
+  const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api.ts'), 'utf8')
+  ok('lib/api.ts: suspend-host and resume-host', apiSrc.includes('/suspend-host`') && apiSrc.includes('/resume-host`'))
 
   const list = fs.readFileSync(path.join(__dirname, '..', 'app', 'users', 'page.tsx'), 'utf8')
   ok('the /users list gates Unban through the same policy', list.includes('accountActions('))
@@ -217,4 +239,4 @@ if (failures.length) {
 console.log(`All ${checks} role-state checks passed.`)
 console.log('  · pending → Review/Approve/Reject; approved → Suspend/Revoke; suspended → Resume; revoked → Request/Review reinstatement')
 console.log('  · a revoked role is never re-activated as an ordinary action; a ban is lifted only via an appeal or the Owner')
-console.log('  · host role suspension is a TODO(B2 API) stub until the backend release; each role row keeps its own status')
+console.log('  · the Host role is suspended / resumed on its own (suspend-host / resume-host); each role row keeps its own status')

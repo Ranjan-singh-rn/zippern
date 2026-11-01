@@ -70,6 +70,19 @@ eq('…the host button targets no partner record', b[0].targetId, '')
 ok('…and says the other roles stay', b[1].effect.includes('other roles'))
 ok('the summary lists both', heldSummary(two) === 'Holds Host + Coin Seller.')
 
+// ── A SUSPENDED Host role is still held (§5, `HELD_HOST_STATUSES`) ──────────
+const pausedHost = roles({
+  held_count: 2,
+  roles: [
+    { role: 'host', label: 'Host', status: 'suspended', actions: ['revoke'] },
+    { role: 'seller', label: 'Coin Seller', id: 'S1', status: 'approved', actions: ['revoke'] },
+  ],
+})
+ok('a suspended Host is still listed as held, and says so', heldSummary(pausedHost) === 'Holds Host (suspended) + Coin Seller.')
+ok('a suspended Host alone is still the only role', heldSummary(roles({
+  held_count: 1, roles: [{ role: 'host', label: 'Host', status: 'suspended', actions: [] }],
+})).includes('only role'))
+
 // ── Restore ────────────────────────────────────────────────────────────────
 const revoked = roles({
   roles: [

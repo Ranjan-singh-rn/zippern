@@ -81,8 +81,15 @@ export const PARTNER_ROLE_LABEL: Readonly<Record<PartnerRole, string>> = {
  * reach the page telling them they are still under review.
  *
  * Matched on a SEGMENT boundary, not by bare prefix — see `onSharedPath`.
+ *
+ * /sessions is the second such screen (B3 / §13): the sessions THIS login
+ * holds and "Sign out everywhere else". Both of its routes are self-scoped on
+ * the server — no id is sent, so there is nothing on it but the caller's own
+ * sessions — and both are on the API's partner-reachable list, so a partner
+ * uses it exactly as staff do. Same rules as /profile: reachable whatever the
+ * capability statuses, never a landing.
  */
-export const PARTNER_SHARED_PATHS: readonly string[] = ['/profile']
+export const PARTNER_SHARED_PATHS: readonly string[] = ['/profile', '/sessions']
 
 /**
  * Is this path one of the shared screens?

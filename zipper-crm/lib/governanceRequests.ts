@@ -218,6 +218,104 @@ export function presentTransferStatus(status: unknown): { label: string; tone: s
 export const OWNER_DECIDES_TRANSFER =
   'Transfers are decided by the Owner. This request waits for them.'
 
+// ── §6: the recommendation, and the hold on unsettled earnings ──────────────
+//
+// `transfer_requests.view` names the request what it is — the Operations
+// RECOMMENDATION (who filed it, their note, when) — and carries the HOLD an
+// approval places on the subject's unsettled earnings BEFORE the move:
+// cause `transfer_review`, settlement policy `OWNER_DECISION_PENDING` (whether
+// earnings pending at the moment of a transfer settle under the old agency,
+// the new one, or are split, is an open Owner decision). The hold is a
+// frozen-money record the Owner releases, withholds or adjusts.
+
+/** `transfer_requests.HOLD_CAUSE`. */
+export const TRANSFER_HOLD_CAUSE = 'transfer_review'
+/** The settlement policy every transfer hold carries until the Owner decides it. */
+export const SETTLEMENT_POLICY_PENDING = 'OWNER_DECISION_PENDING'
+
+export const TRANSFER_HOLD_EXPLAINED =
+  'Earnings the subject had pending at the moment of the move are held for review — nothing that was ' +
+  'pending under the old agency pays out under the new one by itself. Who keeps them is an Owner ' +
+  'decision still to be made; the Owner releases, withholds or adjusts the hold on Frozen money.'
+
+/** Said in the decide dialog, before an approval: the hold goes on first. */
+export const APPROVAL_PLACES_HOLD =
+  'Approving first places a hold on the subject’s unsettled earnings (review: Owner or Finance), ' +
+  'then moves the role. If the hold cannot be placed, nothing is moved.'
+
+export interface TransferRecommendationLine {
+  /** "Asha Rao (ops admin)", or the uid, or "staff". */
+  by: string
+  note: string
+  /** ISO, or '' when not recorded. */
+  at: string
+}
+
+/**
+ * The recommendation on a transfer request. Read from `recommendation` when
+ * the server sends it, else from the request's own fields (an older server
+ * sent only those — they are the same facts).
+ */
+export function presentTransferRecommendation(t: {
+  recommendation?: { by?: { uid?: unknown; role?: unknown; name?: unknown } | null; note?: unknown; at?: unknown } | null
+  requested_by?: { uid?: unknown; role?: unknown; name?: unknown } | null
+  note?: unknown
+  requested_at?: unknown
+}): TransferRecommendationLine {
+  const rec = t.recommendation && typeof t.recommendation === 'object' ? t.recommendation : null
+  const by = (rec?.by && typeof rec.by === 'object' ? rec.by : null) ?? t.requested_by ?? null
+  const name = text(by?.name)
+  const role = text(by?.role).replace(/_/g, ' ')
+  const uid = text(by?.uid)
+  return {
+    by: name ? (role ? `${name} (${role})` : name) : uid ? (role ? `${uid} (${role})` : uid) : role || 'staff',
+    note: text(rec?.note) || text(t.note),
+    at: text(rec?.at) || text(t.requested_at),
+  }
+}
+
+export interface TransferHoldView {
+  /** One heading line. */
+  title: string
+  /** The facts, one per line, in the server's vocabulary where it has one. */
+  lines: string[]
+  /** The money is still frozen (not yet released by the Owner). */
+  frozen: boolean
+  /** The settlement policy is still the Owner's to decide. */
+  policyPending: boolean
+  freezeId: string
+}
+
+/** A transfer's hold, ready to print — or null when no hold was placed. */
+export function presentTransferHold(hold: unknown): TransferHoldView | null {
+  if (!hold || typeof hold !== 'object') return null
+  const h = hold as Record<string, unknown>
+  const cause = text(h.cause)
+  const status = text(h.status) || 'frozen'
+  const policy = text(h.settlement_policy)
+  const reviewBy = text(h.review_by)
+  const freezeId = text(h.freeze_id)
+  const subject = h.subject && typeof h.subject === 'object' ? (h.subject as Record<string, unknown>) : {}
+  const lines: string[] = [
+    cause === TRANSFER_HOLD_CAUSE ? 'Cause: transfer review (transfer_review)' : `Cause: ${cause || 'not recorded'}`,
+    policy === SETTLEMENT_POLICY_PENDING
+      ? 'Settlement policy: an Owner decision still to be made (OWNER_DECISION_PENDING)'
+      : `Settlement policy: ${policy || 'not recorded'}`,
+    `Status: ${status}`,
+  ]
+  if (reviewBy) lines.push(`Reviewed by: ${reviewBy === 'owner_or_finance' ? 'the Owner or Finance' : reviewBy.replace(/_/g, ' ')}`)
+  if (text(subject.type) || text(subject.id)) lines.push(`Held: ${text(subject.type) || '?'} ${text(subject.id)}`.trim())
+  if (freezeId) lines.push(`Frozen-money record: ${freezeId}`)
+  if (text(h.at)) lines.push(`Placed: ${text(h.at)}`)
+  return {
+    title: status === 'frozen' ? 'Unsettled earnings held for review' : `Unsettled earnings: ${status}`,
+    lines,
+    frozen: status === 'frozen',
+    policyPending: policy === SETTLEMENT_POLICY_PENDING,
+    freezeId,
+  }
+}
+
 /** Who may RECOMMEND a transfer: a KYC approver or the Owner (the server's rule). */
 export function canRecommendTransfer(me: { isOwner: boolean; permissions: readonly string[] }): boolean {
   return me.isOwner || me.permissions.includes('can_approve_kyc')

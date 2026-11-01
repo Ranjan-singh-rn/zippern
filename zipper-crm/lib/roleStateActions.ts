@@ -36,12 +36,14 @@
  * Host is restorable. This module never infers either; it only decides what
  * to SHOW for each state, and every call is re-checked on the server.
  *
- * ── WHAT THE BACKEND DOES NOT HAVE YET ──────────────────────────────────────
+ * ── THE HOST ROLE ON ITS OWN ─────────────────────────────────────────────────
  *
- * Suspending the HOST role on its own has no route today (`backendFeatures.
- * hostRoleSuspension`). The control is rendered as a `stub` — visible,
- * disabled, "available after the next backend release" — so the screen says
- * what the lifecycle is without offering a 404.
+ * Suspending and resuming the HOST role without touching the account is
+ * `POST /users/{uid}/suspend-host` / `resume-host` — the same capability as
+ * revoking a Host (`can_approve_kyc`). It was a disabled stub until that route
+ * shipped; `backendFeatures.hostRoleSuspension` is now on, and a context that
+ * says the reviewer lacks the capability (`canManageHostRole: false`) gets the
+ * control disabled with the reason — the server refuses it either way.
  */
 
 import { restrictionOf, userRowActionKeys, type UserRowSubject } from './crmRoles'
@@ -58,7 +60,7 @@ export interface RoleRow {
   /** Partner record id; absent for Host. */
   id?: string
   name?: string
-  /** Host: `active | pending | revoked`. Partner: the `PartnerStatus` string. */
+  /** Host: `active | suspended | pending | revoked`. Partner: the `PartnerStatus` string. */
   status: string
   is_active?: boolean
   /** What the server allows on this role: `revoke`, `restore`. */
@@ -66,6 +68,10 @@ export interface RoleRow {
   restorable?: boolean
   application_id?: string
   pending_application_id?: string
+  /** A suspended Host role: when it lifts itself (ISO), or null for "until resumed". */
+  suspended_until?: string | null
+  /** A suspended Host role: why — the sentence the host and their agency were told. */
+  suspension_reason?: string
 }
 
 export type RoleState =
@@ -93,7 +99,8 @@ export function roleStateOf(r: RoleRow): RoleState {
   const s = String(r.status ?? '').trim()
   if (r.role === 'host') {
     if (s === 'active') return 'approved'
-    if (s === 'pending' || s === 'revoked') return s
+    // `suspend-host`: the Host role paused on its own, the account untouched.
+    if (s === 'pending' || s === 'revoked' || s === 'suspended') return s
     return 'unknown'
   }
   if (s === 'approved') return r.is_active === false ? 'suspended' : 'approved'
@@ -135,7 +142,17 @@ export interface RoleActionContext {
    */
   openReinstatement?: Partial<Record<RoleKind, string>>
   features?: BackendFeatures
+  /**
+   * Whether this reviewer holds `can_approve_kyc` — what suspending, resuming
+   * and revoking a Host costs on the server. `false` disables Suspend / Resume
+   * Host role with the reason; `undefined` (not known) offers them and lets
+   * the server answer.
+   */
+  canManageHostRole?: boolean
 }
+
+export const HOST_ROLE_PERMISSION_HINT =
+  'Suspending or resuming the Host role needs the KYC-approval permission — the same as revoking it.'
 
 /** Where a role row's record is reviewed. */
 export function roleRecordHref(r: RoleRow): string {
@@ -207,20 +224,26 @@ export function roleRowActions(r: RoleRow, ctx: RoleActionContext): RoleRowActio
       break
     case 'approved':
     case 'suspended': {
+      // POST /users/{uid}/suspend-host | resume-host (`can_approve_kyc`).
+      const hostLive = features.hostRoleSuspension
+      const hostBlocked = hostLive && ctx.canManageHostRole === false
+      const hostHint = (live: string) => !hostLive ? NEXT_RELEASE_NOTE : hostBlocked ? HOST_ROLE_PERMISSION_HINT : live
       if (state === 'approved') {
         if (r.role === 'host') {
-          // TODO(B2 API): POST /users/{uid}/suspend-host — see lib/backendFeatures.
-          out.push(action(r, 'suspend_role', `Suspend ${label} role`, features.hostRoleSuspension ? 'api' : 'stub',
-            { disabled: !features.hostRoleSuspension, hint: features.hostRoleSuspension ? '' : NEXT_RELEASE_NOTE }))
+          out.push(action(r, 'suspend_role', `Suspend ${label} role`, hostLive ? 'api' : 'stub', {
+            disabled: !hostLive || hostBlocked,
+            hint: hostHint('Only the Host role is paused — the account and its other roles stay. The person and their agency are told.'),
+          }))
         } else if (addressable) {
           out.push(action(r, 'suspend_role', `Suspend ${label} role`, 'api',
             { hint: 'Temporary. The record keeps its place; the person is told.' }))
         }
       } else {
         if (r.role === 'host') {
-          // TODO(B2 API): POST /users/{uid}/resume-host — see lib/backendFeatures.
-          out.push(action(r, 'resume_role', `Resume ${label} role`, features.hostRoleSuspension ? 'api' : 'stub',
-            { disabled: !features.hostRoleSuspension, hint: features.hostRoleSuspension ? '' : NEXT_RELEASE_NOTE }))
+          out.push(action(r, 'resume_role', `Resume ${label} role`, hostLive ? 'api' : 'stub', {
+            disabled: !hostLive || hostBlocked,
+            hint: hostHint('Lifts the Host-role suspension — the same role, re-activated. The person and their agency are told.'),
+          }))
         } else if (addressable) {
           out.push(action(r, 'resume_role', `Resume ${label} role`, 'api',
             { hint: 'Lifts the role-level suspension. The same record, re-activated.' }))

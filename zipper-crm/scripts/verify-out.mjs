@@ -96,6 +96,22 @@ const MUST_BE_PRESENT = [
   // Lucky gifts: the server's payout guard runs in the browser before the save.
   ['lucky-gift payout guard is in the bundle',
    'exceeds the ceiling'],
+  // §5: the public appeal asks for the phone number or email on the account —
+  // without it the server refuses every appeal (CONTACT_REQUIRED) — and tells
+  // a wrong one (CONTACT_MISMATCH) apart.
+  ['public appeal asks for the contact on the account',
+   'Phone number or email on the account'],
+  ['public appeal recognises the contact-mismatch refusal',
+   'do not match the ones on this account'],
+  // §5: reviewers recommend, the Owner decides — four eyes, in the server's words.
+  ['appeals queue carries the four-eyes sentence',
+   'You made the decision being appealed, so you cannot decide the appeal. '],
+  // B3 / §13: every login can end its other sessions.
+  ['sessions page offers "Sign out everywhere else"',
+   'Sign out everywhere else'],
+  // §8: the Owner fast path on the board.
+  ['board offers the Owner fast path',
+   'Take it through every stage'],
 ]
 
 function walk(dir) {
@@ -551,6 +567,15 @@ const REQUIRED_ROUTES = [
   ['Retired /tickets redirect (C-5)', 'tickets/index.html'],
   ['Feedback & support (what /tickets redirects to)', 'feedback/index.html'],
   ['Reinstatement requests (revoked roles come back here)', 'role-appeals/index.html'],
+  // The public appeal (UGP-F / §5): the only way in for a locked-out person;
+  // the Android app links to it.
+  ['Public appeal form (asks for the contact on the account)', 'appeal/index.html'],
+  // B3 / §13: every staff, Observer and partner login lists and ends its sessions.
+  ['Signed-in devices (sessions, sign out everywhere else)', 'sessions/index.html'],
+  // B1: held items, replica drift and Owner notices — linked from the Finance nav.
+  ['Money integrity (held items, replica drift, Owner notices)', 'finance/integrity/index.html'],
+  // §5: the appeals queue where reviewers recommend and the Owner decides.
+  ['Appeals queue (recommend / Owner decides)', 'operations/appeals/index.html'],
 ]
 for (const [what, html] of REQUIRED_ROUTES) {
   ok(`${what} — ${html} is in the export`, existsSync(join(OUT, html)),
@@ -598,6 +623,7 @@ console.log('  · self guard holds; agency and seller keep ordinary actions')
 console.log('  · the agreed action policy holds in the shipped function')
 console.log('  · twelve distinct colour avatars reachable; no src="avatar:" anywhere')
 console.log('  · /frozen-money, /app-config/lucky-gifts, /observer, /tickets, /feedback, /role-appeals are in the export')
+console.log('  · /appeal, /sessions, /finance/integrity and /operations/appeals are in the export')
 console.log('  · no observer mailbox literal, no grantHost / grantCapability in the API clients')
 console.log(`  · tree sha256 ${treeHash.slice(0, 32)}…`)
 console.log('='.repeat(78) + '\n')

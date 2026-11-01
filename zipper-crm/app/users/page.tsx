@@ -45,6 +45,10 @@ import {
   suspensionResult, type SuspensionTerm,
 } from '@/components/SuspendDuration'
 import { profilePhotoSrc } from '@/lib/profilePhoto'
+import { BanDetailsFields } from '@/components/BanDetailsFields'
+import {
+  DEFAULT_BAN_DETAILS, banDetailsBody, banDetailsProblem, banDetailsSummary, type BanDetailsInput,
+} from '@/lib/banDetails'
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member',
@@ -123,7 +127,7 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     icon: ShieldOff,
     title: 'Ban this account',
     effect:
-      'The account is locked out of the app immediately — moderation needs no owner signature. The reason is stored on the account and in the audit log, against your name.',
+      'The account is locked out of the app immediately — moderation needs no owner signature. Choose below whether its handsets are barred too. The reason, scope, category and evidence are stored on the account and in the audit log, against your name.',
     confirmLabel: 'Ban the account',
     reasonHint: 'What did they do? This is what the next person reviewing the account will read.',
     className: 'bg-red-500/10 hover:bg-red-500/20 border-red-500/30 text-red-300',
@@ -735,6 +739,9 @@ function ReasonModal({
 }) {
   const [reason, setReason] = useState('')
   const [term, setTerm] = useState<SuspensionTerm>(DEFAULT_SUSPENSION)
+  // §5: the same scope / category / evidence the account page asks for, from
+  // the same component, so a ban from a row records what a ban from the page does.
+  const [banDetails, setBanDetails] = useState<BanDetailsInput>({ ...DEFAULT_BAN_DETAILS })
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<{ message: string; isRule: boolean } | null>(null)
 
@@ -760,13 +767,21 @@ function ReasonModal({
       }
     }
 
+    if (spec.key === 'ban') {
+      const problem = banDetailsProblem(banDetails)
+      if (problem) {
+        setFailure({ message: problem, isRule: true })
+        return
+      }
+    }
+
     setBusy(true)
     setFailure(null)
     try {
       switch (spec.key) {
         case 'ban':
-          await api.users.ban(user.uid, why)
-          onDone(`${who} is banned. They are locked out of the app now.`)
+          await api.users.ban(user.uid, why, banDetailsBody(banDetails))
+          onDone(`${who} is banned. They are locked out of the app now. ${banDetailsSummary(banDetails)}`)
           break
         case 'unban':
           await api.users.unban(user.uid, why)
@@ -818,6 +833,10 @@ function ReasonModal({
 
           {spec.key === 'suspend' && (
             <SuspendDuration value={term} onChange={setTerm} />
+          )}
+
+          {spec.key === 'ban' && (
+            <BanDetailsFields value={banDetails} onChange={setBanDetails} />
           )}
 
           <div>

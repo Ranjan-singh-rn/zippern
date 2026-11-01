@@ -522,6 +522,62 @@ export interface Appeal {
   reversed?: string[]
   /** What it could not change, and needs a separate act. */
   outstanding?: string[]
+  /**
+   * §5 — the restriction the account is under NOW, read from `users/{uid}` by
+   * `GET /users/appeals` (`appeals.restriction_summary`): who decided it, when,
+   * why, and — for a ban — its category, evidence references and scope. `null`
+   * for an account under no restriction, or one that could not be read; the
+   * appeal still lists. Presented by `lib/appealReview.ts`.
+   */
+  restriction?: AppealRestriction | null
+  /** §5 — the reviewer's written recommendation for the Owner. Lifts nothing. */
+  recommendation?: AppealRecommendation | null
+  /** On a decided appeal: the recommendation it was decided on, and whether the Owner followed it. */
+  decidedOnRecommendation?: { outcome?: string; byUid?: string; followed?: boolean } | null
+  /** What the account was under when the appeal was filed (`ban` / `suspended`). */
+  restrictionAtFiling?: string
+}
+
+/** `appeals.restriction_summary` — the restriction beside an appeal (§5). */
+export interface AppealRestriction {
+  /** `banned` | `suspended`. */
+  state: string
+  reason: string
+  /** A ban's category label; '' on a suspension. */
+  category: string
+  /** A ban's evidence references (report ids, storage paths, links); [] on a suspension. */
+  evidence: string[]
+  /** `account` | `account_and_devices` on a ban; `account` on a suspension. */
+  scope: string
+  /** The uid of whoever banned or suspended the account — the four-eyes subject. */
+  decidedBy: string
+  decidedByName: string
+  decidedByRole: string
+  decidedAt?: string | { seconds: number } | null
+  suspendedUntil?: string | { seconds: number } | null
+}
+
+/** §5 — `appeal.recommendation`: uphold or overturn, with a note of at least ten characters. */
+export interface AppealRecommendation {
+  outcome: 'uphold' | 'overturn' | string
+  note: string
+  byUid: string
+  byName?: string
+  byRole?: string
+  at?: string | { seconds: number } | null
+}
+
+/** What `POST /users/appeals/{id}/recommend` answers. The appeal stays pending. */
+export interface AppealRecommendResult {
+  appeal_id: string
+  status: string
+  recommendation: AppealRecommendation
+  audit_id: string
+  /** How the Owners were told: the audit action, and the email/in-app outcome. */
+  owner_notified?: {
+    audit?: string
+    email?: { sent?: number; outcomes?: string[]; in_app?: string[]; note?: string }
+  }
 }
 
 export interface AppealOutcome {
@@ -545,6 +601,10 @@ export interface AppealOutcome {
   reversed: string[]
   outstanding: string[]
   audit_id: string
+  /** §12: whether the person was told the outcome (in-app and by email). */
+  notified?: unknown
+  /** Other pending appeals of the same account closed as `resolved` by this overturn. */
+  also_resolved?: string[]
 }
 export type ReportStatus = 'pending' | 'reviewed' | 'actioned' | 'dismissed'
 
@@ -577,6 +637,52 @@ export interface WarnResult extends ModerationResult {
 
 /** UGP-B: `GET /users/{uid}/roles`. The shape lives in `lib/userRoleActions.ts`. */
 export type UserRolesResponse = UserRoles
+
+/**
+ * §5 — what a ban records besides its reason (`routers/users.py` `Ban`).
+ *
+ * `scope`: `account_and_devices` (the server's default, and what a ban has
+ * always done — every handset the account was seen on is barred) or `account`
+ * (the handsets are left alone). `category` is a short label (≤ 80) and
+ * `evidence` up to ten references — report ids, storage paths, links, never
+ * files. Built and checked by `lib/banDetails.ts`.
+ */
+export type BanScope = 'account' | 'account_and_devices'
+
+export interface BanDetails {
+  scope?: BanScope
+  category?: string
+  evidence?: string[]
+}
+
+/**
+ * What `POST /users/{uid}/suspend-host` and `/resume-host` answer — the Host
+ * ROLE on its own, the account untouched. Same capability as revoking a Host
+ * (`can_approve_kyc`). The person and their agency are told (`notified`).
+ */
+export interface HostRoleResult {
+  uid: string
+  host: {
+    /** The Host role's status after the call (`suspended`, or what it returns to). */
+    status: string
+    /** ISO 8601 for a timed suspension; '' or null when indefinite or resumed. */
+    suspendedUntil?: string | null
+    reason?: string
+  }
+  notified?: { host?: boolean; agency?: boolean }
+  audit_id: string
+  /** The same suspension again (a retry, a double press): nothing changed. */
+  already?: boolean
+  /** The server's sentence about what was and was not touched. Shown verbatim. */
+  note?: string
+  /** Host money is frozen for the Owner's review by a suspension… */
+  money_frozen?: boolean
+  /** …and NOT released by a resume (the Owner decides it on Frozen money). */
+  money_released?: boolean
+  /** Live rooms the suspension ended, and any it could not. */
+  live_rooms_ended?: string[]
+  live_rooms_not_ended?: { room_id: string; error: string }[]
+}
 
 /**
  * What deciding a host application returns.
@@ -728,6 +834,37 @@ export interface StaffMember {
   salary_minor?: number | null
   salary_currency?: string | null
   joined_at?: string | null
+  /**
+   * §9 — who this person reports to, resolved from positions and the
+   * department's vacancy state (`staff.reports_to_of`), not from the uid of
+   * whoever invited them. A member of a department with no active Admin reads
+   * `label: "Owner (vacancy)"`, `vacancy: true`. Read via `lib/departments.ts`.
+   */
+  reports_to_resolved?: ReportsToResolved
+}
+
+/** `staff.reports_to_of` — `label` is what a screen shows after "Reports to:". */
+export interface ReportsToResolved {
+  uid: string
+  name: string
+  role: string
+  label: string
+  /** True only for a member whose department has no active Admin. */
+  vacancy: boolean
+}
+
+/**
+ * §9 — one department's Admin state, from `GET /staff/departments`
+ * (`staff.department_state`). `vacancy` is judged from the ACTIVE Admin rows;
+ * `vacancy_since` / `vacancy_cause` come from the open vacancy record.
+ */
+export interface Department {
+  team: string
+  label: string
+  admins: { uid: string; name: string; email: string }[]
+  vacancy: boolean
+  vacancy_since?: string | null
+  vacancy_cause?: string
 }
 
 /** What `PATCH /staff/{uid}/employment` accepts. Omit a field to leave it. */
@@ -842,6 +979,40 @@ function adopt(res: SessionResponse): ApiUser {
 
 /** Who the API says we are, on the token in storage right now. */
 const fetchMe = () => get<ApiUser>('/auth/me')
+
+/**
+ * B3 / §13 — one live session of the caller (`security.list_sessions`).
+ *
+ * Fingerprints only: `id` is the first eight characters of the session id,
+ * never the token and never the whole id. `client` is `crm`, `android` or
+ * `unknown`. Read through `lib/sessions.ts`.
+ */
+export interface ApiSession {
+  id: string
+  /** The session making this request. */
+  current: boolean
+  client: string
+  ip?: string | null
+  user_agent?: string
+  issued_at?: string | null
+  expires_at?: string | null
+  last_active_at?: string | null
+  /** Owner / Observer only: whether the second step was passed; null when not recorded. */
+  mfa_verified?: boolean | null
+  /** True when this session was issued by renewing an earlier one. */
+  renewed?: boolean
+}
+
+/** What `POST /auth/sessions/revoke-all` answers. */
+export interface RevokeAllSessionsResult {
+  /** The server's sentence — "Signed out everywhere else." Shown as written. */
+  message: string
+  /** How many API sessions were ended. */
+  revoked: number
+  /** False when `include_current` ended this one too. */
+  current_kept: boolean
+  problems?: string[]
+}
 
 export const auth = {
   /**
@@ -1053,9 +1224,78 @@ export const auth = {
     }
     setSessionToken(null)
   },
+
+  // ── B3 / §13: the sessions this login holds ─────────────────────────────
+  // Both routes are self-scoped on the server (`own_session_uid`) — no id is
+  // sent, so nobody can list or end anybody else's sessions — and both are on
+  // the partner-reachable list, so an agency or a coin seller uses them
+  // exactly as staff do. A pending Owner/Observer session cannot reach them.
+
+  /** `GET /auth/sessions` — every live session of the caller, current flagged. */
+  sessions: () => get<{ sessions: ApiSession[]; count: number }>('/auth/sessions'),
+
+  /**
+   * `POST /auth/sessions/revoke-all` — "Sign out everywhere else".
+   *
+   * With `includeCurrent` the session making the call ends too, and the
+   * caller must then treat itself as signed out (the token in storage is dead
+   * on the server). Quick login on the phone is not touched by either form.
+   */
+  revokeAllSessions: (includeCurrent = false) =>
+    post<RevokeAllSessionsResult>('/auth/sessions/revoke-all', { include_current: includeCurrent }),
 }
 
 // ── Money board ───────────────────────────────────────────────────────────────
+
+/**
+ * §8 — whether the OTHER Owners were told that money moved
+ * (`owner_mail.notify_other_owners`). Attached as `owner_notice` to a
+ * signature, an execution, a recharge approval and a freeze decision.
+ *
+ *   sent           every other active Owner told, in-app and by email
+ *   pending        not all of them yet — retried every 15 minutes, and by an
+ *                  Owner from Money integrity → Owner notices
+ *   no_recipients  there is no other active Owner to tell
+ *   failed         the notice could not even be recorded; the action stands
+ *
+ * Read through `ownerNoticeLine` in `lib/ownerFastPath.ts`.
+ */
+export interface OwnerNotice {
+  event_key?: string
+  status: 'sent' | 'pending' | 'no_recipients' | 'failed' | string
+  recipients?: number
+  deliveries?: Record<string, { in_app?: boolean; email?: string; name?: string }>
+  already?: boolean
+  attempt?: number
+  error?: string
+}
+
+/** A card as a signature or an execution answers it: plus who was told. */
+export type CardWithNotice = Card & { owner_notice?: OwnerNotice }
+
+/** What `POST /cards/{id}/owner-fast-path` sends. */
+export interface OwnerFastPathBody {
+  /** Required (≥ 3) — the verification note, exactly as Verify asks for one. */
+  verification_note: string
+  signature_note?: string
+  /** Also execute, when the card's type has a registered executor. */
+  execute?: boolean
+  /** A payout's bank reference — required to execute one, as on its own route. */
+  payment_ref?: string
+}
+
+/**
+ * What it answers: the card as it now stands, plus the stages actually run.
+ * `executed` is the type executor's own answer (null when not asked or not
+ * reached); an execution carries its `owner_notice` there when it has one.
+ */
+export type OwnerFastPathResult = Card & {
+  fast_path: {
+    steps: { stage: string; action: string }[]
+    executed: (Record<string, unknown> & { owner_notice?: OwnerNotice }) | null
+  }
+  owner_notice?: OwnerNotice
+}
 
 export const cards = {
   list: (stage?: Stage, limit = 100) =>
@@ -1080,14 +1320,34 @@ export const cards = {
 
   startReview: (id: string) => post<Card>(`/cards/${id}/review`),
   verify: (id: string, note: string) => post<Card>(`/cards/${id}/verify`, { note }),
-  sign: (id: string, note = '') => post<Card>(`/cards/${id}/sign`, { note }),
+  /** The card, approved — with `owner_notice`: whether the other Owners were told (§8). */
+  sign: (id: string, note = '') => post<CardWithNotice>(`/cards/${id}/sign`, { note }),
   reject: (id: string, reason: string) => post<Card>(`/cards/${id}/reject`, { reason }),
 
   signBulk: (ids: string[]) =>
-    post<{ signed: number; failed: { card_id: string; error: string }[]; cards: Card[] }>(
+    post<{ signed: number; failed: { card_id: string; error: string }[]; cards: CardWithNotice[] }>(
       '/cards/sign-bulk',
       ids,
     ),
+
+  /**
+   * §8 — one Owner takes a card through every remaining stage: review →
+   * verification → signature, and execution when asked and the type has an
+   * executor. **Owner only** (`require_owner` + `can_approve_requests`).
+   *
+   * Every stage is still written and audited on its own; each step is
+   * conditional on the stage it expects, so a step that fails leaves the card
+   * at the stage reached — visible on the board — and the error names it.
+   * Re-read the board after any failure. The plan shown before confirming is
+   * `fastPathPlan` in `lib/ownerFastPath.ts`.
+   */
+  ownerFastPath: (id: string, body: OwnerFastPathBody) =>
+    post<OwnerFastPathResult>(`/cards/${encodeURIComponent(id)}/owner-fast-path`, {
+      verification_note: body.verification_note,
+      signature_note: body.signature_note ?? '',
+      execute: body.execute === true,
+      payment_ref: body.payment_ref ?? '',
+    }),
 }
 
 // ── Audit ─────────────────────────────────────────────────────────────────────
@@ -1136,6 +1396,14 @@ export const staff = {
 
   overview: () =>
     get<{ team: string; headcount: number; roles: string[] }[]>('/staff/overview'),
+
+  /**
+   * §9 — every department's Admin state: who the active Admins are, and
+   * whether the seat is VACANT (members report to the Owner until one is
+   * appointed), since when and why. Any internal session may read it; it is
+   * written only by the staff lifecycle. Read through `lib/departments.ts`.
+   */
+  departments: () => get<{ departments: Department[] }>('/staff/departments'),
 
   invite: (body: {
     email: string
@@ -1186,8 +1454,20 @@ export const staff = {
  * it in the UI rather than sending a request that is going to be rejected.
  */
 export const users = {
-  ban: (uid: string, reason: string) =>
-    post<ModerationResult>(`/users/${uid}/ban`, { reason }),
+  /**
+   * Ban an account. §5: `details` carries the scope (`account` alone, or
+   * `account_and_devices` — the server's default and what a ban has always
+   * done), a category and up to ten evidence references. Omitted fields are
+   * not sent, so a caller without them gets exactly the ban it always got.
+   * Build and check them with `lib/banDetails.ts`.
+   */
+  ban: (uid: string, reason: string, details: BanDetails = {}) =>
+    post<ModerationResult>(`/users/${uid}/ban`, {
+      reason,
+      ...(details.scope ? { scope: details.scope } : {}),
+      ...(details.category ? { category: details.category } : {}),
+      ...(details.evidence && details.evidence.length ? { evidence: details.evidence } : {}),
+    }),
 
   unban: (uid: string, reason: string) =>
     post<ModerationResult>(`/users/${uid}/unban`, { reason }),
@@ -1254,6 +1534,23 @@ export const users = {
 
   revokeHost: (uid: string, reason: string) =>
     post<ModerationResult>(`/users/${uid}/revoke-host`, { reason }),
+
+  /**
+   * Suspend the HOST ROLE on its own — the account, its balances and its other
+   * roles are untouched (`backendFeatures.hostRoleSuspension`). Same
+   * capability as revoking a Host (`can_approve_kyc`). The reason must be at
+   * least ten characters — the person and their agency are told, with it.
+   * `days` (1–365) makes it timed; omit it for "until somebody resumes it".
+   */
+  suspendHost: (uid: string, reason: string, days?: number) =>
+    post<HostRoleResult>(`/users/${encodeURIComponent(uid)}/suspend-host`, {
+      reason,
+      ...(days !== undefined ? { days } : {}),
+    }),
+
+  /** Lift a Host-role suspension: the SAME role, re-activated. Same capability. */
+  resumeHost: (uid: string, reason: string) =>
+    post<HostRoleResult>(`/users/${encodeURIComponent(uid)}/resume-host`, { reason }),
 
   /**
    * Decide one host application — the only writer of that decision.
@@ -1349,7 +1646,7 @@ export const users = {
    * double-apply.
    */
   executeBalanceCard: (cardId: string) =>
-    post<Card>(`/users/balance-cards/${encodeURIComponent(cardId)}/execute`),
+    post<CardWithNotice>(`/users/balance-cards/${encodeURIComponent(cardId)}/execute`),
 
   warnings: (uid: string, limit = 100) =>
     get<UserWarning[]>(`/users/${uid}/warnings?limit=${limit}`),
@@ -1398,8 +1695,27 @@ export const users = {
     return get<Appeal[]>(`/users/appeals?${q.toString()}`)
   },
 
+  /**
+   * §5: the OWNER's decision. A reviewer reaching it is refused (403) and told
+   * to recommend instead; the four-eyes rule holds for the Owner too — whoever
+   * made the decision being appealed cannot decide the appeal. Both refusals
+   * are sentences written to be shown verbatim.
+   */
   decideAppeal: (appealId: string, verdict: AppealVerdict, reason: string) =>
     post<AppealOutcome>(`/users/appeals/${appealId}/decide`, { verdict, reason }),
+
+  /**
+   * §5: a reviewer's written recommendation — `uphold` or `overturn` — for the
+   * Owner. `can_ban_users`; the note is at least ten characters; never by the
+   * person who made the decision being appealed. Lifts nothing: the appeal
+   * stays pending and the Owners are told. A second recommendation replaces
+   * the first (both stay on the record).
+   */
+  recommendAppeal: (appealId: string, outcome: 'uphold' | 'overturn', note: string) =>
+    post<AppealRecommendResult>(
+      `/users/appeals/${encodeURIComponent(appealId)}/recommend`,
+      { outcome, note },
+    ),
 
   /**
    * UGP-F: fifteen-minute signed links to an appeal's PRIVATE attachments
@@ -1817,24 +2133,40 @@ export interface PublicAppealLookup {
 }
 
 export const publicAppeals = {
-  /** Which account these details name, masked — or "not found" (also for an unrestricted one). */
-  lookup: (accountId: string, displayName: string) =>
+  /**
+   * Which account these details name, masked — or "not found" (also for an
+   * unrestricted one).
+   *
+   * §5: `contact` — the phone number or email address ON the account — is
+   * required to get past `not_found`. The server answers a missing one with
+   * CONTACT_REQUIRED and a wrong one with CONTACT_MISMATCH, both 400 with a
+   * sentence written for this page (`lib/publicAppealContact.ts` tells them
+   * apart). An unrestricted account still answers `not_found` first, so the
+   * mismatch never confirms a ban.
+   */
+  lookup: (accountId: string, displayName: string, contact: string) =>
     post<PublicAppealLookup>(
       '/public/appeals/lookup',
-      { account_id: accountId, display_name: displayName },
+      { account_id: accountId, display_name: displayName, contact },
       false,
     ),
 
-  /** File the appeal. Multipart, because of the attachments. Never signed in. */
+  /**
+   * File the appeal. Multipart, because of the attachments. Never signed in.
+   * `contact` is checked again here against the account's own record — the
+   * filing is refused without it, exactly as the lookup is.
+   */
   submit: async (form: {
     accountId: string
     displayName: string
+    contact: string
     statement: string
     files: File[]
   }): Promise<{ reference: string; status: string }> => {
     const fd = new FormData()
     fd.append('account_id', form.accountId)
     fd.append('display_name', form.displayName)
+    fd.append('contact', form.contact)
     fd.append('statement', form.statement)
     for (const f of form.files) fd.append('files', f)
     let response: Response
@@ -2082,6 +2414,154 @@ export const partnerOps = {
     get<SubAgencyPayout[]>('/partner-ops/subagency-payouts/open'),
 }
 
+// ── B1: money integrity — held items, replica drift, Owner notices ───────────
+//
+// Finance and the Owners. The server is the authority on every one of these
+// and states its own gates (`routers/partner_ops.py`, the B1 block):
+//
+//   GET  /partner-ops/held-items                          can_process_payout
+//   POST /partner-ops/held-items/{type}/{id}/release      can_process_payout, and
+//                                                         Finance admin or Owner
+//                                                         (`money_freeze.can_decide_held`)
+//   GET  /partner-ops/money/replica-drift                 can_process_payout
+//   POST /partner-ops/money/replica-drift/repair          can_process_payout
+//   GET  /partner-ops/owner-notices                       Owner
+//   POST /partner-ops/owner-notices/retry                 Owner
+//
+// What the CRM offers to whom is `moneyIntegrityAccess` in
+// `lib/moneyIntegrity.ts`; a refusal is the server's sentence, shown as written.
+
+/** What a held item is: the four kinds a role revocation can hold. */
+export type HeldItemType = 'card' | 'recharge' | 'sale' | 'subagency_payout'
+
+/** `held` on the item itself — never a copy. Kept, with the release, as history. */
+export interface HeldMarker {
+  /** `role_revoked` today. */
+  reason: string
+  partner_kind: string
+  partner_id: string
+  note?: string
+  at?: string | null
+  by?: { uid?: string; name?: string; role?: string } | null
+  released_at?: string | null
+  released_by?: { uid?: string; name?: string; role?: string } | null
+  release_reason?: string
+}
+
+/** One held document, as its own collection stores it, plus `id` and `held`. */
+export type HeldDoc = Record<string, unknown> & { id: string; held?: HeldMarker }
+
+export interface HeldItemsResponse {
+  cards: HeldDoc[]
+  recharges: HeldDoc[]
+  sales: HeldDoc[]
+  subagency_payouts: HeldDoc[]
+  total: number
+}
+
+/** One balance whose Firestore replica is behind the ledger (M-1). Mongo is right. */
+export interface ReplicaDriftRow {
+  id: string
+  holder_type?: string
+  holder_id?: string
+  currency?: string
+  /** The ledger's balance — the true figure. */
+  amount?: number
+  replica_stale?: boolean
+  replica_stale_at?: string | null
+  /** The deltas still owed to Firestore, each keyed on its ledger id. */
+  replica_pending?: {
+    delta?: number
+    ledger_id?: string
+    idempotency_key?: string
+    at?: string | null
+    balance_after?: number
+  }[]
+  replica_repair_last_at?: string | null
+  replica_repair_last_error?: string | null
+}
+
+/** What a repair run did — the same summary the 15-minute sweep reports. */
+export interface ReplicaRepairSummary {
+  rows: number
+  repaired: number
+  replayed: number
+  already_applied: number
+  failed: number
+  details: {
+    holder_type?: string
+    holder_id?: string
+    currency?: string
+    ok?: boolean
+    replayed?: number
+    already_applied?: number
+    pending?: number
+    error?: string | null
+  }[]
+}
+
+/** One Owner money notification not yet delivered to every Owner (§8). */
+export interface OwnerNoticeRow {
+  id: string
+  event_key?: string
+  action?: string
+  reference?: string
+  reference_type?: string
+  actor?: { uid?: string; name?: string; role?: string }
+  amount?: number | null
+  currency?: string
+  title?: string
+  card_type?: string
+  status?: string
+  attempts?: number
+  deliveries?: Record<string, { in_app?: boolean; email?: string; name?: string }>
+  last_error?: string | null
+  created_at?: string | null
+  last_attempt_at?: string | null
+}
+
+export const moneyIntegrity = {
+  /** Every pending item of a revoked partner, held for Finance/Owner review. */
+  heldItems: (opts: { includeReleased?: boolean; limit?: number } = {}) => {
+    const q = new URLSearchParams({ limit: String(opts.limit ?? 200) })
+    if (opts.includeReleased) q.set('include_released', 'true')
+    return get<HeldItemsResponse>(`/partner-ops/held-items?${q.toString()}`)
+  },
+
+  /**
+   * Lift the hold so the item can be decided through its ordinary route. The
+   * marker stays on the item with who, when and why. Reason ≥ 5 characters.
+   * Finance (its admin) or an Owner; anybody else is refused with 403.
+   */
+  releaseHeld: (itemType: HeldItemType, itemId: string, reason: string) =>
+    post<HeldDoc>(
+      `/partner-ops/held-items/${encodeURIComponent(itemType)}/${encodeURIComponent(itemId)}/release`,
+      { reason },
+    ),
+
+  /** Balances whose last Firestore sync failed, with the deltas still owed. */
+  replicaDrift: (limit = 200) =>
+    get<{ balances: ReplicaDriftRow[]; count: number }>(`/partner-ops/money/replica-drift?limit=${limit}`),
+
+  /**
+   * Replay every pending replica delta once, keyed on its ledger id, so a
+   * repair can never double-credit. The sweep does the same every 15 minutes;
+   * this is the button for "Firestore is back now".
+   */
+  repairReplicaDrift: (limit = 200) =>
+    post<ReplicaRepairSummary>(`/partner-ops/money/replica-drift/repair?limit=${limit}`),
+
+  /** §8: Owner money notifications not yet delivered to every Owner. Owner only. */
+  ownerNotices: (limit = 200) =>
+    get<{ pending: OwnerNoticeRow[]; count: number }>(`/partner-ops/owner-notices?limit=${limit}`),
+
+  /** §8: re-attempt every pending Owner notification now. Owner only. */
+  retryOwnerNotices: (limit = 100) =>
+    post<{ retried: number; rows: { event_key: string; outcome: string; status?: string; error?: string | null }[] }>(
+      `/partner-ops/owner-notices/retry?limit=${limit}`,
+    ),
+}
+
 // ── Reports ───────────────────────────────────────────────────────────────────
 
 /**
@@ -2138,6 +2618,16 @@ export interface ReportDefinitions {
   export: { format: string; logged: string }
 }
 
+/** `GET /reports/payout-policy` — `routers/reports.py`. Shown by `payoutPolicyLines`. */
+export interface PayoutPolicy {
+  release_arrears_weeks: number
+  setting: string
+  owner_decision_pending: boolean
+  current_behaviour: string
+  applies_to?: string
+  note?: string
+}
+
 type Range = { since?: string; until?: string }
 
 function rangeQuery(params: Record<string, unknown>): string {
@@ -2169,6 +2659,13 @@ export const reports = {
     get<ReportEnvelope>(`/reports/audit-summary?${rangeQuery(r)}`),
   dashboard: () => get<ReportEnvelope>('/reports/dashboard'),
   definitions: () => get<ReportDefinitions>('/reports/definitions'),
+  /**
+   * The hold between a week closing and its beans becoming withdrawable —
+   * `PAYOUT_RELEASE_ARREARS_WEEKS`, an OWNER_DECISION_PENDING setting. Any
+   * internal session. Read it, do not restate it: the figure is published
+   * here so the CRM, the app and the Function cannot disagree.
+   */
+  payoutPolicy: () => get<PayoutPolicy>('/reports/payout-policy'),
 
   /**
    * Download any report as CSV.
@@ -2268,6 +2765,6 @@ export const health = () =>
 
 const api = {
   auth, cards, audit, staff, users, hostVerification, documents, partners,
-  partnerOps, reports, tickets, health,
+  partnerOps, moneyIntegrity, reports, tickets, health,
 }
 export default api
