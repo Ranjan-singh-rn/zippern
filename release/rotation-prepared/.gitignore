@@ -1,0 +1,4 @@
+# Evidence of every run (may name revisions, functions, the masked operator) and the owner's approval file stay on
+# the Mac and never make the working tree dirty (the scripts refuse a dirty tree).
+/production/
+/FINAL-PHASE-APPROVED
