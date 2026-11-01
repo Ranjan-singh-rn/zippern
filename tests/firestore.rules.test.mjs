@@ -59,7 +59,11 @@ import {
 import { doc, setDoc, updateDoc, deleteField, deleteDoc, getDoc } from 'firebase/firestore'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const RULES = readFileSync(join(here, '..', 'firestore.rules'), 'utf8')
+// ZIPPER_RULES_FILE=<path> runs the same checks against another rules file
+// (as the other suites do); the default is unchanged: ../firestore.rules.
+const RULES_PATH = process.env.ZIPPER_RULES_FILE || join(here, '..', 'firestore.rules')
+const RULES = readFileSync(RULES_PATH, 'utf8')
+console.log(`rules under test: ${RULES_PATH}`)
 
 let checks = 0
 let failures = 0

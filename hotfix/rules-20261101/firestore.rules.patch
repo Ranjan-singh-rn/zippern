@@ -1,0 +1,128 @@
+--- firestore.rules.DEPLOYED
++++ firestore.rules
+@@ -1950,6 +1950,17 @@
+        * interim, until D1/D2 decide the change workflow). Writing the same
+        * value again is fine, and so is respelling the same phone number — a
+        * legacy bare `9876543210` becoming the token's `+919876543210`.
++       *
++       * HOTFIX-1 A-1 (2026-11-01, old-client relief): an EMPTY value written
++       * over a contact the document does not hold (key absent, null or '')
++       * changes nothing, so it is accepted as "no change". App builds before
++       * 19 write `email: ""` / `phoneNumber: ""` on profile setup for every
++       * guest and phone user, and `changed()` reports the ADDED key, which
++       * sent the whole owner arm into the `!= ''` branch and refused the
++       * save. Only the empty-over-empty case is new: a NON-empty value still
++       * has to be the verified token value, and an existing non-empty contact
++       * is still never cleared or replaced — `'' over 'x'` falls through to
++       * the original branch, which requires the new value to be non-empty.
+        */
+       function ownerContactWriteOk() {
+         let ch = changed();
+@@ -1959,12 +1970,16 @@
+         let oldDigits = string(oldPhone).replace('[^0-9]', '');
+         let newDigits = string(request.resource.data.get('phoneNumber', '')).replace('[^0-9]', '');
+         return (!ch.hasAny(['email'])
++                || (request.resource.data.get('email', '') == ''
++                    && (oldEmail == null || oldEmail == ''))
+                 || (request.resource.data.get('email', '') != ''
+                     && tokenEmailVerified()
+                     && newEmail == request.auth.token.get('email', '').lower()
+                     && (oldEmail == null || oldEmail == ''
+                         || string(oldEmail).lower() == newEmail)))
+             && (!ch.hasAny(['phoneNumber'])
++                || (request.resource.data.get('phoneNumber', '') == ''
++                    && (oldPhone == null || oldPhone == ''))
+                 || (request.resource.data.get('phoneNumber', '') != ''
+                     && request.resource.data.get('phoneNumber', '')
+                          == request.auth.token.get('phone_number', '')
+@@ -2462,9 +2477,14 @@
+     // Also written by Support routing an app-user ticket (routeSupportTicketToTeam).
+     // ══════════════════════════════════════════════════════════════════════════
+     match /techTickets/{ticketId} {
+-      allow read:   if isCrmUser();
+-      allow create: if isCrmUser();
+-      allow update: if isCrmUser();
++      // HOTFIX-1 R-5 (2026-11-01): INTERNAL staff only. `isCrmUser()` is also
++      // true for every agency and coin-seller login, so partners could read
++      // and edit the team board. Client create/update stay allowed for staff
++      // because the CRM still files and moves tickets from the browser (the
++      // server-side tickets API is not deployed yet).
++      allow read:   if isStaff();
++      allow create: if isStaff();
++      allow update: if isStaff();
+       allow delete: if isSuperAdmin();
+     }
+ 
+@@ -2903,7 +2923,13 @@
+       // This is the record a payment gateway is shown when a user disputes a
+       // recharge — "the diamonds were spent on this call, of this length, with
+       // this account". A row either party could create or edit proves nothing.
+-      allow write: if isAdmin();
++      //
++      // HOTFIX-1 R-3 (2026-11-01): no client writes it at all. `isAdmin()`
++      // matches any `*_admin` role by spelling, so a marketing or support admin
++      // could rewrite dispute evidence from a browser. The only writers are
++      // Cloud Functions (calls.ts) through the Admin SDK; neither the CRM nor
++      // the app writes this collection (grep, 2026-11-01).
++      allow write: if false;
+     }
+ 
+     // ── Host identity verification ──────────────────────────────────────────
+@@ -3514,7 +3540,13 @@
+                         && (resource.data.callerId   == request.auth.uid
+                          || resource.data.receiverId == request.auth.uid))
+                     || isAdmin();
+-      allow write:  if isAdmin();
++      // HOTFIX-1 R-3 (2026-11-01): no client writes the bill. `isAdmin()` is
++      // spelling-based (`.*_admin`), so any department admin could edit
++      // `tickIndex` and the rate from a browser. startCall / acceptCall /
++      // declineCall / tickCall / endCall and the watchdog write it with the
++      // Admin SDK; the app only reads and listens, and the CRM never touches
++      // it (grep, 2026-11-01). The in-call chat below is unchanged.
++      allow write:  if false;
+ 
+       // In-call chat. Either party may read and post; a message names its
+       // sender and nothing else about the bill is reachable from here.
+@@ -3592,8 +3624,16 @@
+       //
+       // Tech and the owner. A department that cannot configure the economy from
+       // the API should not be able to configure it from a browser.
+-      allow write: if (docId == 'paymentCredentials' && isSuperAdmin())
+-                    || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin()));
++      //
++      // HOTFIX-1 A-5 (2026-11-01): `androidUpdate` is written by no client.
++      // It is the fleet's update order — version code, mandatory flag, APK
++      // URL and hash — and one mistaken or hostile `tech_member` write shows
++      // every phone an inescapable "Update required". The only writer is
++      // backend/scripts/publish_apk.py through the Admin SDK, which these
++      // rules do not govern. Every other appConfig document is unchanged.
++      allow write: if docId != 'androidUpdate'
++                    && ((docId == 'paymentCredentials' && isSuperAdmin())
++                        || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin())));
+     }
+ 
+     match /announcements/{docId} {
+@@ -3875,9 +3915,20 @@
+                  || (isCrmUser()
+                      && get(/databases/$(database)/documents/sellers/$(resource.data.sellerUid))
+                           .data.get('crmUid', '') == request.auth.uid);
+-      // List queries (getDocs): resource.data is unavailable, so allow any authenticated CRM user.
+-      // Client always queries with where('sellerUid','==',sellerId) — no extra enforcement needed.
+-      allow list: if isAdmin() || isFinance() || isCrmUser();
++      // List queries: staff as before; a seller only for queries constrained to
++      // its OWN record (`where('sellerUid', '==', <its sellerId>)`, which is what
++      // the seller dashboard sends). HOTFIX-1 R-2 (2026-11-01, ported from the
++      // working tree's P1-A1 hunk): this was `|| isCrmUser()`, so any agency or
++      // seller login could list every seller's purchase requests — amounts,
++      // references and proof links — by leaving the filter off. On a list,
++      // `resource.data` is evaluated against every document the query would
++      // return, so an unconstrained query is refused.
++      // The legacy uid-keyed seller record (sellerUid == the login uid) is kept.
++      allow list: if isAdmin() || isFinance()
++                  || (isCrmUser()
++                      && (resource.data.sellerUid == request.auth.uid
++                          || resource.data.sellerUid
++                               == get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('sellerId', '-')));
+ 
+       // ── Who files one ───────────────────────────────────────────────────────
+       //

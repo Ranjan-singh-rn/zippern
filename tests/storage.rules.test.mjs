@@ -39,7 +39,12 @@ import { ref, uploadBytes, getBytes, listAll, deleteObject } from 'firebase/stor
 import { doc as fsDoc, setDoc as fsSet } from 'firebase/firestore'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const RULES = readFileSync(join(here, '..', 'storage.rules'), 'utf8')
+// ZIPPER_STORAGE_RULES_FILE=<path> runs the same checks against another
+// storage rules file (ZIPPER_RULES_FILE below does the same for the Firestore
+// rules the Storage emulator reads); the defaults are unchanged.
+const RULES_PATH = process.env.ZIPPER_STORAGE_RULES_FILE || join(here, '..', 'storage.rules')
+const RULES = readFileSync(RULES_PATH, 'utf8')
+console.log(`storage rules under test: ${RULES_PATH}`)
 
 let checks = 0
 let failures = 0
@@ -64,7 +69,9 @@ const img = { contentType: 'image/jpeg' }
 // P1-A3b: `storage.rules` reads `ownerMfaSessions/{uid}` from Firestore for an
 // owner claim (cross-service rules), so the Firestore emulator runs alongside
 // (`--only storage,firestore`) with the real firestore.rules loaded.
-const FS_RULES = readFileSync(join(here, '..', 'firestore.rules'), 'utf8')
+const FS_RULES_PATH = process.env.ZIPPER_RULES_FILE || join(here, '..', 'firestore.rules')
+const FS_RULES = readFileSync(FS_RULES_PATH, 'utf8')
+console.log(`firestore rules loaded: ${FS_RULES_PATH}`)
 const testEnv = await initializeTestEnvironment({
   projectId: 'demo-zipper',
   storage: { rules: RULES, host: '127.0.0.1', port: 9199 },

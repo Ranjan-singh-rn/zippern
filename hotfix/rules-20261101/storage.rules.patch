@@ -1,0 +1,19 @@
+--- storage.rules.DEPLOYED
++++ storage.rules
+@@ -300,8 +300,15 @@
+     // platform.
+     match /profileMedia/{uid}/{fileName} {
+       allow read:  if isSignedIn();
++      // HOTFIX-1 A-1 (2026-11-01): the image cap is 15 MB, up from 5. The
++      // published app (build 19) uploads the raw gallery photo at profile
++      // setup without compressing it, and a 12–50 MP JPEG is routinely
++      // 4–10 MB, so the 5 MB cap refused the upload and the sign-up stalled
++      // on "User does not have permission to access this object". Videos
++      // stay at 50 MB. The app-side fix (compress at signup, as Edit Profile
++      // already does) needs a new APK; this holds until it ships.
+       allow write: if isOwner(uid)
+-                   && ((isImage() && maxSize(5)) || (isVideo() && maxSize(50)));
++                   && ((isImage() && maxSize(15)) || (isVideo() && maxSize(50)));
+       allow delete: if isOwner(uid);
+     }
+ 

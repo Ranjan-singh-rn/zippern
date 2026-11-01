@@ -1,0 +1,46 @@
+# HOTFIX-1 C-1 — REFERENCE ONLY, NOT APPLIED to hotfix/rules-20261101/firestore.rules
+#
+# What it would do: require `isActive == false` on the crmUsers document a
+# self-registering partner creates (agency and seller arms), so that a
+# self-registered login is never `isCrmUser()` until approval (audit 03-crm C-1).
+#
+# Why it is NOT in the bundle (2026-11-01): the DEPLOYED CRM
+# (zipper-release/mfa-release-rc2-20261027T230620Z/baseline/crm/zipper-crm/lib/auth.ts,
+# proven equal to the live Hosting version) writes the login document with
+# `isActive: true, status: 'pending'` in createAgencyAccount (line 1424),
+# createSellerAccount (line 1483) and createSubAgencyAccount (line 1588), and its
+# sign-in path (resolveCrmUser) signs out any login whose document is not
+# isActive and then writes `lastLoginAt` through the `isCrmUser() && own uid`
+# arm. The audit's "signup pages write isActive: false" refers to the agencies/
+# sellers partner RECORD, not the login document. With this hunk every live
+# self-signup would fail at step 4 ("CRM account could not be attached") and the
+# existing suite pins the live write as allowed
+# (tests/firestore.phase1a.rules.test.mjs: "P0-5: the VERIFIED applicant still
+# creates their pending CRM login", CRM5 = isActive: true).
+#
+# Apply it only together with a CRM release that writes `isActive: false` for
+# self-signup logins AND lets a pending partner reach the waiting room without
+# `isCrmUser()` (the lastLoginAt arm). Until then, R-2 and R-5 in this bundle
+# close the two exposures C-1 was raised for (techTickets, coinPurchaseRequests
+# list) for every non-staff CRM login, pending self-signups included.
+#
+# To apply on top of the hotfix text:  patch -p0 < firestore.rules.C-1.NOT-APPLIED.patch
+--- firestore.rules	2026-11-01 13:52:57.605594287 +0530
++++ firestore.rules	2026-11-01 13:53:39.050002442 +0530
+@@ -1008,12 +1008,16 @@
+                         && request.resource.data.role == 'agency'
+                         && request.resource.data.get('createdBy', '')
+                              in ['self_signup', 'agency_created']
++                        // C-1: a self-registered login is INACTIVE until approval.
++                        && request.resource.data.get('isActive', true) == false
+                         && !request.resource.data.keys().hasAny(['roles', 'roleStatus', 'secondRoleOwnerUid'])
+                         && unlinked(request.resource.data.get('sellerId', ''))
+                         && agencyNamesCaller(request.resource.data.agencyId))
+                     || (partnerSelfRegistration(uid)
+                         && request.resource.data.role == 'seller'
+                         && request.resource.data.get('createdBy', '') == 'self_signup'
++                        // C-1: a self-registered login is INACTIVE until approval.
++                        && request.resource.data.get('isActive', true) == false
+                         && !request.resource.data.keys().hasAny(['roles', 'roleStatus', 'secondRoleOwnerUid'])
+                         && unlinked(request.resource.data.get('agencyId', ''))
+                         && sellerNamesCaller(request.resource.data.sellerId));

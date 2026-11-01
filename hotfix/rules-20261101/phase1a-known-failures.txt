@@ -1,0 +1,12 @@
+# tests/firestore.phase1a.rules.test.mjs — checks that FAIL against the DEPLOYED
+# Firestore rules lineage (17b8ffee…) and therefore against hotfix-1, which keeps
+# the deployed `gateAnswers` arms untouched. Recorded in the rc2 Mac validation
+# of 2026-10-28 (zipper-release/mfa-release-rc2-20261027T230620Z/tools/
+# mac-validation-20261028T064807Z/rules-deployed-phase1a.log: "3 of 255 … FAILED").
+# They were written for the Owner-MFA candidate, which removes the first-login gate.
+#
+# run-hotfix1-rules-tests.command treats phase1a as PASSED only if every FAIL line
+# it prints is one of these claims (one claim per line, exact text, no indent).
+an Owner can no longer set its own gate answers (gate removed, P1-A3)
+an Owner cannot write gate answers onto a member's document either
+a department member cannot set its own gate answers
