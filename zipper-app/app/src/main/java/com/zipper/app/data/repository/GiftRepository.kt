@@ -1,6 +1,7 @@
 package com.zipper.app.data.repository
 
 import com.google.firebase.firestore.FirebaseFirestore
+import com.zipper.app.util.LuckyCombos
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -30,7 +31,21 @@ data class GiftItem(
 
 sealed class GiftResult {
     object Success : GiftResult()
-    data class LuckyWin(val multiplier: Int, val diamondsBack: Long) : GiftResult()
+    /**
+     * A lucky gift settled and the SERVER rolled the reward (spec §11):
+     * [diamondsBack] = [multiplier] × [unit], already credited in the same
+     * transaction as the charge. Every lucky send ends here — the sender always
+     * wins between 5× and 100× one unit — so this is "the result", not "a win".
+     */
+    data class LuckyWin(
+        val multiplier: Int,
+        val diamondsBack: Long,
+        val combo: Int = 0,
+        val unit: Long = 0L,
+        /** `unit × combo`, what was paid. */
+        val charged: Long = 0L,
+        val configVersion: Long = 0L,
+    ) : GiftResult()
     data class Error(val message: String) : GiftResult()
     object InsufficientDiamonds : GiftResult()
 }
@@ -68,17 +83,21 @@ class GiftRepository @Inject constructor(
      * @param gift      The gift chosen. Only [GiftItem.id] is sent; the server
      *                  reads the price from the `gifts` collection, so a
      *                  tampered client cannot buy a 9,999 gift for 1.
-     * @param quantity  1, or a combo count (17 / 37 / 77)
+     * @param quantity  For a NORMAL gift: how many. For a LUCKY gift
+     *                  ([GiftItem.isLucky]): the COMBO the sender picked — one
+     *                  of `appConfig/luckyGifts.combos` — which is sent as
+     *                  `combo`, never as `quantity`. The server refuses a lucky
+     *                  gift sent without a combo.
      * @param roomId    Live/party room id, or null for a 1-on-1 send
      *
      * [targetName] and [senderName] are unused now — the server reads both
      * names from the user documents. They stay on the signature so the dozen
      * call sites keep compiling; drop them when the UI is rebuilt.
      *
-     * Note on [GiftResult.LuckyWin]: the server does not yet roll lucky gifts,
-     * so this never returns it. Chance mechanics are deliberately unshipped —
-     * they are what India's Online Gaming Act 2025 reaches, and that needs a
-     * legal opinion before any money rides on a random number.
+     * A lucky gift returns [GiftResult.LuckyWin] with the server's roll. The
+     * client never rolls, predicts or simulates it (spec §11): the odds table
+     * lives in the CRM, the random number is drawn in `settleGift`, and the
+     * reward is credited in the same transaction as the charge.
      */
     suspend fun sendGift(
         targetUid: String,
@@ -103,8 +122,13 @@ class GiftRepository @Inject constructor(
         // LiveRepository.sendGiftInLive did not even check the balance, so
         // gifting drove it negative.
         //
-        // Only the gift id and the recipient leave the device.
-        val qty = quantity.coerceIn(1, 9999)
+        // Only the gift id, the recipient and the count (or the combo) leave
+        // the device.
+        val shape = LuckyCombos.sendShape(gift.isLucky, quantity)
+        if (gift.isLucky && shape.combo != null && shape.combo < LuckyCombos.COMBO_MIN) {
+            return GiftResult.Error("Lucky gifts are sent as a combo. Pick one on the gift sheet.")
+        }
+        val qty = (shape.quantity ?: 1).coerceIn(1, 9999)
         val context = if (roomId.isNullOrBlank()) "dm" else "live"
 
         return when (val res = money.settleGift(
@@ -114,19 +138,35 @@ class GiftRepository @Inject constructor(
             context = context,
             roomId = roomId,
             idempotencyKey = idempotencyKey,
+            combo = shape.combo,
         )) {
-            is MoneyFunctions.Result.Ok -> GiftResult.Success
-            is MoneyFunctions.Result.Failed -> when (res.code) {
-                // The server phrases this one with the actual numbers, which is
-                // more use than a generic "not enough diamonds".
-                "FAILED_PRECONDITION" ->
-                    if (res.userMessage.contains("diamond", ignoreCase = true)) {
-                        GiftResult.InsufficientDiamonds
-                    } else {
-                        GiftResult.Error(res.userMessage)
-                    }
-                else -> GiftResult.Error(res.userMessage)
-            }
+            is MoneyFunctions.Result.Ok -> resultOf(res.value)
+            // The server phrases a refusal with the actual numbers, which is
+            // more use than a generic "not enough diamonds".
+            is MoneyFunctions.Result.Failed -> failureOf(res)
+        }
+    }
+
+    companion object {
+        /** The server's answer as the screens read it. Shared by every send path, so a lucky roll is never dropped. */
+        fun resultOf(outcome: MoneyFunctions.GiftOutcome): GiftResult {
+            val lucky = outcome.lucky ?: return GiftResult.Success
+            return GiftResult.LuckyWin(
+                multiplier = lucky.multiplier,
+                diamondsBack = lucky.reward,
+                combo = lucky.combo,
+                unit = lucky.unit,
+                charged = outcome.totalCost,
+                configVersion = lucky.configVersion,
+            )
+        }
+
+        /** A refusal as the screens read it: "not enough diamonds" gets its own branch. */
+        fun failureOf(res: MoneyFunctions.Result.Failed): GiftResult = when (res.code) {
+            "FAILED_PRECONDITION" ->
+                if (res.userMessage.contains("diamond", ignoreCase = true)) GiftResult.InsufficientDiamonds
+                else GiftResult.Error(res.userMessage)
+            else -> GiftResult.Error(res.userMessage)
         }
     }
 

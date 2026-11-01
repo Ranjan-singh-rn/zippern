@@ -1,45 +1,27 @@
 package com.zipper.app.util
 
-import kotlin.random.Random
-
 /**
- * Single source of truth for all Zipper economic calculations.
+ * Zipper economic constants that the CLIENT still needs — and nothing that
+ * moves money.
  *
  * Currency: 1 Diamond == 1 Bean (1:1 parity)
  * - Diamonds : spent by users  (calls, gifts, topped up offline via coin sellers)
  * - Beans    : earned by hosts/users (withdrawable)
  *
- * ── Gift reward rules ────────────────────────────────────────────────────────
+ * ── What is deliberately NOT here any more (APK 20, spec §11) ────────────────
  *
- * NORMAL gift  → receiver always gets exactly 50% of total diamond cost as beans
- * SPECIAL gift → receiver gets 50–55% (luck roll per transaction)
- * LUCKY gift   → receiver always gets 5% as beans; sender additionally rolls:
+ * The lucky-gift odds tables and the client-side roll (`luckyGiftOutcome`,
+ * `rollSingle`, `rollCombo`, `weightedRandom`), the per-category bean reward
+ * (`giftBeanReward`) and the casino bet denominations are gone. Every one of
+ * them was a number the server now decides: `settleGift` prices the gift from
+ * the catalogue, takes the receiver's share from the CRM, and for a lucky
+ * gift draws the multiplier from `appConfig/luckyGifts` inside the same
+ * transaction as the charge. A client that keeps a copy of the odds is a
+ * client that can be edited to show — or to expect — a different result than
+ * the one it is charged for, and nothing on this side should be able to
+ * disagree with the ledger.
  *
- *   Single (qty = 1):
- *     0× no return   65%
- *     1× cost back   20%
- *     2× cost × 2     9%
- *     3× cost × 3     4%
- *     4× cost × 4     2%
- *   Expected sender return = 0.58× spend → platform nets ~37% after receiver cut.
- *
- *   Combo (qty = 17 / 37 / 77):
- *     Multiplier is applied to per-gift cost (NOT total combo spend).
- *     5×   80%
- *     10×  10%
- *     20×   5%
- *     50×   3%
- *     100×  1.5%
- *     200×  0.5%
- *   Expected sender return = 10× per-gift-cost → platform nets 36–82% depending on combo size.
- *   Larger combo = worse deal for sender, much better for platform.
- *
- *   ⚠️  Individual 200× wins cause a per-transaction platform loss. This is intentional —
- *       profit comes from statistical aggregate across all lucky gift sends.
- *       Diamond returns to sender are synthetic (credited from platform's cut); no pool needed
- *       since real money was already collected offline by coin sellers.
- *
- * ── Call cost rules ──────────────────────────────────────────────────────────
+ * ── Call cost rules (reference; the server's `rateFor` in pricing.ts decides) ─
  *
  * USER ↔ USER  (neither is host)
  *   Fixed 1600 diamonds/min. Receiver always earns.
@@ -84,19 +66,6 @@ object EconomyEngine {
     /** Wholesale price Zipper charges coin sellers per lakh diamonds (INR) */
     const val WHOLESALE_PRICE_PER_LAKH_INR = 2_290
 
-    // ── Gaming bet denominations ───────────────────────────────────────────────
-
-    /** Valid bet amounts in diamonds for all casino / lucky games */
-    val GAMING_BET_DENOMINATIONS = longArrayOf(10L, 100L, 500L, 1_000L, 5_000L, 10_000L)
-
-    /**
-     * Platform house edge on gaming bets (5%).
-     * The actual odds/payouts are handled by the WebView game engine.
-     * The Android app deducts bets and credits winnings; the 5% edge is
-     * embedded in the game's payout math on the server/WebView side.
-     */
-    const val GAMING_HOUSE_EDGE_PCT = 5
-
     // ── Withdrawal helpers ────────────────────────────────────────────────────
 
     /**
@@ -112,86 +81,6 @@ object EconomyEngine {
      * Checks whether a host has enough beans to withdraw.
      */
     fun canWithdraw(beans: Long): Boolean = beans >= MIN_WITHDRAWAL_BEANS
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Gift types
-    // ─────────────────────────────────────────────────────────────────────────
-
-    enum class GiftType { NORMAL, LUCKY, SPECIAL }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Gift bean rewards
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Beans earned by the gift receiver for [totalCostDiamonds] worth of gifts.
-     *
-     * NORMAL  → 50% exactly
-     * SPECIAL → random 50–55% (rolled here, same value written to Firestore)
-     * LUCKY   → 5% exactly (sender return handled separately via [luckyGiftOutcome])
-     */
-    fun giftBeanReward(totalCostDiamonds: Long, type: GiftType): Long {
-        val pct = when (type) {
-            GiftType.NORMAL  -> 50L
-            GiftType.LUCKY   -> 5L
-            GiftType.SPECIAL -> 50L + Random.nextLong(6L)   // 50, 51, 52, 53, 54, or 55
-        }
-        return (totalCostDiamonds * pct) / 100L
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Lucky gift outcome
-    // ─────────────────────────────────────────────────────────────────────────
-
-    data class LuckyGiftResult(
-        /** Multiplier applied to per-gift cost (0/1/2/3/4 for single; 5–200 for combo) */
-        val multiplier: Int,
-        /** Diamonds credited back to sender = multiplier × perGiftCostDiamonds */
-        val diamondsBack: Long,
-        /** Whether the sender actually wins anything */
-        val isWin: Boolean,
-    )
-
-    /**
-     * Determines the lucky gift outcome for the sender.
-     *
-     * @param perGiftCostDiamonds  Cost of ONE gift (not total combo cost)
-     * @param isCombo              true if quantity > 1 (17 / 37 / 77)
-     *
-     * ⚠️  Currently client-side. MUST migrate to Cloud Functions before production
-     *     to prevent APK tampering for guaranteed 4× / 200× outcomes.
-     */
-    fun luckyGiftOutcome(perGiftCostDiamonds: Long, isCombo: Boolean): LuckyGiftResult {
-        val multiplier = if (isCombo) rollCombo() else rollSingle()
-        val diamondsBack = perGiftCostDiamonds * multiplier
-        return LuckyGiftResult(
-            multiplier   = multiplier,
-            diamondsBack = diamondsBack,
-            isWin        = multiplier > 0,
-        )
-    }
-
-    // Single: weights out of 10 000
-    // 0× = 65%, 1× = 20%, 2× = 9%, 3× = 4%, 4× = 2%
-    private val SINGLE_MULTIPLIERS = intArrayOf(0, 1, 2, 3, 4)
-    private val SINGLE_WEIGHTS     = intArrayOf(6500, 2000, 900, 400, 200)
-
-    // Combo: weights out of 10 000
-    // 5× = 80%, 10× = 10%, 20× = 5%, 50× = 3%, 100× = 1.5%, 200× = 0.5%
-    private val COMBO_MULTIPLIERS = intArrayOf(5, 10, 20, 50, 100, 200)
-    private val COMBO_WEIGHTS     = intArrayOf(8000, 1000, 500, 300, 150, 50)
-
-    private fun rollSingle(): Int = weightedRandom(SINGLE_WEIGHTS, SINGLE_MULTIPLIERS)
-    private fun rollCombo(): Int  = weightedRandom(COMBO_WEIGHTS,  COMBO_MULTIPLIERS)
-
-    private fun weightedRandom(weights: IntArray, values: IntArray): Int {
-        var roll = Random.nextInt(weights.sum())
-        for (i in weights.indices) {
-            roll -= weights[i]
-            if (roll < 0) return values[i]
-        }
-        return values.last()
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Call rewards

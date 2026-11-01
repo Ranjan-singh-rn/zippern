@@ -98,10 +98,13 @@ import javax.inject.Singleton
  * for this app, means losing the account on any handset that signed in as a
  * guest.
  *
- * So the channel is read from [BuildConfig.DEBUG] and the other channel is
- * never touched. Not a preference, not a remote flag, not a field on the
- * document: the one thing that cannot be wrong about which key signed the
- * running build is the build type that produced it.
+ * So the channel is read from `BuildConfig.OTA_CHANNEL` — a string each build
+ * type declares in app/build.gradle.kts — and the other channel is never
+ * touched. Not a preference, not a remote flag, not a field on the document:
+ * the one thing that cannot be wrong about which key signed the running build
+ * is the build type that produced it. (It used to be derived from
+ * `BuildConfig.DEBUG`; the `prod` build type — not debuggable, debug-signed —
+ * is why it is a name now.)
  *
  * ── A FAILED CHECK IS "UP TO DATE" ───────────────────────────────────────────
  *
@@ -274,7 +277,14 @@ class UpdateRepository @Inject constructor(
             // THE ONLY PLACE THE CHANNEL IS CHOSEN. See the class comment: a
             // debug build offered the release APK would fail to install after a
             // complete download, with an OS error nobody can act on.
-            val channel = if (BuildConfig.DEBUG) CHANNEL_DEBUG else CHANNEL_RELEASE
+            //
+            // A-4 (APK 20): from `BuildConfig.OTA_CHANNEL`, a string each build
+            // type declares, rather than from `BuildConfig.DEBUG`. The `prod`
+            // build type is not debuggable but IS signed with the debug key, so
+            // it reads the "debug" channel; deriving the channel from
+            // debuggability would have sent it to the release-keystore APK and
+            // the install would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+            val channel = channelFor(BuildConfig.OTA_CHANNEL)
 
             @Suppress("UNCHECKED_CAST")
             val map = doc.get(channel) as? Map<String, Any?> ?: return UpdateCheck.UpToDate
@@ -542,5 +552,14 @@ class UpdateRepository @Inject constructor(
         const val CHANNEL_DEBUG = "debug"
         const val CHANNEL_RELEASE = "release"
         private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
+
+        /**
+         * The channel map to read for a build's `OTA_CHANNEL`. Only the two
+         * known names; anything else — a typo in a new build type — reads the
+         * debug channel, which is the key every installed handset trusts, so a
+         * mistake here can at worst offer a build that installs.
+         */
+        fun channelFor(otaChannel: String): String =
+            if (otaChannel.trim().lowercase() == CHANNEL_RELEASE) CHANNEL_RELEASE else CHANNEL_DEBUG
     }
 }

@@ -71,9 +71,12 @@ import kotlinx.coroutines.delay
  *   input row 48h + gold gift button
  *   controls: Flip · Mute · End (64, coral) · PIP, with 11sp labels
  *
- * Money: the server bills per tick and tells us the balance; the "Time left"
- * figure is balance ÷ rate and is only a hint. When the server says endNow the
- * ViewModel ends the call; we just show the state.
+ * Money (APK 20 / spec §11): the server charges whole minutes — the first on
+ * connect, then one at every 60-second mark — and every figure here comes from
+ * what it reported (`CallBilling`): elapsed time by the server's clock, "next
+ * minute in Ns", minutes billed, diamonds spent. "Time left" is the server's
+ * affordable-minutes figure. When the server ends the call (out of diamonds) a
+ * dialog says so before the screen closes.
  */
 
 @Composable
@@ -123,7 +126,51 @@ fun VideoCallScreen(
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) chatState.animateScrollToItem(state.messages.size - 1)
     }
-    LaunchedEffect(state.endReason) { if (state.endReason != null) onCallEnded() }
+    /*
+     * A call the SERVER ended is explained before the screen closes. An
+     * ordinary hang-up closes at once, as before; `insufficient_diamonds`, a
+     * restriction or a displaced session hold the screen on a dialog whose OK
+     * is what navigates — a call that simply vanishes is the thing people
+     * report as a bug.
+     */
+    LaunchedEffect(state.endReason, state.serverEndMessage) {
+        if (state.endReason != null && state.serverEndMessage == null) onCallEnded()
+    }
+    state.serverEndMessage?.let { msg ->
+        if (state.endReason != null) {
+            val outOfDiamonds = state.isPayer && (
+                state.endReason == com.zipper.app.util.CallBilling.END_INSUFFICIENT_DIAMONDS ||
+                    state.endReason == com.zipper.app.util.CallBilling.END_DIAMONDS_EXHAUSTED
+                )
+            // Typed explicitly: an inline conditional composable lambda leans on
+            // expected-type inference through an `if`, which is fragile.
+            val rechargeButton: (@Composable () -> Unit)? = if (outOfDiamonds) ({
+                androidx.compose.material3.TextButton(onClick = { onCallEnded(); onRecharge() }) {
+                    Text("Recharge", color = c.textSecondary)
+                }
+            }) else null
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = onCallEnded,
+                containerColor = c.bgElevated,
+                title = { Text("Call ended", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
+                        Text(msg, style = ZipperTheme.type.bodyM, color = c.textSecondary)
+                        Text(
+                            "${formatDuration(state.durationSeconds)} · ${state.minutesBilled} min billed" +
+                                (if (state.isPayer) " · ${indianGrouping(state.diamondsSpent)} diamonds"
+                                 else " · ${indianGrouping(state.beansEarned)} beans earned"),
+                            style = ZipperTheme.type.caption, color = c.textMuted,
+                        )
+                    }
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = onCallEnded) { Text("OK", color = c.textBrand) }
+                },
+                dismissButton = rechargeButton,
+            )
+        }
+    }
     LaunchedEffect(state.error) {
         state.error?.let { snackbar.showSnackbar(it); viewModel.clearError() }
     }
@@ -329,6 +376,12 @@ fun VideoCallScreen(
             enter = fadeIn(), exit = fadeOut(),
         ) { LowBalanceCard(onRecharge) }
 
+        // Spec §11: the server's lucky roll on an in-call gift, celebrated for a few seconds.
+        state.lastLuckyWin?.let { win ->
+            LaunchedEffect(win) { delay(4_000); viewModel.clearLuckyWin() }
+            LuckyWinBanner(win, Modifier.align(Alignment.Center).padding(Space.xl))
+        }
+
         SnackbarHost(snackbar, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 120.dp)) { data ->
             Snackbar(snackbarData = data, containerColor = c.bgElevated, contentColor = c.textPrimary)
         }
@@ -385,32 +438,62 @@ fun PulseRings(content: @Composable () -> Unit) {
     }
 }
 
+/**
+ * The cost bar. Every number is the server's (see `CallBilling`): minutes
+ * billed and diamonds spent are what has actually been charged, "next" is the
+ * countdown to the next whole-minute charge, and "left" is how many more
+ * minutes the balance covers.
+ */
 @Composable
 private fun CostBar(state: VideoCallUiState, isPayer: Boolean, onRecharge: () -> Unit) {
     val c = ZipperTheme.colors
     val rate = state.perMinRateDiamonds
-    val minutesLeft = if (rate > 0) state.myDiamonds / rate else 0L
-    Row(
-        Modifier.fillMaxWidth().height(48.dp)
+    val minutesLeft = state.minutesLeft
+    val next = state.secondsToNextCharge
+    Column(
+        Modifier.fillMaxWidth()
             .background(c.scrimMedium, RoundedCornerShape(Radius.lg))
             .border(1.dp, c.glassMid, RoundedCornerShape(Radius.lg))
-            .padding(horizontal = Space.md),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(horizontal = Space.md, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        if (isPayer) {
-            Segment("Balance", indianGrouping(state.myDiamonds), Currency.Diamond, Modifier.weight(1f))
-            VerticalRule()
-            Segment("Rate", "$rate/min", Currency.Diamond, Modifier.weight(1f))
-            VerticalRule()
-            Segment(
-                "Time left", "${minutesLeft}m", null, Modifier.weight(1f),
-                valueColor = if (state.lowBalanceWarning || minutesLeft < 2) c.statusWarning else c.textPrimary,
+        Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (isPayer) {
+                Segment("Balance", indianGrouping(state.myDiamonds), Currency.Diamond, Modifier.weight(1f))
+                VerticalRule()
+                Segment("Rate", "$rate/min", Currency.Diamond, Modifier.weight(1f))
+                VerticalRule()
+                Segment(
+                    "Left",
+                    if (minutesLeft == null) "—" else "${minutesLeft}m",
+                    null, Modifier.weight(1f),
+                    valueColor = if (state.lowBalanceWarning) c.statusWarning else c.textPrimary,
+                )
+                Text("Top up", style = ZipperTheme.type.labelS, color = c.textBrand, modifier = Modifier.clickableNoRipple(onRecharge))
+            } else {
+                Segment("Earned", indianGrouping(state.beansEarned), Currency.Bean, Modifier.weight(1f))
+                VerticalRule()
+                Segment("Billed", "${state.minutesBilled} min", null, Modifier.weight(1f))
+                VerticalRule()
+                Segment("Duration", formatDuration(state.durationSeconds), null, Modifier.weight(1f))
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (isPayer) "Billed ${state.minutesBilled} min · ${indianGrouping(state.diamondsSpent)} spent"
+                else "Per full minute · first minute charged on connect",
+                style = ZipperTheme.type.caption, color = c.textSecondary, maxLines = 1,
             )
-            Text("Top up", style = ZipperTheme.type.labelS, color = c.textBrand, modifier = Modifier.clickableNoRipple(onRecharge))
-        } else {
-            Segment("Earned", indianGrouping(state.beansEarned), Currency.Bean, Modifier.weight(1f))
-            VerticalRule()
-            Segment("Duration", formatDuration(state.durationSeconds), null, Modifier.weight(1f))
+            Text(
+                when {
+                    next == null -> ""
+                    next <= 0L -> "Next minute now"
+                    else -> "Next minute in ${next}s"
+                },
+                style = ZipperTheme.type.caption,
+                color = if (next != null && next <= 5L) c.statusWarning else c.textSecondary,
+                maxLines = 1,
+            )
         }
     }
 }
@@ -461,7 +544,8 @@ private fun LowBalanceCard(onRecharge: () -> Unit) {
         }
         Text("Balance running low", style = ZipperTheme.type.headingS, color = c.textPrimary)
         Text(
-            "Less than a minute left. Top up now to keep the call going.",
+            "Your balance covers fewer than two more minutes. The call ends at the next " +
+                "60-second mark you cannot pay for — top up now to keep it going.",
             style = ZipperTheme.type.bodyS, color = c.textSecondary, textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(Space.xs))

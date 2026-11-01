@@ -119,6 +119,16 @@ data class AuthUiState(
      * A failure to become a host is worth stopping for.
      */
     val hostActivationError: String? = null,
+    /**
+     * A-1 / A-2 (APK 20): the profile saved but the photo did not upload.
+     *
+     * Held as a dialog, like [hostActivationError], because the screen must
+     * not navigate away in the same frame it is asked to explain something.
+     * The person picks a smaller photo and saves again (the save is a
+     * `set(merge)`, so repeating it is harmless), or continues without one.
+     * Navigation waits on that choice.
+     */
+    val photoUploadFailed: String? = null,
 )
 
 @HiltViewModel
@@ -340,69 +350,109 @@ class AuthViewModel @Inject constructor(
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
             when (val result = repo.saveUserProfile(name, gender, dob, age, city, country, deviceId, photoUri, languages, email, phone, bio, defaultAvatar)) {
-                is AuthResult.Success -> {
-                    // If a valid referral code was entered, activate the host application now
-                    val state = _uiState.value
-                    var activationError: String? = null
-                    /** Redeemed successfully — this person is a host as of now. */
-                    var becameHost = false
-                    if (state.referralValid && state.referralCode.isNotBlank()) {
-                        // The server re-checks the code, the phone and the email
-                        // before granting host status — checkReferralCode above
-                        // was a preview, not the decision.
-                        // The details THIS profile was just saved with, not the
-                        // ones captured when the code was checked. Somebody who
-                        // verifies a code and then corrects a typo in their
-                        // email would otherwise redeem against the old value and
-                        // be told the code belongs to a different person.
-                        //
-                        // The server prefers the auth token over both, and
-                        // `users/{uid}` over the form — these are the fallback,
-                        // and they matter only on this first save, when the
-                        // profile document is being written in the same breath.
-                        val res = repo.activateHostApplication(
-                            state.referralCode,
-                            phone = phone.ifBlank { state.referralPhone },
-                            email = email.ifBlank { state.referralEmail },
-                        )
-                        if (res is AuthResult.Error) activationError = res.message
-                        else becameHost = true
-                    }
-                    /*
-                     * A NEW HOST GOES STRAIGHT TO THE FACE CAPTURE. AN ORDINARY
-                     * USER IS NEVER ASKED.
-                     *
-                     * This used to send everybody to Home with a comment saying
-                     * a host would be "prompted for it from Home" — and nothing
-                     * on Home ever prompted. `navigateToFaceVerification`
-                     * existed, `FaceVerificationScreen` existed, the route was
-                     * registered, and not one line in the app ever set the flag.
-                     *
-                     * So every host who redeemed a code landed on Home tagged
-                     * HOST · PENDING, permanently: `isVerifiedHost` gates going
-                     * live, gates earning at their own rate, and gates the
-                     * weekly payout release. They were a host who could not host
-                     * and could not be paid, with nothing on screen to say why
-                     * or what to do about it.
-                     *
-                     * The capture is skippable from the capture screen itself —
-                     * it needs decent light and a free minute, and forcing it at
-                     * signup would cost real recruits. What it must not be is
-                     * INVISIBLE. `MyProfileScreen` carries the same prompt for
-                     * anyone who skips it here.
-                     */
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            hostActivationError = activationError,
-                            navigateToFaceVerification = activationError == null && becameHost,
-                            navigateToMain = activationError == null && !becameHost,
-                        )
-                    }
+                is AuthResult.Success -> afterProfileSaved(email, phone)
+                /*
+                 * A-1 / A-2 (APK 20): saved, minus the photo. Stop and say so —
+                 * the referral redemption and the navigation run from
+                 * [continueWithoutPhoto] once the person has decided, or from
+                 * the next save if they pick a smaller photo and try again.
+                 */
+                is AuthResult.SavedWithoutPhoto -> {
+                    pendingAfterSave = email to phone
+                    _uiState.update { it.copy(isLoading = false, photoUploadFailed = result.message) }
                 }
                 is AuthResult.Error -> _uiState.update { it.copy(isLoading = false, error = result.message) }
                 else -> {}
             }
+        }
+    }
+
+    /**
+     * The contact details the profile was saved with, held while the
+     * photo-failed dialog is up so [continueWithoutPhoto] can redeem the
+     * referral code against the same values the save used.
+     */
+    private var pendingAfterSave: Pair<String, String>? = null
+
+    /** "Continue" on the photo-failed dialog: finish signing up without the photo. */
+    fun continueWithoutPhoto() {
+        val (email, phone) = pendingAfterSave ?: ("" to "")
+        pendingAfterSave = null
+        _uiState.update { it.copy(photoUploadFailed = null, isLoading = true) }
+        viewModelScope.launch { afterProfileSaved(email, phone) }
+    }
+
+    /** "Try another photo" on the photo-failed dialog: stay on the form. */
+    fun dismissPhotoUploadFailed() {
+        pendingAfterSave = null
+        _uiState.update { it.copy(photoUploadFailed = null) }
+    }
+
+    /**
+     * Everything that happens once the profile document is written: redeem a
+     * referral code, then route to Home or to the host's face capture.
+     *
+     * One function for the plain save and for the saved-without-photo path, so
+     * the two cannot drift.
+     */
+    private suspend fun afterProfileSaved(email: String, phone: String) {
+        // If a valid referral code was entered, activate the host application now
+        val state = _uiState.value
+        var activationError: String? = null
+        /** Redeemed successfully — this person is a host as of now. */
+        var becameHost = false
+        if (state.referralValid && state.referralCode.isNotBlank()) {
+            // The server re-checks the code, the phone and the email
+            // before granting host status — checkReferralCode above
+            // was a preview, not the decision.
+            // The details THIS profile was just saved with, not the
+            // ones captured when the code was checked. Somebody who
+            // verifies a code and then corrects a typo in their
+            // email would otherwise redeem against the old value and
+            // be told the code belongs to a different person.
+            //
+            // The server prefers the auth token over both, and
+            // `users/{uid}` over the form — these are the fallback,
+            // and they matter only on this first save, when the
+            // profile document is being written in the same breath.
+            val res = repo.activateHostApplication(
+                state.referralCode,
+                phone = phone.ifBlank { state.referralPhone },
+                email = email.ifBlank { state.referralEmail },
+            )
+            if (res is AuthResult.Error) activationError = res.message
+            else becameHost = true
+        }
+        /*
+         * A NEW HOST GOES STRAIGHT TO THE FACE CAPTURE. AN ORDINARY
+         * USER IS NEVER ASKED.
+         *
+         * This used to send everybody to Home with a comment saying
+         * a host would be "prompted for it from Home" — and nothing
+         * on Home ever prompted. `navigateToFaceVerification`
+         * existed, `FaceVerificationScreen` existed, the route was
+         * registered, and not one line in the app ever set the flag.
+         *
+         * So every host who redeemed a code landed on Home tagged
+         * HOST · PENDING, permanently: `isVerifiedHost` gates going
+         * live, gates earning at their own rate, and gates the
+         * weekly payout release. They were a host who could not host
+         * and could not be paid, with nothing on screen to say why
+         * or what to do about it.
+         *
+         * The capture is skippable from the capture screen itself —
+         * it needs decent light and a free minute, and forcing it at
+         * signup would cost real recruits. What it must not be is
+         * INVISIBLE. `MyProfileScreen` carries the same prompt for
+         * anyone who skips it here.
+         */
+        _uiState.update {
+            it.copy(
+                isLoading = false,
+                hostActivationError = activationError,
+                navigateToFaceVerification = activationError == null && becameHost,
+                navigateToMain = activationError == null && !becameHost,
+            )
         }
     }
 
@@ -585,9 +635,15 @@ class AuthViewModel @Inject constructor(
                 _uiState.update {
                     it.copy(
                         isLoading = false,
-                        error = "This account manages the Zipper CRM and cannot be used in the app.",
+                        // The same sentence the splash gate uses, whichever server refused.
+                        error = com.zipper.app.util.ObserverAccess.DENIED_MESSAGE,
                     )
                 }
+            // Only `saveUserProfile` produces this, and it never reaches a
+            // sign-in path; listed so the `when` stays exhaustive. Treated as
+            // the success it is.
+            is AuthResult.SavedWithoutPhoto ->
+                _uiState.update { it.copy(isLoading = false, navigateToMain = true) }
             is AuthResult.DeletedRecoverable ->
                 _uiState.update { it.copy(isLoading = false, navigateToRecoverAccount = true) }
             /*

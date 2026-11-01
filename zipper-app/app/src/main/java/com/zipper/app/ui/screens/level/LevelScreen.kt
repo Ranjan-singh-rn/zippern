@@ -136,7 +136,10 @@ fun LevelScreen(
     val userInfo = remember(state.totalXp, state.userThresholds) { LevelEngine.computeUserLevel(state.totalXp, state.userThresholds) }
     val hostInfo = remember(state.totalBeansEarned, state.hostThresholds) { LevelEngine.computeHostLevel(state.totalBeansEarned, state.hostThresholds) }
 
-    val isHostTab = selectedTab == 1
+    // Spec §10 / F-16: the host tab exists for a HOST only, and a non-host can
+    // never land on it — whatever `selectedTab` says (a revoked host mid-session).
+    val visibility = com.zipper.app.util.LevelVisibility.decide(state.isHost, selectedTab)
+    val isHostTab = visibility.effectiveTab == com.zipper.app.util.LevelVisibility.TAB_HOST
     val levels: List<LevelConfigRepository.LevelConfig> = if (isHostTab) state.hostLevels else state.userLevels
     val current = if (isHostTab) hostInfo.level else userInfo.level
     val spending = if (isHostTab) state.totalBeansEarned else state.totalXp
@@ -153,7 +156,7 @@ fun LevelScreen(
     ZipperScreen(topBar = { TopBar("My Level", onBack = onBack) }) { _ ->
         if (state.loading) { LoadingState(); return@ZipperScreen }
         LazyColumn(contentPadding = PaddingValues(horizontal = Space.lg, vertical = Space.md), verticalArrangement = Arrangement.spacedBy(Space.md)) {
-            if (state.isHost) {
+            if (visibility.showHostLevel) {
                 item {
                     Row(Modifier.fillMaxWidth().height(38.dp).background(c.bgRaised, CircleShape).padding(2.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                         listOf("Wealth level", "Host level").forEachIndexed { i, t ->

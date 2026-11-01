@@ -137,6 +137,10 @@ fun AppUpdateGate(
         if (required) null else ({ TextButton(dismiss) { Text("Later", color = c.textSecondary) } })
     val notNowButton: (@Composable () -> Unit)? =
         if (required) null else ({ TextButton(dismiss) { Text("Not now", color = c.textSecondary) } })
+    // A-23: a download the person no longer wants can be stopped. Cancel
+    // removes the partial file; a REQUIRED update has no Cancel, as it has no Later.
+    val cancelButton: (@Composable () -> Unit)? =
+        if (required) null else ({ TextButton(dismiss) { Text("Cancel", color = c.textSecondary) } })
 
     when (state.phase) {
         UpdatePhase.UpToDate -> {
@@ -251,9 +255,10 @@ fun AppUpdateGate(
             val verifying = phase == UpdatePhase.Verifying
             val applying = phase == UpdatePhase.Applying
             AlertDialog(
-                // Never dismissible by tapping away, required or not: this one
-                // has a running download behind it, and dismissing throws the
-                // bytes away. Later was offered on the previous step.
+                // Never dismissible by tapping AWAY, required or not: this one
+                // has a running download behind it, and a stray tap outside
+                // must not throw the bytes away. A non-mandatory update has an
+                // explicit Cancel below instead (A-23).
                 onDismissRequest = {},
                 properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
                 containerColor = c.bgElevated,
@@ -358,6 +363,7 @@ fun AppUpdateGate(
                     }
                 },
                 confirmButton = {},
+                dismissButton = cancelButton,
             )
         }
 
@@ -394,6 +400,8 @@ fun AppUpdateGate(
                         style = ZipperTheme.type.bodyM, color = c.textSecondary,
                     )
                 },
+                // Try again RE-READS the update document (A-5), so a corrected
+                // publish is picked up and a withdrawn one closes the dialog.
                 confirmButton = { TextButton({ viewModel.retry() }) { Text("Try again", color = c.brandPrimary) } },
                 dismissButton = laterButton,
             )

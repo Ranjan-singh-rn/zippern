@@ -281,6 +281,12 @@ fun WatchLiveScreen(
         // Gift animation
         state.recentGifts.firstOrNull()?.let { GiftAnimationOverlay(giftEvent = it, onDismiss = viewModel::dismissGift) }
 
+        // Spec §11: the server's lucky roll, celebrated for a few seconds.
+        state.luckyWin?.let { win ->
+            LaunchedEffect(win) { kotlinx.coroutines.delay(4_000); viewModel.clearLuckyWin() }
+            LuckyWinBanner(win, Modifier.align(Alignment.Center).padding(Space.xl))
+        }
+
         SnackbarHost(snackbar, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 120.dp)) { data ->
             Snackbar(snackbarData = data, containerColor = c.bgElevated, contentColor = c.textPrimary)
         }

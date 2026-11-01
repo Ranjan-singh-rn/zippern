@@ -619,6 +619,12 @@ fun PartyRoomScreen(
             PartyGate.None, PartyGate.Password -> Unit
         }
 
+        // Spec §11: the server's lucky roll, celebrated for a few seconds.
+        state.luckyWin?.let { win ->
+            LaunchedEffect(win) { kotlinx.coroutines.delay(4_000); viewModel.clearLuckyWin() }
+            LuckyWinBanner(win, Modifier.align(Alignment.Center).padding(Space.xl))
+        }
+
         SnackbarHost(
             snackbar,
             Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = Space.x7l),

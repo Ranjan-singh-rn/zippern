@@ -99,6 +99,8 @@ data class PartyRoomUiState(
      * So the signal is stated rather than deduced.
      */
     val lastGiftResult: GiftTapResult? = null,
+    /** Spec §11: the server's roll on the last lucky gift sent from this room, for the celebration. */
+    val luckyWin: com.zipper.app.data.repository.GiftResult.LuckyWin? = null,
     /** A seat tap in flight, so the same seat is not requested twice. */
     val busySeat: Int = -1,
     /** A moderator action in flight against this uid. */
@@ -225,6 +227,13 @@ class PartyRoomViewModel @Inject constructor(
 
     /** The Agora uid we joined on. A seat holder's is their seat index. */
     @Volatile private var myAgoraUid = 0
+
+    /**
+     * A-7: the seat index the last rejoin asked a token for. If the server
+     * signed that token for another uid (the seat write had not landed), the
+     * reconcile must not ask again on every snapshot — one attempt per seat.
+     */
+    @Volatile private var seatUidTried = -1
 
     /** Last role we asked the engine for, so a snapshot storm is not a role storm. */
     @Volatile private var publishing = false
@@ -473,9 +482,21 @@ class PartyRoomViewModel @Inject constructor(
             val mySeat = _state.value.mySeat
             myAgoraUid = mySeat?.index ?: 0
 
+            // A-6: the hour-long token is renewed in place through the one
+            // repository that mints it.
+            AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
+
             when (val r = agoraTokenRepo.requestToken(channelName, myAgoraUid)) {
                 is AgoraTokenResult.Granted -> {
                     val publisher = mySeat != null
+                    /*
+                     * A-7: THE SERVER'S UID, NEVER 0. A seat holder's token is
+                     * signed for the seat index (the server reads the seat
+                     * document); a listener's for a uid derived from their
+                     * account. Either way it is the number in the grant, and
+                     * joining with any other is refused by Agora.
+                     */
+                    if (r.uid > 0) myAgoraUid = r.uid
                     AgoraManager.joinPartyChannel(
                         channelId = channelName,
                         token = r.token,
@@ -524,7 +545,7 @@ class PartyRoomViewModel @Inject constructor(
          * suggests why. `takePartySeat` allows the move with no "already seated"
          * guard, so it is an ordinary tap away.
          */
-        if (mySeat != null && myAgoraUid != mySeat.index) {
+        if (mySeat != null && myAgoraUid != mySeat.index && seatUidTried != mySeat.index) {
             /*
              * A client cannot change its Agora uid without rejoining, which is why
              * this is the one path that leaves and comes back.
@@ -550,8 +571,23 @@ class PartyRoomViewModel @Inject constructor(
                      */
                     when (val r = agoraTokenRepo.requestToken(channelName, seatUid)) {
                         is AgoraTokenResult.Granted -> {
-                            myAgoraUid = seatUid
-                            AgoraManager.rejoinPartyAs(channelName, r.token, seatUid, video)
+                            /*
+                             * A-7: join with the uid the token was signed for.
+                             * The server reads the seat document and signs for
+                             * the seat index, so this is `seatUid` — unless the
+                             * seat write had not landed when the token was cut,
+                             * in which case the grant carries the derived uid
+                             * and is logged. Joining with the grant's uid keeps
+                             * the audio up either way; `seatUidTried` stops the
+                             * reconcile below from asking again for this seat.
+                             */
+                            val joinUid = if (r.uid > 0) r.uid else seatUid
+                            if (joinUid != seatUid) {
+                                android.util.Log.w("PartyRoom", "Seat $seatUid token signed for uid $joinUid; joining with the signed uid.")
+                            }
+                            seatUidTried = seatUid
+                            myAgoraUid = joinUid
+                            AgoraManager.rejoinPartyAs(channelName, r.token, joinUid, video)
                             AgoraManager.enableSpeakingIndicator(true)
                             publishing = true
                             applyLocalMediaState(mySeat)
@@ -573,7 +609,7 @@ class PartyRoomViewModel @Inject constructor(
         if (shouldPublish != publishing) {
             AgoraManager.setPartyRole(shouldPublish, video)
             publishing = shouldPublish
-            if (!shouldPublish) myAgoraUid = 0
+            if (!shouldPublish) { myAgoraUid = 0; seatUidTried = -1 }
         }
         applyLocalMediaState(mySeat)
     }
@@ -951,19 +987,29 @@ class PartyRoomViewModel @Inject constructor(
             return
         }
         val base = "party_${gift.id}_${quantity}_$tapNonce"
+        // Spec §11: a lucky gift travels as `combo` (per recipient), a normal one as `quantity`.
+        val shape = com.zipper.app.util.LuckyCombos.sendShape(gift.isLucky, quantity)
         _state.update { it.copy(giftSending = true, lastGiftResult = null) }
         viewModelScope.launch {
             val failures = mutableListOf<String>()
             var delivered = 0
+            var luckyWin: com.zipper.app.data.repository.GiftResult.LuckyWin? = null
             recipients.forEach { uid ->
-                val err = repo.sendGiftToSeat(
+                val res = repo.sendGiftToSeatDetailed(
                     roomId = roomId,
                     receiverUid = uid,
                     giftId = gift.id,
-                    quantity = quantity,
+                    quantity = shape.quantity ?: 1,
                     idempotencyKey = "${base}_$uid",
+                    combo = shape.combo,
                 )
-                if (err != null) failures += err else delivered++
+                when (res) {
+                    is com.zipper.app.data.repository.GiftResult.Error -> failures += res.message
+                    is com.zipper.app.data.repository.GiftResult.InsufficientDiamonds ->
+                        failures += "Not enough diamonds — recharge to send this gift."
+                    is com.zipper.app.data.repository.GiftResult.LuckyWin -> { delivered++; luckyWin = res }
+                    is com.zipper.app.data.repository.GiftResult.Success -> delivered++
+                }
             }
             val result = GiftTapResult(
                 nonce = tapNonce,
@@ -975,6 +1021,8 @@ class PartyRoomViewModel @Inject constructor(
                 it.copy(
                     giftSending = false,
                     lastGiftResult = result,
+                    // The SERVER's roll on the last lucky send, shown as it came back.
+                    luckyWin = luckyWin ?: it.luckyWin,
                     /*
                      * A partial send reports as a NOTICE naming both numbers, not
                      * as an error. Showing only the failure would tell somebody who
@@ -996,6 +1044,9 @@ class PartyRoomViewModel @Inject constructor(
 
     /** The screen has consumed [PartyRoomUiState.lastGiftResult] and retired its nonce. */
     fun clearGiftResult() { _state.update { it.copy(lastGiftResult = null) } }
+
+    /** The lucky celebration has been shown. */
+    fun clearLuckyWin() { _state.update { it.copy(luckyWin = null) } }
 
     /** A nonce for one gift tap. Held by the screen so a retry reuses it. */
     fun newGiftTapNonce(): String = UUID.randomUUID().toString()

@@ -126,7 +126,9 @@ fun EditProfileScreen(
     BackHandler(enabled = state.isSaving) { /* swallow — don't navigate away mid-save */ }
 
     val user = state.user
-    val isHost = user?.isHost == true
+    // Spec §10 / F-16: the call-rate card and the Host Level line are host-level
+    // items; a normal user never sees them.
+    val isHost = com.zipper.app.util.LevelVisibility.showCallRateCard(user?.isHost == true)
 
     // Host call rate limits by HOST level (0–10), NOT user spending level.
     // `user.hostLevel` is written as 0 at signup and never updated, so compute

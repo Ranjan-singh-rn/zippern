@@ -103,7 +103,11 @@ fun IncomingCallScreen(
                     CurrencyDisc(Currency.Diamond, 20.dp)
                     Column {
                         Text("This call costs ${indianGrouping(rate)} diamonds/min", style = ZipperTheme.type.labelM, color = c.textPrimary)
-                        Text("Billed from your balance every 10 seconds", style = ZipperTheme.type.caption, color = c.textSecondary)
+                        // Spec §11: whole minutes, the first on connect. No ten-second increments.
+                        Text(
+                            "First minute charged when you accept, then one full minute at each 60-second mark",
+                            style = ZipperTheme.type.caption, color = c.textSecondary,
+                        )
                     }
                 }
             }
@@ -125,7 +129,7 @@ fun IncomingCallScreen(
                             style = ZipperTheme.type.labelM, color = c.textPrimary,
                         )
                         Text(
-                            "Credited every 10 seconds while connected",
+                            "Credited per full minute — the first when you accept, then at each 60-second mark",
                             style = ZipperTheme.type.caption, color = c.textSecondary,
                         )
                     }

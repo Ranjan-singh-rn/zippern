@@ -38,6 +38,13 @@ data class UserNotification(
     val body: String = "",
     val createdAt: Long = 0L,
     val isRead: Boolean = false,
+    /**
+     * What the notice is about — a ticket id, a recharge id, a partner record
+     * — when the writer named one. The backend's notice writer
+     * (`services/notices.py`) puts it under `meta` (`ticket_id`, `partner_id`,
+     * …) and the canonical shape names it `relatedId`; both are read.
+     */
+    val relatedId: String = "",
 ) {
     /**
      * A warning is the one kind of notice that is a moderation decision rather

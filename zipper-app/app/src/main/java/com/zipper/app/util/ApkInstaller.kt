@@ -2,11 +2,16 @@ package com.zipper.app.util
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
+import android.content.pm.Signature
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
+import androidx.core.content.pm.PackageInfoCompat
 import com.zipper.app.data.repository.UpdateRepository.UpdateInfo
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
@@ -514,6 +519,21 @@ class ApkInstaller @Inject constructor(
      * @return null on success, or a message to show when no installer answered.
      */
     fun install(file: File): String? {
+        /*
+         * A-5 (APK 20): PACKAGE, VERSION AND SIGNER, BEFORE THE INSTALLER.
+         *
+         * The hash proved the file is what was published. This proves what was
+         * published is an update to this app: same package, a higher
+         * versionCode, the same signing certificates. A refused file is deleted
+         * here — it is not a download to retry — and the sentence says so.
+         */
+        when (val verdict = verify(file)) {
+            is ApkVerification.Verdict.Refused -> {
+                runCatching { file.delete() }
+                return verdict.reason
+            }
+            ApkVerification.Verdict.Ok -> Unit
+        }
         return try {
             val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
             val intent = Intent(Intent.ACTION_VIEW)
@@ -524,6 +544,94 @@ class ApkInstaller @Inject constructor(
         } catch (e: Exception) {
             "Could not open the installer: ${e.message ?: "unknown error"}"
         }
+    }
+
+    /**
+     * Read the archive's manifest and signing block and compare them with the
+     * running app. See [ApkVerification] for the three checks and why.
+     */
+    fun verify(file: File): ApkVerification.Verdict {
+        val running = try {
+            val info = packageInfoWithSigners(context.packageName, archivePath = null)
+            ApkVerification.Running(
+                packageName = context.packageName,
+                versionCode = info?.let { PackageInfoCompat.getLongVersionCode(it) } ?: 0L,
+                signerSha256 = signerHashes(info),
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read the running package's signers", e)
+            ApkVerification.Running(context.packageName, 0L, emptyList())
+        }
+        val candidate = try {
+            val info = packageInfoWithSigners(context.packageName, archivePath = file.absolutePath)
+            info?.let {
+                ApkVerification.Candidate(
+                    packageName = it.packageName,
+                    versionCode = PackageInfoCompat.getLongVersionCode(it),
+                    signerSha256 = signerHashes(it),
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not parse the downloaded APK", e)
+            null
+        }
+        return ApkVerification.decide(candidate, running)
+    }
+
+    /**
+     * The package info WITH its signing certificates: the installed package when
+     * [archivePath] is null, the archive on disk otherwise. API 28 introduced
+     * `GET_SIGNING_CERTIFICATES`; 26 and 27 still have the deprecated
+     * `GET_SIGNATURES`, which returns the same certificates for a v1/v2-signed
+     * APK like ours.
+     *
+     * `getPackageArchiveInfo` with the signing flag returns null on some
+     * builds for an archive it cannot verify — that null is the refusal.
+     */
+    @Suppress("DEPRECATION")   // GET_SIGNATURES / the int-flag overloads: the only API on 26–27 and 33+'s fallback
+    private fun packageInfoWithSigners(packageName: String, archivePath: String?): PackageInfo? {
+        val pm = context.packageManager
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+        return if (archivePath == null) pm.getPackageInfo(packageName, flags)
+        else pm.getPackageArchiveInfo(archivePath, flags)
+    }
+
+    /** Lowercase hex SHA-256 of every signing certificate on [info]; empty when there are none to read. */
+    @Suppress("DEPRECATION")   // `signatures` is the pre-28 field
+    private fun signerHashes(info: PackageInfo?): List<String> {
+        if (info == null) return emptyList()
+        val signatures: Array<Signature> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val signing = info.signingInfo ?: return emptyList()
+            // The certificates that signed THIS APK's contents — not the
+            // rotation history — which is the set Android compares on install.
+            signing.apkContentsSigners ?: return emptyList()
+        } else {
+            info.signatures ?: return emptyList()
+        }
+        return signatures.map { ApkVerification.sha256Hex(it.toByteArray()) }
+    }
+
+    /**
+     * A-23: remove every APK and patch this installer left in its directory.
+     *
+     * Called at the next launch and when an update is dismissed or cancelled.
+     * NOT called straight after [install]: the system installer reads the
+     * file through the content URI after `startActivity` returns, and a
+     * delete at that moment is the install failing with "file not found". If
+     * the install succeeded the process is restarted and the launch sweep
+     * takes the file; if the person backed out, Cancel or the next launch
+     * does. A verified file never outlives the next launch either way.
+     */
+    fun cleanupStaleFiles() {
+        val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return
+        val stale = dir.listFiles { f ->
+            f.isFile && f.name.startsWith("zipper-") && (f.name.endsWith(".apk") || f.name.endsWith(".bsdiff"))
+        } ?: return
+        stale.forEach { f -> runCatching { f.delete() } }
     }
 
     /**

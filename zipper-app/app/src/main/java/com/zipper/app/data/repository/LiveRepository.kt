@@ -215,6 +215,8 @@ class LiveRepository @Inject constructor(
      * cannot pay, moves the money, and writes the room's ticker row and
      * totals itself.
      *
+     * @param combo For a LUCKY gift: the combo picked on the sheet, sent as
+     *   `combo` with no `quantity` (spec §11). Null for a normal gift.
      * @return null on success, or a message to show the sender.
      */
     suspend fun sendGiftInLive(
@@ -223,7 +225,25 @@ class LiveRepository @Inject constructor(
         giftId: String,
         quantity: Int,
         idempotencyKey: String = money.newIdempotencyKey(),
-    ): String? = when (
+        combo: Int? = null,
+    ): String? = when (val res = sendGiftInLiveDetailed(roomId, hostUid, giftId, quantity, idempotencyKey, combo)) {
+        is GiftResult.Error -> res.message
+        is GiftResult.InsufficientDiamonds -> "Not enough diamonds — recharge to send this gift."
+        is GiftResult.Success, is GiftResult.LuckyWin -> null
+    }
+
+    /**
+     * [sendGiftInLive] with the server's answer in full, so a lucky roll
+     * reaches the room's celebration rather than being flattened to "sent".
+     */
+    suspend fun sendGiftInLiveDetailed(
+        roomId: String,
+        hostUid: String,
+        giftId: String,
+        quantity: Int,
+        idempotencyKey: String = money.newIdempotencyKey(),
+        combo: Int? = null,
+    ): GiftResult = when (
         val res = money.settleGift(
             giftId = giftId,
             receiverUid = hostUid,
@@ -231,10 +251,11 @@ class LiveRepository @Inject constructor(
             context = "live",
             roomId = roomId,
             idempotencyKey = idempotencyKey,
+            combo = combo,
         )
     ) {
-        is MoneyFunctions.Result.Ok -> null
-        is MoneyFunctions.Result.Failed -> res.userMessage
+        is MoneyFunctions.Result.Ok -> GiftRepository.resultOf(res.value)
+        is MoneyFunctions.Result.Failed -> GiftRepository.failureOf(res)
     }
 
     /**
@@ -247,7 +268,8 @@ class LiveRepository @Inject constructor(
         giftId: String,
         quantity: Int,
         idempotencyKey: String = money.newIdempotencyKey(),
-    ): String? = sendGiftInLive(roomId, hostUid, giftId, quantity, idempotencyKey)
+        combo: Int? = null,
+    ): String? = sendGiftInLive(roomId, hostUid, giftId, quantity, idempotencyKey, combo)
 
     // ── Viewer presence ───────────────────────────────────────────────────────
 
@@ -408,8 +430,14 @@ class LiveRepository @Inject constructor(
         // Best-effort, and deliberately not awaited into a failure: a report
         // that cannot be filed because a name lookup failed is worse than a
         // report filed without the names.
+        //
+        // A-8 / R-1 (APK 20): the OTHER person's name comes from
+        // `publicProfiles/{uid}`, never from their full `users/{uid}` document
+        // — a report is not a reason to download somebody's phone number and
+        // balances. The reporter's own document is theirs to read.
         suspend fun nameOf(uid: String): String = try {
-            firestore.collection("users").document(uid).get().await()
+            val col = if (uid == myUid) "users" else "publicProfiles"
+            firestore.collection(col).document(uid).get().await()
                 .getString("name").orEmpty()
         } catch (_: Exception) {
             ""

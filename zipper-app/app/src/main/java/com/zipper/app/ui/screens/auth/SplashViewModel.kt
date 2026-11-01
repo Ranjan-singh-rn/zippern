@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.zipper.app.data.repository.AuthRepository
+import com.zipper.app.data.repository.AuthResult
 import com.zipper.app.data.repository.MoneyFunctions
 import com.zipper.app.util.DeletionWindow
 import com.zipper.app.util.SessionManager
@@ -44,6 +45,17 @@ sealed interface SplashVerdict {
 object SplashGate {
     const val MAX_ATTEMPTS = 3
 
+    /**
+     * The observer account (CRM-only, read-only) refused at the gate. The same
+     * sentence `AuthViewModel` shows for a refused observer sign-in; the server
+     * refuses it as well (`observer_denied`), this is only what is said.
+     */
+    const val OBSERVER_DENIED_MESSAGE = com.zipper.app.util.ObserverAccess.DENIED_MESSAGE
+
+    /** A-9: the device holds no session and could not claim one. Stay on the retry screen. */
+    const val NO_SESSION_MESSAGE =
+        "Could not start your session on this device. Check your connection and try again."
+
     /** Backoff before attempt [n] (1-based). Bounded: total wait ≈ 2s. */
     fun backoffMs(n: Int): Long = when (n) { 1 -> 0L; 2 -> 500L; else -> 1_500L }
 
@@ -69,6 +81,8 @@ object SplashGate {
             )
             "deleted_recoverable" -> SplashVerdict.Recover
             DeletionWindow.DELETED_PERMANENT -> SplashVerdict.AccountDeleted(DeletionWindow.ACCOUNT_DELETED)
+            // The server refuses the observer on every mobile path; the login
+            // screen says so with OBSERVER_DENIED_MESSAGE.
             "observer_denied" -> SplashVerdict.SignOut
             // An answer this build does not recognise is not permission.
             else -> SplashVerdict.Unverified(
@@ -126,6 +140,22 @@ class SplashViewModel @Inject constructor(
         }
         return SplashGate.decide(last)
     }
+
+    /**
+     * A-9: claim a mobile session when this device holds none for the signed-in
+     * account. See `AuthRepository.ensureMobileSession`.
+     */
+    suspend fun ensureSession(deviceId: String): AuthResult? {
+        // Boxed so a legitimate null (session held or claimed) is told apart
+        // from the timeout's null: a claim that never answered is a refusal
+        // the retry screen has to show, not a pass.
+        class Answer(val result: AuthResult?)
+        val answer = withTimeoutOrNull(12_000) { Answer(authRepository.ensureMobileSession(deviceId)) }
+        return if (answer == null) AuthResult.Error(SplashGate.NO_SESSION_MESSAGE) else answer.result
+    }
+
+    /** Still signed in after the session claim? A refused non-guest is signed out by the claim itself. */
+    fun isSignedIn(): Boolean = authRepository.isSignedIn()
 
     /**
      * Re-derive the partner/staff role flags from `crmUsers/{uid}` on a RESTORED

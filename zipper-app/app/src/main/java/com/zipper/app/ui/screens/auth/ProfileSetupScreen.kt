@@ -877,6 +877,39 @@ fun ProfileSetupScreen(
             )
         }
 
+        /*
+         * A-1 / A-2 (APK 20): the profile saved but the photo did not upload.
+         *
+         * A dialog for the same reason the agency one is: the choice has to be
+         * made before the screen goes anywhere. "Continue" finishes the sign-up
+         * (referral redemption, then Home or the face capture) without a photo;
+         * "Try another photo" clears the picked file so the next Let's Go! runs
+         * the whole save again — harmless, it is a merge — with a smaller one.
+         */
+        uiState.photoUploadFailed?.let { msg ->
+            AlertDialog(
+                onDismissRequest = { viewModel.dismissPhotoUploadFailed() },
+                containerColor = c.bgElevated,
+                title = { Text("Profile saved — photo not uploaded", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+                text = {
+                    Text(
+                        "$msg\n\nYour profile is saved without it. You can also add a photo later from Edit profile.",
+                        style = ZipperTheme.type.bodyM, color = c.textSecondary,
+                    )
+                },
+                confirmButton = {
+                    TextButton({ viewModel.continueWithoutPhoto() }) {
+                        Text("Continue without photo", color = c.textBrand)
+                    }
+                },
+                dismissButton = {
+                    TextButton({ photoUri = null; viewModel.dismissPhotoUploadFailed() }) {
+                        Text("Try another photo", color = c.textSecondary)
+                    }
+                },
+            )
+        }
+
         if (showLanguagePicker) {
             LanguagePickerSheet(selected = selectedLanguages, onDismiss = { showLanguagePicker = false }, onConfirm = { selectedLanguages = it; showLanguagePicker = false })
         }

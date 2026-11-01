@@ -268,6 +268,25 @@ class ChatRepository @Inject constructor(
                     return@addSnapshotListener
                 }
                 val list = snap?.documents?.map { doc ->
+                    /*
+                     * THE NOTICE SHAPE (APK 20, item 10). One writer on the
+                     * server — `backend/app/services/notices.py` — and the
+                     * Cloud Functions write the top-level `notifications`
+                     * collection as
+                     *
+                     *   { userId, type, title, body, isRead, createdAt,
+                     *     reason?, meta?: { ticket_id | partner_id | … } }
+                     *
+                     * The canonical shape agreed for the CRM is
+                     *   { userId, type, title, body, relatedId, createdAt, read }
+                     * and the CRM itself no longer writes notices directly
+                     * (every ticket reply goes through the API). Both
+                     * spellings of the read flag and of the related id are
+                     * accepted here so neither writer renders a blank or an
+                     * always-unread card.
+                     */
+                    @Suppress("UNCHECKED_CAST")
+                    val meta = doc.get("meta") as? Map<String, Any?>
                     UserNotification(
                         id        = doc.id,
                         type      = doc.getString("type") ?: "",
@@ -278,7 +297,11 @@ class ChatRepository @Inject constructor(
                         // one of them renders the other as a blank card.
                         body      = doc.getString("body") ?: doc.getString("message") ?: "",
                         createdAt = doc.millis("createdAt"),
-                        isRead    = doc.getBoolean("isRead") ?: false,
+                        isRead    = doc.getBoolean("isRead") ?: doc.getBoolean("read") ?: false,
+                        relatedId = doc.getString("relatedId")
+                            ?: (meta?.get("relatedId") ?: meta?.get("ticket_id") ?: meta?.get("partner_id")
+                                ?: meta?.get("recharge_id") ?: meta?.get("id"))?.toString()
+                            ?: "",
                     )
                 } ?: emptyList()
                 trySend(list)

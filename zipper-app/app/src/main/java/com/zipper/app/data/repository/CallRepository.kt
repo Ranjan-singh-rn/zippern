@@ -55,12 +55,22 @@ class CallRepository @Inject constructor(
         is MoneyFunctions.Result.Failed -> CallStart.Failed(res.userMessage)
     }
 
-    /** Pick up. The server stamps the start time; the clock begins there. */
+    /**
+     * Pick up. The server stamps the start time — the clock begins there —
+     * and charges the first full minute in the same transaction.
+     *
+     * @return null on success, or the server's refusal ("You need 750
+     *   diamonds for one minute. You have 420.").
+     */
     suspend fun acceptCall(callId: String): String? =
         when (val res = money.acceptCall(callId)) {
             is MoneyFunctions.Result.Ok -> null
             is MoneyFunctions.Result.Failed -> res.userMessage
         }
+
+    /** [acceptCall] with the server's billing figures, for the screen that connects. */
+    suspend fun acceptCallDetailed(callId: String): MoneyFunctions.Result<MoneyFunctions.CallAccept> =
+        money.acceptCall(callId)
 
     suspend fun declineCall(callId: String): String? =
         when (val res = money.declineCall(callId, "declined")) {
@@ -131,13 +141,20 @@ class CallRepository @Inject constructor(
     }
 
     /**
-     * Charge for the time elapsed since the last tick.
+     * The liveness ping — and the one source of the billed figures on screen.
      *
      * Sends a call id and nothing else. The previous version was handed
      * `tickDiamonds` and `tickBeans` by the ViewModel, which had computed them
      * from a rate it read once — so the amount billed was whatever the caller's
      * app said it should be, and a client that simply stopped calling this was
      * on a free call.
+     *
+     * APK 20: the server charges whole minutes from its own clock (the first
+     * on connect, then one at every 60-second mark); this tick charges nothing
+     * by itself. BOTH devices send it every [LIVENESS_TICK_SECONDS] — the
+     * earner's refreshes the watchdog and is never charged — and the answer
+     * carries `minutesBilled`, `billedThroughMs`, `startedAtMs` and
+     * `elapsedSeconds`, which `CallBilling` turns into the timer and the price.
      */
     suspend fun tickCall(callId: String): MoneyFunctions.CallTick? =
         when (val res = money.tickCall(callId)) {
@@ -316,13 +333,18 @@ class CallRepository @Inject constructor(
         val TRANSIENT_CODES = setOf("UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "ABORTED")
 
         /**
-         * How often the caller asks the server to bill elapsed time.
+         * How often EACH device pings `tickCall`.
          *
-         * Must match TICK_SECONDS in functions/src/calls.ts. The server
-         * computes ticks due from its own clock, so a mismatch here does not
-         * change what is charged — it only changes how often the balance on
-         * screen catches up with it.
+         * APK 20: this is a liveness interval, not a billing unit. The server
+         * bills whole minutes from its own clock (functions/src/calls.ts) and
+         * closes a call whose last tick from either side is older than two
+         * minutes; ten seconds keeps the figures on screen fresh and the
+         * watchdog quiet. A mismatch here changes nothing about what is
+         * charged.
          */
-        const val TICK_SECONDS = 10L
+        const val LIVENESS_TICK_SECONDS = com.zipper.app.util.CallBilling.LIVENESS_TICK_SECONDS
+
+        /** Old name, kept for callers that still read it. */
+        const val TICK_SECONDS = LIVENESS_TICK_SECONDS
     }
 }

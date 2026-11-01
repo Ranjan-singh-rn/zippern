@@ -25,6 +25,8 @@ import androidx.compose.material3.TextButton
 import com.google.firebase.firestore.Source
 import com.zipper.app.data.model.AccountRestriction
 import com.zipper.app.data.model.restrictionOf
+import com.zipper.app.data.repository.AuthResult
+import com.zipper.app.data.repository.RestrictionKind
 import com.zipper.app.util.DeviceBan
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.millis
@@ -200,6 +202,9 @@ fun SplashScreen(
             }
             SplashVerdict.Recover -> { onNavigateToRecoverAccount(); return@LaunchedEffect }
             SplashVerdict.SignOut -> {
+                // The observer: refused here with a sentence, as the server
+                // refuses it (`observer_denied`). Said on the login screen.
+                ForcedSignOut.raise(SplashGate.OBSERVER_DENIED_MESSAGE)
                 sessionViewModel.tearDownSession()
                 onNavigateToLogin()
                 return@LaunchedEffect
@@ -358,6 +363,54 @@ fun SplashScreen(
                 sessionViewModel.tearDownSession()
                 onNavigateToLogin()
                 return@LaunchedEffect
+            }
+
+            /*
+             * A-9 (APK 20): NO SESSION ON THIS DEVICE → CLAIM ONE, OR STAY HERE.
+             *
+             * A guest whose `startMobileSession` failed at sign-in keeps the
+             * anonymous credential (it is the only copy of the account) and
+             * so arrives here signed in with no session. Before this, the
+             * gate let them into Main, where every protected callable was
+             * refused and every write silently denied. Now the session is
+             * claimed first; a claim that fails keeps them on this screen's
+             * retry state, with the same sentence sign-in would have shown.
+             *
+             * The blank-local-id case is the ONLY one that claims: a device
+             * holding a session that still matches the server's was handled
+             * above, and one that did not match has already been signed out.
+             */
+            if (localSessionId.isBlank()) {
+                when (val refusal = splashViewModel.ensureSession(deviceId)) {
+                    null -> Unit
+                    // B3 / spec §8: `startMobileSession` refused the observer.
+                    is AuthResult.ObserverDenied -> {
+                        ForcedSignOut.raise(SplashGate.OBSERVER_DENIED_MESSAGE)
+                        sessionViewModel.tearDownSession()
+                        onNavigateToLogin()
+                        return@LaunchedEffect
+                    }
+                    is AuthResult.Banned -> {
+                        if (refusal.kind == RestrictionKind.Device) onNavigateToDeviceBanned(refusal.reason)
+                        else onNavigateToBanned(refusal.reason)
+                        return@LaunchedEffect
+                    }
+                    is AuthResult.Error -> {
+                        if (!splashViewModel.isSignedIn()) {
+                            // A non-guest refusal signs out inside the claim;
+                            // say why on the login screen.
+                            ForcedSignOut.raise(refusal.message)
+                            onNavigateToLogin()
+                        } else {
+                            gateError = refusal.message
+                        }
+                        return@LaunchedEffect
+                    }
+                    else -> {
+                        gateError = SplashGate.NO_SESSION_MESSAGE
+                        return@LaunchedEffect
+                    }
+                }
             }
 
             // Verification is host-only and is not a gate on entering the app.

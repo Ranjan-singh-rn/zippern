@@ -1,5 +1,10 @@
 package com.zipper.app.ui.components
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -23,6 +28,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -32,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.zipper.app.data.repository.GiftItem
+import com.zipper.app.data.repository.GiftResult
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
@@ -50,6 +57,15 @@ import com.zipper.app.ui.theme.ZipperTheme
  * The catalogue comes from Firestore `gifts` (CRM-managed) — never hardcoded.
  * Money only moves through `settleGift`; this composable just reports the
  * chosen gift and quantity.
+ *
+ * ── Lucky gifts (spec §11, APK 20) ───────────────────────────────────────────
+ *
+ * A lucky gift is sent as a COMBO, never singly: when the selected gift is
+ * lucky the quantity chips become the combo picker (`appConfig/luckyGifts
+ * .combos`, default 10 / 17 / 25 / 77), the total is `unit × combo`, and the
+ * number handed to `onSend` is the combo. The SERVER rolls the reward (5× to
+ * 100× one unit) and the screen celebrates what came back; nothing here
+ * computes, predicts or simulates it.
  */
 
 private val QUANTITIES = listOf(1, 10, 77, 177, 520, 1314)
@@ -110,12 +126,48 @@ fun GiftDrawer(
     selectedRecipientIds: Set<String> = emptySet(),
     onToggleRecipient: (GiftRecipient) -> Unit = {},
     onSelectEveryone: () -> Unit = {},
+    /**
+     * The combos a lucky gift may be sent as. Null — the normal case — reads
+     * `appConfig/luckyGifts` through [LuckyGiftConfigViewModel]; a caller
+     * that already has the list may pass it.
+     */
+    luckyCombos: List<Int>? = null,
+    /** The receiver's share of a lucky send, for the explainer line. Null reads the config. */
+    luckyReceiverPct: Int? = null,
 ) {
     val c = ZipperTheme.colors
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
+    // One shared read of the lucky configuration (see LuckyGiftConfigViewModel).
+    val luckyConfigVm: LuckyGiftConfigViewModel = androidx.hilt.navigation.compose.hiltViewModel()
+    val luckyConfig by luckyConfigVm.config.collectAsState()
+    val receiverPct = luckyReceiverPct ?: luckyConfig.receiverPct
+
     var selected by remember { mutableStateOf<GiftItem?>(null) }
     var quantity by remember { mutableIntStateOf(1) }
+    val luckySelected = selected?.isLucky == true
+    val combos = remember(luckyCombos, luckyConfig) {
+        val list = luckyCombos ?: luckyConfig.combos
+        if (list.isEmpty()) com.zipper.app.util.LuckyCombos.DEFAULT else list
+    }
+    /*
+     * Pick a gift: a lucky one starts on the smallest combo (the cheapest tap),
+     * a normal one keeps the chip that was chosen — unless it was a combo that
+     * is not a quantity chip, in which case it falls back to one.
+     */
+    val pick: (GiftItem) -> Unit = { g ->
+        selected = g
+        quantity = when {
+            g.isLucky -> if (quantity in combos) quantity else com.zipper.app.util.LuckyCombos.defaultChoice(combos)
+            quantity in QUANTITIES -> quantity
+            else -> 1
+        }
+    }
+    // The configured list can arrive after a lucky gift was picked on the
+    // defaults; a combo the server would refuse must not stay selected.
+    LaunchedEffect(combos, luckySelected) {
+        if (luckySelected && quantity !in combos) quantity = com.zipper.app.util.LuckyCombos.defaultChoice(combos)
+    }
 
     // Tabs are derived from the catalogue so a new CRM category shows up
     // without an app release. "Hot" is everything.
@@ -310,34 +362,60 @@ fun GiftDrawer(
                     verticalArrangement = Arrangement.spacedBy(Space.sm),
                 ) {
                     items(visible, key = { it.id }) { gift ->
-                        GiftTile(gift, selected?.id == gift.id) { selected = gift }
+                        GiftTile(gift, selected?.id == gift.id) { pick(gift) }
                     }
                 }
             }
 
-            // Quantity row
+            // Quantity row — or, for a lucky gift, the COMBO picker.
+            if (luckySelected) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = Space.md, end = Space.md, top = Space.sm),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Combo", style = ZipperTheme.type.labelS, color = c.brandVip)
+                    Spacer(Modifier.width(Space.sm))
+                    Text(
+                        "Lucky gifts are sent as a combo",
+                        style = ZipperTheme.type.caption, color = c.textSecondary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
                     .padding(horizontal = Space.md, vertical = Space.sm),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                QUANTITIES.forEach { q ->
+                (if (luckySelected) combos else QUANTITIES).forEach { q ->
                     val active = q == quantity
                     Box(
                         Modifier
                             .height(34.dp)
-                            .background(if (active) c.tintBrandMedium else c.glassMid, CircleShape)
-                            .border(1.dp, if (active) c.brandPrimary else c.borderSubtle, CircleShape)
+                            .background(
+                                if (active) (if (luckySelected) c.tintGoldSubtle else c.tintBrandMedium) else c.glassMid,
+                                CircleShape,
+                            )
+                            .border(1.dp, if (active) (if (luckySelected) c.brandVip else c.brandPrimary) else c.borderSubtle, CircleShape)
                             .clickableNoRipple { quantity = q }
                             .padding(horizontal = 14.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            q.toString(), style = ZipperTheme.type.labelS,
+                            if (luckySelected) "×$q" else q.toString(), style = ZipperTheme.type.labelS,
                             color = if (active) c.textPrimary else c.textSecondary,
                         )
                     }
                 }
+            }
+            if (luckySelected) {
+                val unit = selected?.costDiamonds ?: 0L
+                Text(
+                    com.zipper.app.util.LuckyCombos.explainer(unit, quantity, receiverPct),
+                    style = ZipperTheme.type.caption, color = c.textMuted,
+                    modifier = Modifier.padding(horizontal = Space.md),
+                )
+                Spacer(Modifier.height(Space.xs))
             }
 
             // Insufficient-balance strip (Figma 154:100)
@@ -382,6 +460,7 @@ fun GiftDrawer(
                 ZipperButton(
                     text = when {
                         insufficient -> "Recharge"
+                        luckySelected -> "Send combo ×$quantity"
                         multiSelect && payees > 1 -> "Send ×$payees"
                         else -> "Send"
                     },
@@ -503,6 +582,48 @@ fun GiftEventPill(senderName: String, giftName: String, quantity: Int, photoUrl:
             ) {
                 Text("x$quantity", style = ZipperTheme.type.overline, color = Color(0xFF0E0F21))
             }
+        }
+    }
+}
+
+/**
+ * The lucky reward, as the SERVER rolled it (spec §11): "×25 — you won 2,500
+ * diamonds back". A small celebration that floats over the screen for a few
+ * seconds; the caller clears it. Nothing here decides the number — it draws
+ * `GiftResult.LuckyWin`, which is the settlement's own answer.
+ */
+@Composable
+fun LuckyWinBanner(win: GiftResult.LuckyWin, modifier: Modifier = Modifier) {
+    val big = win.multiplier >= 25
+    val pulse = rememberInfiniteTransition(label = "lucky")
+    val scale by pulse.animateFloat(
+        initialValue = 1f, targetValue = if (big) 1.08f else 1.03f,
+        animationSpec = infiniteRepeatable(tween(600), RepeatMode.Reverse),
+        label = "scale",
+    )
+    Column(
+        modifier
+            .scale(scale)
+            .background(
+                Brush.linearGradient(listOf(Color(0xFFFFE08A), Color(0xFFFFB627), Color(0xFFE89806))),
+                RoundedCornerShape(Radius.xl),
+            )
+            .border(1.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(Radius.xl))
+            .padding(horizontal = Space.xl, vertical = Space.lg),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(if (big) "BIG LUCKY WIN" else "LUCKY WIN", style = ZipperTheme.type.overline, color = Color(0xFF0E0F21))
+        Text("×${win.multiplier}", style = ZipperTheme.type.displayM, color = Color(0xFF0E0F21))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            CurrencyDisc(Currency.Diamond, 16.dp)
+            Text("+${indianGrouping(win.diamondsBack)} diamonds back", style = ZipperTheme.type.labelM, color = Color(0xFF0E0F21))
+        }
+        if (win.combo > 0 && win.unit > 0L) {
+            Text(
+                "Combo ×${win.combo} · ${indianGrouping(win.unit)} each · paid ${indianGrouping(win.charged)}",
+                style = ZipperTheme.type.caption, color = Color(0xFF0E0F21).copy(alpha = 0.75f),
+            )
         }
     }
 }

@@ -240,14 +240,18 @@ class GoLiveViewModel @Inject constructor(
                     return@launch
                 }
                 AgoraManager.init(context)
+                // A-6: renew the hour-long token in place, through the one
+                // repository that mints it.
+                AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
                 FaceDetectionManager.init()
                 val roomId = repo.startLive(
                     title = _state.value.title.ifBlank { "${user.name}'s Live" },
                     category = _state.value.category,
                     hostUser = user,
                 )
-                val liveToken = agoraTokenRepo.fetchToken(roomId)
-                AgoraManager.joinAsBroadcaster(roomId, liveToken)
+                // A-7: the uid the token was signed for, never 0.
+                val liveGrant = agoraTokenRepo.fetchGrant(roomId)
+                AgoraManager.joinAsBroadcaster(roomId, liveGrant?.token, liveGrant?.uid ?: 0)
                 _state.update {
                     it.copy(
                         isLive = true, roomId = roomId, isLoading = false,
@@ -675,7 +679,7 @@ class GoLiveViewModel @Inject constructor(
      * renegotiation while still paying for every redundant snapshot.
      *
      * A token the server refuses comes back as null rather than as an exception
-     * (see AgoraTokenRepository.fetchToken), so a refusal cannot be told apart
+     * (see AgoraTokenRepository.fetchGrant), so a refusal cannot be told apart
      * from an unconfigured server here and the join is attempted either way.
      * Committing [pkChannel] before the fetch is what stops a battle that
      * cannot be joined from asking again on each of the several room snapshots
@@ -688,12 +692,12 @@ class GoLiveViewModel @Inject constructor(
         pkChannelJob?.cancel()
         pkChannelJob = viewModelScope.launch {
             try {
-                val token = agoraTokenRepo.fetchToken(channelId)
+                val grant = agoraTokenRepo.fetchGrant(channelId)
                 // The battle can end while the callable is in flight, and
                 // joining then would open a channel that nothing is left to
                 // close — [leavePKChannel] has already cleared the field.
                 if (pkChannel != channelId) return@launch
-                AgoraManager.joinAsBroadcaster(channelId, token)
+                AgoraManager.joinAsBroadcaster(channelId, grant?.token, grant?.uid ?: 0)
                 // A previous unwind may have stopped the capture on its way out
                 // of the last channel; see cameraEpoch. Re-binding a preview
                 // that is already running costs nothing.
@@ -746,8 +750,8 @@ class GoLiveViewModel @Inject constructor(
         if (roomId.isBlank() || !_state.value.isLive) return
         pkChannelJob = viewModelScope.launch {
             AgoraManager.leaveChannel()
-            val token = agoraTokenRepo.fetchToken(roomId)
-            AgoraManager.joinAsBroadcaster(roomId, token)
+            val grant = agoraTokenRepo.fetchGrant(roomId)
+            AgoraManager.joinAsBroadcaster(roomId, grant?.token, grant?.uid ?: 0)
             // leaveChannel puts the camera down with the channel — it treats the
             // capture as belonging to the broadcast — so the preview has to be
             // started again now that we are back on air. Bumped last, once the

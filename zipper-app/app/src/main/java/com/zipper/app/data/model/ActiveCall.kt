@@ -19,7 +19,21 @@ data class ActiveCall(
     val perMinRateDiamonds: Long = 0L,   // computed at create time, stored so both sides agree
     /** "caller" | "receiver" — who EARNS. The other side pays. A host calling a user earns. */
     val earner: String = "receiver",
+    // ── Per-minute billing (APK 20 / calls.ts) — written by the server only ──
+    /** `minute` on every call connected under the whole-minute rule; absent on legacy ten-second calls. */
+    val billingUnit: String = "",
+    /** The server's counter of what it has billed: whole minutes, or ten-second ticks on a legacy call. */
+    val tickIndex: Long = 0L,
+    /** When the next whole minute is charged; 0 before the call connected. */
+    val billedThroughMs: Long = 0L,
+    /** Running totals, both sides can read them: what the payer has spent and the earner has been credited. */
+    val diamondsCharged: Long = 0L,
+    val beansCredited: Long = 0L,
 ) {
+    /** Whole minutes charged so far, whichever rule the call was connected under (mirrors `billedMinutesOf`). */
+    val minutesBilled: Long
+        get() = if (billingUnit == "minute") tickIndex.coerceAtLeast(0L)
+        else (tickIndex.coerceAtLeast(0L) + 5L) / 6L
     val payerId: String get() = if (earner == "caller") receiverId else callerId
     val earnerId: String get() = if (earner == "caller") callerId else receiverId
 
@@ -52,6 +66,14 @@ data class ActiveCall(
                 endReason          = doc.getString("endReason") ?: "",
                 perMinRateDiamonds = doc.getLong("perMinRateDiamonds") ?: 0L,
                 earner             = doc.getString("earner") ?: "receiver",
+                billingUnit        = doc.getString("billingUnit") ?: "",
+                // `get` + Number, not `getLong`: a value that went through
+                // JavaScript arithmetic can land as a Double, and `getLong`
+                // on one throws inside a snapshot callback.
+                tickIndex          = (doc.get("tickIndex") as? Number)?.toLong() ?: 0L,
+                billedThroughMs    = (doc.get("billedThroughMs") as? Number)?.toLong() ?: 0L,
+                diamondsCharged    = (doc.get("diamondsCharged") as? Number)?.toLong() ?: 0L,
+                beansCredited      = (doc.get("beansCredited") as? Number)?.toLong() ?: 0L,
             )
         }
     }

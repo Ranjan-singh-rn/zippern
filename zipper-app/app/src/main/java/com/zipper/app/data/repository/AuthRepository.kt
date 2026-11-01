@@ -1,5 +1,6 @@
 package com.zipper.app.data.repository
 
+import android.content.Context
 import android.net.Uri
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
@@ -13,9 +14,12 @@ import com.zipper.app.data.model.User
 import com.zipper.app.util.DeviceKey
 import com.zipper.app.util.DeviceSecretStore
 import com.zipper.app.util.GuestLinkWarning
+import com.zipper.app.util.MediaUtils
+import com.zipper.app.util.ProfilePhotoUpload
 import com.zipper.app.util.QuickLoginStore
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.UserLanguage
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -104,6 +108,17 @@ sealed class AuthResult {
      * the person is told.
      */
     data class AccountDeleted(val message: String) : AuthResult()
+
+    /**
+     * A-1 / A-2 (APK 20): the profile IS saved — but without the photo.
+     *
+     * Returned by [AuthRepository.saveUserProfile] alone. The avatar upload was
+     * refused (Storage size cap, a rule) or could not be read, and refusing the
+     * whole sign-up over a picture is the P0 this replaces. [message] is what
+     * the person is told; the screen lets them pick a smaller photo and save
+     * again, or carry on without one.
+     */
+    data class SavedWithoutPhoto(val message: String) : AuthResult()
 }
 
 /** Which of the three refusals this is. See [AuthResult.Banned]. */
@@ -137,6 +152,12 @@ class AuthRepository @Inject constructor(
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
     private val storage: FirebaseStorage,
+    /**
+     * A-2 (APK 20): only to decode and compress the signup avatar through
+     * `MediaUtils.compressImage`, the same path Edit Profile uses. Nothing
+     * else in here touches the platform.
+     */
+    @ApplicationContext private val appContext: Context,
     private val sessionManager: SessionManager,
     private val hostFunctions: HostFunctions,
     private val money: MoneyFunctions,
@@ -294,7 +315,12 @@ class AuthRepository @Inject constructor(
                  * server's reason, as `gateIdentity` shows `device_banned`; one
                  * that sent no id is told so in the server's own sentence.
                  */
-                if (com.zipper.app.util.DeviceBan.isDeviceBarred(res.detail)) {
+                if (com.zipper.app.util.ObserverAccess.isDenied(res.detail)) {
+                    // B3 / spec §8: `startMobileSession` refuses the observer by
+                    // name. Already signed out above (never a guest); the same
+                    // refusal `resolveIdentity` gives, said the same way.
+                    AuthResult.ObserverDenied
+                } else if (com.zipper.app.util.DeviceBan.isDeviceBarred(res.detail)) {
                     if (deviceId.isBlank()) AuthResult.Error(res.userMessage)
                     else AuthResult.Banned(res.userMessage, RestrictionKind.Device)
                 } else if (com.zipper.app.util.ServerRefusals.classify(res.detail) ==
@@ -2251,10 +2277,27 @@ class AuthRepository @Inject constructor(
             // is stored as-is, so an account that skipped the photo step still
             // has a face instead of a blank disc.
             var photoUrl = defaultAvatar
+            /*
+             * A-1 / A-2 (APK 20): THE PHOTO CANNOT BLOCK THE ACCOUNT.
+             *
+             * Build 19 put the raw gallery file up (`putFile`) against a 5 MiB
+             * Storage cap, and the refusal failed the whole save: "User does
+             * not have permission to access this object." on Let's Go!, for
+             * anyone who attached a modern camera JPEG. Two changes:
+             *
+             *   * compressed first, exactly as Edit Profile does
+             *     (`MediaUtils.compressImage`, 1080 px / q72, ~5× smaller);
+             *   * a failed upload is RECORDED, not thrown. The profile below is
+             *     written without `photoUrl` (the default avatar, if one was
+             *     kept, still lands) and the result says so, so the screen can
+             *     offer a smaller photo or let the person carry on.
+             */
+            var photoSkipped: String? = null
             if (photoUri != null) {
-                val ref = storage.reference.child("profileMedia/$uid/avatar.jpg")
-                ref.putFile(photoUri, com.google.firebase.storage.StorageMetadata.Builder().setContentType("image/jpeg").build()).await()
-                photoUrl = ref.downloadUrl.await().toString()
+                when (val outcome = uploadSignupAvatar(uid, photoUri)) {
+                    is ProfilePhotoUpload.Outcome.Uploaded -> photoUrl = outcome.photoUrl
+                    is ProfilePhotoUpload.Outcome.Skipped -> photoSkipped = outcome.message
+                }
             }
             // Serialize languages as a list of maps (Firestore-safe; supports filtering/queries)
             val languagesMaps = languages.map { mapOf("id" to it.id, "code" to it.code, "name" to it.name) }
@@ -2341,10 +2384,83 @@ class AuthRepository @Inject constructor(
             firestore.collection("users").document(uid)
                 .set(patch, com.google.firebase.firestore.SetOptions.merge())
                 .await()
-            AuthResult.Success
+            val skipped = photoSkipped
+            if (skipped != null) AuthResult.SavedWithoutPhoto(skipped) else AuthResult.Success
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Profile save failed")
         }
+    }
+
+    /**
+     * The signup avatar: compress, upload, resolve the download URL — or say why
+     * not, in a sentence the person can act on. Never throws.
+     *
+     * The same path `ProfileRepository.updateProfile` takes for the Edit Profile
+     * avatar, so the two cannot drift apart on size again. `putFile` of the
+     * original is kept only as the fallback for an image the decoder could not
+     * read (a format `BitmapFactory` lacks), and only when the original is
+     * under the Storage cap — otherwise the upload is known to be refused and
+     * there is no point spending the person's data on it.
+     */
+    private suspend fun uploadSignupAvatar(uid: String, photoUri: Uri): ProfilePhotoUpload.Outcome {
+        val meta = com.google.firebase.storage.StorageMetadata.Builder().setContentType("image/jpeg").build()
+        return try {
+            val ref = storage.reference.child("profileMedia/$uid/avatar.jpg")
+            val bytes = MediaUtils.compressImage(appContext, photoUri)
+            if (bytes != null && ProfilePhotoUpload.acceptableSize(bytes.size.toLong())) {
+                ref.putBytes(bytes, meta).await()
+            } else {
+                val originalSize = originalSizeOf(photoUri)
+                if (originalSize != null && !ProfilePhotoUpload.acceptableSize(originalSize)) {
+                    return ProfilePhotoUpload.Outcome.Skipped(ProfilePhotoUpload.UPLOAD_FAILED_MESSAGE)
+                }
+                ref.putFile(photoUri, meta).await()
+            }
+            ProfilePhotoUpload.Outcome.Uploaded(ref.downloadUrl.await().toString())
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (ProfilePhotoUpload.saveWithoutPhoto(e)) {
+                ProfilePhotoUpload.Outcome.Skipped(ProfilePhotoUpload.messageFor(e))
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /** The picked file's size in bytes, or null when the provider will not say. */
+    private fun originalSizeOf(uri: Uri): Long? = try {
+        appContext.contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+            fd.statSize.takeIf { it > 0L }
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * A-9 (APK 20): a signed-in device that holds NO mobile session for this
+     * account claims one now — or the caller keeps the person on a retry
+     * screen rather than in Main.
+     *
+     * How a device gets here: a GUEST whose `startMobileSession` failed at
+     * sign-in. The sign-in refused (SESS-4) but the anonymous credential had
+     * to be kept — it is the only copy of the account — so the next cold start
+     * found a signed-in user, `resolveIdentity` said allow, and Splash walked
+     * into Main with no session: every protected callable refused, every write
+     * silently denied. A session claimed here is the same claim sign-in makes
+     * (`generateSession`: retried once, displaces nothing that is newer, and
+     * refuses a token older than the account's cut-off).
+     *
+     * @return null when a session is held or was claimed; otherwise the
+     *   refusal, exactly as a sign-in would have returned it.
+     */
+    suspend fun ensureMobileSession(deviceId: String): AuthResult? {
+        val uid = auth.currentUser?.uid ?: return null
+        val localToken = try { sessionManager.sessionToken.first() } catch (_: Exception) { "" }
+        val localUid = try { sessionManager.sessionUid.first() } catch (_: Exception) { "" }
+        if (localToken.isNotBlank() && localUid == uid) return null
+        generateSession(uid, deviceId)?.let { return it }
+        return null
     }
 
     // ── Face verification + referral code ─────────────────────────────────────

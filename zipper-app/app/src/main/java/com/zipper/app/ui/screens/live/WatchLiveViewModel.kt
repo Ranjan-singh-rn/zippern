@@ -58,6 +58,8 @@ data class WatchLiveUiState(
     val gifts: List<GiftItem> = emptyList(),
     val myDiamonds: Long = 0L,
     val giftSending: Boolean = false,
+    /** Spec §11: the server's roll on the last lucky gift this viewer sent, for the celebration. */
+    val luckyWin: com.zipper.app.data.repository.GiftResult.LuckyWin? = null,
     // PK Battle
     val pkActive: Boolean = false,
     val pkScore: Long = 0L,
@@ -219,14 +221,18 @@ class WatchLiveViewModel @Inject constructor(
         if (roomId.isBlank()) return
         AgoraManager.init(context)
         AgoraManager.onUserJoined = { uid -> onRemoteUserJoined(uid) }
+        // A-6: the hour-long token is renewed in place by AgoraManager through
+        // the same repository call that issued it.
+        AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
         viewModelScope.launch {
             // The server refuses a token to a viewer the host has kicked. That
             // refusal is authoritative — the room document may not have reached
             // this device yet, and on a fresh open it never will, because the
             // kicked user is opening the room for the first time.
             when (val r = agoraTokenRepo.requestToken(roomId)) {
+                // A-7: joined with the uid the token was signed for, never 0.
                 is com.zipper.app.data.repository.AgoraTokenResult.Granted ->
-                    AgoraManager.joinAsAudience(roomId, r.token)
+                    AgoraManager.joinAsAudience(roomId, r.token, r.uid)
                 com.zipper.app.data.repository.AgoraTokenResult.Denied -> onKicked()
                 com.zipper.app.data.repository.AgoraTokenResult.Ended ->
                     _state.update { it.copy(isLiveEnded = true, isConnected = false) }
@@ -309,8 +315,8 @@ class WatchLiveViewModel @Inject constructor(
                 if (r is com.zipper.app.data.repository.AgoraTokenResult.Ended) {
                     _state.update { it.copy(isLiveEnded = true, isRejoining = false) }; return@launch
                 }
-                val token = (r as? com.zipper.app.data.repository.AgoraTokenResult.Granted)?.token
-                AgoraManager.joinAsAudience(roomId, token)
+                val grant = r as? com.zipper.app.data.repository.AgoraTokenResult.Granted
+                AgoraManager.joinAsAudience(roomId, grant?.token, grant?.uid ?: 0)
                 // Presence is a document, not a counter: re-joining Agora
                 // without re-writing it left us invisible in the host's viewer
                 // list for the rest of the session.
@@ -350,19 +356,32 @@ class WatchLiveViewModel @Inject constructor(
         // One key for this tap. If the send is retried, it must be this key —
         // a new one would read as a second gift and charge twice.
         val key = idempotencyKeyFor(gift.id, targetHostUid, qty)
+        // Spec §11: a lucky gift travels as `combo`, a normal one as `quantity`.
+        val shape = com.zipper.app.util.LuckyCombos.sendShape(gift.isLucky, qty)
         _state.update { it.copy(giftSending = true) }
         viewModelScope.launch {
-            val error = repo.sendGiftInLive(
+            val result = repo.sendGiftInLiveDetailed(
                 roomId = targetRoomId,
                 hostUid = targetHostUid,
                 giftId = gift.id,
-                quantity = qty,
+                quantity = shape.quantity ?: 1,
                 idempotencyKey = key,
+                combo = shape.combo,
             )
             _state.update { it.copy(giftSending = false) }
-            if (error != null) {
-                _state.update { it.copy(error = error) }
-                return@launch
+            when (result) {
+                is com.zipper.app.data.repository.GiftResult.Error -> {
+                    _state.update { it.copy(error = result.message) }
+                    return@launch
+                }
+                is com.zipper.app.data.repository.GiftResult.InsufficientDiamonds -> {
+                    _state.update { it.copy(error = "Not enough diamonds — recharge to send this gift.") }
+                    return@launch
+                }
+                // The SERVER's roll, shown as it came back; never computed here.
+                is com.zipper.app.data.repository.GiftResult.LuckyWin ->
+                    _state.update { it.copy(luckyWin = result) }
+                is com.zipper.app.data.repository.GiftResult.Success -> Unit
             }
             if (_state.value.pkActive) {
                 val partnerRoomId = if (targetRoomId == roomId) _state.value.pkPartnerId else roomId
@@ -370,6 +389,9 @@ class WatchLiveViewModel @Inject constructor(
             }
         }
     }
+
+    /** The celebration has been shown. */
+    fun clearLuckyWin() { _state.update { it.copy(luckyWin = null) } }
 
     /**
      * A key per send, stable only for the coroutine that owns it. Two taps a

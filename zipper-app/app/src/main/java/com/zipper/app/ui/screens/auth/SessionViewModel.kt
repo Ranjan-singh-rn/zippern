@@ -8,6 +8,7 @@ import com.zipper.app.data.model.AccountRestriction
 import com.zipper.app.data.model.restrictionOf
 import com.zipper.app.data.repository.AuthRepository
 import com.zipper.app.util.ServerRefusals
+import com.zipper.app.util.SessionCutoff
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.millis
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -217,6 +218,9 @@ class SessionViewModel @Inject constructor(
      */
     private var refusalHandled = false
 
+    /** A-9: the cut-off sign-out, once per signed-in stretch — the snapshot keeps firing while we tear down. */
+    private var cutoffHandled = false
+
     init {
         viewModelScope.launch {
             ServerRefusals.events.collect { kind -> onServerRefusal(kind) }
@@ -275,6 +279,7 @@ class SessionViewModel @Inject constructor(
         stopWatching()
         watchingUid = uid
         refusalHandled = false
+        cutoffHandled = false
 
         listenerRegistration = firestore.collection("users").document(uid)
             .addSnapshotListener { snap, _ ->
@@ -357,14 +362,51 @@ class SessionViewModel @Inject constructor(
                 val remoteSessionId = snap.getString("activeMobileSession.sessionId")
                     ?.takeIf { it.isNotBlank() }
                     ?: snap.getString("sessionToken").orEmpty()
-                // No session claimed at all: a brand-new document, or one whose
-                // session was given up by `endMobileSession`. Nothing to compare
-                // against, and emitting here would sign out the only device.
-                if (remoteSessionId.isBlank()) return@addSnapshotListener
 
+                /*
+                 * A-9 (APK 20): THE CUT-OFF. `credentialsValidAfter` moves
+                 * forward when another device starts a session, when the account
+                 * is suspended or a deletion is requested, and on a security
+                 * reset. A sign-in older than it is one the account has moved
+                 * past; the server already refuses every protected call it
+                 * makes, so staying in Main would be a screen full of silent
+                 * failures. Read here, on the same listener, and compared with
+                 * this token's `auth_time` exactly as the server compares it
+                 * (SessionCutoff). Checked BEFORE the session-id comparison:
+                 * a stale sign-in is stale whether or not a session id is held.
+                 */
+                val validAfter = SessionCutoff.validAfterOf(snap.get("credentialsValidAfter"))
                 val replacedBy = snap.getString("activeMobileSession.deviceName").orEmpty()
 
                 viewModelScope.launch {
+                    if (validAfter != null && !cutoffHandled) {
+                        val authTime = try {
+                            FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.authTimestamp
+                        } catch (_: Exception) {
+                            // Unreachable token service: not a verdict. The next
+                            // snapshot, or the next callable's refusal, decides.
+                            null
+                        }
+                        if (authTime != null && SessionCutoff.signInPredatesCutoff(
+                                validAfter, authTime, System.currentTimeMillis() / 1000L,
+                            )
+                        ) {
+                            cutoffHandled = true
+                            val message = if (remoteSessionId.isNotBlank() && replacedBy.isNotBlank()) {
+                                ForcedSignOut.anotherDevice(replacedBy)
+                            } else {
+                                SessionCutoff.SIGNED_OUT_MESSAGE
+                            }
+                            _events.emit(SessionEvent.SignedOut(message))
+                            return@launch
+                        }
+                    }
+
+                    // No session claimed at all: a brand-new document, or one whose
+                    // session was given up by `endMobileSession`. Nothing to compare
+                    // against, and emitting here would sign out the only device.
+                    if (remoteSessionId.isBlank()) return@launch
+
                     val localSessionId = sessionManager.sessionToken.first()
                     /*
                      * A BLANK LOCAL ID IS NOT A MISMATCH.

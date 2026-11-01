@@ -71,6 +71,23 @@ class MoneyFunctions @Inject constructor(
 
     // ── Gifts ────────────────────────────────────────────────────────────────
 
+    /**
+     * The server's roll on a lucky gift (spec §11). Shown, never computed
+     * here: `reward = multiplier × unit`, drawn server-side from the CRM's odds
+     * table inside the same transaction as the charge.
+     */
+    data class LuckyOutcome(
+        val combo: Int,
+        /** One gift's catalogue price. */
+        val unit: Long,
+        /** 5–100. */
+        val multiplier: Int,
+        /** Diamonds credited back to the sender: `multiplier × unit`. */
+        val reward: Long,
+        /** `appConfig/luckyGifts.version` the roll ran on, for a dispute. */
+        val configVersion: Long,
+    )
+
     data class GiftOutcome(
         val transactionId: String,
         val totalCost: Long,
@@ -78,8 +95,17 @@ class MoneyFunctions @Inject constructor(
         val receiverPct: Int,
         /** True when the server recognised a replay and charged nothing. */
         val replayed: Boolean,
+        /** Non-null for a lucky gift. */
+        val lucky: LuckyOutcome? = null,
     )
 
+    /**
+     * Send a gift.
+     *
+     * [combo] is the lucky shape, [quantity] the normal one, and the server
+     * refuses the wrong one for the gift: a lucky gift without a combo, a
+     * normal gift with one. Exactly one of the two is sent.
+     */
     suspend fun settleGift(
         giftId: String,
         receiverUid: String,
@@ -87,20 +113,32 @@ class MoneyFunctions @Inject constructor(
         context: String,
         roomId: String? = null,
         idempotencyKey: String,
+        combo: Int? = null,
     ): Result<GiftOutcome> = call("settleGift", buildMap {
         put("giftId", giftId)
         put("receiverUid", receiverUid)
-        put("quantity", quantity)
+        if (combo != null) put("combo", combo) else put("quantity", quantity)
         put("context", context)
         put("idempotencyKey", idempotencyKey)
         roomId?.let { put("roomId", it) }
     }) { m ->
+        @Suppress("UNCHECKED_CAST")
+        val lucky = (m["lucky"] as? Map<String, Any?>)?.let { l ->
+            LuckyOutcome(
+                combo         = (l["combo"] as? Number)?.toInt() ?: (combo ?: 0),
+                unit          = (l["unit"] as? Number)?.toLong() ?: 0L,
+                multiplier    = (l["multiplier"] as? Number)?.toInt() ?: 0,
+                reward        = (l["reward"] as? Number)?.toLong() ?: 0L,
+                configVersion = (l["configVersion"] as? Number)?.toLong() ?: 0L,
+            )
+        }
         GiftOutcome(
             transactionId = m["transactionId"] as? String ?: "",
             totalCost     = (m["totalCost"] as? Number)?.toLong() ?: 0L,
             beansCredited = (m["beansCredited"] as? Number)?.toLong() ?: 0L,
             receiverPct   = (m["receiverPct"] as? Number)?.toInt() ?: 0,
             replayed      = m["replayed"] as? Boolean ?: false,
+            lucky         = lucky,
         )
     }
 
@@ -117,12 +155,29 @@ class MoneyFunctions @Inject constructor(
             )
         }
 
-    data class CallAccept(val callId: String, val status: String, val alreadyConnected: Boolean)
+    data class CallAccept(
+        val callId: String,
+        val status: String,
+        val alreadyConnected: Boolean,
+        // ── Per-minute billing (APK 20 / calls.ts) ──────────────────────────
+        /** The server's clock at connection; the only thing elapsed time is measured from. */
+        val startedAtMs: Long? = null,
+        /** 1 on a fresh accept: the first full minute is charged on connect. */
+        val minutesBilled: Long = 0L,
+        /** `startedAtMs + minutesBilled × 60 000` — when the next minute is charged. */
+        val billedThroughMs: Long? = null,
+        val perMinRateDiamonds: Long = 0L,
+        /** Diamonds taken for the first minute (0 on a replayed accept). */
+        val charged: Long = 0L,
+        /** Beans credited to the earner for it. */
+        val beans: Long = 0L,
+    )
 
     /**
      * The receiver picks up. The server stamps `startedAt` with its own clock —
      * the client must never set it, because that timestamp is the only thing
-     * the charge is measured against.
+     * the charge is measured against — and charges the FIRST FULL MINUTE in
+     * the same transaction.
      */
     suspend fun acceptCall(callId: String): Result<CallAccept> =
         call("acceptCall", mapOf("callId" to callId)) { m ->
@@ -130,6 +185,12 @@ class MoneyFunctions @Inject constructor(
                 callId = m["callId"] as? String ?: callId,
                 status = m["status"] as? String ?: "",
                 alreadyConnected = m["alreadyConnected"] as? Boolean ?: false,
+                startedAtMs = (m["startedAtMs"] as? Number)?.toLong(),
+                minutesBilled = (m["minutesBilled"] as? Number)?.toLong() ?: 0L,
+                billedThroughMs = (m["billedThroughMs"] as? Number)?.toLong(),
+                perMinRateDiamonds = (m["perMinRateDiamonds"] as? Number)?.toLong() ?: 0L,
+                charged = (m["charged"] as? Number)?.toLong() ?: 0L,
+                beans = (m["beans"] as? Number)?.toLong() ?: 0L,
             )
         }
 
@@ -138,19 +199,39 @@ class MoneyFunctions @Inject constructor(
         call("declineCall", mapOf("callId" to callId, "reason" to reason)) { }
 
     data class CallTick(
+        /** Diamonds charged BY THIS TICK (whole minutes that fell due); 0 on most ticks. */
         val charged: Long,
         val beans: Long,
-        /** The server has decided this call must stop — usually no diamonds left. */
+        /** The server has decided this call must stop — see [endReason]. */
         val endNow: Boolean,
         val status: String,
+        // ── Per-minute billing (APK 20 / calls.ts) ──────────────────────────
+        /** Whole minutes charged so far on this call. */
+        val minutesBilled: Long = 0L,
+        /** When the next whole minute is charged (`startedAtMs + minutesBilled × 60 000`). */
+        val billedThroughMs: Long? = null,
+        val nextChargeAtMs: Long? = null,
+        val perMinRateDiamonds: Long = 0L,
+        /** The server's clock at connection. */
+        val startedAtMs: Long? = null,
+        /** Seconds elapsed BY THE SERVER'S CLOCK when it answered. */
+        val elapsedSeconds: Long = 0L,
+        /** Further whole minutes the payer can afford; null on a free call, for the earner, or when unknown. */
+        val affordableMinutes: Long? = null,
+        /** `payer` or `earner` — which side this device is, as the server sees it. */
+        val role: String = "",
+        /** `insufficient_diamonds`, `party_restricted`, `session_displaced` when [endNow]. */
+        val endReason: String? = null,
     )
 
     /**
-     * Charge for elapsed time.
+     * Liveness ping — and the one source of truth for the figures on screen.
      *
      * No duration is sent. The server computes elapsed from the call's own
-     * `startedAt`, so a device with a moved clock, or one that stops calling
-     * this, changes nothing about what is owed.
+     * `startedAt` and charges WHOLE MINUTES from its own clock, so a device
+     * with a moved clock, or one that stops calling this, changes nothing
+     * about what is owed. Both devices call it every ten seconds; a tick from
+     * the earner's device charges nothing and only refreshes the watchdog.
      */
     suspend fun tickCall(callId: String): Result<CallTick> =
         call("tickCall", mapOf("callId" to callId)) { m ->
@@ -159,10 +240,30 @@ class MoneyFunctions @Inject constructor(
                 beans   = (m["beans"] as? Number)?.toLong() ?: 0L,
                 endNow  = m["endNow"] as? Boolean ?: false,
                 status  = m["status"] as? String ?: "",
+                minutesBilled = (m["minutesBilled"] as? Number)?.toLong()
+                    ?: (m["tickIndex"] as? Number)?.toLong() ?: 0L,
+                billedThroughMs = (m["billedThroughMs"] as? Number)?.toLong(),
+                nextChargeAtMs = (m["nextChargeAtMs"] as? Number)?.toLong(),
+                perMinRateDiamonds = (m["perMinRateDiamonds"] as? Number)?.toLong() ?: 0L,
+                startedAtMs = (m["startedAtMs"] as? Number)?.toLong(),
+                elapsedSeconds = (m["elapsedSeconds"] as? Number)?.toLong() ?: 0L,
+                affordableMinutes = (m["affordableMinutes"] as? Number)?.toLong(),
+                role = m["role"] as? String ?: "",
+                endReason = m["endReason"] as? String,
             )
         }
 
-    data class CallEnd(val durationSeconds: Long, val diamondsCharged: Long, val beansCredited: Long)
+    data class CallEnd(
+        val durationSeconds: Long,
+        val diamondsCharged: Long,
+        val beansCredited: Long,
+        /** Whole minutes billed in total, including the one in progress at the end. */
+        val minutesBilled: Long = 0L,
+        val billedThroughMs: Long? = null,
+        /** The server's reason, which stands over whatever the client sent. */
+        val endReason: String? = null,
+        val alreadyEnded: Boolean = false,
+    )
 
     suspend fun endCall(callId: String, reason: String = "user_ended"): Result<CallEnd> =
         call("endCall", mapOf("callId" to callId, "reason" to reason)) { m ->
@@ -170,6 +271,10 @@ class MoneyFunctions @Inject constructor(
                 durationSeconds = (m["durationSeconds"] as? Number)?.toLong() ?: 0L,
                 diamondsCharged = (m["diamondsCharged"] as? Number)?.toLong() ?: 0L,
                 beansCredited   = (m["beansCredited"] as? Number)?.toLong() ?: 0L,
+                minutesBilled   = (m["minutesBilled"] as? Number)?.toLong() ?: 0L,
+                billedThroughMs = (m["billedThroughMs"] as? Number)?.toLong(),
+                endReason       = m["endReason"] as? String,
+                alreadyEnded    = m["alreadyEnded"] as? Boolean ?: false,
             )
         }
 

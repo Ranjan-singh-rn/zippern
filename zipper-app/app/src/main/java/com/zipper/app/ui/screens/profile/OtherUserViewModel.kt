@@ -56,6 +56,8 @@ data class OtherUserUiState(
     val errorMessage: String? = null,
     val toastMessage: String? = null,
     val navigateToCall: String? = null,   // non-null = callId to navigate to
+    /** Spec §11: the server's roll on the last lucky gift sent from this profile, for the celebration. */
+    val luckyWin: GiftResult.LuckyWin? = null,
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -288,11 +290,14 @@ class OtherUserViewModel @Inject constructor(
             } catch (e: Exception) { GiftResult.Error(e.localizedMessage ?: "Could not send gift") }
             val msg = when (result) {
                 is GiftResult.Success            -> "Sent ${gift.name}" + (if (quantity > 1) " ×$quantity" else "")
-                is GiftResult.LuckyWin           -> "Lucky win! +${result.diamondsBack} diamonds back"
+                // The SERVER's roll, shown as it came back.
+                is GiftResult.LuckyWin           -> "Lucky ×${result.multiplier}! +${result.diamondsBack} diamonds back"
                 is GiftResult.InsufficientDiamonds -> "Not enough diamonds — recharge to send this"
                 is GiftResult.Error              -> result.message
             }
-            _uiState.update { it.copy(giftSending = false, toastMessage = msg) }
+            _uiState.update {
+                it.copy(giftSending = false, toastMessage = msg, luckyWin = result as? GiftResult.LuckyWin ?: it.luckyWin)
+            }
         }
     }
 
@@ -359,6 +364,9 @@ class OtherUserViewModel @Inject constructor(
     fun clearToast() {
         _uiState.update { it.copy(toastMessage = null) }
     }
+
+    /** The lucky celebration has been shown. */
+    fun clearLuckyWin() { _uiState.update { it.copy(luckyWin = null) } }
 
     // ── Video Call ────────────────────────────────────────────────────────────
 

@@ -10,12 +10,57 @@ import io.agora.rtc2.RtcEngine
 import io.agora.rtc2.RtcEngineConfig
 import io.agora.rtc2.video.CameraCapturerConfiguration
 import io.agora.rtc2.video.VideoCanvas
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 object AgoraManager {
     private var engine: RtcEngine? = null
     var onUserJoined: ((Int) -> Unit)? = null
     var onUserOffline: ((Int) -> Unit)? = null
     var onError: ((Int) -> Unit)? = null
+
+    /**
+     * A-6 (APK 20): WHO MINTS A FRESH TOKEN FOR THE CHANNEL WE ARE IN.
+     *
+     * Tokens expire after one hour and the engine then removes the user from
+     * the channel — every live room, party and paid call over an hour was cut
+     * at sixty minutes. The engine warns thirty seconds ahead through
+     * `onTokenPrivilegeWillExpire`; this is answered by asking the server for
+     * a new token for the SAME channel (the server signs for the same uid) and
+     * handing it to `RtcEngine.renewToken`.
+     *
+     * The request itself stays in `AgoraTokenRepository`, the one caller of
+     * the Cloud Function; a screen installs it here when it joins. A lambda
+     * rather than an injected dependency because this object predates Hilt
+     * and every screen already holds the repository.
+     */
+    @Volatile
+    var tokenRenewer: (suspend (channelId: String) -> String?)? = null
+
+    /** Told after a renewal attempt: `true` when the engine took the new token. */
+    var onTokenRenewed: ((channelId: String, ok: Boolean) -> Unit)? = null
+
+    private val renewScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var renewJob: Job? = null
+
+    /**
+     * How the engine was last joined, so an expired token can be recovered by
+     * replaying the join with a fresh one. `onRequestToken` fires once the
+     * token has already lapsed; the SDK documents a rejoin for that case, and
+     * `renewToken` alone does not always bring the connection back.
+     */
+    private data class JoinSpec(
+        val channelId: String,
+        val uid: Int,
+        val role: Int,
+        val options: () -> ChannelMediaOptions,
+    )
+
+    @Volatile
+    private var lastJoin: JoinSpec? = null
 
     /**
      * Who is talking right now, as Agora hears it: uid to volume, 0-255.
@@ -49,7 +94,7 @@ object AgoraManager {
      *
      *     repo.roomFlow(roomId).collect { room ->
      *         if (room.pkActive && room.pkChannelId.isNotBlank()) {
-     *             val t = agoraTokenRepo.fetchToken(room.pkChannelId)   // a callable
+     *             val t = agoraTokenRepo.fetchGrant(room.pkChannelId)   // a callable
      *             AgoraManager.joinAsBroadcaster(room.pkChannelId, t)   // a rejoin
      *         }
      *     }
@@ -103,6 +148,21 @@ object AgoraManager {
                         val s = speakers ?: return
                         onAudioVolume?.invoke(s)
                     }
+                    /*
+                     * A-6: thirty seconds before the token lapses. Renewed in
+                     * place — the connection and every subscription survive.
+                     */
+                    override fun onTokenPrivilegeWillExpire(token: String?) {
+                        renewCurrentToken(rejoin = false)
+                    }
+                    /*
+                     * A-6: the token HAS lapsed (the renewal above did not land
+                     * in time — a backgrounded app, a dead network). Recover by
+                     * replaying the last join with a fresh token.
+                     */
+                    override fun onRequestToken() {
+                        renewCurrentToken(rejoin = true)
+                    }
                 }
             }
             engine = RtcEngine.create(config)
@@ -130,14 +190,17 @@ object AgoraManager {
         // back to it on a weak connection — instead of buffering. Best effort:
         // a refusal leaves the single stream exactly as before.
         runCatching { @Suppress("DEPRECATION") eng.enableDualStreamMode(true) }
-        val options = ChannelMediaOptions().apply {
-            clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
-            channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
-            publishCameraTrack = true
-            publishMicrophoneTrack = true
+        val options = {
+            ChannelMediaOptions().apply {
+                clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
+                channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
+                publishCameraTrack = true
+                publishMicrophoneTrack = true
+            }
         }
-        eng.joinChannel(token, channelId, uid, options)
+        eng.joinChannel(token, channelId, uid, options())
         joinedChannel = channelId
+        lastJoin = JoinSpec(channelId, uid, Constants.CLIENT_ROLE_BROADCASTER, options)
     }
 
     /**
@@ -148,14 +211,66 @@ object AgoraManager {
     fun joinAsAudience(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
         eng.setClientRole(Constants.CLIENT_ROLE_AUDIENCE)
-        val options = ChannelMediaOptions().apply {
-            clientRoleType = Constants.CLIENT_ROLE_AUDIENCE
-            channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
-            publishCameraTrack = false
-            publishMicrophoneTrack = false
+        val options = {
+            ChannelMediaOptions().apply {
+                clientRoleType = Constants.CLIENT_ROLE_AUDIENCE
+                channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
+                publishCameraTrack = false
+                publishMicrophoneTrack = false
+            }
         }
-        eng.joinChannel(token, channelId, uid, options)
+        eng.joinChannel(token, channelId, uid, options())
         joinedChannel = channelId
+        lastJoin = JoinSpec(channelId, uid, Constants.CLIENT_ROLE_AUDIENCE, options)
+    }
+
+    /**
+     * A-6: ask for a fresh token for the channel we are in and hand it to the
+     * engine. [rejoin] replays the last join with the new token, for the case
+     * where the old one has already lapsed and the engine has let go.
+     *
+     * One attempt in flight at a time. A failure is logged and reported
+     * through [onTokenRenewed]; the engine then behaves exactly as it did
+     * before renewal existed — the user is dropped at expiry — never worse.
+     */
+    private fun renewCurrentToken(rejoin: Boolean) {
+        val channelId = joinedChannel
+        if (channelId.isEmpty()) return
+        val renewer = tokenRenewer ?: run {
+            android.util.Log.w("AgoraManager", "Token expiring for $channelId but no renewer is installed.")
+            return
+        }
+        if (renewJob?.isActive == true) return
+        renewJob = renewScope.launch {
+            val fresh = try { renewer(channelId) } catch (e: Exception) {
+                android.util.Log.w("AgoraManager", "Token renewal failed for $channelId", e)
+                null
+            }
+            val eng = engine
+            // The screen may have left while the request was in flight.
+            if (fresh.isNullOrBlank() || eng == null || joinedChannel != channelId) {
+                onTokenRenewed?.invoke(channelId, false)
+                return@launch
+            }
+            val ok = try {
+                if (rejoin) {
+                    val spec = lastJoin
+                    if (spec != null && spec.channelId == channelId) {
+                        eng.leaveChannel()
+                        eng.setClientRole(spec.role)
+                        eng.joinChannel(fresh, spec.channelId, spec.uid, spec.options()) == 0
+                    } else {
+                        eng.renewToken(fresh) == 0
+                    }
+                } else {
+                    eng.renewToken(fresh) == 0
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("AgoraManager", "renewToken threw for $channelId", e)
+                false
+            }
+            onTokenRenewed?.invoke(channelId, ok)
+        }
     }
 
     /**
@@ -181,6 +296,9 @@ object AgoraManager {
         engine?.stopPreview()
         engine?.leaveChannel()
         joinedChannel = ""
+        lastJoin = null
+        renewJob?.cancel()
+        renewJob = null
     }
 
     // ── Party rooms ──────────────────────────────────────────────────────────
@@ -220,16 +338,19 @@ object AgoraManager {
         if (video) useVideo() else useAudioOnly()
         val role = if (asBroadcaster) Constants.CLIENT_ROLE_BROADCASTER else Constants.CLIENT_ROLE_AUDIENCE
         eng.setClientRole(role)
-        val options = ChannelMediaOptions().apply {
-            clientRoleType = role
-            channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
-            publishMicrophoneTrack = asBroadcaster
-            publishCameraTrack = asBroadcaster && video
-            autoSubscribeAudio = true
-            autoSubscribeVideo = video
+        val options = {
+            ChannelMediaOptions().apply {
+                clientRoleType = role
+                channelProfile = Constants.CHANNEL_PROFILE_LIVE_BROADCASTING
+                publishMicrophoneTrack = asBroadcaster
+                publishCameraTrack = asBroadcaster && video
+                autoSubscribeAudio = true
+                autoSubscribeVideo = video
+            }
         }
-        eng.joinChannel(token, channelId, uid, options)
+        eng.joinChannel(token, channelId, uid, options())
         joinedChannel = channelId
+        lastJoin = JoinSpec(channelId, uid, role, options)
     }
 
     /**
@@ -249,6 +370,16 @@ object AgoraManager {
             publishCameraTrack = asBroadcaster && video
         }
         eng.updateChannelMediaOptions(options)
+        // Keep the recovery replay honest about the role we now hold.
+        lastJoin = lastJoin?.let { spec ->
+            spec.copy(role = role, options = {
+                spec.options().apply {
+                    clientRoleType = role
+                    publishMicrophoneTrack = asBroadcaster
+                    publishCameraTrack = asBroadcaster && video
+                }
+            })
+        }
     }
 
     /**
@@ -347,6 +478,11 @@ object AgoraManager {
         engine = null
         audioOnly = false
         onAudioVolume = null
+        lastJoin = null
+        renewJob?.cancel()
+        renewJob = null
+        tokenRenewer = null
+        onTokenRenewed = null
         /*
          * Clear the membership too, or `isInChannel` lies about a destroyed engine.
          *

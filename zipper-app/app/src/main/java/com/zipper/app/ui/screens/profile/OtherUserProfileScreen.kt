@@ -72,6 +72,13 @@ fun OtherUserProfileScreen(
     var showMore by remember { mutableStateOf(false) }
     var showReport by remember { mutableStateOf(false) }
     var confirmBlock by remember { mutableStateOf(false) }
+    /*
+     * Spec §11 (APK 20): the pre-call confirmation. Says what a minute costs
+     * and that the FIRST minute is charged the moment the call connects, before
+     * the server is asked to ring anybody. Only when there is something to pay:
+     * a host ringing a user earns and is not asked.
+     */
+    var showCallConfirm by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.navigateToCall) {
         val id = state.navigateToCall ?: return@LaunchedEffect
@@ -95,13 +102,19 @@ fun OtherUserProfileScreen(
                 onBack = onBack,
                 onMore = { showMore = true },
                 onLike = viewModel::toggleLike,
-                onCall = viewModel::initiateCall,
+                onCall = { if (state.callCostDiamonds > 0L) showCallConfirm = true else viewModel.initiateCall() },
                 onGift = { showGifts = true },
                 onMessage = { onMessage(user.uid) },
                 onJoinLive = { if (user.liveRoomId.isNotBlank()) onJoinLive(user.liveRoomId) },
                 onJoinParty = { if (user.partyRoomId.isNotBlank()) onJoinParty(user.partyRoomId) },
                 onOpenGallery = { i -> onOpenGallery(user.uid, i, user.mediaUrls) },
             )
+        }
+
+        // Spec §11: the server's lucky roll, celebrated for a few seconds.
+        state.luckyWin?.let { win ->
+            LaunchedEffect(win) { kotlinx.coroutines.delay(4_000); viewModel.clearLuckyWin() }
+            LuckyWinBanner(win, Modifier.align(Alignment.Center).padding(Space.xl))
         }
 
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) { data ->
@@ -163,6 +176,36 @@ fun OtherUserProfileScreen(
             },
             confirmButton = {},
             dismissButton = { TextButton({ showReport = false }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
+
+    if (showCallConfirm && user != null) {
+        AlertDialog(
+            onDismissRequest = { showCallConfirm = false },
+            containerColor = c.bgElevated,
+            title = { Text("Call ${user.name}?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+                        CurrencyDisc(Currency.Diamond, 14.dp)
+                        Text("${indianGrouping(state.callCostDiamonds)} per minute", style = ZipperTheme.type.labelM, color = c.textPrimary)
+                    }
+                    Text(
+                        com.zipper.app.util.CallBilling.confirmText(state.callCostDiamonds),
+                        style = ZipperTheme.type.bodyM, color = c.textSecondary,
+                    )
+                    Text(
+                        "Your balance: ${indianGrouping(state.currentUserDiamonds)} diamonds",
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton({ showCallConfirm = false; viewModel.initiateCall() }) {
+                    Text("Call — first minute charged on connect", color = c.textBrand)
+                }
+            },
+            dismissButton = { TextButton({ showCallConfirm = false }) { Text("Cancel", color = c.textSecondary) } },
         )
     }
 

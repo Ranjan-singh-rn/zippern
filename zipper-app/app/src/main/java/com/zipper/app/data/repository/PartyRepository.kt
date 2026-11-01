@@ -406,7 +406,23 @@ class PartyRepository @Inject constructor(
         giftId: String,
         quantity: Int,
         idempotencyKey: String,
-    ): String? = when (
+        /** A LUCKY gift's combo (spec §11), sent instead of `quantity`. Null for a normal gift. */
+        combo: Int? = null,
+    ): String? = when (val res = sendGiftToSeatDetailed(roomId, receiverUid, giftId, quantity, idempotencyKey, combo)) {
+        is GiftResult.Error -> res.message
+        is GiftResult.InsufficientDiamonds -> "Not enough diamonds — recharge to send this gift."
+        is GiftResult.Success, is GiftResult.LuckyWin -> null
+    }
+
+    /** [sendGiftToSeat] with the server's answer in full, so a lucky roll reaches the room. */
+    suspend fun sendGiftToSeatDetailed(
+        roomId: String,
+        receiverUid: String,
+        giftId: String,
+        quantity: Int,
+        idempotencyKey: String,
+        combo: Int? = null,
+    ): GiftResult = when (
         val res = money.settleGift(
             giftId = giftId,
             receiverUid = receiverUid,
@@ -414,10 +430,11 @@ class PartyRepository @Inject constructor(
             context = "party",
             roomId = roomId,
             idempotencyKey = idempotencyKey,
+            combo = combo,
         )
     ) {
-        is MoneyFunctions.Result.Ok -> null
-        is MoneyFunctions.Result.Failed -> res.userMessage
+        is MoneyFunctions.Result.Ok -> GiftRepository.resultOf(res.value)
+        is MoneyFunctions.Result.Failed -> GiftRepository.failureOf(res)
     }
 
     // ── Callables ─────────────────────────────────────────────────────────────

@@ -51,16 +51,24 @@ if (agoraAppId.isEmpty()) {
 //     zipper.apiBase=https://<host>          (zipper-app/local.properties)
 //     ZIPPER_API_BASE=https://<host>          (environment, for CI)
 //
-// There is no staging project and the default host IS production, so the two
-// build types differ on purpose:
-//   * release — defaults to the production CRM host when nothing is set;
+// There is no staging project and the default host IS production, so the
+// build types differ on purpose (A-18):
+//   * release and prod — default to the production API host when nothing is
+//               set. That host is the Hosting origin, `https://zipperlive.web.app`:
+//               firebase.json rewrites `/api/**` to the Cloud Run service
+//               `zipper-api` (asia-south1), the same origin the CRM calls
+//               (DEPLOYMENT.md §8.5, `ZIPPER_API_BASE_URL`). The Cloud Run URL
+//               itself would work too and skip the Hosting hop; the Hosting
+//               origin is used because it is the stable, named one.
 //   * debug   — defaults to EMPTY: the work screens say the API is not
 //               configured and make no request. A developer opts in by setting
 //               the property — to a local backend (backend/LOCAL_DEVELOPMENT.md)
 //               for anything that writes.
+// `zipper.apiBase` / `ZIPPER_API_BASE` override every build type.
 val zipperApiBase: String =
     (localProperties.getProperty("zipper.apiBase") ?: System.getenv("ZIPPER_API_BASE") ?: "").trim().trimEnd('/')
-val zipperApiBaseRelease: String = zipperApiBase.ifEmpty { "https://zipperlive.web.app" }
+val zipperApiBaseProduction = "https://zipperlive.web.app"
+val zipperApiBaseRelease: String = zipperApiBase.ifEmpty { zipperApiBaseProduction }
 
 android {
     namespace = "com.zipper.app"
@@ -99,8 +107,16 @@ android {
         // replace it. 19 is also the first build that pins appeal ids and
         // reports its versionCode to the sign-in gate (D18): the forced-update
         // cutoff `minSupportedVersionCode` is set to it, never lower.
-        versionCode = 19
-        versionName = "1.2.5"
+        //
+        // 20 / 1.2.6 — APK 20 (2026-11-01): avatar compression + readable
+        // errors (A-1/A-2), Agora uid + token renewal (A-6/A-7), per-minute
+        // call UI, lucky combos, publicProfiles reads (A-8), level visibility,
+        // the `prod` build type, updater verification (A-5/A-23) and the
+        // session cut-off (A-9). Publish with `minSupportedVersionCode: 20` —
+        // 19 still runs the ten-second tick loop against a server that bills
+        // whole minutes and shows a price that no longer matches.
+        versionCode = 20
+        versionName = "1.2.6"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 
@@ -250,6 +266,19 @@ android {
     // Note that flipping this to false does NOT remove REQUEST_INSTALL_PACKAGES
     // from the merged manifest. A Play submission needs that line in
     // AndroidManifest.xml dealt with as well — see the comment on it there.
+    //
+    // ── OTA_CHANNEL — WHICH MAP OF `appConfig/androidUpdate` THIS BUILD READS ──
+    //
+    // The channel used to be derived from `BuildConfig.DEBUG`
+    // (UpdateRepository.kt): debug → "debug", anything else → "release". That
+    // was right while the only non-debug build was the release-keystore one.
+    // The `prod` build type below is NOT debuggable and IS minified, but it is
+    // signed with the DEBUG key — the fleet's only authenticity root, which
+    // every installed handset already trusts and which cannot be changed
+    // without `INSTALL_FAILED_UPDATE_INCOMPATIBLE` on every phone (A-4) — so
+    // it must keep reading the "debug" channel, where the publish script puts
+    // debug-signed APKs. A string per build type says which, explicitly, and
+    // a new build type fails to compile rather than inheriting a guess.
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -260,13 +289,63 @@ android {
             // True today because a release APK is still something a human mails
             // to a tester. Set false for anything going to Play.
             buildConfigField("boolean", "OTA_ENABLED", "true")
+            buildConfigField("String", "OTA_CHANNEL", "\"release\"")
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
         }
         debug {
             isMinifyEnabled = false
             buildConfigField("boolean", "OTA_ENABLED", "true")
+            buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             // Opt-in only — see `zipperApiBase` above.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBase\"")
+        }
+        /*
+         * ── prod: WHAT THE FLEET SHOULD ACTUALLY RUN (A-4 / A-17 / A-18) ────
+         *
+         * Build 19 and everything before it went to the fleet as `debug`:
+         * `debuggable=true` (so `adb run-as` reads the Firebase refresh token
+         * and prefs, and Frida/JDWP can instrument the economy client without
+         * root), unminified, FLAG_SECURE off. The reason was the key — the
+         * fleet trusts the debug keystore and switching keys would strand every
+         * guest account — not the build type.
+         *
+         * `prod` keeps the key and drops everything else: it inherits `release`
+         * (minify, shrink, the proguard rules, OTA on, the production API
+         * host), is explicitly NOT debuggable, and is signed with the DEBUG
+         * signing config — the same `~/.android/debug.keystore` the debug build
+         * uses, resolved by name so nothing about the identity changes here.
+         * `BuildConfig.DEBUG` is therefore false in this build, which is also
+         * what turns FLAG_SECURE on (MainActivity) and the diagnostic lines off.
+         *
+         * Publish `assembleProd` output to the "debug" channel of
+         * `appConfig/androidUpdate` — see OTA_CHANNEL above — with
+         * `publish_apk.py`, which accepts the debug CN. `versionCode` must be
+         * bumped for every build that leaves the Mac (A-17); a prod build with
+         * the number of an installed debug build is indistinguishable to the
+         * updater.
+         *
+         * Verify on the Mac: `./gradlew :app:assembleProd`, then on the APK:
+         * `apksigner verify --print-certs` must show the debug certificate,
+         * `aapt dump badging` must NOT show `application-debuggable`, and the
+         * app must run through sign-in, a live room, a call and a gift under
+         * R8 before it is published — minification has never been exercised on
+         * this app.
+         */
+        create("prod") {
+            initWith(getByName("release"))
+            isDebuggable = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // The DEBUG key, on purpose — see above. Never the release keystore.
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+
+            buildConfigField("boolean", "OTA_ENABLED", "true")
+            // The channel debug-signed APKs are published to.
+            buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
+            // Production host by default; `zipper.apiBase` still overrides.
+            buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
         }
     }
 

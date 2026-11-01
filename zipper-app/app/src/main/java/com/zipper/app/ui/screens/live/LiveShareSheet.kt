@@ -92,9 +92,20 @@ class LiveShareViewModel @Inject constructor(
                     }
                 awaitClose { listener.remove() }
             }.collect { uids ->
+                /*
+                 * A-8 / R-1 (APK 20): `publicProfiles/{uid}`, NOT `users/{uid}`.
+                 *
+                 * This read fetched up to fifty full user documents of chat
+                 * partners — phone, email, date of birth, device id, balances,
+                 * ban reason — to draw a name, a photo and a green dot. The
+                 * public projection carries exactly those three, and reading it
+                 * is what lets the `users/{uid}` get rule be tightened to the
+                 * owner and staff.
+                 */
                 val contacts = uids.mapNotNull { uid ->
                     try {
-                        val snap = firestore.collection("users").document(uid).get().await()
+                        val snap = firestore.collection("publicProfiles").document(uid).get().await()
+                        if (!snap.exists()) return@mapNotNull null
                         ShareContact(
                             uid       = uid,
                             name      = snap.getString("name") ?: return@mapNotNull null,

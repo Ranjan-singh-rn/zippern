@@ -119,6 +119,10 @@ class UpdateViewModel @Inject constructor(
     fun checkOnce() {
         if (checked) return
         checked = true
+        // A-23: whatever the last update left behind — a verified APK the
+        // installer consumed (we are the result), or one the person backed out
+        // of — goes now, before anything is downloaded again.
+        apkInstaller.cleanupStaleFiles()
         runCheck(manual = false)
     }
 
@@ -257,23 +261,49 @@ class UpdateViewModel @Inject constructor(
         }
     }
 
-    /** Try the whole download again after a failure. */
+    /**
+     * "Try again" after a failure — which RE-READS `appConfig/androidUpdate`
+     * (A-5) rather than retrying the same document from memory.
+     *
+     * A failed download is most often a wrong document: a typo in the url, a
+     * stale hash, a build the publisher has since replaced. Retrying the copy
+     * in memory can only fail the same way, and for a REQUIRED update that was
+     * an inescapable dialog whose only button did nothing useful. A fresh read
+     * picks up the publisher's correction; a document that now says "up to
+     * date" (the bad release was withdrawn) hides the dialog; a document that
+     * is still required stays required.
+     */
     fun retry() {
-        _state.value = _state.value.copy(phase = UpdatePhase.Prompt, error = null, file = null)
+        downloadJob?.cancel()
+        downloadJob = null
+        apkInstaller.cleanupStaleFiles()
+        _state.value = UpdateUiState()
+        checked = true
+        viewModelScope.launch {
+            when (val result = updateRepository.check()) {
+                is UpdateRepository.UpdateCheck.UpToDate -> _state.value = UpdateUiState()
+                is UpdateRepository.UpdateCheck.Available ->
+                    _state.value = UpdateUiState(phase = UpdatePhase.Prompt, info = result.info, required = false)
+                is UpdateRepository.UpdateCheck.Required ->
+                    _state.value = UpdateUiState(phase = UpdatePhase.Prompt, info = result.info, required = true)
+            }
+        }
     }
 
     /**
-     * Later, or the "up to date" acknowledgement.
+     * Later, Cancel, or the "up to date" acknowledgement.
      *
      * Refuses to do anything for a required update, so a stray caller cannot
      * open the escape hatch the dialog deliberately does not draw. Also cancels
      * an in-flight download — [ApkInstaller.download] deletes the partial file
-     * when its flow is cancelled, so nothing is left on the handset.
+     * when its flow is cancelled — and sweeps a verified file the person
+     * decided not to install (A-23), so nothing is left on the handset.
      */
     fun dismiss() {
         if (_state.value.required && _state.value.phase != UpdatePhase.UpToDate) return
         downloadJob?.cancel()
         downloadJob = null
+        apkInstaller.cleanupStaleFiles()
         _state.value = UpdateUiState()
     }
 }

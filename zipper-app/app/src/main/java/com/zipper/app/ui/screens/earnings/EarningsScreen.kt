@@ -65,6 +65,13 @@ data class EarningsUiState(
     val home: HostStatsRepository.HostHome? = null,
     val statements: List<HostStatsRepository.Statement> = emptyList(),
     val error: String? = null,
+    /**
+     * Spec §10 / F-16: the host level card and the rate items are drawn for a
+     * HOST only. Read from the account, not inferred from `home` — the server
+     * refuses `getHostHome` to a non-host anyway, but the card must not depend
+     * on a refusal to stay hidden.
+     */
+    val isHost: Boolean = false,
 )
 
 @HiltViewModel
@@ -123,6 +130,7 @@ class EarningsViewModel @Inject constructor(
                         currentBeans    = snap.getLong("beans") ?: 0L,
                         totalBeansEarned = snap.getLong("totalBeansEarned") ?: 0L,
                         callRateBeans   = snap.getLong("callRateBeans") ?: 375L,
+                        isHost          = snap.getBoolean("isHost") == true,
                     )
                 }
             } catch (_: Exception) {}
@@ -182,7 +190,11 @@ fun EarningsScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val c = ZipperTheme.colors
-    val home = state.home
+    // Spec §10 / F-16: host figures — today, the week, the HOST LEVEL card —
+    // are for a host only. A normal user sees the bean activity below and
+    // nothing host-level.
+    val showHost = com.zipper.app.util.LevelVisibility.showHostEarnings(state.isHost, state.home != null)
+    val home = state.home?.takeIf { showHost }
 
     ZipperScreen(topBar = { TopBar("Earnings", onBack = onBack) { CurrencyPill(Currency.Bean, state.currentBeans, onClick = onConvertBeans) } }) { _ ->
         if (state.isLoading && home == null) { LoadingState(); return@ZipperScreen }
@@ -266,8 +278,8 @@ fun EarningsScreen(
                         }
                     }
                 }
-            } else {
-                item { Notice("Host figures unavailable — this account isn't a host, or the server couldn't be reached.", c.textSecondary) }
+            } else if (state.isHost) {
+                item { Notice("Host figures unavailable — the server couldn't be reached. Pull down or come back in a moment.", c.textSecondary) }
             }
 
             if (state.statements.isNotEmpty()) {

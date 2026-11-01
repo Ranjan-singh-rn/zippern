@@ -12,9 +12,11 @@ import com.zipper.app.data.repository.AgoraTokenRepository
 import com.zipper.app.data.repository.CallRepository
 import com.zipper.app.data.repository.GiftItem
 import com.zipper.app.data.repository.GiftRepository
+import com.zipper.app.data.repository.MoneyFunctions
 import com.zipper.app.data.repository.ProfileRepository
 import com.zipper.app.data.repository.ProfileResult
 import com.zipper.app.ui.screens.live.AgoraManager
+import com.zipper.app.util.CallBilling
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,10 +43,27 @@ data class VideoCallUiState(
     val otherPartyUid: String = "",
     val isOtherPartyLiked: Boolean = false,
     val status: CallStatus = CallStatus.RINGING,
+    /** Seconds since the call connected, BY THE SERVER'S CLOCK (see CallBilling). */
     val durationSeconds: Long = 0L,
     val myDiamonds: Long = 0L,                  // caller's live diamond balance
-    val beansEarned: Long = 0L,                 // receiver's beans earned this session
+    /** Beans credited to the earner so far, as the server wrote them on the call. */
+    val beansEarned: Long = 0L,
     val perMinRateDiamonds: Long = 0L,
+    // ── Per-minute billing (APK 20 / spec §11) — every figure from the server ──
+    /** Whole minutes charged so far. The first is charged on connect. */
+    val minutesBilled: Long = 0L,
+    /** What the payer has spent on this call so far. */
+    val diamondsSpent: Long = 0L,
+    /** Seconds until the next whole minute is charged; null before the call connected. */
+    val secondsToNextCharge: Long? = null,
+    /** Minutes the payer's balance still covers; null on a free call. */
+    val minutesLeft: Long? = null,
+    /**
+     * The server ended the call (out of diamonds, a restriction, a displaced
+     * session). Shown as a dialog before the screen closes, because a call
+     * that just vanished with no word is the thing people report as a bug.
+     */
+    val serverEndMessage: String? = null,
     val remoteUid: Int = 0,
     val isMicOn: Boolean = true,
     val isCameraFront: Boolean = true,
@@ -52,12 +71,14 @@ data class VideoCallUiState(
     val messageInput: String = "",
     val endReason: String? = null,              // non-null = call over
     val error: String? = null,
-    val lowBalanceWarning: Boolean = false,     // < 1 min remaining
+    val lowBalanceWarning: Boolean = false,     // < 2 min affordable
     /** A hang-up is in flight. Stops a second tap re-entering endCall. */
     val ending: Boolean = false,
     val gifts: List<GiftItem> = emptyList(),    // CRM catalogue for the in-call drawer
     val giftSending: Boolean = false,
     val lastGiftEvent: GiftEvent? = null,       // floats over video for a few seconds
+    /** The sender's lucky reward on the last in-call lucky gift, for the celebration. */
+    val lastLuckyWin: com.zipper.app.data.repository.GiftResult.LuckyWin? = null,
 )
 
 data class GiftEvent(val senderName: String, val senderPhotoUrl: String?, val giftName: String, val quantity: Int, val at: Long = System.currentTimeMillis())
@@ -79,14 +100,21 @@ class VideoCallViewModel @Inject constructor(
     private val callId: String = checkNotNull(savedStateHandle["callId"])
     private val isOutgoing: Boolean = savedStateHandle["isOutgoing"] ?: false
 
-    private var durationJob: Job? = null
+    private var displayJob: Job? = null
     private var tickJob: Job? = null
     private var ringTimeoutJob: Job? = null
     private var callDoc: ActiveCall? = null
 
     private var callerUid: String = ""
     private var receiverUid: String = ""
-    private var beansEarnedThisCall: Long = 0L
+
+    /**
+     * What the server last said about the billing, and how far this device's
+     * clock is from the server's. Every number on screen is derived from these
+     * two by `CallBilling`; nothing here counts seconds or minutes itself.
+     */
+    private var billing = CallBilling.Snapshot()
+    private var clockOffsetMs = 0L
 
     private companion object {
         /**
@@ -156,7 +184,7 @@ class VideoCallViewModel @Inject constructor(
                     "ringing"   -> CallStatus.RINGING
                     "connected" -> CallStatus.CONNECTED
                     // The server marks a call `ending` while it settles the
-                    // final tick. Unmapped, it fell through to RINGING — so a
+                    // final minute. Unmapped, it fell through to RINGING — so a
                     // call that was finishing said "Ringing…" to the person who
                     // did not hang up, with the cost bar gone, until the other
                     // side's endCall landed. It is still connected until the
@@ -169,6 +197,22 @@ class VideoCallViewModel @Inject constructor(
                 }
 
                 val iPay = myUid == call.payerId
+
+                /*
+                 * THE DOCUMENT IS THE SERVER'S LEDGER FOR THIS CALL. `tickIndex`
+                 * (minutes), `billedThroughMs`, `diamondsCharged` and
+                 * `beansCredited` are written by the same transaction that moves
+                 * the money, and both parties can read them — so the earner's
+                 * "Earned" and the payer's "Spent" come from here, not from
+                 * adding up tick responses that a dropped network would miss.
+                 */
+                billing = billing.copy(
+                    startedAtMs = call.startedAt.takeIf { it > 0L } ?: billing.startedAtMs,
+                    minutesBilled = maxOf(billing.minutesBilled, call.minutesBilled),
+                    billedThroughMs = call.billedThroughMs.takeIf { it > 0L } ?: billing.billedThroughMs,
+                    perMinRateDiamonds = call.perMinRateDiamonds,
+                )
+
                 _state.update {
                     it.copy(
                         isPayer             = iPay,
@@ -177,9 +221,13 @@ class VideoCallViewModel @Inject constructor(
                         otherPartyPhotoUrl  = otherPhoto,
                         status              = newStatus,
                         perMinRateDiamonds  = call.perMinRateDiamonds,
+                        beansEarned         = maxOf(it.beansEarned, call.beansCredited),
+                        diamondsSpent       = maxOf(it.diamondsSpent, call.diamondsCharged),
+                        minutesBilled       = billing.minutesBilled,
                         endReason           = if (call.status in listOf("ended","declined","missed")) call.endReason else null,
                     )
                 }
+                refreshDisplay()
 
                 when (call.status) {
                     "connected" -> onCallConnected()
@@ -210,28 +258,56 @@ class VideoCallViewModel @Inject constructor(
     // ── Connected ─────────────────────────────────────────────────────────────
 
     private fun onCallConnected() {
-        if (durationJob != null) return   // already running
-        durationJob = viewModelScope.launch {
+        if (displayJob != null) return   // already running
+        // The timer: every second, re-derive the figures from the server's
+        // snapshot and the corrected clock. Nothing is incremented locally.
+        displayJob = viewModelScope.launch {
             while (true) {
+                refreshDisplay()
                 delay(1000)
-                _state.update { it.copy(durationSeconds = it.durationSeconds + 1) }
             }
         }
-        // The paying side drives the tick (either party may; one is enough).
-        if (_state.value.isPayer) {
-            startEconomyTick()
+        /*
+         * BOTH SIDES TICK. The payer's tick used to be the charge; the server
+         * now charges whole minutes from its own clock, so a tick is a
+         * liveness ping and the way the figures on screen stay true. The
+         * earner's tick is never charged — the server answers it with
+         * `role: 'earner'` and `charged: 0` — but it keeps the watchdog away
+         * when the payer's device goes quiet, and it brings back the same
+         * `minutesBilled` the payer sees.
+         */
+        startLivenessTick()
+    }
+
+    /** The figures on screen, from the last server snapshot and the corrected clock. */
+    private fun refreshDisplay() {
+        // Once the server has settled the call its figures are final; the
+        // clock must not keep running underneath them.
+        if (_state.value.endReason != null || _state.value.status == CallStatus.ENDED) return
+        val serverNow = CallBilling.serverNowMs(System.currentTimeMillis(), clockOffsetMs)
+        val d = CallBilling.display(billing, serverNow, _state.value.myDiamonds.takeIf { _state.value.isPayer })
+        _state.update {
+            it.copy(
+                durationSeconds = d.elapsedSeconds,
+                minutesBilled = d.minutesBilled,
+                diamondsSpent = maxOf(it.diamondsSpent, d.diamondsSpent),
+                secondsToNextCharge = d.secondsToNextCharge,
+                minutesLeft = d.minutesLeft,
+                lowBalanceWarning = it.isPayer && d.lowBalance,
+            )
         }
     }
 
-    private fun startEconomyTick() {
+    private fun startLivenessTick() {
+        if (tickJob != null) return
         tickJob = viewModelScope.launch {
             while (true) {
-                delay(CallRepository.TICK_SECONDS * 1000L)
+                delay(CallBilling.LIVENESS_TICK_SECONDS * 1000L)
 
                 // A call id, and nothing else. The server computes elapsed time
-                // from its own `startedAt`, so a paused app, a changed device
-                // clock, or a skipped tick all settle correctly — the next tick
-                // bills everything outstanding rather than only ten seconds.
+                // from its own `startedAt` and charges whole minutes from its
+                // own clock, so a paused app, a changed device clock, or a
+                // skipped tick changes nothing about what is owed.
                 val tick = callRepo.tickCall(callId)
                 if (tick == null) {
                     // Transient: a dropped request must not end a live call.
@@ -239,23 +315,39 @@ class VideoCallViewModel @Inject constructor(
                     // quiet, two minutes past the last successful tick.
                     continue
                 }
-
-                _state.update {
-                    it.copy(
-                        beansEarned = it.beansEarned + tick.beans,
-                        lowBalanceWarning = tick.endNow,
-                    )
-                }
-                loadMyDiamonds()
+                applyTick(tick)
 
                 if (tick.endNow) {
                     // The server has already stopped the call — out of
-                    // diamonds. Hanging up here just tidies up the UI and Agora.
-                    endCall("diamonds_exhausted")
+                    // diamonds, a restriction, a displaced session. Hanging up
+                    // here just tidies up the UI and Agora; the server's reason
+                    // stands over whatever is sent.
+                    val reason = tick.endReason ?: CallBilling.END_INSUFFICIENT_DIAMONDS
+                    _state.update { it.copy(serverEndMessage = CallBilling.endMessage(reason, it.isPayer)) }
+                    endCall(reason)
                     return@launch
                 }
             }
         }
+    }
+
+    /** Fold a tick's answer into the snapshot and the clock offset. */
+    private fun applyTick(tick: MoneyFunctions.CallTick) {
+        val startedAt = tick.startedAtMs ?: billing.startedAtMs
+        if (tick.startedAtMs != null && tick.startedAtMs > 0L) {
+            clockOffsetMs = CallBilling.clockOffsetMs(tick.startedAtMs, tick.elapsedSeconds, System.currentTimeMillis())
+        }
+        billing = billing.copy(
+            startedAtMs = startedAt,
+            minutesBilled = maxOf(billing.minutesBilled, tick.minutesBilled),
+            billedThroughMs = tick.billedThroughMs ?: tick.nextChargeAtMs ?: billing.billedThroughMs,
+            perMinRateDiamonds = if (tick.perMinRateDiamonds > 0L) tick.perMinRateDiamonds else billing.perMinRateDiamonds,
+            affordableMinutes = tick.affordableMinutes ?: billing.affordableMinutes,
+        )
+        if (tick.beans > 0L) _state.update { it.copy(beansEarned = it.beansEarned + tick.beans) }
+        refreshDisplay()
+        // A minute fell due on this tick: the balance moved.
+        if (_state.value.isPayer && tick.charged > 0L) loadMyDiamonds()
     }
 
     // ── Call end ──────────────────────────────────────────────────────────────
@@ -270,32 +362,38 @@ class VideoCallViewModel @Inject constructor(
      * screen said ENDED and navigated away. If the hang-up did not reach the
      * server — which is most likely precisely when the signal has just gone —
      * the call stayed `connected`, nothing ticked, and the watchdog settled the
-     * whole silent gap at full rate two minutes later. The user hung up and paid
-     * for two more minutes.
+     * whole silent gap two minutes later. The user hung up and paid for two
+     * more minutes.
      *
-     * So the ticks keep going while we try. That is not a cost: each one bills
-     * ten seconds the call is genuinely still open on the server, which is the
-     * honest answer. They are cancelled once it is actually closed.
+     * So the ticks keep going while we try. That is not a cost: a tick charges
+     * nothing by itself, it only tells the server the call is genuinely still
+     * open on this side, which is the honest answer. They are cancelled once it
+     * is actually closed.
      */
     fun endCall(reason: String = if (isOutgoing) "caller_ended" else "receiver_ended") {
         if (_state.value.ending) return
         ringTimeoutJob?.cancel()
         _state.update { it.copy(ending = true) }
-        durationJob?.cancel()
+        displayJob?.cancel()
         viewModelScope.launch {
             when (val res = callRepo.endCall(callId, reason)) {
                 is CallRepository.CallEndResult.Settled -> {
                     tickJob?.cancel()
                     AgoraManager.leaveChannel()
+                    val serverReason = res.end.endReason?.takeIf { it.isNotBlank() } ?: reason
                     _state.update {
                         it.copy(
                             ending = false,
-                            endReason = reason,
+                            endReason = serverReason,
                             status = CallStatus.ENDED,
-                            // Server figures, including the part-tick that had
-                            // not been billed when the user hung up.
+                            // Server figures, including the minute in progress
+                            // when the user hung up — a started minute is owed.
                             durationSeconds = res.end.durationSeconds,
                             beansEarned = res.end.beansCredited,
+                            diamondsSpent = res.end.diamondsCharged,
+                            minutesBilled = maxOf(it.minutesBilled, res.end.minutesBilled),
+                            serverEndMessage = it.serverEndMessage
+                                ?: CallBilling.endMessage(serverReason, it.isPayer),
                         )
                     }
                 }
@@ -319,10 +417,16 @@ class VideoCallViewModel @Inject constructor(
     }
 
     private fun onCallTerminated(reason: String) {
-        durationJob?.cancel()
+        displayJob?.cancel()
         tickJob?.cancel()
         AgoraManager.leaveChannel()
-        _state.update { it.copy(status = CallStatus.ENDED, endReason = reason) }
+        _state.update {
+            it.copy(
+                status = CallStatus.ENDED,
+                endReason = reason,
+                serverEndMessage = it.serverEndMessage ?: CallBilling.endMessage(reason, it.isPayer),
+            )
+        }
     }
 
     // ── Agora ─────────────────────────────────────────────────────────────────
@@ -334,11 +438,15 @@ class VideoCallViewModel @Inject constructor(
             // Remote party disconnected — end call
             endCall("network")
         }
+        // A-6: a call over an hour used to die at the token's expiry. The
+        // engine warns ahead and AgoraManager renews through the one
+        // repository that mints tokens.
+        AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
         // Fetch a server-generated RTC token before joining — production safe.
-        // Falls back to null if the Cloud Function is not yet deployed (App Certificate must be OFF in that case).
+        // A-7: joined with the uid the token was signed for, never 0.
         viewModelScope.launch {
-            val token = agoraTokenRepo.fetchToken(callId)
-            AgoraManager.joinAsBroadcaster(callId, token)
+            val grant = agoraTokenRepo.fetchGrant(callId)
+            AgoraManager.joinAsBroadcaster(callId, grant?.token, grant?.uid ?: 0)
         }
     }
 
@@ -393,20 +501,27 @@ class VideoCallViewModel @Inject constructor(
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    // A-12: guarded. An unguarded `await` in viewModelScope on a dropped
+    // connection took the whole process down mid-call.
     private fun checkLiked(otherUid: String) {
         val myUid = auth.currentUser?.uid ?: return
         viewModelScope.launch {
-            val snap = firestore.collection("users").document(myUid)
-                .collection("liked").document(otherUid).get().await()
-            _state.update { it.copy(isOtherPartyLiked = snap.exists()) }
+            try {
+                val snap = firestore.collection("users").document(myUid)
+                    .collection("liked").document(otherUid).get().await()
+                _state.update { it.copy(isOtherPartyLiked = snap.exists()) }
+            } catch (_: Exception) {}
         }
     }
 
     private fun loadMyDiamonds() {
         val uid = auth.currentUser?.uid ?: return
         viewModelScope.launch {
-            val snap = firestore.collection("users").document(uid).get().await()
-            _state.update { it.copy(myDiamonds = snap.getLong("diamonds") ?: 0L) }
+            try {
+                val snap = firestore.collection("users").document(uid).get().await()
+                _state.update { it.copy(myDiamonds = snap.getLong("diamonds") ?: 0L) }
+                refreshDisplay()
+            } catch (_: Exception) {}
         }
     }
 
@@ -414,6 +529,10 @@ class VideoCallViewModel @Inject constructor(
 
     // ── In-call gifts ─────────────────────────────────────────────────────────
 
+    /**
+     * [quantity] is the combo for a lucky gift (`gift.isLucky`) and the count
+     * for a normal one; the repository sends the right field.
+     */
     fun sendGiftInCall(targetUid: String, gift: GiftItem, quantity: Int = 1) {
         if (_state.value.giftSending) return
         _state.update { it.copy(giftSending = true) }
@@ -429,6 +548,7 @@ class VideoCallViewModel @Inject constructor(
                         it.copy(
                             giftSending = false,
                             lastGiftEvent = GiftEvent(me?.displayName ?: "You", me?.photoUrl?.toString(), gift.name, quantity),
+                            lastLuckyWin = res as? com.zipper.app.data.repository.GiftResult.LuckyWin,
                         )
                     }
                     notifyGiftSent(gift, quantity)
@@ -453,6 +573,7 @@ class VideoCallViewModel @Inject constructor(
     }
 
     fun clearGiftEvent() { _state.update { it.copy(lastGiftEvent = null) } }
+    fun clearLuckyWin() { _state.update { it.copy(lastLuckyWin = null) } }
 
     override fun onCleared() {
         /*
@@ -469,7 +590,7 @@ class VideoCallViewModel @Inject constructor(
             }
         }
         super.onCleared()
-        durationJob?.cancel()
+        displayJob?.cancel()
         tickJob?.cancel()
         ringTimeoutJob?.cancel()
         // These are global on AgoraManager; left set, a later live room's
@@ -483,4 +604,5 @@ class VideoCallViewModel @Inject constructor(
 // `perMinRateToDiamonds` and `tickBeansFrom` are gone. They existed so the
 // caller's device could work out what to charge and what to credit — the second
 // one was a hardcoded 50% with a comment admitting it was a guess. The server
-// returns both numbers per tick now, from the rate and split it actually used.
+// returns both numbers per minute now, from the rate and split it actually used,
+// and `CallBilling` is the only arithmetic left on this side.
