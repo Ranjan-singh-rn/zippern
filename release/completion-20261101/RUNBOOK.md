@@ -149,6 +149,11 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
   `.firebaserc`, which Node parses as JavaScript (SyntaxError). Fixed (read as JSON). The fix is a later commit than the
   one 11 recorded, so 12 and 45 now accept a backend-revision.txt written at an ancestor of HEAD with the same `backend/`
   tree (and refuse it once `backend/` changed).
+- **2 Nov, later:** the CRM is published again for the QR code on the authenticator set-up screens (Owner /login,
+  Observer /observer; drawn in the browser by `zipper-crm/lib/qrCode.ts`). 50 refuses while `production/crm-live.txt`
+  exists, so the first record is moved aside on purpose first:
+  `mv production/crm-live.txt production/crm-live-20261102T135110Z.txt` — its `previous=ba740f4158292308` stays the
+  version to return to for a full CRM rollback.
 - **Verify:** 50 PASS, `production/crm-live.txt` written; sign in as an Owner (MFA step or the "MFA unavailable"
   notice), Observer TOTP, one money screen read-only.
 - **Rollback:** `H-CRM-ROLLBACK` (console, to the version recorded as `previous=` — `ba740f4158292308`), together with 19 if

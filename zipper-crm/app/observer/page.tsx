@@ -27,6 +27,7 @@ import { Eye, Loader2, Mail, ShieldCheck, ArrowLeft, AlertTriangle, KeyRound } f
 import api, { ApiError, type OwnerMfaEnrolment } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { OBSERVER_MFA_UNAVAILABLE_NOTICE, mfaUnavailable } from '@/lib/mfaAvailability'
+import TotpQrCode from '@/components/TotpQrCode'
 
 type Step =
   | 'request' | 'verify'
@@ -313,13 +314,19 @@ export default function ObserverSignIn() {
                 Authenticator, Microsoft Authenticator, 1Password…) after the emailed code.
               </p>
               <ol className="text-slate-400 text-sm list-decimal pl-5 space-y-1 mt-3">
-                <li>In the app, add an account and choose <b>enter a setup key</b>.</li>
-                <li>Type the key below (time-based, 6 digits).</li>
+                <li>In the app tap <b>+</b> and choose <b>Scan a QR code</b>.</li>
+                <li>Scan the code below.</li>
                 <li>Enter the 6-digit code the app shows.</li>
               </ol>
+              <div className="mt-4">
+                <TotpQrCode uri={enrolment.otpauth_uri} />
+              </div>
+              <p className="text-slate-500 text-xs mt-2">
+                Set this up before? Delete the old Zipper entry in the app first — only this code works now.
+              </p>
               <div className="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 mt-4">
-                <p className="text-slate-500 text-xs uppercase tracking-wide mb-1">Setup key</p>
-                <p className="text-white font-mono text-sm break-all select-all">
+                <p className="text-slate-500 text-xs uppercase tracking-wide mb-1">Can&apos;t scan? Setup key (time-based)</p>
+                <p className="text-white font-mono text-sm select-all leading-relaxed">
                   {enrolment.secret.replace(/(.{4})/g, '$1 ').trim()}
                 </p>
               </div>

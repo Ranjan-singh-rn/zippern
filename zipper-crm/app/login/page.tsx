@@ -16,6 +16,7 @@ import {
 import { useAuth } from '@/components/AuthProvider'
 import api, { ApiError, firestoreBindingOf, getSessionToken, type FirestoreBinding, type OwnerMfaEnrolment } from '@/lib/api'
 import { OWNER_MFA_UNAVAILABLE_NOTICE, mfaUnavailable } from '@/lib/mfaAvailability'
+import TotpQrCode from '@/components/TotpQrCode'
 
 /** P1-A3: wait for AuthProvider's API session exchange rather than racing it. */
 async function waitForApiSession(ms = 15000): Promise<boolean> {
@@ -453,13 +454,17 @@ export default function LoginPage() {
                   Microsoft Authenticator, 1Password…) every time they sign in.
                 </p>
                 <ol className="text-slate-400 text-sm list-decimal pl-5 space-y-1">
-                  <li>In the app, add an account and choose <b>enter a setup key</b>.</li>
-                  <li>Type the key below (time-based, 6 digits).</li>
+                  <li>In the app tap <b>+</b> and choose <b>Scan a QR code</b>.</li>
+                  <li>Scan the code below.</li>
                   <li>Enter the 6-digit code the app shows.</li>
                 </ol>
+                <TotpQrCode uri={enrolment.otpauth_uri} />
+                <p className="text-slate-500 text-xs">
+                  Set this up before? Delete the old Zipper entry in the app first — only this code works now.
+                </p>
                 <div className="bg-slate-800 border border-slate-700 rounded-lg px-4 py-3">
-                  <p className="text-slate-500 text-xs uppercase tracking-wide mb-1">Setup key</p>
-                  <p className="text-white font-mono text-sm break-all select-all">
+                  <p className="text-slate-500 text-xs uppercase tracking-wide mb-1">Can&apos;t scan? Setup key (time-based)</p>
+                  <p className="text-white font-mono text-sm select-all leading-relaxed">
                     {enrolment.secret.replace(/(.{4})/g, '$1 ').trim()}
                   </p>
                 </div>
