@@ -97,8 +97,9 @@ echo ""
 
 # ── 4. Say exactly where this goes ───────────────────────────────────────────
 cd "$PROJECT_ROOT"
-FB_PROJECT="$(node -e "const r=require('./.firebaserc'); process.stdout.write(String(r.projects && r.projects.default || ''))")"
-FB_SITES="$(node -e "const r=require('./.firebaserc'); const t=((r.targets||{})['$FB_PROJECT']||{}).hosting||{}; process.stdout.write((t['$HOSTING_TARGET']||[]).join(', '))")"
+# .firebaserc is JSON without a .json extension: require() would parse it as JavaScript (SyntaxError on 2 Nov), so read it.
+FB_PROJECT="$(node -e "const r=JSON.parse(require('fs').readFileSync('./.firebaserc','utf8')); process.stdout.write(String(r.projects && r.projects.default || ''))")"
+FB_SITES="$(node -e "const r=JSON.parse(require('fs').readFileSync('./.firebaserc','utf8')); const t=((r.targets||{})['$FB_PROJECT']||{}).hosting||{}; process.stdout.write((t['$HOSTING_TARGET']||[]).join(', '))")"
 FB_PUBLIC="$(node -e "const c=require('./firebase.json'); const h=(c.hosting||[]).find(x=>x.target==='$HOSTING_TARGET'); process.stdout.write(h?h.public:'')")"
 [ -n "$FB_PROJECT" ] || fail ".firebaserc has no default project."
 [ -n "$FB_SITES" ] || fail ".firebaserc has no hosting site for target '$HOSTING_TARGET'."

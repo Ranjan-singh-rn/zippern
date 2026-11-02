@@ -145,6 +145,10 @@ and **the typed word** the script asks for. Nothing in this folder has been run 
   is the one with the Observer TOTP step.
 - **Precondition:** the completion backend serves 100% (checked). `zipper-crm/.env.local` complete (deploy-crm checks names only).
 - **Do:** `./50-deploy-crm.command` (CRM), then deploy-crm.command's own DEPLOY. Hosting only.
+- **2 Nov:** the first run built and verified the CRM, then deploy-crm.command stopped before deploying: it `require()`d
+  `.firebaserc`, which Node parses as JavaScript (SyntaxError). Fixed (read as JSON). The fix is a later commit than the
+  one 11 recorded, so 12 and 45 now accept a backend-revision.txt written at an ancestor of HEAD with the same `backend/`
+  tree (and refuse it once `backend/` changed).
 - **Verify:** 50 PASS, `production/crm-live.txt` written; sign in as an Owner (MFA step or the "MFA unavailable"
   notice), Observer TOTP, one money screen read-only.
 - **Rollback:** `H-CRM-ROLLBACK` (console, to the version recorded as `previous=` — `ba740f4158292308`), together with 19 if

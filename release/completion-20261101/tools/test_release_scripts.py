@@ -1101,6 +1101,25 @@ rc, o = run(C19, "")
 ok("19 re-run: nothing to do, no prompt", rc == 0 and "ABOUT TO" not in o and "update-traffic" not in calls(), o[-300:])
 s = st(); s["service"]["traffic"] = [{"revisionName": NEW, "percent": 100}]; put(s)   # canary re-done (as tested above)
 
+# A later commit after 11 recorded the backend (2 Nov: the deploy-crm.command fix, after the backend was at 100%).
+# With NEW at 100%, `12 10` passes the record check and then stops at the split check — that proves which check spoke.
+w(REPO / "deploy-crm.command", DEPLOY_CRM.replace("#!/bin/bash", "#!/bin/bash\n# a later fix, no backend file", 1), 0o755)
+git("add", "deploy-crm.command"); git("commit", "-q", "-m", "a later fix, no backend file")
+run("make-release-txt.sh")
+rc, o = run(C12, "", ("10",))
+ok("12: backend-revision.txt of an ancestor commit with the same backend/ tree is accepted (note), then the split is checked",
+   "has the same backend/ tree" in o and "not RELEASE.txt's HEAD" not in o and "current split is not the previous step" in o, o[-800:])
+w(REPO / "backend" / "app" / "config.py", "x = 2\n")
+git("add", "backend/app/config.py"); git("commit", "-q", "-m", "a backend change after 11")
+run("make-release-txt.sh")
+rc, o = run(C12, "", ("10",))
+ok("12 refuses backend-revision.txt once backend/ changed after it was written", rc == 3 and "not RELEASE.txt's HEAD, nor an ancestor" in o, o[-600:])
+rc, o = run(C45, "", env={"ALL_OWNERS_ENROLLED": "yes"})
+ok("45 refuses it the same way", rc == 3 and "not RELEASE.txt's HEAD, nor an ancestor" in o, o[-600:])
+git("reset", "-q", "--hard", HEAD)
+run("make-release-txt.sh")
+ok("back at the reviewed HEAD for the rest of the run", git("rev-parse", "HEAD") == HEAD and "HEAD=%s\n" % HEAD in (RELC / "RELEASE.txt").read_text())
+
 # ── 30 / 39 Firestore hotfix-1 ──
 rc, o = run(C30, "RELEASE\n")
 ok("30 refuses without an emulator results folder", rc == 3 and "firebase deploy" not in calls(), o[-300:])
@@ -1654,6 +1673,13 @@ ok("fn-classify refuses a name listed in two waves (DUPLICATE)", "DUPLICATE b in
 p = subprocess.run([sys.executable, "-I", str(RELC / "rel_helpers.py"), "fn-classify", str(U / "exports.txt"), "a b", "", "c", "asia-south1", "us-central1", "c"],
                    capture_output=True, text=True)
 ok("fn-classify accepts an exact split in the right regions", p.stdout.strip().endswith("CLASSIFY ok"), p.stdout + p.stderr)
+
+# ── unit: the repository's real deploy-crm.command (the harness runs a fake one) reads .firebaserc as JSON ──
+REAL_CRM = REL.parent.parent / "deploy-crm.command"
+if REAL_CRM.exists():
+    rc_text = REAL_CRM.read_text(encoding="utf-8")
+    ok("deploy-crm.command never require()s .firebaserc (2 Nov: Node parsed it as JavaScript, SyntaxError, no deploy)",
+       "require('./.firebaserc')" not in rc_text and rc_text.count("JSON.parse(require('fs').readFileSync('./.firebaserc','utf8'))") == 2)
 
 # ── unit: tools/apk_cert.py — the certificate(s) of the APK Signing Block ──
 for name, certs in (("one", ["fleet"]), ("two", ["fleet", "release"]), ("none", None)):

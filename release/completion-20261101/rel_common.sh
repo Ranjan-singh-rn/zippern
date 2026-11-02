@@ -167,6 +167,19 @@ require_release() {
   check ok "clean working tree at HEAD $HEAD_SHORT = RELEASE.txt (branch $(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null))"
 }
 
+# backend_record_ok <head= of backend-revision.txt>: the recorded revision was built for this release — the recorded
+# commit is RELEASE.txt's HEAD, or an ancestor of it whose backend/ tree is identical (a later commit that changed no
+# backend file, e.g. the 2 Nov deploy-crm.command fix, leaves the deployed revision the release's backend). After
+# require_release. Prints nothing; returns 1 otherwise.
+backend_record_ok() {
+  local rec="$1" t_rec t_head
+  [ -n "$rec" ] || return 1
+  [ "$rec" = "$HEAD_SHA" ] && return 0
+  git -C "$REPO" merge-base --is-ancestor "$rec" "$HEAD_SHA" 2>/dev/null || return 1
+  t_rec="$(git -C "$REPO" rev-parse "$rec:backend" 2>/dev/null)"; t_head="$(git -C "$REPO" rev-parse "$HEAD_SHA:backend" 2>/dev/null)"
+  [ -n "$t_head" ] && [ "$t_rec" = "$t_head" ]
+}
+
 # gcloud identity, masked (the account is a person's address).
 who() {
   say "gcloud: $(gcloud --version 2>>"$ERR" | head -1)   project: $(gcloud config get-value project 2>/dev/null)   account: $(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>>"$ERR" | sed -E 's/^(.).*@/\1***@/')"  #RO

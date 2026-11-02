@@ -42,7 +42,9 @@ NAME_RE='^zipper-api-[0-9]{5}-[a-z0-9]{3}$'
 printf '%s' "$BASE" | grep -Eq "$NAME_RE" || stop "bad revision name in backend-revision.txt"
 printf '%s' "$WANT_DIG" | grep -Eq '^sha256:[0-9a-f]{64}$' || stop "bad digest in backend-revision.txt"
 [ "$BASE" != "$RETIRED_REV" ] || stop "$RETIRED_REV must never receive traffic"
-[ "$(sed -n 's/^head=//p' "$STATE_BACKEND" | head -1)" = "$HEAD_SHA" ] || stop "backend-revision.txt was written for another HEAD than RELEASE.txt"
+REC_HEAD="$(sed -n 's/^head=//p' "$STATE_BACKEND" | head -1)"
+backend_record_ok "$REC_HEAD" || stop "backend-revision.txt was written for $(printf '%s' "$REC_HEAD" | cut -c1-12): not RELEASE.txt's HEAD, nor an ancestor of it with the same backend/ tree"
+[ "$REC_HEAD" = "$HEAD_SHA" ] || say "   note: backend-revision.txt was written at $(printf '%s' "$REC_HEAD" | cut -c1-7); HEAD $HEAD_SHORT has the same backend/ tree"
 say "BASE = $BASE (the completion revision)"
 
 # ── 1. Read-only gate ───────────────────────────────────────────────────────────────────────────────

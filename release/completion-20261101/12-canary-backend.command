@@ -27,7 +27,9 @@ NAME_RE='^zipper-api-[0-9]{5}-[a-z0-9]{3}$'
 printf '%s' "$NEW" | grep -Eq "$NAME_RE" && printf '%s' "$BASE" | grep -Eq "$NAME_RE" || stop "bad revision names in backend-revision.txt"
 printf '%s' "$WANT_DIG" | grep -Eq '^sha256:[0-9a-f]{64}$' || stop "bad digest in backend-revision.txt"
 [ "$NEW" != "$RETIRED_REV" ] && [ "$BASE" != "$RETIRED_REV" ] && [ "$NEW" != "$BASE" ] || stop "$RETIRED_REV must never receive traffic, and NEW must differ from BASE"
-[ "$(sed -n 's/^head=//p' "$STATE_BACKEND" | head -1)" = "$HEAD_SHA" ] || stop "backend-revision.txt was written for another HEAD than RELEASE.txt"
+REC_HEAD="$(sed -n 's/^head=//p' "$STATE_BACKEND" | head -1)"
+backend_record_ok "$REC_HEAD" || stop "backend-revision.txt was written for $(printf '%s' "$REC_HEAD" | cut -c1-12): not RELEASE.txt's HEAD, nor an ancestor of it with the same backend/ tree"
+[ "$REC_HEAD" = "$HEAD_SHA" ] || say "   note: backend-revision.txt was written at $(printf '%s' "$REC_HEAD" | cut -c1-7); HEAD $HEAD_SHORT has the same backend/ tree"
 say "NEW=$NEW (digest ${WANT_DIG:0:19}…)  BASE=$BASE"
 
 LIVE_DIG="$(gcloud run revisions describe "$NEW" --project "$P" --region "$REGION" --format='value(status.imageDigest)' 2>>"$ERR")"; LIVE_DIG="${LIVE_DIG##*@}"  #RO
