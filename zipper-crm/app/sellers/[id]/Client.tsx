@@ -47,6 +47,7 @@ import {
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { SellerHistoryPanel } from '@/components/SellerHistoryPanel'
+import SellerBusinessPanel from '@/components/SellerBusinessPanel'
 import { canAccess } from '@/lib/auth'
 import api, { ApiError } from '@/lib/api'
 import { roleButtons, type UserRoles } from '@/lib/userRoleActions'
@@ -649,11 +650,15 @@ export default function SellerDetail() {
           holds its own read and its own date range, so switching tabs does not
           re-fetch the record and a slow history never blocks the page. */}
       {tab === 'history' && (
-        <SellerHistoryPanel
-          sellerId={id}
-          audience="owner"
-          sellerName={partner.name || partner.id}
-        />
+        <>
+          <SellerHistoryPanel
+            sellerId={id}
+            audience="owner"
+            sellerName={partner.name || partner.id}
+          />
+          {/* B9: margin, tier, credit limit, borrowing and trades. */}
+          <SellerBusinessPanel sellerId={id} audience="staff" />
+        </>
       )}
 
       {tab === 'ledger' && (

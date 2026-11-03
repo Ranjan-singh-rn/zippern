@@ -874,6 +874,161 @@ async def execute_lending(card_id: str, user: dict = Depends(require_owner)):
         raise _fail(exc) from exc
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# B9 (3 Nov 2026): tiers, credit limits, borrow requests, seller-to-seller trades,
+# self-use, profit — services/seller_business.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+from app.services import seller_business as seller_biz  # noqa: E402
+
+
+class SellerTier(BaseModel):
+    tier: str = Field(default="", max_length=32)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class CreditLimit(BaseModel):
+    coins: int = Field(ge=0)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class BorrowRequest(BaseModel):
+    coins: int = Field(gt=0)
+    days: int = Field(ge=1, le=30)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class SellerTradeFiling(BaseModel):
+    buyer_seller_id: str = Field(min_length=1, max_length=64)
+    seller_seller_id: str = Field(min_length=1, max_length=64)
+    coins: int = Field(gt=0)
+    amount_paid_minor: int = Field(ge=0)
+    payment_ref: str = Field(min_length=1, max_length=200)
+    client_request_id: str = Field(min_length=8, max_length=64)
+
+
+class TradeDecision(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+class SelfUse(BaseModel):
+    coins: int = Field(gt=0)
+    client_request_id: str = Field(min_length=8, max_length=64)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+@router.post("/sellers/{seller_id}/tier", dependencies=[_COIN_OPS])
+async def set_seller_tier(seller_id: str, body: SellerTier, user: dict = Depends(require_owner)):
+    """Put a seller on a priced tier — it decides the wholesale price their purchases are checked against."""
+    try:
+        return await seller_biz.set_seller_tier(seller_id, body.tier, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/sellers/{seller_id}/credit-limit", dependencies=[_COIN_OPS])
+async def set_credit_limit(seller_id: str, body: CreditLimit, user: dict = Depends(require_owner)):
+    """The most this seller may owe at once. With a limit set, nobody lends past it."""
+    try:
+        return await seller_biz.set_credit_limit(seller_id, body.coins, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/sellers/{seller_id}/borrow-requests", status_code=status.HTTP_201_CREATED)
+async def request_borrow(seller_id: str, body: BorrowRequest, user: dict = Depends(require_write_or_partner)):
+    """A seller asks to borrow inventory within their limit. It is a lending card; an owner signs it."""
+    seller_id = _own_id_or_403(user, seller_id, kind="seller")
+    try:
+        card = await seller_biz.request_borrow(seller_id, body.coins, body.days, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+    if R.is_external(user["role"]):
+        return cards_svc.partner_view(card, partner_ids_of(user), user.get("uid", ""))
+    return card
+
+
+@router.post("/seller-trades", status_code=status.HTTP_201_CREATED)
+async def file_seller_trade(body: SellerTradeFiling, user: dict = Depends(require_write_or_partner)):
+    """A seller buying coins from another seller files the trade. Nothing moves until an owner approves it."""
+    buyer_id = _own_id_or_403(user, body.buyer_seller_id, kind="seller")
+    try:
+        return await seller_biz.request_trade(
+            buyer_id, body.seller_seller_id, body.coins, body.amount_paid_minor, body.payment_ref,
+            body.client_request_id, user,
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/seller-trades")
+async def list_seller_trades(
+    seller_id: str | None = Query(default=None), trade_status: str | None = Query(default=None, alias="status"),
+    user: dict = Depends(current_user),
+):
+    """Staff see every trade; a seller sees the trades they bought or sold in."""
+    if R.is_external(user["role"]):
+        seller_id = _own_id_or_403(user, seller_id or "me", kind="seller")
+    elif not R.is_internal(user["role"]):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not available.")
+    return await seller_biz.list_trades(seller_id, trade_status)
+
+
+@router.post("/seller-trades/{trade_id}/approve", dependencies=[_COIN_OPS])
+async def approve_seller_trade(trade_id: str, body: TradeDecision, user: dict = Depends(require_owner)):
+    """The payment was verified. The selling seller's coins move to the buyer, once."""
+    try:
+        return await seller_biz.approve_trade(trade_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/seller-trades/{trade_id}/reject", dependencies=[_COIN_OPS])
+async def reject_seller_trade(trade_id: str, body: TradeDecision, user: dict = Depends(require_write)):
+    """Staff refuse a pending trade. Nothing has moved, so nothing moves back."""
+    try:
+        return await seller_biz.reject_trade(trade_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/seller-trades/{trade_id}/dispute")
+async def dispute_seller_trade(trade_id: str, body: TradeDecision, user: dict = Depends(require_write_or_partner)):
+    """The SELLING seller says "I was not paid for this". It decides nothing: it stops approval until staff look."""
+    try:
+        trade = await seller_biz.get_trade(trade_id)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+    seller_id = _own_id_or_403(user, str(trade.get("seller_id") or ""), kind="seller")
+    try:
+        return await seller_biz.dispute_trade(trade_id, seller_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/sellers/{seller_id}/self-use", status_code=status.HTTP_201_CREATED)
+async def use_inventory_for_self(seller_id: str, body: SelfUse, user: dict = Depends(require_write_or_partner)):
+    """Where Zipper allows it, a seller moves their own coins into their own app wallet — never a sale."""
+    if not R.is_external(user["role"]):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the seller can use their own inventory.")
+    seller_id = _own_id_or_403(user, seller_id, kind="seller")
+    try:
+        return await seller_biz.use_inventory_for_self(seller_id, body.coins, body.client_request_id, body.reason, user)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.get("/sellers/{seller_id}/profit")
+async def seller_profit(seller_id: str, user: dict = Depends(current_user)):
+    """Purchase price, inventory, borrowing, sales and profit — the seller's own, or any for staff."""
+    if not R.is_internal(user["role"]):
+        seller_id = _own_id_or_403(user, seller_id, kind="seller")
+    try:
+        return await seller_biz.seller_profit(seller_id)
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
 @router.post(
     "/sellers/{seller_id}/repayments",
     status_code=status.HTTP_201_CREATED,

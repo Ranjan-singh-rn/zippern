@@ -70,6 +70,8 @@ fun MyProfileScreen(
     /** The liveness capture, for a host who has not done it. Takes their gender. */
     onNavigateToFaceVerification: (String) -> Unit = {},
     onNavigateToPartnerHub: () -> Unit = {},
+    /** B10: the account switcher (the accounts signed in on this device). */
+    onNavigateToSwitchAccount: () -> Unit = {},
     onLogout: () -> Unit = {},
     viewModel: ProfileViewModel = hiltViewModel(),
 ) {
@@ -99,7 +101,7 @@ fun MyProfileScreen(
                 Avatar(
                     user.photoUrl, size = AvatarSize.LG, initial = user.name,
                     ring = if (user.isVerifiedHost) AvatarRing.Vip else AvatarRing.None,
-                    frameUrl = user.equippedFrame.ifBlank { null },
+                    frameItemId = user.equippedFrame.ifBlank { null }, animatedFrame = true,
                 )
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(user.name, style = ZipperTheme.type.headingS, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -279,6 +281,7 @@ fun MyProfileScreen(
                     add(Cell(Icons.Outlined.WorkOutline, "Work", onNavigateToWork))
                 }
                 add(Cell(Icons.Outlined.Settings, "Settings", onNavigateToSettings))
+                add(Cell(Icons.Outlined.SwitchAccount, "Switch account", onNavigateToSwitchAccount))
                 add(Cell(Icons.Outlined.ChatBubbleOutline, "Feedback", onNavigateToFeedback))
                 add(Cell(Icons.AutoMirrored.Outlined.Logout, "Log out", { confirmLogout = true }, danger = true))
             }

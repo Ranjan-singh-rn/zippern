@@ -2,13 +2,14 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from 'react'
 import { onCrmAuthChange, crmSignOut, normalizeCrmRole, CrmUser, hasPermission, canAccess, Permission, CrmRole } from '@/lib/auth'
-import { db } from '@/lib/firebase'
+import { db, auth as firebaseAuth } from '@/lib/firebase'
 import { doc, onSnapshot } from 'firebase/firestore'
 import type { User } from 'firebase/auth'
 import api, {
   ApiError, endSession, getSessionToken, sessionNeedsRenewal, setSessionToken,
   API_UNAUTHORIZED_EVENT, type ApiUnauthorizedEvent, type ApiUser,
 } from '@/lib/api'
+import { handOverSession as runHandover, waitForPartnerClaim } from '@/lib/sessionHandover'
 
 interface AuthContextValue {
   firebaseUser: User | null
@@ -53,6 +54,15 @@ interface AuthContextValue {
    * before it decides.
    */
   crmProfileUnread: boolean
+  /**
+   * QA #26: run a step that makes the server end this session ON PURPOSE (an
+   * approved partner's role starting once both contacts are verified), then —
+   * only if `changed(result)` — sign in again through the ordinary door and
+   * adopt the new session, with the 401 handler held for the whole window.
+   * See `lib/sessionHandover.ts` for what it deliberately does not do.
+   */
+  handOverSession: <T>(work: () => Promise<T>, changed: (result: T) => boolean) =>
+    Promise<{ result: T; handedOver: boolean }>
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -68,6 +78,7 @@ const AuthContext = createContext<AuthContextValue>({
   refreshApiUser: async () => null,
   mustSignInAgain: false,
   crmProfileUnread: false,
+  handOverSession: async (work) => ({ result: await work(), handedOver: false }),
 })
 
 // ── How long a session lives, and how it stays alive ─────────────────────────
@@ -157,6 +168,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   //: Set when renewal has been refused. Nothing retries after this — the only
   //: thing that clears it is a fresh sign-in.
   const giveUp = useRef(false)
+  //: QA #26: deliberate session handovers in progress (`handOverSession`).
+  //: A scheduled renewal must not try to renew the session the server is
+  //: ending on purpose — it would be refused and sign the person out.
+  //: A COUNT, not a flag (security review, 3 Nov 2026): a second handover
+  //: started while one runs is not ended by the first one's release; each
+  //: hold is released once, and by HANDOVER_HOLD_MS at the latest.
+  const handovers = useRef(0)
 
   /** A session we now hold. The one place `apiReady` becomes true. */
   const accept = useCallback((u: ApiUser): ApiUser => {
@@ -202,7 +220,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * laptop must not cost anybody their session.
    */
   const renewNow = useCallback(async (): Promise<ApiUser | null> => {
-    if (giveUp.current) return null
+    if (giveUp.current || handovers.current > 0) return null
     if (renewing.current) return renewing.current
     if (!getSessionToken()) return null
 
@@ -382,7 +400,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * step 1 again, forever.
    */
   const recoverFromUnauthorized = useCallback((): void => {
-    if (giveUp.current || recovering.current) return
+    // A handover in progress also holds this (QA #26) — by the count as well as
+    // by `recovering`, which a recovery already running when the handover
+    // began would clear in its `finally`.
+    if (giveUp.current || recovering.current || handovers.current > 0) return
 
     recovering.current = (async () => {
       try {
@@ -501,6 +522,50 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setApiError(err?.message ?? 'Could not establish an API session.')
       })
   }, [firebaseUser, apiUser, accept])
+
+  // ── QA #26: a session the server ends on purpose is handed over ────────────
+  //
+  // `recovering` is what `recoverFromUnauthorized` checks first, so holding it
+  // for the window keeps a 401 caused by the server's own revocation from
+  // turning into a refused renewal and `requireSignIn` (a Firebase sign-out)
+  // while the new session is being made. `renewedAt` then makes any straggler
+  // that still carries the old token be CHECKED against the new one, not
+  // believed — the same rule a rotation already follows.
+  const handOverSession = useCallback(
+    <T,>(work: () => Promise<T>, changed: (result: T) => boolean) =>
+      runHandover<T, ApiUser>(work, changed, {
+        hold: () => {
+          let release: () => void = () => undefined
+          const held = new Promise<void>((resolve) => { release = resolve })
+          recovering.current = held
+          handovers.current += 1
+          let done = false
+          return () => {
+            if (done) return
+            done = true
+            if (recovering.current === held) recovering.current = null
+            handovers.current = Math.max(0, handovers.current - 1)
+            release()
+          }
+        },
+        signIn: async () => {
+          giveUp.current = false
+          // The started role's Storage claim is written by a trigger moments
+          // after the role starts — wait for it to reach the token, so the
+          // dashboard's uploads work at once (E2E re-run, 3 Nov 2026).
+          await waitForPartnerClaim(async () => {
+            const result = await firebaseAuth.currentUser?.getIdTokenResult(true)
+            return (result?.claims ?? null) as Record<string, unknown> | null
+          })
+          return api.auth.signInWithFirebase()
+        },
+        adopt: (u) => {
+          renewedAt.current = Date.now()
+          accept(u)
+        },
+      }),
+    [accept],
+  )
 
   // Holds the unsubscribe fn for the current user-doc listener
   const userDocUnsubRef = useRef<(() => void) | null>(null)
@@ -664,6 +729,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     refreshApiUser,
     mustSignInAgain,
     crmProfileUnread,
+    handOverSession,
   }
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

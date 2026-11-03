@@ -1662,3 +1662,77 @@ const apiPartners = {
 }
 
 export default apiPartners
+
+// ── B9 (3 Nov 2026): the coin-seller business — tiers, credit limits, borrow requests, seller-to-seller trades,
+//    self-use and profit (backend services/seller_business.py) ───────────────────────────────────────────────────
+
+export interface SellerTrade {
+  id: string
+  buyer_id: string
+  seller_id: string
+  buyer_name?: string
+  seller_name?: string
+  coins: number
+  amount_paid_minor: number
+  payment_ref: string
+  status: 'pending' | 'approving' | 'approved' | 'rejected'
+  disputed?: boolean
+  dispute_reason?: string
+  shortfall?: { available: number; needed: number }
+  created_at?: string
+  approved_at?: string
+  rejection_reason?: string
+}
+
+export interface SellerProfit {
+  seller_id: string
+  tier: string
+  inventory_coins: number
+  purchased_coins: number
+  purchase_cost_minor: number
+  avg_cost_inr_per_lakh: number
+  borrowed_coins_total: number
+  credit_limit: number
+  credit_outstanding: number
+  borrow_headroom: number
+  coins_sold: number
+  revenue_minor: number
+  avg_sale_inr_per_lakh: number
+  cost_of_sold_minor: number
+  gross_profit_minor: number
+  self_use_coins: number
+  excluded_non_inr_recharges: number
+  definitions: Record<string, string>
+}
+
+export const sellerBusiness = {
+  /** Coin ops + Owner: put a seller on a priced tier ('' = the published wholesale price). */
+  setTier: (sellerId: string, tier: string, reason: string) =>
+    post<{ seller_id: string; tier: string; tier_name: string }>(
+      `/partner-ops/sellers/${encodeURIComponent(sellerId)}/tier`, { tier, reason }),
+  /** Coin ops + Owner: the most a seller may owe. With a limit set nobody lends past it. */
+  setCreditLimit: (sellerId: string, coins: number, reason: string) =>
+    post<{ seller_id: string; credit_limit: number }>(
+      `/partner-ops/sellers/${encodeURIComponent(sellerId)}/credit-limit`, { coins, reason }),
+  /** The seller (or staff for them): ask to borrow within the limit — a lending card an owner signs. */
+  requestBorrow: (sellerId: string, coins: number, days: number, reason: string) =>
+    post<PartnerCard>(`/partner-ops/sellers/${encodeURIComponent(sellerId)}/borrow-requests`, { coins, days, reason }),
+  /** The BUYER seller files a trade with another seller. Nothing moves until an owner approves. */
+  fileTrade: (body: { buyer_seller_id: string; seller_seller_id: string; coins: number; amount_paid_minor: number;
+    payment_ref: string; client_request_id: string }) => post<SellerTrade>('/partner-ops/seller-trades', body),
+  listTrades: (params: { seller_id?: string; status?: string } = {}) => {
+    const q = new URLSearchParams()
+    if (params.seller_id) q.set('seller_id', params.seller_id)
+    if (params.status) q.set('status', params.status)
+    return get<SellerTrade[]>(`/partner-ops/seller-trades${q.toString() ? `?${q}` : ''}`)
+  },
+  approveTrade: (id: string, reason: string) => post<SellerTrade>(`/partner-ops/seller-trades/${encodeURIComponent(id)}/approve`, { reason }),
+  rejectTrade: (id: string, reason: string) => post<SellerTrade>(`/partner-ops/seller-trades/${encodeURIComponent(id)}/reject`, { reason }),
+  /** The SELLING seller: "I was not paid" — stops approval until staff look. */
+  disputeTrade: (id: string, reason: string) => post<SellerTrade>(`/partner-ops/seller-trades/${encodeURIComponent(id)}/dispute`, { reason }),
+  /** The seller, where Zipper allows it: own coins → own app wallet. Never a sale. */
+  selfUse: (sellerId: string, coins: number, clientRequestId: string, reason: string) =>
+    post<{ coins: number; credited_uid: string; replayed: boolean }>(
+      `/partner-ops/sellers/${encodeURIComponent(sellerId)}/self-use`, { coins, client_request_id: clientRequestId, reason }),
+  profit: (sellerId: string) => get<SellerProfit>(`/partner-ops/sellers/${encodeURIComponent(sellerId)}/profit`),
+}

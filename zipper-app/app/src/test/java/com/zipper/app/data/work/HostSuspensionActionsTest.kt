@@ -128,7 +128,8 @@ class HostSuspensionActionsTest {
 
     @Test fun `a suspended host reads the server's sentence, word for word`() {
         val until = Instant.parse("2026-11-04T10:15:00Z").toEpochMilli()
-        assertEquals("Your Host role is suspended until 04 Nov 2026, 10:15 UTC — reason: Repeated no-shows.",
+        // QA #54: the end is read in IST (it used to be "04 Nov 2026, 10:15 UTC").
+        assertEquals("Your Host role is suspended until 4 Nov 2026, 3:45 pm IST — reason: Repeated no-shows.",
             HostSuspension.message(until, "Repeated no-shows."))
         assertEquals("Your Host role is suspended until it is resumed — reason: Under review.",
             HostSuspension.message(null, "Under review."))

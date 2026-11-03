@@ -73,6 +73,14 @@ data class PartyRoom(
     val lockedSeats: List<Int> = emptyList(),
     /** Removed from the room. Refused a token, so it is a real removal and not a request. */
     val kickedUsers: List<String> = emptyList(),
+    /** B7: Zipper officials who entered this private room without its PIN — shown to everyone in it. */
+    val officialPresentUids: List<String> = emptyList(),
+    /** B7: the room's background (one of ROOM_THEMES in functions/src/party.ts). */
+    val theme: String = "classic",
+    /** B7: the owner is not taking calls while in the room. */
+    val ownerBlocksCalls: Boolean = false,
+    /** B7: what is playing (a catalogue track), and who is playing it; null when nothing is. */
+    val music: PartyMusic? = null,
 ) {
     val isAudio: Boolean get() = mode == MODE_AUDIO
     val isPrivate: Boolean get() = visibility == VISIBILITY_PRIVATE
@@ -187,6 +195,20 @@ data class PartyRoom(
                     ?.mapNotNull { (it as? Number)?.toInt() } ?: emptyList(),
                 kickedUsers   = (doc.get("kickedUsers") as? List<*>)
                     ?.mapNotNull { it as? String } ?: emptyList(),
+                officialPresentUids = (doc.get("officialPresentUids") as? List<*>)
+                    ?.mapNotNull { it as? String } ?: emptyList(),
+                theme = doc.getString("theme") ?: "classic",
+                ownerBlocksCalls = doc.getBoolean("ownerBlocksCalls") ?: false,
+                music = (doc.get("music") as? Map<*, *>)?.let { m ->
+                    PartyMusic(
+                        trackId = m["trackId"] as? String ?: "",
+                        title = m["title"] as? String ?: "",
+                        artist = m["artist"] as? String ?: "",
+                        url = m["url"] as? String ?: "",
+                        playing = m["playing"] as? Boolean ?: false,
+                        by = m["by"] as? String ?: "",
+                    )
+                }?.takeIf { it.trackId.isNotBlank() },
             )
         }
     }
@@ -293,3 +315,14 @@ data class PartySeatInvite(
         }
     }
 }
+
+
+/** B7: room music — a track from Zipper's licensed catalogue (`musicTracks`), played by [by]'s phone into the room. */
+data class PartyMusic(
+    val trackId: String,
+    val title: String,
+    val artist: String,
+    val url: String,
+    val playing: Boolean,
+    val by: String,
+)

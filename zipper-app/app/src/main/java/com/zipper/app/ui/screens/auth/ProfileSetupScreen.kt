@@ -433,23 +433,25 @@ fun ProfileSetupScreen(
      * appear a moment late; the cost of the unsafe one is that everybody else
      * is asked for their number.
      *
-     * ── WHY A TYPED REFERRAL CODE ALSO COUNTS ────────────────────────────────
+     * ── A TYPED REFERRAL CODE NO LONGER ASKS FOR THEM (QA #51) ───────────────
      *
-     * Somebody entering an agency code is ASKING to become a host, and is not
-     * one yet — so the server truthfully reports that nothing is required of
-     * them. But `verifyReferralCode` matches the code against the agency's
-     * invitation using both contact details, and redeeming it on save needs the
-     * same pair. Without this clause the code would be refused on save with no
-     * field on screen to fix it. The original comment on `extraEmail` already
-     * claimed the fields were "shown only when referral code is entered"; the
-     * code never did that, and this is it.
+     * A typed agency code used to show both fields here, on the theory that the
+     * server matched the invitation with the pair. It does not: since Phase 1A
+     * it compares only contacts the account has VERIFIED, and ignores anything
+     * typed (`identityFor` in functions/src/hosts.ts) — so an invited host who
+     * signed up by phone typed their e-mail into this box, the server never saw
+     * it, and they were told "Details don't match the agency record". The
+     * server now finds the invitation by the verified phone alone, says which
+     * contact is still missing and what the agency registered for it, and the
+     * Host role starts by itself once that contact is verified in Settings
+     * (`ReferralContacts`). A field here would only collect a value nobody uses.
      *
      * `hasEmail` / `hasPhone` still come from FirebaseAuth, and still should:
      * they answer "do we already know it", which is a fact about the credential.
      * The role answers "should we ask at all". Two different questions.
      */
-    val needsEmail = (uiState.requiresEmail || referralCode.isNotBlank()) && !hasEmail
-    val needsPhone = (uiState.requiresPhone || referralCode.isNotBlank()) && !hasPhone
+    val needsEmail = uiState.requiresEmail && !hasEmail
+    val needsPhone = uiState.requiresPhone && !hasPhone
 
     // Verify button is enabled when code >= 6 chars AND missing fields are filled
     val verifyEnabled = referralCode.length >= 6 &&
@@ -815,7 +817,10 @@ fun ProfileSetupScreen(
                         when {
                             uiState.referralError != null -> Text(uiState.referralError!!, style = ZipperTheme.type.caption, color = c.statusDanger)
                             uiState.referralValid -> Text(
-                                "Valid code" + (if (uiState.referralAgencyName.isNotBlank()) " — joining ${uiState.referralAgencyName}" else "") + ". You'll be registered as a host.",
+                                // QA #51: says which contact the Host role still waits for.
+                                com.zipper.app.util.ReferralContacts.validLine(
+                                    uiState.referralAgencyName, uiState.referralNeeds, uiState.referralHint,
+                                ),
                                 style = ZipperTheme.type.caption, color = c.statusSuccess,
                             )
                             uiState.referralNotFound -> Text("Code not recognised — you'll join as a regular user", style = ZipperTheme.type.caption, color = c.statusWarning)
@@ -872,6 +877,25 @@ fun ProfileSetupScreen(
                 dismissButton = {
                     TextButton({ viewModel.continueWithoutAgency() }) {
                         Text("Continue as user", color = c.textSecondary)
+                    }
+                },
+            )
+        }
+
+        /*
+         * QA #51: the profile saved and the agency invitation is now this
+         * account's, but the Host role waits for a contact to be verified.
+         * Read before Home, like the two dialogs either side of it.
+         */
+        uiState.hostAwaitingNotice?.let { notice ->
+            AlertDialog(
+                onDismissRequest = { viewModel.acknowledgeHostAwaiting() },
+                containerColor = c.bgElevated,
+                title = { Text("Agency code accepted — one more step", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+                text = { Text(notice, style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+                confirmButton = {
+                    TextButton({ viewModel.acknowledgeHostAwaiting() }) {
+                        Text("OK", color = c.textBrand)
                     }
                 },
             )
@@ -1083,7 +1107,9 @@ private suspend fun fetchLocationFromNominatim(lat: Double, lon: Double): Pair<S
                 "?format=json&lat=$lat&lon=$lon&accept-language=en&zoom=10"
             )
             val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
-                setRequestProperty("User-Agent", "ZipperApp/1.0 (contact@zipper.app)")
+                // OSM's Nominatim policy requires a working contact in the User-Agent.
+                // QA #47: the official support address, not an unused domain.
+                setRequestProperty("User-Agent", "ZipperApp/1.0 (${com.zipper.app.util.ZipperContacts.SUPPORT})")
                 connectTimeout = 6000
                 readTimeout  = 6000
             }

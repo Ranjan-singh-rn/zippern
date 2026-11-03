@@ -199,7 +199,9 @@ class SignInRoutingTest {
 
     @Test fun `the guest path runs the device binding check inside quick login`() {
         val guest = repo.substring(repo.indexOf("if (existing == null && savedQuickLogin() != null) {"))
-        val call = guest.indexOf("signInWithQuickLogin(deviceId) { recovered ->")
+        // B10: the call names the device's guest account when this device remembers it (several accounts may be
+        // saved here); the binding check is still passed in, as the trailing lambda, exactly as before.
+        val call = guest.indexOf("signInWithQuickLogin(deviceId, accountUid = if (guestSaved) guestUid else null) { recovered ->")
         assertTrue("the guest path must pass the check into quick login", call >= 0)
         assertTrue(guest.indexOf("confirmDeviceBinding(deviceId, secret, recovered)") in call until call + 400)
         // Not-a-guest no longer signs a STARTED session out — nothing was started.

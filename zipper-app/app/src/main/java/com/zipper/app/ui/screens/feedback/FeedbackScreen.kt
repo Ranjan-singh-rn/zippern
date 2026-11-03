@@ -260,8 +260,8 @@ class FeedbackViewModel @Inject constructor(
 
 private fun formatDate(ts: Long): String {
     if (ts == 0L) return ""
-    return java.text.SimpleDateFormat("dd MMM yyyy, h:mm a", java.util.Locale.getDefault())
-        .format(java.util.Date(ts))
+    // QA #54: IST, whatever the handset's zone.
+    return com.zipper.app.util.IstTime.format(ts)
 }
 
 private fun isVideoUri(context: android.content.Context, uri: Uri): Boolean {

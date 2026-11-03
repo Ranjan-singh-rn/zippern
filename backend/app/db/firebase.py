@@ -102,9 +102,54 @@ def storage_bucket():
     return fb_storage.bucket()
 
 
+class SignedInBeforeRevocation(Exception):
+    """The ID token belongs to a sign-in made before the account's sessions
+    were last ended (`tokensValidAfterTime`). Refused like a revoked token."""
+
+
 def verify_id_token(token: str) -> dict:
-    """Verify a Firebase ID token. Raises on anything invalid or revoked."""
-    return fb_auth.verify_id_token(token, check_revoked=True)
+    """Verify a Firebase ID token. Raises on anything invalid or revoked.
+
+    `check_revoked=True` is Firebase's own test: the token's ISSUE time (`iat`)
+    against the account's `tokensValidAfterTime`. It stops every token issued
+    before a revocation, and relies on Firebase refusing to mint new ones from a
+    revoked refresh token — which production Firebase does.
+
+    E2E round 2 (3 Nov 2026, QA #45). The local Auth emulator does not refuse
+    that refresh, and a production revocation can fail (`revoke_sessions`
+    reports it and writes the cut-off anyway). Either way a refresh token kept
+    from before the revocation mints an ID token with a NEW `iat` and the
+    ORIGINAL `auth_time`, and `/auth/signin` accepted it: on the local copy a
+    browser kept from before the Observer reset an Owner's authenticator got a
+    fresh pending Owner session — the step a new authenticator is enrolled
+    from. So the sign-in time is compared too: a token whose `auth_time` is
+    older than the account's last revocation is refused. It is the rule
+    `firestore.rules` already applies to `credentialsValidAfter`
+    (`sessionCurrent()` compares `auth_time`, not `iat`), against Firebase's
+    own revocation time — which only a revocation moves (a ban, a suspension,
+    a security reset, a password or e-mail change), never a new phone session.
+    """
+    decoded = fb_auth.verify_id_token(token, check_revoked=True)
+    _refuse_sign_in_older_than_revocation(decoded)
+    return decoded
+
+
+def _refuse_sign_in_older_than_revocation(decoded: dict) -> None:
+    uid = str(decoded.get("uid") or decoded.get("sub") or "").strip()
+    if not uid:
+        return  # nothing to compare: every caller refuses a token that names no account
+    auth_time = decoded.get("auth_time")
+    if isinstance(auth_time, bool) or not isinstance(auth_time, (int, float)):
+        raise SignedInBeforeRevocation("The ID token does not say when its sign-in was made.")
+    try:
+        user = fb_auth.get_user(uid)
+    except fb_auth.UserNotFoundError as exc:
+        raise SignedInBeforeRevocation("The account this ID token names no longer exists.") from exc
+    valid_after_ms = getattr(user, "tokens_valid_after_timestamp", None)
+    if isinstance(valid_after_ms, (int, float)) and not isinstance(valid_after_ms, bool) \
+            and auth_time * 1000 < valid_after_ms:
+        raise SignedInBeforeRevocation(
+            "This sign-in was made before the account's sessions were ended. Sign in again.")
 
 
 def get_user_by_email(email: str):
@@ -224,22 +269,59 @@ def revoke_sessions(uid: str) -> str:
     A suspension must still let the person sign in to be told they are
     suspended (and to appeal), so the account is not disabled — but the tokens
     already issued must stop working now, not in an hour. Revoking refresh
-    tokens stops new ID tokens; the caller also moves `credentialsValidAfter`
-    past now so the rules refuse the ones already out there.
+    tokens stops new ID tokens; `credentialsValidAfter` is moved past now so
+    the rules and every protected callable refuse the ones already out there.
+
+    Security review (3 Nov 2026): that second half used to be left to the
+    caller, and the security reset (`security.revoke_sessions_for_uid(...,
+    mobile=True)`: an Observer MFA reset, "sign out everywhere" with a reset)
+    never did it — so an ID token already on a stolen phone kept working for
+    up to an hour after the Owner's authenticator was reset. It is done here
+    now, for every caller (a suspension, which also sets it, is unaffected:
+    the value only ever moves forward).
+
+    The cut-off is made even when the revocation fails: a refreshed ID token
+    keeps the `auth_time` of the original sign-in, so the cut-off stops the
+    tokens a refresh token would still mint as well as the ones already out.
 
     @return '' on success, or a sentence describing what could not be done.
     """
     uid = (uid or "").strip()
     if not uid:
         return "No account id was given."
+    problem = ""
     try:
         fb_auth.revoke_refresh_tokens(uid)
-        return ""
     except fb_auth.UserNotFoundError:
         return ""
     except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
         log.exception("could not revoke refresh tokens for %s", uid)
-        return f"The live sessions could not be revoked: {exc}"
+        problem = f"The live sessions could not be revoked: {exc}"
+    return " ".join(p for p in (problem, cut_off_issued_tokens(uid)) if p)
+
+
+def cut_off_issued_tokens(uid: str) -> str:
+    """Move `users/{uid}.credentialsValidAfter` past now — never backwards.
+
+    `firestore.rules` (`sessionCurrent`) and `functions/src/mobileSession`
+    refuse an ID token whose `auth_time` is before it. An account with no app
+    document (a CRM-only login) has nothing to cut off. @return '' or a sentence.
+    """
+    import time
+
+    try:
+        ref = firestore_client().collection("users").document(uid)
+        snap = ref.get()
+        if not getattr(snap, "exists", False):
+            return ""
+        cutoff = int(time.time()) + 1
+        current = int((snap.to_dict() or {}).get("credentialsValidAfter") or 0)
+        if current < cutoff:
+            ref.update({"credentialsValidAfter": cutoff})
+        return ""
+    except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
+        log.exception("could not cut off the issued tokens of %s", uid)
+        return f"The sign-ins already issued could not be cut off: {exc}"
 
 
 #: Where `functions/src/quickLogin.ts` keeps the mobile quick-login credentials:

@@ -20,69 +20,22 @@
  * and omitting it is the indefinite case. They are checked here as well as
  * there because a refused suspension is a round trip that tells the operator
  * nothing they could not have been told while they were still typing.
- */
-
-export const MIN_SUSPEND_DAYS = 1
-export const MAX_SUSPEND_DAYS = 365
-
-/**
- * What the dialog is holding.
  *
- * `days` is the raw string from the input and not a number, because the field
- * is legitimately mid-edit — empty, or "1" on the way to "14" — and coercing it
- * to a number would make every one of those states read as a bad value.
+ * QA #52: the rules themselves (empty start, digits only, 1–365, the end date
+ * shown in IST before confirming) are in `lib/suspensionTerm.ts`, which has no
+ * React and runs in a spec; this file re-exports them for the existing callers.
  */
-export interface SuspensionTerm {
-  timed: boolean
-  days: string
-}
 
-/**
- * A suspension is timed by default. An indefinite one is a real decision —
- * "off the platform while we investigate" — but it is the one that needs
- * somebody to remember to come back, so it is chosen rather than defaulted to.
- */
-export const DEFAULT_SUSPENSION: SuspensionTerm = { timed: true, days: '7' }
+import {
+  DEFAULT_SUSPENSION, MAX_SUSPEND_DAYS, MIN_SUSPEND_DAYS, normaliseDaysInput,
+  suspensionDays, suspensionPreview, suspensionProblem, suspensionResult,
+  type SuspensionTerm,
+} from '@/lib/suspensionTerm'
 
-/** What to send as `days`. `undefined` is the indefinite case the API expects. */
-export function suspensionDays(term: SuspensionTerm): number | undefined {
-  return term.timed ? Number(term.days) : undefined
+export {
+  DEFAULT_SUSPENSION, MAX_SUSPEND_DAYS, MIN_SUSPEND_DAYS, suspensionDays, suspensionProblem, suspensionResult,
 }
-
-/** The sentence to show, or null when the term is good. */
-export function suspensionProblem(term: SuspensionTerm): string | null {
-  if (!term.timed) return null
-  const n = Number(term.days)
-  if (!Number.isInteger(n) || n < MIN_SUSPEND_DAYS || n > MAX_SUSPEND_DAYS) {
-    return (
-      `A suspension runs from ${MIN_SUSPEND_DAYS} to ${MAX_SUSPEND_DAYS} days. ` +
-      'For longer than that, choose indefinite and lift it with Resume.'
-    )
-  }
-  return null
-}
-
-/**
- * What just happened, in one sentence, from what the server sent back.
- *
- * Shared for the same reason the control is: the difference between the two
- * outcomes — one ends by itself, one waits for a person — is the thing the
- * operator most needs to have understood, and a screen that reports it in
- * vaguer words than the other is the screen that gets it wrong.
- *
- * `suspendedUntil` is the server's ISO 8601 string, or '' for indefinite.
- */
-export function suspensionResult(days: number | undefined, suspendedUntil?: string): string {
-  if (!days) {
-    return 'Suspended with no end date. It stays in force until somebody presses Resume.'
-  }
-  const when = suspendedUntil ? new Date(suspendedUntil) : null
-  const until = when && !isNaN(when.getTime()) ? `, until ${when.toLocaleString('en-IN')}` : ''
-  return (
-    `Suspended for ${days} day${days === 1 ? '' : 's'}${until}. ` +
-    'It lifts itself on the scheduled sweep — nobody has to remember.'
-  )
-}
+export type { SuspensionTerm }
 
 /**
  * The control itself. The caller owns the state, so a dialog can reset it with
@@ -95,14 +48,16 @@ export function SuspendDuration({
   value: SuspensionTerm
   onChange: (term: SuspensionTerm) => void
 }) {
+  const preview = suspensionPreview(value)
+  const problem = value.timed && value.days !== '' ? suspensionProblem(value) : null
   return (
     <div className="space-y-3">
       <div>
         <label className="block text-slate-400 text-xs font-medium mb-1.5">How long</label>
         <div className="flex gap-2">
           {[
-            { value: true, label: 'For a set number of days' },
-            { value: false, label: 'Indefinite' },
+            { value: true, label: 'Temporary — a set number of days' },
+            { value: false, label: 'Indefinite — until Resume' },
           ].map((option) => (
             <button
               key={String(option.value)}
@@ -123,7 +78,7 @@ export function SuspendDuration({
             resumes the account off it, so the date is a fact about what will
             happen rather than a label on a screen. */}
         <p className="text-slate-500 text-xs mt-2">
-          A timed suspension <strong className="text-slate-300">ends by itself</strong> on the
+          A temporary suspension <strong className="text-slate-300">ends by itself</strong> on the
           scheduled sweep. An indefinite one{' '}
           <strong className="text-slate-300">waits for somebody to press Resume</strong> — nothing
           will lift it on its own.
@@ -133,18 +88,34 @@ export function SuspendDuration({
       {value.timed && (
         <div>
           <label className="block text-slate-400 text-xs font-medium mb-1.5">
-            Days ({MIN_SUSPEND_DAYS}–{MAX_SUSPEND_DAYS})
+            Number of days ({MIN_SUSPEND_DAYS}–{MAX_SUSPEND_DAYS})
           </label>
+          {/* A text box, not a number input: a number input accepts "1e2", "-3"
+              and "2.5", and its spinner nudges the value. Digits only, at most
+              three; and it starts EMPTY — a pre-filled 7 turned a typed 2 into 72
+              (QA #52). */}
           <input
-            type="number"
-            min={MIN_SUSPEND_DAYS}
-            max={MAX_SUSPEND_DAYS}
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            autoComplete="off"
             value={value.days}
-            onChange={(e) => onChange({ ...value, days: e.target.value })}
-            placeholder="e.g. 7"
+            onChange={(e) => onChange({ ...value, days: normaliseDaysInput(e.target.value) })}
+            placeholder="Number of days"
+            aria-describedby="suspend-duration-preview"
             className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm placeholder-slate-600 focus:outline-none focus:border-pink-500"
           />
+          {problem && <p className="text-red-400 text-xs mt-1.5">{problem}</p>}
         </div>
+      )}
+
+      {preview && (
+        <p
+          id="suspend-duration-preview"
+          className="text-xs rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-slate-200"
+        >
+          {preview}
+        </p>
       )}
     </div>
   )

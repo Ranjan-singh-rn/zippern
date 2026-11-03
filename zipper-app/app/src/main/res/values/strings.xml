@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Zipper</string>
+    <string name="app_name" translatable="false">Zipper</string>
     <string name="app_tagline">Live. Connect. Shine.</string>
 
     <!--
@@ -30,31 +30,16 @@
     <string name="get_otp">Get OTP</string>
     <string name="continue_with_google">Continue with Google</string>
     <string name="continue_as_guest">Continue as Guest</string>
-    <string name="verify_otp">Verify OTP</string>
-    <string name="resend_otp">Resend OTP</string>
-    <string name="terms_accept">I agree to the Terms &amp; Conditions</string>
-    <string name="age_confirm">By continuing you confirm you\'re 18+</string>
 
     <!-- Profile Setup -->
-    <string name="set_up_profile">Set Up Profile</string>
-    <string name="tell_us_who_you_are">Tell us who you are</string>
-    <string name="display_name">Display Name</string>
-    <string name="what_to_call_you">What should we call you?</string>
-    <string name="gender">Gender</string>
     <string name="male">Male</string>
     <string name="female">Female</string>
     <string name="transgender">Transgender</string>
     <string name="date_of_birth">Date of Birth</string>
-    <string name="select_dob">Select date of birth</string>
-    <string name="age_error">You must be 18 or older to use Zipper</string>
     <string name="city">City</string>
-    <string name="your_city">Your city</string>
-    <string name="detecting">Detecting…</string>
-    <string name="lets_go">Let\'s Go! ⚡</string>
 
     <!-- General -->
     <string name="ok">OK</string>
     <string name="cancel">Cancel</string>
     <string name="back">Back</string>
-    <string name="error_generic">Something went wrong. Please try again.</string>
 </resources>

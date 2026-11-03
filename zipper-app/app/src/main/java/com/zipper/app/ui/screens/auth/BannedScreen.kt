@@ -92,7 +92,8 @@ enum class BanKind(val arg: String) {
  * ── WHAT THIS SCREEN USED TO BE ──────────────────────────────────────────────
  *
  * A danger disc, the reason, and the sentence "if you believe this is a
- * mistake, contact support@zipperlive.app". That is the whole product's answer
+ * mistake, contact support" (at an address on a domain Zipper does not use —
+ * QA #47). That was the whole product's answer
  * to a wrongful ban: leave, open an email client, and hope somebody reads it.
  * There was a TODO in the file saying the callbacks for a Contact support
  * button did not exist.
@@ -180,6 +181,22 @@ fun BannedScreen(
                 color = c.textSecondary,
                 textAlign = TextAlign.Center,
             )
+
+            if (kind == BanKind.Account && reason.isBlank() && FirebaseAuth.getInstance().currentUser == null) {
+                /*
+                 * QA #55: reached from a sign-in Firebase refused (a disabled
+                 * login) where the reason could not be proved to belong to this
+                 * person — no quick-login key for this account on this phone.
+                 * Say where the reason is, rather than leave a bare wall.
+                 */
+                Spacer(Modifier.height(Space.md))
+                Text(
+                    com.zipper.app.util.DisabledSignIn.REASON_ELSEWHERE,
+                    style = ZipperTheme.type.bodyS,
+                    color = c.textMuted,
+                    textAlign = TextAlign.Center,
+                )
+            }
 
             if (kind == BanKind.Device) {
                 /*
@@ -283,8 +300,8 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
                 WebAppealCard(accountId = PublicAppeal.accountIdToShow(null))
                 Spacer(Modifier.height(Space.md))
                 Text(
-                    "You can also write to support@zipperlive.app from the email address or " +
-                        "phone number on the account. A person reads it.",
+                    "You can also write to ${com.zipper.app.util.ZipperContacts.SUPPORT} from the email " +
+                        "address or phone number on the account. A person reads it.",
                     style = ZipperTheme.type.caption, color = c.textMuted,
                     textAlign = TextAlign.Center,
                 )
@@ -551,7 +568,7 @@ internal fun AppealPanel(viewModel: BannedViewModel = hiltViewModel()) {
             WebAppealCard(accountId = PublicAppeal.accountIdToShow(FirebaseAuth.getInstance().currentUser?.uid))
             Spacer(Modifier.height(Space.md))
             Text(
-                "You can also write to support@zipperlive.app",
+                "You can also write to ${com.zipper.app.util.ZipperContacts.SUPPORT}",
                 style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center,
             )
         }

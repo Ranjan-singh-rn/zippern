@@ -15,6 +15,7 @@ import {
 import AnimationThumb from '@/components/AnimationThumb'
 import BagItemThumb from '@/components/BagItemThumb'
 import UserSearchPicker from '@/components/UserSearchPicker'
+import { bagItemWrite, frameScaleOf, svgaKeyOk, FRAME_SCALE_DEFAULT } from '@/lib/decorAssets'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +87,7 @@ const HOST_LEVELS  = Array.from({ length: 11 }, (_, i) => i)   // 0–10
 // ── Row component ─────────────────────────────────────────────────────────────
 
 type PatchableField = 'unlockLevel' | 'minHostLevel' | 'source' | 'previewUrl' | 'price' | 'animationUrl' | 'targetGender' | 'targetRole' | 'targetUserId'
+  | 'svgaUrl' | 'videoUrl' | 'svgaAvatarKey' | 'svgaNameKey' | 'frameScale'
 
 function ItemRow({
   item,
@@ -115,9 +117,10 @@ function ItemRow({
     setEditingUrl(false)
   }
 
-  // ALL categories support animation (Lottie JSON or SVGA).
-  const hasAnimation = !!(item.animationUrl || item.animationAsset)
-  const animationSrc = item.animationUrl || item.animationAsset || ''
+  // B13: the app plays the SVGA (svgaUrl) first; animationUrl is the old Lottie, kept for rollback only.
+  const animationSrc = item.svgaUrl || item.animationUrl || item.animationAsset || ''
+  const hasAnimation = !!animationSrc
+  const [scaleDraft, setScaleDraft] = useState(String(item.frameScale ?? FRAME_SCALE_DEFAULT))
 
   return (
     <tr className={`border-b border-slate-800 transition-colors ${isDirty ? 'bg-yellow-500/5' : 'hover:bg-slate-800/40'}`}>
@@ -178,20 +181,63 @@ function ItemRow({
                     {animationSrc.includes('.svga') ? '📦 SVGA' : '🎬 Lottie'}
                   </p>
                 )}
-                {/* Animation URL editor for non-entrance categories */}
-                {item.category !== 'entrance' && (
-                  <div className="mt-2 pt-2 border-t border-slate-700">
+                {/* B13: what the app plays — SVGA for every category, MP4 for entrances */}
+                <div className="mt-2 pt-2 border-t border-slate-700 space-y-2">
+                  <UploadField
+                    label="SVGA animation"
+                    value={item.svgaUrl || ''}
+                    onChange={url => onChange('svgaUrl', url)}
+                    storagePath={`contentAssets/bag_items/${item.category}/${item.id}/svga`}
+                    accept=".svga"
+                    hint="What the app plays. Transparent, so it sits over live video."
+                    maxSizeMb={5}
+                  />
+                  {item.category === 'entrance' && (
+                    <>
+                      <UploadField
+                        label="MP4 (fallback)"
+                        value={item.videoUrl || ''}
+                        onChange={url => onChange('videoUrl', url)}
+                        storagePath={`contentAssets/bag_items/${item.category}/${item.id}/video`}
+                        accept="video/mp4"
+                        hint="Played only when there is no SVGA."
+                        maxSizeMb={15}
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="text-[10px] text-slate-400">Photo layer
+                          <input value={item.svgaAvatarKey ?? ''} placeholder="avatar"
+                            onChange={e => onChange('svgaAvatarKey', e.target.value.trim())}
+                            className={`mt-0.5 w-full bg-slate-900 border rounded px-1.5 py-1 text-[11px] text-white ${svgaKeyOk(item.svgaAvatarKey ?? '') ? 'border-slate-600' : 'border-red-500'}`} />
+                        </label>
+                        <label className="text-[10px] text-slate-400">Name layer
+                          <input value={item.svgaNameKey ?? ''} placeholder="name"
+                            onChange={e => onChange('svgaNameKey', e.target.value.trim())}
+                            className={`mt-0.5 w-full bg-slate-900 border rounded px-1.5 py-1 text-[11px] text-white ${svgaKeyOk(item.svgaNameKey ?? '') ? 'border-slate-600' : 'border-red-500'}`} />
+                        </label>
+                      </div>
+                      <p className="text-[10px] text-slate-500">The layers the app swaps for the arriving user&apos;s photo and name. tools/decor/inspect.py lists them for a bought file.</p>
+                    </>
+                  )}
+                  {item.category === 'frame' && (
+                    <label className="block text-[10px] text-slate-400">Frame size × photo (1.0–2.5)
+                      <input value={scaleDraft} inputMode="decimal"
+                        onChange={e => setScaleDraft(e.target.value)}
+                        onBlur={() => { const v = frameScaleOf(scaleDraft); if (v === null) { setScaleDraft(String(item.frameScale ?? FRAME_SCALE_DEFAULT)) } else { setScaleDraft(String(v)); onChange('frameScale', v) } }}
+                        className="mt-0.5 w-full bg-slate-900 border border-slate-600 rounded px-1.5 py-1 text-[11px] text-white" />
+                    </label>
+                  )}
+                  {item.category !== 'entrance' && (
                     <UploadField
-                      label="Animation"
+                      label="Lottie (legacy)"
                       value={item.animationUrl || ''}
                       onChange={url => onChange('animationUrl', url)}
                       storagePath={`contentAssets/bag_items/${item.category}/${item.id}`}
-                      accept=".json,.svga,video/mp4,application/json"
-                      hint="Lottie JSON, SVGA, or an MP4."
+                      accept=".json,application/json"
+                      hint="Old format, kept for rollback — the app plays the SVGA above."
                       maxSizeMb={25}
                     />
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             )}
 
@@ -396,23 +442,15 @@ export default function BagItemsConfigPage() {
   async function saveItem(id: string) {
     const item = items.find(it => it.id === id)
     if (!item) return
+    if (!svgaKeyOk(item.svgaAvatarKey ?? '') || !svgaKeyOk(item.svgaNameKey ?? '')) {
+      showToast('err', `${item.name}: a layer name may only use letters, digits, _ . -`)
+      return
+    }
     setSaving(s => ({ ...s, [id]: true }))
     try {
-      await setDoc(doc(db, 'bagItems', id), {
-        name:           item.name,
-        category:       item.category,
-        previewUrl:     item.previewUrl,
-        unlockLevel:    item.unlockLevel,
-        minHostLevel:   item.minHostLevel,
-        price:          item.price,
-        source:         item.source,
-        animationAsset: item.animationAsset,
-        animationUrl:   item.animationUrl ?? '',
-        targetGender:   item.targetGender  ?? 'all',
-        targetRole:     item.targetRole    ?? 'all',
-        targetUserId:   item.targetUserId  ?? '',
-        isActive:       item.isActive,
-      })
+      // B13: MERGE. A plain setDoc replaced the document and deleted every field this page does not show —
+      // `durations` (the timed prices purchaseBagItem sells from) and `videoUrl` (MP4 entrances from the upload script).
+      await setDoc(doc(db, 'bagItems', id), bagItemWrite(item), { merge: true })
       setDirty(prev => { const s = new Set(prev); s.delete(id); return s })
     } catch { showToast('err', 'Failed to save.') } finally {
       setSaving(s => ({ ...s, [id]: false }))

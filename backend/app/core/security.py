@@ -577,6 +577,28 @@ async def list_sessions(uid: str, *, current_jti: str = "") -> list[dict]:
 # a password — which is the correct end of "and if expire also… asking relogin".
 
 
+#: QA #44 — the refusal for an inactive STAFF login names which kind of
+#: inactive it is (`services/staff.py` status model). A suspension is
+#: reversible; "deactivated" read as final to a suspended member of staff.
+STAFF_SUSPENDED_MESSAGE = (
+    "Your staff access is suspended. An Owner can restore it. "
+    "Your personal Zipper app account is not affected."
+)
+STAFF_DEACTIVATED_MESSAGE = "This account has been deactivated."
+
+
+def inactive_staff_message(staff: Mapping) -> str:
+    """The sentence for a staff row with `is_active` false (pure).
+
+    `status` says which kind of inactive; a legacy row without one, or with
+    anything unrecognised, reads as deactivated — exactly as
+    `services.staff.status_of` reads it.
+    """
+    if str((staff or {}).get("status") or "") == "suspended":
+        return STAFF_SUSPENDED_MESSAGE
+    return STAFF_DEACTIVATED_MESSAGE
+
+
 async def renew_session(token: str, *, ip: str | None = None) -> tuple[str, datetime, dict]:
     """Replace a live or recently expired session with a fresh one.
 
@@ -657,7 +679,7 @@ async def renew_session(token: str, *, ip: str | None = None) -> tuple[str, date
 
     if staff is not None:
         if not staff.get("is_active", True):
-            raise AuthError("This account has been deactivated.")
+            raise AuthError(inactive_staff_message(staff))
         await _refuse_restricted_app_account(uid)
 
         current = Role(staff["role"])
@@ -1063,7 +1085,7 @@ async def sign_in_with_firebase(
         # deliberate — they get an internal session with no partner scope on it,
         # and read their own agency the way any other staff member does.
         if not staff.get("is_active", True):
-            raise AuthError("This account has been deactivated.")
+            raise AuthError(inactive_staff_message(staff))
         await _refuse_restricted_app_account(uid)
 
         role = Role(staff["role"])

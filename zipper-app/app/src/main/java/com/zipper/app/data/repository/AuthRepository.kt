@@ -3,6 +3,7 @@ package com.zipper.app.data.repository
 import android.content.Context
 import android.net.Uri
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.PhoneAuthCredential
@@ -143,8 +144,25 @@ sealed class ReferralResult {
      * `applicationId` were travelling through the UI purely so the client could
      * write them back to Firestore, which it may no longer do.
      */
-    data class Valid(val agencyName: String) : ReferralResult()
+    data class Valid(
+        val agencyName: String,
+        /** QA #51: contacts still to verify before the Host role can start ("phone" / "email"). */
+        val needsVerification: List<String> = emptyList(),
+        /** QA #51: the masked value the agency registered for each of them. */
+        val contactHint: Map<String, String> = emptyMap(),
+    ) : ReferralResult()
     data class Error(val message: String) : ReferralResult()
+}
+
+/**
+ * QA #51 — what redeeming an agency code came to. Only [Started] made this
+ * account a Host; [Awaiting] means the invitation is now theirs and the role
+ * starts by itself once the [Awaiting.missing] contacts are verified.
+ */
+sealed class HostActivationOutcome {
+    object Started : HostActivationOutcome()
+    data class Awaiting(val missing: List<String>, val contactHint: Map<String, String>) : HostActivationOutcome()
+    data class Failed(val message: String) : HostActivationOutcome()
 }
 
 @Singleton
@@ -199,13 +217,94 @@ class AuthRepository @Inject constructor(
         PhoneAuthProvider.verifyPhoneNumber(options)
     }
 
-    suspend fun verifyOtp(verificationId: String, code: String, deviceId: String = ""): AuthResult {
+    /**
+     * [phone] is the number the code was sent to (QA #55): when Firebase refuses
+     * the sign-in because the login is disabled, it is what tells the server
+     * which account was tried — see [restrictionAfterDisabledSignIn].
+     */
+    suspend fun verifyOtp(verificationId: String, code: String, deviceId: String = "", phone: String = ""): AuthResult {
         return try {
             val credential = PhoneAuthProvider.getCredential(verificationId, code)
-            signInWithCredential(credential, deviceId)
+            signInWithCredential(credential, deviceId, phone)
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "OTP verification failed")
         }
+    }
+
+    /**
+     * QA #31: every sign-out the app makes on purpose goes through here, so
+     * `SessionViewModel`'s Firebase listener can tell it from a session Firebase
+     * ended on its own (`AuthLoss`) — only the second sends somebody to Login
+     * with "Your session has expired".
+     */
+    private fun signOutFirebase() {
+        com.zipper.app.util.AuthLoss.expect()
+        auth.signOut()
+    }
+
+    /**
+     * QA #55 — Firebase refused a sign-in because the login is switched off,
+     * which only a ban does. The person used to read Firebase's own sentence
+     * ("The user account has been disabled by an administrator.") with no
+     * reason and no way to appeal.
+     *
+     * The login stays disabled; nothing here signs anybody in. If this handset
+     * holds a quick-login key, the server is asked — with a signature from it —
+     * what happened to the account just tried ([phone] / [email]), and answers
+     * only when the key's account IS that one. The result is the Banned (or
+     * Suspended) screen, with the reason when it could be proved, and with the
+     * appeals that do not need the key when it could not.
+     */
+    private suspend fun restrictionAfterDisabledSignIn(deviceId: String, phone: String, email: String): AuthResult {
+        try { signOutFirebase() } catch (_: Exception) {}
+        com.zipper.app.util.PublicAppeal.forgetRestrictedUid()
+        getDeviceBanReason(deviceId)?.let { return AuthResult.Banned(it, RestrictionKind.Device) }
+
+        /*
+         * B10: this handset may remember several accounts. Each key-signed question names ONE credential, and the
+         * server answers `other_account` unless that credential's account is the sign-in just tried — so ask for
+         * each remembered account in turn (most recent first, at most [QuickLoginStore.MAX_ACCOUNTS]) and stop at
+         * the first that is not somebody else's. A refused or failed question for one account moves on to the next;
+         * nothing here signs anybody in or forgets anything.
+         */
+        val notice: MoneyFunctions.RestrictionNotice? = try {
+            val candidates = if (deviceKey.hasKey()) {
+                quickLogin.loadAll().ifEmpty { listOfNotNull(quickLogin.load()) }
+            } else emptyList()
+            var found: MoneyFunctions.RestrictionNotice? = null
+            for (saved in candidates.take(QuickLoginStore.MAX_ACCOUNTS)) {
+                val challenge = (money.quickLoginChallenge() as? MoneyFunctions.Result.Ok)?.value ?: break
+                val signature = challenge.challenge.takeIf { it.isNotBlank() }?.let { deviceKey.sign(it) } ?: break
+                val answer = (money.quickLoginRestriction(
+                    token = saved.token,
+                    challengeId = challenge.challengeId,
+                    signature = signature,
+                    deviceId = deviceId,
+                    phone = phone,
+                    email = email,
+                ) as? MoneyFunctions.Result.Ok)?.value ?: continue
+                if (answer.outcome != "other_account") { found = answer; break }
+                found = answer   // remembered, so "none of these" still reads as other_account
+            }
+            found
+        } catch (_: Exception) {
+            null
+        }
+
+        val v = com.zipper.app.util.DisabledSignIn.verdict(
+            outcome = notice?.outcome,
+            uid = notice?.uid.orEmpty(),
+            reason = notice?.reason.orEmpty(),
+            message = notice?.message.orEmpty(),
+            suspendedUntilMs = notice?.suspendedUntilMs,
+        )
+        com.zipper.app.util.PublicAppeal.lastRestrictedUid = v.uid
+        com.zipper.app.util.PublicAppeal.deviceKeyAppealAllowed = v.deviceKeyAppeal
+        return AuthResult.Banned(
+            reason = v.reason,
+            kind = v.kind,
+            untilMillis = v.untilMillis,
+        )
     }
 
     // ── Session token ─────────────────────────────────────────────────────────
@@ -306,7 +405,7 @@ class AuthRepository @Inject constructor(
                 if (auth.currentUser?.isAnonymous == true) {
                     mintQuickLoginCredential(deviceId)
                 } else {
-                    try { auth.signOut() } catch (_: Exception) {}
+                    try { signOutFirebase() } catch (_: Exception) {}
                     sessionManager.clear()
                 }
                 /*
@@ -379,6 +478,9 @@ class AuthRepository @Inject constructor(
                         token = res.value.token,
                         displayName = res.value.displayName,
                         photoUrl = res.value.photoUrl,
+                        // B10: whose it is, so the account switcher can list every account on this device.
+                        uid = auth.currentUser?.uid.orEmpty(),
+                        savedAtMs = System.currentTimeMillis(),
                     ),
                 )
                 is MoneyFunctions.Result.Failed -> Unit
@@ -399,6 +501,75 @@ class AuthRepository @Inject constructor(
      */
     suspend fun savedQuickLogin(): QuickLoginStore.Saved? =
         if (deviceKey.hasKey()) quickLogin.load() else null
+
+    /**
+     * B10: every account remembered on this device, most recently used first — the account switcher's and the
+     * login screen's list. Empty without a device key, for the reason above: a credential nothing can sign for is
+     * not an offer. A blob saved before B10 carries no uid; it is offered on its own (as the one button always
+     * was) until its first redemption files it under its account.
+     *
+     * Views only — names, photos and IDs. The secrets stay in here ([SavedAccount] has no token).
+     */
+    suspend fun savedAccounts(): List<SavedAccount> {
+        if (!deviceKey.hasKey()) return emptyList()
+        val all = quickLogin.loadAll().ifEmpty { listOfNotNull(quickLogin.load()) }
+        return SavedAccount.rowsOf(all, currentUid = auth.currentUser?.uid)
+    }
+
+    /** B10: whoever is signed in now, or null. */
+    fun currentUid(): String? = auth.currentUser?.uid
+
+    /**
+     * B10 — "Remove" in the account switcher and on the login screen: this device forgets ONE account.
+     *
+     * The server forgets it too, with the same proof redemption takes (the secret and a signature from this
+     * handset's key over a fresh challenge — `forgetQuickLogin`), so the credential is dead everywhere rather than
+     * merely lost here. That works for any remembered account, signed in or not. Best-effort: offline, the local
+     * copy still goes, and the server's copy can never be used without it (the secret exists only here) and
+     * expires on its own. The other accounts are untouched; [uid] "" is the one blob saved before B10.
+     */
+    suspend fun forgetSavedAccount(deviceId: String, uid: String) {
+        val saved = try {
+            if (uid.isNotBlank()) quickLogin.loadFor(uid) else quickLogin.load()?.takeIf { it.uid.isBlank() }
+        } catch (_: Exception) { null }
+        if (saved != null && deviceKey.hasKey()) {
+            try {
+                withTimeoutOrNull(SIGN_OUT_STEP_TIMEOUT_MS) {
+                    val challenge = (money.quickLoginChallenge() as? MoneyFunctions.Result.Ok)?.value
+                    val signature = challenge?.challenge?.takeIf { it.isNotBlank() }?.let { deviceKey.sign(it) }
+                    if (challenge != null && signature != null) {
+                        money.forgetQuickLogin(saved.token, challenge.challengeId, signature, deviceId)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        if (uid.isNotBlank()) quickLogin.remove(uid) else quickLogin.forgetUnfiled()
+    }
+
+    /**
+     * B10 — switch to another account this device remembers, without the visual sign-in flow.
+     *
+     * The ORDER is the safety: the other account's credential is redeemed first, while the current account stays
+     * signed in. Only when the server has said yes — a session, not a ban, a suspension, an expiry or a refusal —
+     * is the current account signed out, by the ordinary sign-out ([signOut]: its own quick-login credential is
+     * minted on the way out, its server session closed, its push token dropped), and the new session opened. A
+     * refused switch therefore leaves the person exactly where they were, and no switch ever signs an account out
+     * of being one tap away.
+     *
+     * Every check an ordinary quick sign-in makes still runs for the new account (device bar, key signature,
+     * account state, identity gate, the one-session record), because this IS that sign-in.
+     */
+    suspend fun switchToAccount(deviceId: String, targetUid: String): AuthResult {
+        val current = auth.currentUser?.uid
+        if (targetUid.isBlank()) return AuthResult.Error("Choose an account.")
+        if (current == targetUid) return AuthResult.Error(SavedAccount.ALREADY_SIGNED_IN)
+        return signInWithQuickLogin(
+            deviceId = deviceId,
+            accountUid = targetUid,
+            beforeSignIn = if (current != null) ({ signOut(deviceId) }) else null,
+        )
+    }
 
     /**
      * Sign in from the saved credential.
@@ -429,6 +600,14 @@ class AuthRepository @Inject constructor(
      */
     suspend fun signInWithQuickLogin(
         deviceId: String,
+        /** B10: sign in as THIS remembered account (the switcher); null = the most recent one (the login button). */
+        accountUid: String? = null,
+        /**
+         * B10: run after the server has granted the session and before it is opened — the switcher's sign-out of
+         * the account it is leaving. Never run for a refusal, a ban or a suspension, so those leave whoever is
+         * signed in untouched.
+         */
+        beforeSignIn: (suspend () -> Unit)? = null,
         /**
          * FX-15: asked with the recovered uid AFTER the credential is redeemed
          * and BEFORE anything is started for the account — no gate, no
@@ -438,6 +617,8 @@ class AuthRepository @Inject constructor(
          * only after `startMobileSession` had already displaced the saved
          * account's other phone and revoked that phone's quick-login
          * credential (RF-29).
+         *
+         * Kept LAST (B10): the guest path passes it as a trailing lambda.
          */
         beforeSession: (suspend (uid: String) -> AuthResult?)? = null,
     ): AuthResult {
@@ -445,7 +626,8 @@ class AuthRepository @Inject constructor(
         // not this attempt's to show.
         com.zipper.app.util.PublicAppeal.forgetRestrictedUid()
         signInSerial.incrementAndGet()   // B11 — see signOut
-        val saved = quickLogin.load() ?: return AuthResult.Error("Nothing saved on this device.")
+        val saved = (if (accountUid != null) quickLogin.loadFor(accountUid) else quickLogin.load())
+            ?: return AuthResult.Error("Nothing saved on this device.")
 
         getDeviceBanReason(deviceId)?.let { return AuthResult.Banned(it, RestrictionKind.Device) }
 
@@ -512,7 +694,7 @@ class AuthRepository @Inject constructor(
                 )
             ) {
                 is MoneyFunctions.Result.Ok -> res.value
-                is MoneyFunctions.Result.Failed -> return refuseQuickLogin(res)
+                is MoneyFunctions.Result.Failed -> return refuseQuickLogin(res, saved.uid)
             }
 
             /*
@@ -537,6 +719,11 @@ class AuthRepository @Inject constructor(
             val restriction = com.zipper.app.util.AppealRoute.kindOfOutcome(value.outcome)
                 ?.takeIf { it == RestrictionKind.Suspension || it == RestrictionKind.Account }
             if (restriction != null) {
+                // B10: a blob saved before B10 learns whose it is here (no rotation on this path), so the appeal
+                // that follows signs with THIS account's credential and the switcher can list it.
+                if (saved.uid.isBlank() && value.uid.isNotBlank()) {
+                    try { quickLogin.save(saved.copy(uid = value.uid, savedAtMs = System.currentTimeMillis())) } catch (_: Exception) {}
+                }
                 // UGP-F: the restriction screen shows this account's ID for the
                 // public web appeal — the device has just proved itself, and it
                 // is the person's own account. In memory only.
@@ -564,9 +751,14 @@ class AuthRepository @Inject constructor(
                         token = value.token,
                         displayName = value.displayName.ifBlank { saved.displayName },
                         photoUrl = value.photoUrl.ifBlank { saved.photoUrl },
+                        uid = value.uid.ifBlank { saved.uid },
+                        savedAtMs = System.currentTimeMillis(),
                     ),
                 )
             }
+
+            // B10: the switcher signs the account it is leaving out here — only now that this one is granted.
+            if (beforeSignIn != null) beforeSignIn()
 
             auth.signInWithCustomToken(value.customToken).await()
             opened = true
@@ -578,7 +770,7 @@ class AuthRepository @Inject constructor(
                     // Nothing was started for this account, so there is nothing
                     // to end; the rotated credential is already saved above, so
                     // the saved-account button still works.
-                    try { auth.signOut() } catch (_: Exception) {}
+                    try { signOutFirebase() } catch (_: Exception) {}
                     sessionManager.clear()
                     opened = false
                     return refusal
@@ -659,7 +851,7 @@ class AuthRepository @Inject constructor(
      *                                          attempts into a permanent loss
      *   unreachable server                   → KEPT. Obviously
      */
-    private suspend fun refuseQuickLogin(res: MoneyFunctions.Result.Failed): AuthResult {
+    private suspend fun refuseQuickLogin(res: MoneyFunctions.Result.Failed, savedUid: String = ""): AuthResult {
         if (res.detail.isNotBlank()) {
             return when (res.detail) {
                 "device_banned" ->
@@ -690,16 +882,14 @@ class AuthRepository @Inject constructor(
                     // salvaged: the credential was minted before device keys
                     // existed, so no proof of possession can be constructed for
                     // it after the fact. One ordinary sign-in replaces it.
-                    quickLogin.clear()
+                    forgetRefused(savedUid)
                     AuthResult.Error(res.userMessage)
                 }
 
                 "deleted", "refused" -> {
-                    quickLogin.clear()
-                    AuthResult.Error(
-                        "That saved sign-in is no longer valid, so it has been " +
-                            "removed. Sign in to continue.",
-                    )
+                    forgetRefused(savedUid)
+                    // QA #37: the reason, shown in Login's banner (not a snackbar).
+                    AuthResult.Error(com.zipper.app.util.QuickLoginNotice.REMOVED)
                 }
 
                 // An outcome this build does not know. Report it, keep the
@@ -720,14 +910,24 @@ class AuthRepository @Inject constructor(
         if (res.code !in DEFINITIVE_TOKEN_REFUSALS) {
             return AuthResult.Error(res.userMessage)
         }
-        quickLogin.clear()
+        forgetRefused(savedUid)
         val generic = res.userMessage.contains("expired", ignoreCase = true) ||
             res.userMessage.isBlank()
+        // QA #37: the same removal as the `deleted` / `refused` arm above, so
+        // the same reason — in Login's banner, not a passing snackbar.
         return AuthResult.Error(
-            if (generic) "That saved sign-in is no longer valid, so it has been " +
-                "removed. Sign in to continue."
+            if (generic) com.zipper.app.util.QuickLoginNotice.REMOVED
             else res.userMessage,
         )
+    }
+
+    /**
+     * B10: forget the ONE credential the server disowned — [savedUid]'s, or the single blob saved before B10 when
+     * it has no uid yet. Never the other accounts this device remembers: one account's expiry, deletion or
+     * opening on another phone says nothing about them.
+     */
+    private suspend fun forgetRefused(savedUid: String) {
+        if (savedUid.isNotBlank()) quickLogin.remove(savedUid) else quickLogin.forgetUnfiled()
     }
 
     /**
@@ -1223,7 +1423,7 @@ class AuthRepository @Inject constructor(
      */
     private suspend fun adoptSameUidSession(customToken: String) {
         val current = auth.currentUser?.uid ?: return
-        if (com.zipper.app.util.CustomTokens.uidOf(customToken) != current) return
+        if (!com.zipper.app.util.CustomTokens.adoptable(customToken, current)) return
         try {
             val res = auth.signInWithCustomToken(customToken).await()
             if (res.user?.uid != current) {
@@ -1238,6 +1438,8 @@ class AuthRepository @Inject constructor(
     private suspend fun signInWithCredential(
         credential: PhoneAuthCredential,
         deviceId: String = "",
+        /** QA #55: the number the code went to — see [restrictionAfterDisabledSignIn]. */
+        phone: String = "",
     ): AuthResult {
         signInSerial.incrementAndGet()   // B11 — see signOut
         return try {
@@ -1292,6 +1494,13 @@ class AuthRepository @Inject constructor(
             else {
                 val snap = firestore.collection("users").document(uid).get().await()
                 routeSignIn(snap.getBoolean("isProfileComplete") == true)
+            }
+        } catch (e: FirebaseAuthInvalidUserException) {
+            // QA #55: a disabled login is a ban — the Banned screen, not Firebase's sentence.
+            if (com.zipper.app.util.DisabledSignIn.isAccountDisabled(e.errorCode)) {
+                restrictionAfterDisabledSignIn(deviceId, phone, "")
+            } else {
+                AuthResult.Error(e.message ?: "Sign in failed")
             }
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Sign in failed")
@@ -1360,7 +1569,7 @@ class AuthRepository @Inject constructor(
                     )
                 }
                 if (step == GoogleAdoption.Step.FailClosed) {
-                    try { auth.signOut() } catch (_: Exception) {}
+                    try { signOutFirebase() } catch (_: Exception) {}
                     return AuthResult.Error(GoogleAdoption.COULD_NOT_CHECK)
                 }
                 if (step == GoogleAdoption.Step.Adopt && adopted != null) {
@@ -1442,12 +1651,20 @@ class AuthRepository @Inject constructor(
              * Phone OTP is offered as the immediate way in because linking
              * makes the number resolve to that same account too.
              */
-            try { auth.signOut() } catch (_: Exception) {}
+            try { signOutFirebase() } catch (_: Exception) {}
             AuthResult.IdentityTaken(
                 "This email already belongs to a Zipper account that signs in a " +
                 "different way. Sign in with that account's phone number, or " +
                 "contact support to reach it."
             )
+        } catch (e: FirebaseAuthInvalidUserException) {
+            // QA #55: as for a phone sign-in — the e-mail in Google's ID token is
+            // the account that was tried.
+            if (com.zipper.app.util.DisabledSignIn.isAccountDisabled(e.errorCode)) {
+                restrictionAfterDisabledSignIn(deviceId, "", com.zipper.app.util.JwtClaims.string(idToken, "email"))
+            } else {
+                AuthResult.Error(e.message ?: "Google sign-in failed")
+            }
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Google sign-in failed")
         }
@@ -1588,7 +1805,11 @@ class AuthRepository @Inject constructor(
                  * result is known.
                  */
                 var check: BindingCheck = BindingCheck.Agrees
-                val resumed = signInWithQuickLogin(deviceId) { recovered ->
+                // B10: with several accounts remembered here, try the device's own guest account (FX-21 remembers
+                // its uid) rather than whichever account was used last; the binding check below still decides.
+                val guestUid = deviceGuestUid()
+                val guestSaved = guestUid.isNotBlank() && try { quickLogin.loadFor(guestUid) != null } catch (_: Exception) { false }
+                val resumed = signInWithQuickLogin(deviceId, accountUid = if (guestSaved) guestUid else null) { recovered ->
                     check = if (recovered.isEmpty()) BindingCheck.Agrees
                         else confirmDeviceBinding(deviceId, secret, recovered)
                     when (val c = check) {
@@ -1840,9 +2061,10 @@ class AuthRepository @Inject constructor(
     private suspend fun discardUnboundGuest(uid: String) {
         val doomed = auth.currentUser?.takeIf { it.uid == uid && it.isAnonymous } ?: return
         try {
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: deleting the login signs it out
             doomed.delete().await()
         } catch (_: Exception) {
-            try { auth.signOut() } catch (_: Exception) {}
+            try { signOutFirebase() } catch (_: Exception) {}
         }
     }
 
@@ -2053,7 +2275,7 @@ class AuthRepository @Inject constructor(
                     // Make sure there is a way back in before refusing entry.
                     mintQuickLoginCredential(deviceId)
                 } else {
-                    try { auth.signOut() } catch (_: Exception) {}
+                    try { signOutFirebase() } catch (_: Exception) {}
                     sessionManager.clear()
                 }
                 return AuthResult.Error(
@@ -2072,10 +2294,13 @@ class AuthRepository @Inject constructor(
              * without deleting it would leave exactly the account that must not
              * exist, and the next attempt would find it and behave differently.
              */
+            val deadUid = auth.currentUser?.uid.orEmpty()   // B10: read before the login goes
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: deleting the login signs it out
             try { auth.currentUser?.delete()?.await() } catch (_: Exception) {}
-            try { auth.signOut() } catch (_: Exception) {}
+            try { signOutFirebase() } catch (_: Exception) {}
             sessionManager.clear()
-            quickLogin.clear()
+            // B10: only the login that must not exist is forgotten — not the other accounts on this device.
+            forgetRefused(deadUid)
             return AuthResult.ObserverDenied
         }
 
@@ -2114,7 +2339,7 @@ class AuthRepository @Inject constructor(
          * signs up as a genuinely new one.
          */
         if (com.zipper.app.util.DeletionWindow.endsAccount(id.decision)) {
-            try { auth.signOut() } catch (_: Exception) {}
+            try { signOutFirebase() } catch (_: Exception) {}
             sessionManager.clear()
             return AuthResult.AccountDeleted(com.zipper.app.util.DeletionWindow.ACCOUNT_DELETED)
         }
@@ -2130,7 +2355,7 @@ class AuthRepository @Inject constructor(
             if (auth.currentUser?.isAnonymous == true) {
                 mintQuickLoginCredential(deviceId)
             } else {
-                try { auth.signOut() } catch (_: Exception) {}
+                try { signOutFirebase() } catch (_: Exception) {}
                 sessionManager.clear()
             }
             return AuthResult.Error(SignInRouting.UNKNOWN_GATE_ANSWER)
@@ -2479,6 +2704,7 @@ class AuthRepository @Inject constructor(
         val uid = auth.currentUser?.uid ?: return AuthResult.Error("Not logged in")
         return try {
             firestore.collection("users").document(uid).delete().await()
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: deleting the login signs it out
             auth.currentUser?.delete()?.await()
             AuthResult.Success
         } catch (e: Exception) {
@@ -2496,10 +2722,12 @@ class AuthRepository @Inject constructor(
             try { storage.reference.child("profileMedia/$uid/avatar.jpg").delete().await() } catch (_: Exception) {}
             try { storage.reference.child("face_verifications/$uid.jpg").delete().await() } catch (_: Exception) {}
             // Delete Auth account last
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: deleting the login signs it out
             auth.currentUser?.delete()?.await()
             AuthResult.Success
         } catch (e: Exception) {
             // Even if Firestore delete failed, try to delete auth account
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: deleting the login signs it out
             try { auth.currentUser?.delete()?.await() } catch (_: Exception) {}
             AuthResult.Error(e.message ?: "Cleanup failed")
         }
@@ -2555,7 +2783,7 @@ class AuthRepository @Inject constructor(
     ): ReferralResult = when (
         val res = hostFunctions.checkReferralCode(code, overridePhone, overrideEmail)
     ) {
-        is HostFunctions.CodeCheck.Valid -> ReferralResult.Valid(res.agencyName)
+        is HostFunctions.CodeCheck.Valid -> ReferralResult.Valid(res.agencyName, res.needsVerification, res.contactHint)
         is HostFunctions.CodeCheck.Invalid -> when (res.reason) {
             HostFunctions.ReferralRefusal.NOT_FOUND       -> ReferralResult.NotFound
             HostFunctions.ReferralRefusal.ALREADY_USED    -> ReferralResult.AlreadyUsed
@@ -2592,6 +2820,11 @@ class AuthRepository @Inject constructor(
                     "Your Host role is suspended. It comes back when it is resumed — a referral code does not change that."
                 }
             )
+            // QA #51: the agency stopped taking hosts (or its code changed) —
+            // the server's own sentence.
+            HostFunctions.ReferralRefusal.AGENCY_INACTIVE -> ReferralResult.Error(
+                res.message.ifBlank { "This agency is not currently accepting hosts." }
+            )
             HostFunctions.ReferralRefusal.UNKNOWN         -> ReferralResult.Error("That code could not be used.")
         }
         is HostFunctions.CodeCheck.Failed -> ReferralResult.Error(res.message)
@@ -2612,10 +2845,15 @@ class AuthRepository @Inject constructor(
         referralCode: String,
         phone: String = "",
         email: String = "",
-    ): AuthResult =
+    ): HostActivationOutcome =
         when (val res = hostFunctions.activateHost(referralCode, phone, email)) {
-            is HostFunctions.Result.Ok -> AuthResult.Success
-            is HostFunctions.Result.Failed -> AuthResult.Error(res.userMessage)
+            is HostFunctions.Result.Ok ->
+                if (res.value.awaitingVerification) {
+                    HostActivationOutcome.Awaiting(res.value.missing, res.value.contactHint)
+                } else {
+                    HostActivationOutcome.Started
+                }
+            is HostFunctions.Result.Failed -> HostActivationOutcome.Failed(res.userMessage)
         }
 
     /**
@@ -2786,8 +3024,15 @@ class AuthRepository @Inject constructor(
             // An account pending deletion must stop ringing this phone. Before
             // the sign-out, while the uid and the auth token still exist.
             com.zipper.app.service.PushNotifications.clearToken(uid)
+            // QA #38, found again in the E2E re-run: the server revokes this
+            // phone's saved sign-in the moment the account is marked deleted
+            // (`revokeQuickLoginOnRestriction`), so a "Continue as" card for it
+            // could only fail. Coming back within the window is an ordinary
+            // sign-in, which offers the account back.
+            // B10: THIS account's saved sign-in only — the other accounts on this device are untouched.
+            try { quickLogin.remove(uid) } catch (_: Exception) {}
             sessionManager.clear()
-            auth.signOut()
+            signOutFirebase()
             AuthResult.Success
         } catch (e: Exception) {
             AuthResult.Error(e.message ?: "Delete request failed")
@@ -2843,7 +3088,7 @@ class AuthRepository @Inject constructor(
             is HostFunctions.Result.Ok -> openRecoveredSession(deviceId)
             is HostFunctions.Result.Failed ->
                 if (com.zipper.app.util.DeletionWindow.isRecoveryExpired(res.detail)) {
-                    try { auth.signOut() } catch (_: Exception) {}
+                    try { signOutFirebase() } catch (_: Exception) {}
                     try { sessionManager.clear() } catch (_: Exception) {}
                     AuthResult.AccountDeleted(com.zipper.app.util.DeletionWindow.ACCOUNT_DELETED)
                 } else {
@@ -2900,6 +3145,9 @@ class AuthRepository @Inject constructor(
         val uid = auth.currentUser?.uid
         return when (val res = hostFunctions.purgeMyAccountNow()) {
             is HostFunctions.Result.Ok -> {
+                // QA #31: the server has just deleted this login. Should Firebase
+                // notice before the sign-out below, the loss is still the app's own.
+                com.zipper.app.util.AuthLoss.expect()
                 // Before the sign-out, while the uid and the token still exist.
                 // The server purge removes the `fcmTokens` subcollection with
                 // the account, but a token already registered with FCM on this
@@ -2907,8 +3155,13 @@ class AuthRepository @Inject constructor(
                 // exists until something unregisters it — and the account it
                 // belonged to is gone, so nothing else ever will.
                 uid?.let { com.zipper.app.service.PushNotifications.clearToken(it) }
+                // QA #38: Login offered "Continue as" the account just deleted.
+                // This phone's saved sign-in was minted for it at sign-in; it
+                // goes with the account. B10: that account's only — never the
+                // other accounts this device remembers.
+                try { uid?.let { quickLogin.remove(it) } } catch (_: Exception) {}
                 sessionManager.clear()
-                auth.signOut()
+                signOutFirebase()
                 AuthResult.Success
             }
             is HostFunctions.Result.Failed -> AuthResult.Error(res.userMessage)
@@ -3083,6 +3336,10 @@ class AuthRepository @Inject constructor(
             // Each on its own: a DataStore failure must not leave the Firebase
             // session signed in behind a logout that reported success.
             try { sessionManager.clear() } catch (_: Exception) {}
+            // The Firebase sign-out itself, here behind the guard (spelled out
+            // rather than through `signOutFirebase()` so the guard is visible
+            // at the call), marked as the app's own like every other.
+            com.zipper.app.util.AuthLoss.expect()   // QA #31: the app's own sign-out
             auth.signOut()
         }
     }
@@ -3158,7 +3415,7 @@ class AuthRepository @Inject constructor(
             }
             if (isCrmAccount) {
                 sessionManager.clear()
-                auth.signOut()
+                signOutFirebase()
                 return AuthResult.Success
             }
 
@@ -3186,21 +3443,34 @@ class AuthRepository @Inject constructor(
                 )
             }
 
-            quickLogin.clear()
-            // The account is being thrown away, so the binding goes with it.
-            // Leaving the key behind would let the NEXT account minted on this
-            // handset inherit a key the discarded one had already registered.
-            deviceKey.clear()
+            /*
+             * B10: the discarded account's credentials go — on the server too, while this login can still ask
+             * (`revokeQuickLogin` with allDevices needs the session) — and its entry here. NOT the other accounts
+             * this device remembers: "Add account" lands on profile setup for a brand-new account, and backing out
+             * of it must not cost the person every other account on the phone.
+             */
+            try { withTimeoutOrNull(SIGN_OUT_STEP_TIMEOUT_MS) { money.revokeQuickLogin(token = "", allDevices = true) } } catch (_: Exception) {}
+            try { quickLogin.remove(uid) } catch (_: Exception) {}
+            // The binding goes with the LAST account it signs for. Leaving the key
+            // behind would let the NEXT account minted on this handset inherit a
+            // key the discarded one had already registered; while other accounts
+            // are remembered here they need it, and the discarded one's credential
+            // is already revoked above.
+            val othersRemembered = try { quickLogin.loadAll().isNotEmpty() } catch (_: Exception) { true }
+            if (!othersRemembered) deviceKey.clear()
             sessionManager.clear()
 
             try {
+                // QA #31: deleting the login signs it out — the app's own doing,
+                // not a lost session ("Your session has expired" on Login).
+                com.zipper.app.util.AuthLoss.expect()
                 user.delete().await()
             } catch (_: Exception) {
                 // Firebase refuses `delete()` on a stale login. Signing out
                 // still gets them back to a clean login screen, and the document
                 // — the part that would have been visible to other people — is
                 // already gone.
-                auth.signOut()
+                signOutFirebase()
             }
             AuthResult.Success
         } catch (e: Exception) {

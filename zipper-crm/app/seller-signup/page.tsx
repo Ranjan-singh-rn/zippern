@@ -59,6 +59,7 @@ import { useState, useRef } from 'react'
 import { auth, db, storage } from '@/lib/firebase'
 import { addDoc, collection, serverTimestamp, doc, updateDoc } from 'firebase/firestore'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
 import { signupDocName } from '@/lib/signupDocName'
 import {
   createPartnerLogin, createSellerAccount, discardPartnerLogin, ensurePartnerEmailVerified,
@@ -76,6 +77,7 @@ import {
 import PhoneInput from '@/components/PhoneInput'
 import { registeredMessage, useRegisteredCheck } from '@/lib/useRegisteredCheck'
 import api from '@/lib/api'
+import { SUPPORT_EMAIL, mailtoHref } from '@/lib/contacts'  // QA #47: the official support address
 
 /** Whether the login was finished, kept separate from "the form was filed". */
 type LoginOutcome =
@@ -196,6 +198,11 @@ export default function SellerSignupPage() {
     setUrl: (s: string) => void,
     setFile: (f: File) => void,
   ) {
+    // QA #29 / #32: clear the last attempt's error; refuse what the Storage
+    // rules would refuse, saying why.
+    setError('')
+    const problem = kycFileProblem(file)
+    if (problem) { setError(problem); return }
     setFile(file)
     setProgress(0)
     const task = uploadBytesResumable(ref(storage, path), file)
@@ -206,11 +213,12 @@ export default function SellerSignupPage() {
         console.error('Upload error:', err)
         setProgress(0)
         setFile(null as unknown as File)
-        setError('Upload failed: ' + (err.message ?? 'Please try again.'))
+        setError(kycUploadErrorText(err))
       },
       async () => {
         try {
           setUrl(await getDownloadURL(task.snapshot.ref))
+          setError('')
         } catch (err: unknown) {
           console.error('getDownloadURL error:', err)
           setProgress(0)
@@ -520,7 +528,7 @@ export default function SellerSignupPage() {
           } catch (undoErr: unknown) {
             setCheckWarning(
               `A login was created for ${emailLower} while checking and could not `
-              + `be removed again: ${errorMessage(undoErr)}. Contact support — `
+              + `be removed again: ${errorMessage(undoErr)}. Write to ${SUPPORT_EMAIL} — `
               + 'nothing else was created.',
             )
           }
@@ -709,10 +717,11 @@ export default function SellerSignupPage() {
             <p className="text-red-100/75 text-sm mt-3">
               Filing a second one does not make it move faster — it puts two of you
               in front of our team, which is what slows a decision down. If the
-              application above was refused, reply to the email we sent you rather
-              than reapplying. If you cannot get into your account, contact{' '}
-              <a href="mailto:support@zipperlive.com" className="text-red-200 underline underline-offset-2 hover:text-white">
-                support@zipperlive.com
+              application above was refused, write to us quoting the reference in the
+              email we sent you, rather than reapplying (replies to that email are not
+              read). If you cannot get into your account, contact{' '}
+              <a href={mailtoHref(SUPPORT_EMAIL)} className="text-red-200 underline underline-offset-2 hover:text-white">
+                {SUPPORT_EMAIL}
               </a>{' '}
               and quote this address.
             </p>
@@ -785,8 +794,8 @@ export default function SellerSignupPage() {
             <p className="text-red-100/75 text-sm mt-2">
               <strong>Do not fill this form in again</strong> — that would file a
               second application and would be refused anyway. Email{' '}
-              <a href="mailto:support@zipperlive.com" className="text-red-200 underline underline-offset-2 hover:text-white">
-                support@zipperlive.com
+              <a href={mailtoHref(SUPPORT_EMAIL)} className="text-red-200 underline underline-offset-2 hover:text-white">
+                {SUPPORT_EMAIL}
               </a>{' '}
               with the reference above and we will attach your login by hand.
             </p>
@@ -815,7 +824,7 @@ export default function SellerSignupPage() {
 
         <p className="text-slate-500 text-sm">
           Questions? Contact us at{' '}
-          <a href="mailto:support@zipperlive.com" className="text-pink-400 hover:underline">support@zipperlive.com</a>
+          <a href={mailtoHref(SUPPORT_EMAIL)} className="text-pink-400 hover:underline">{SUPPORT_EMAIL}</a>
         </p>
       </div>
     )

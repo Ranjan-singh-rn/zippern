@@ -61,6 +61,7 @@ import {
   generateCrmId, partnerSignUpWithGoogle,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
 import { signupDocName } from '@/lib/signupDocName'
 import {
   Upload,
@@ -88,6 +89,7 @@ import {
 } from '@/lib/partnerDuplicates'
 import PhoneInput from '@/components/PhoneInput'
 import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
+import { SUPPORT_EMAIL, mailtoHref } from '@/lib/contacts'  // QA #47: the official support address
 
 /** Whether the login was finished, kept separate from "the form was filed". */
 type LoginOutcome =
@@ -227,6 +229,11 @@ export default function AgencySignupPage() {
     setUrl: (s: string) => void,
     setFile: (f: File) => void,
   ) {
+    // QA #29 / #32: clear the last attempt's error; refuse what the Storage
+    // rules would refuse, saying why.
+    setError('')
+    const problem = kycFileProblem(file)
+    if (problem) { setError(problem); return }
     setFile(file)
     setProgress(0)
     const storageRef  = ref(storage, path)
@@ -238,12 +245,13 @@ export default function AgencySignupPage() {
         console.error('Upload error:', err)
         setProgress(0)
         setFile(null as unknown as File)
-        setError('Upload failed: ' + (err.message ?? 'Please try again.'))
+        setError(kycUploadErrorText(err))
       },
       async () => {
         try {
           const url = await getDownloadURL(uploadTask.snapshot.ref)
           setUrl(url)
+          setError('')
         } catch (err) {
           console.error('getDownloadURL error:', err)
           setProgress(0)
@@ -706,7 +714,7 @@ export default function AgencySignupPage() {
           } catch (undoErr: unknown) {
             setCheckWarning(
               `A login was created for ${emailLower} while checking and could not `
-              + `be removed again: ${errorMessage(undoErr)}. Contact support — `
+              + `be removed again: ${errorMessage(undoErr)}. Write to ${SUPPORT_EMAIL} — `
               + 'nothing else was created.',
             )
           }
@@ -934,10 +942,11 @@ export default function AgencySignupPage() {
             <p className="text-red-100/75 text-sm mt-3">
               Filing a second one does not make it move faster — it puts two of you
               in front of our team, which is what slows a decision down. If the
-              application above was refused, reply to the email we sent you rather
-              than reapplying. If you cannot get into your account, contact{' '}
-              <a href="mailto:314zipper@gmail.com" className="text-red-200 underline underline-offset-2 hover:text-white">
-                314zipper@gmail.com
+              application above was refused, write to us quoting the reference in the
+              email we sent you, rather than reapplying (replies to that email are not
+              read). If you cannot get into your account, contact{' '}
+              <a href={mailtoHref(SUPPORT_EMAIL)} className="text-red-200 underline underline-offset-2 hover:text-white">
+                {SUPPORT_EMAIL}
               </a>{' '}
               and quote this address.
             </p>
@@ -1003,8 +1012,8 @@ export default function AgencySignupPage() {
             <p className="text-red-100/75 text-sm mt-2">
               <strong>Do not fill this form in again</strong> — that would file a
               second application and would be refused anyway. Email{' '}
-              <a href="mailto:314zipper@gmail.com" className="text-red-200 underline underline-offset-2 hover:text-white">
-                314zipper@gmail.com
+              <a href={mailtoHref(SUPPORT_EMAIL)} className="text-red-200 underline underline-offset-2 hover:text-white">
+                {SUPPORT_EMAIL}
               </a>{' '}
               with the reference below and we will attach your login by hand.
             </p>
@@ -1069,7 +1078,7 @@ export default function AgencySignupPage() {
 
         <p className="text-slate-500 text-sm">
           Questions? Contact us at{' '}
-          <a href="mailto:314zipper@gmail.com" className="text-pink-400 hover:underline">314zipper@gmail.com</a>
+          <a href={mailtoHref(SUPPORT_EMAIL)} className="text-pink-400 hover:underline">{SUPPORT_EMAIL}</a>
         </p>
       </div>
     )
@@ -1130,7 +1139,7 @@ export default function AgencySignupPage() {
         {step < 4 && (
           <p className="text-center text-slate-600 text-xs mt-6">
             Already registered?{' '}
-            <a href="mailto:314zipper@gmail.com" className="text-pink-500 hover:underline">Contact support</a>
+            <a href={mailtoHref(SUPPORT_EMAIL)} className="text-pink-500 hover:underline">Contact support</a>
           </p>
         )}
       </div>

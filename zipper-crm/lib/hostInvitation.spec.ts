@@ -15,6 +15,7 @@ import * as path from 'path'
 import {
   duplicateInvitationMessage, findOpenInvitation, invitationId, invitationKey, isWithdrawableInvitation,
   runInvitationCreate, type InvitationCreateSteps,
+  invitationStageLabel, isApprovedInvitationStatus,
 } from './hostInvitation'
 
 let checks = 0
@@ -162,6 +163,25 @@ async function main(): Promise<void> {
     ok('RC: the rule refuses an agency delete of a self-filed application',
       allowDelete.includes("resource.data.get('applicantUid', '') == ''")
       && allowDelete.includes("resource.data.get('source', '') != 'self_app'"))
+  }
+
+  // ── QA #51: a claimed invitation stays on the agency's list ───────────────
+  {
+    eq('QA #51: approved and claimed-awaiting invitations are both approved invitations',
+      [isApprovedInvitationStatus('approved'), isApprovedInvitationStatus('awaiting_verification'),
+        isApprovedInvitationStatus('pending'), isApprovedInvitationStatus('rejected')],
+      [true, true, false, false])
+    eq('QA #51: the row says the code was entered and what the host still verifies',
+      invitationStageLabel({ status: 'awaiting_verification', activationPending: ['email'] }),
+      'Code entered — host verifying email')
+    eq('QA #51: …a phone', invitationStageLabel({ status: 'awaiting_verification', activationPending: ['phone'] }),
+      'Code entered — host verifying phone number')
+    eq('QA #51: an approved invitation still waits for its code',
+      invitationStageLabel({ status: 'approved' }), 'Awaiting Activation')
+    const page = fs.readFileSync(path.join(__dirname, '..', 'app', 'agency-dashboard', 'page.tsx'), 'utf8')
+    ok('QA #51: the dashboard keeps claimed invitations in its approved list',
+      page.includes('setApprovedHostApps(apps.filter((a) => isApprovedInvitationStatus(a.status) && !a.isActivated))')
+      && page.includes('{invitationStageLabel(app)}'))
   }
 
   if (failures.length) {

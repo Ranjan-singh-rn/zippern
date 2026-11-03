@@ -29,12 +29,25 @@ object PublicAppeal {
     var lastRestrictedUid: String = ""
 
     /**
+     * QA #55 — may the in-app DEVICE-KEY appeal speak for the restriction on
+     * screen? False when that screen was reached by a sign-in Firebase refused
+     * (a disabled login) and the server could not confirm that this phone's
+     * quick-login key belongs to the account that was tried: the key would file
+     * the appeal for ITS account, which may be another one. Such a screen
+     * offers the public web appeal and support instead. Process-level, in
+     * memory, reset with [forgetRestrictedUid].
+     */
+    @Volatile
+    var deviceKeyAppealAllowed: Boolean = true
+
+    /**
      * Forget it. Called when a quick login starts and on sign-out, so a later
      * restriction screen — a device ban hit by somebody else on this phone, say
      * — never shows the previous person's account id (UGP review).
      */
     fun forgetRestrictedUid() {
         lastRestrictedUid = ""
+        deviceKeyAppealAllowed = true
     }
 
     /** The id to show: the signed-in account's, else the one quick login reported. */

@@ -13,6 +13,7 @@ import { invalidateRates } from '@/lib/rates'
 import { calcBinanceConversion } from '@/lib/commission'
 import { submitApproval } from '@/lib/approvals'
 import { Loader2, Save, Plus, Trash2, AlertTriangle, CheckCircle, Info } from 'lucide-react'
+import SellerTiersEditor from '@/components/SellerTiersEditor'
 
 const inputCls = 'w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-pink-500'
 const labelCls = 'text-slate-400 text-xs mb-1 block'
@@ -367,6 +368,8 @@ export default function EconomyConfigPage() {
               ? ` At these figures a seller keeps ₹${(config.diamondPackPriceInr - config.sellerWholesalePriceInr).toLocaleString('en-IN')} per lakh.`
               : ' Set it equal to the retail price to give no discount.'}
           </p>
+          {/* B9: tiers (each a wholesale price) and self-use — their own merge on appConfig/economy. */}
+          <SellerTiersEditor retailPerLakh={config.diamondPackPriceInr} updatedBy={crmUser?.uid ?? ''} />
           <NumberInput label="Diamond pack price (USD)" value={config.diamondPackPriceUsd}
             onChange={v => setConfig(c => c ? { ...c, diamondPackPriceUsd: v } : c)} min={0} step={1} unit="USD per 1,00,000 diamonds"
             hint="Price for foreign users" />

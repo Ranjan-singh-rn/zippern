@@ -612,6 +612,18 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
                 )
                 if k == "agency":
                     blocked.setdefault("host", f"An {label} cannot also be a Host, and a revoked one still counts.")
+            elif str(p.get("status") or "") == str(PartnerStatus.PENDING):
+                # QA #33: an application with a reviewer is not a role held —
+                # "You already hold a Sub-agency" told a person whose first
+                # application was still waiting that they had one.
+                blocked[k] = f"Your {label} application is already with a reviewer."
+                sibling = "sub_agency" if k == "agency" else "agency"
+                blocked.setdefault(
+                    sibling,
+                    f"Your {label} application is with a reviewer. One agency-family role per person.",
+                )
+                if k == "agency":
+                    blocked["host"] = f"An {label} cannot also be a Host, and your {label} application is with a reviewer."
             else:
                 blocked["agency"] = f"You already hold a {label}. One agency-family role per person."
                 blocked["sub_agency"] = blocked["agency"]
@@ -619,9 +631,10 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
                     blocked["host"] = f"An {label} cannot also be a Host."
                 if str(p.get("status") or "") == str(PartnerStatus.AWAITING_VERIFICATION):
                     # Decision 15 (RC): approved, not started — say that, not "you hold".
+                    # QA #34: which contact is missing is on the screen above this line.
                     blocked[k] = (
-                        f"Your {label} role is approved. It starts once your phone number and "
-                        "email address are both verified."
+                        f"Your {label} role is approved. It starts once your contact details "
+                        "are verified — see what is still needed above."
                     )
         elif k == "seller":
             constraints.append(_ALLOWS["seller"])
@@ -629,9 +642,11 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
                 blocked.setdefault("seller", partner_roles.revoked_refusal("seller"))
             elif str(p.get("status") or "") == str(PartnerStatus.AWAITING_VERIFICATION):
                 blocked["seller"] = (
-                    "Your Coin Seller role is approved. It starts once your phone number and "
-                    "email address are both verified."
+                    "Your Coin Seller role is approved. It starts once your contact details "
+                    "are verified — see what is still needed above."
                 )
+            elif str(p.get("status") or "") == str(PartnerStatus.PENDING):
+                blocked["seller"] = "Your Coin Seller application is already with a reviewer."  # QA #33
             else:
                 blocked["seller"] = "You already hold a Coin Seller role."
 
@@ -659,8 +674,8 @@ def eligible_kinds(held: dict[str, Any]) -> dict[str, Any]:
             blocked["host"] = "You are already a Host."
         elif str((held.get("pending_host_application") or {}).get("status") or "") == "awaiting_verification":
             blocked["host"] = (
-                "Your Host application is approved. It starts once your phone number and "
-                "email address are both verified."
+                "Your Host application is approved. It starts once your contact details "
+                "are verified — see what is still needed above."
             )
         else:
             blocked["host"] = "Your Host application is already with a reviewer."
@@ -885,11 +900,20 @@ def _clean(form: dict, allowed: tuple[str, ...]) -> dict[str, Any]:
     return out
 
 
+def _stored_url_ok(url: str) -> bool:
+    """An uploaded file's link: https — or, in the local test copy only, a
+    Storage-emulator link (`isolation.is_local_emulator_media_url`)."""
+    from app.config import settings
+    from app.core import isolation
+
+    return url.startswith("https://") or isolation.is_local_emulator_media_url(settings, url)
+
+
 def _urls(form: dict, key: str, max_items: int = 3) -> list[str]:
     raw = form.get(key) or []
     if not isinstance(raw, list):
         return []
-    return [str(u).strip() for u in raw if str(u).strip().startswith("https://")][:max_items]
+    return [u for u in (str(x).strip() for x in raw) if _stored_url_ok(u)][:max_items]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

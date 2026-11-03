@@ -207,6 +207,7 @@ export default function ReportsHubPage() {
   const [channels, setChannels] = useState<Slot<ChannelReport>>(LOADING)
   const [liabilities, setLiabilities] = useState<Slot<LiabilityReport>>(LOADING)
   const [partners, setPartners] = useState<Slot<AnyReport>>(LOADING)
+  const [promotions, setPromotions] = useState<Slot<AnyReport>>(LOADING)
   const [throughput, setThroughput] = useState<Slot<ThroughputReport>>(LOADING)
   const [auditSummary, setAuditSummary] = useState<Slot<AnyReport>>(LOADING)
   const [defs, setDefs] = useState<Slot<DefinitionsResponse>>(LOADING)
@@ -234,6 +235,7 @@ export default function ReportsHubPage() {
     run(reports.margin(p), setMargin, 'margin')
     run(reports.channels(p), setChannels, 'channel')
     run(reports.liabilities(), setLiabilities, 'liabilities')
+    run(reports.promotions(p), setPromotions, 'promotions')
     run(reports.teamThroughput(p), setThroughput, 'team throughput')
     run(reports.definitions(), setDefs, 'definitions')
 
@@ -576,6 +578,45 @@ export default function ReportsHubPage() {
                       label="Still outstanding"
                       value={formatInrMinorShort(num(partners.value.totals, 'closing_total'))}
                       tone="text-white"
+                    />
+                  </>
+                ) : null
+              }
+            />
+
+            {/* Promotions — B2c */}
+            <ReportCard
+              icon={Users}
+              title="Promotions"
+              blurb="What daily rewards and free call cards gave away in the period. Promotional diamonds are never revenue — they are a liability until spent. A free call card pays the first minute of a call; the host is paid for that minute and Zipper bears the cost."
+              slot={promotions}
+              emptyHint="No daily rewards were claimed and no free call cards were used in this period."
+              href="/app-config/daily-rewards"
+              hrefLabel="Daily reward schedule"
+              exporting={busy === 'promotions'}
+              onExport={() => exportCsv('promotions', '/promotions', p, 'promotions')}
+              figures={
+                promotions.status === 'ok' ? (
+                  <>
+                    <Line
+                      label="Daily-reward claims"
+                      value={formatCount(num(promotions.value.totals, 'daily_reward_claims'))}
+                      tone="text-slate-200"
+                    />
+                    <Line
+                      label="Promotional diamonds issued"
+                      value={formatCount(num(promotions.value.totals, 'promo_diamonds_issued'))}
+                      tone="text-sky-300"
+                    />
+                    <Line
+                      label="Free call cards issued / used"
+                      value={`${formatCount(num(promotions.value.totals, 'call_cards_issued'))} / ${formatCount(num(promotions.value.totals, 'call_cards_redeemed'))}`}
+                      tone="text-slate-200"
+                    />
+                    <Line
+                      label="Host cost of free minutes"
+                      value={formatInrMinorShort(num(promotions.value.totals, 'card_host_cost_inr_minor'))}
+                      tone="text-orange-300"
                     />
                   </>
                 ) : null

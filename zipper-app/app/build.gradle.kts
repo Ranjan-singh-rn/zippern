@@ -115,8 +115,8 @@ android {
         // session cut-off (A-9). Publish with `minSupportedVersionCode: 20` —
         // 19 still runs the ten-second tick loop against a server that bills
         // whole minutes and shows a price that no longer matches.
-        versionCode = 20
-        versionName = "1.2.6"
+        versionCode = 21
+        versionName = "1.2.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 
@@ -291,6 +291,9 @@ android {
             buildConfigField("boolean", "OTA_ENABLED", "true")
             buildConfigField("String", "OTA_CHANNEL", "\"release\"")
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
+            buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
+            buildConfigField("String", "EMULATOR_HOST", "\"\"")
+            buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
         }
         debug {
             isMinifyEnabled = false
@@ -298,6 +301,9 @@ android {
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             // Opt-in only — see `zipperApiBase` above.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBase\"")
+            buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
+            buildConfigField("String", "EMULATOR_HOST", "\"\"")
+            buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
         }
         /*
          * ── prod: WHAT THE FLEET SHOULD ACTUALLY RUN (A-4 / A-17 / A-18) ────
@@ -346,6 +352,38 @@ android {
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             // Production host by default; `zipper.apiBase` still overrides.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
+            buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
+            buildConfigField("String", "EMULATOR_HOST", "\"\"")
+            buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
+        }
+        /*
+         * ── emu: THE LOCAL TEST COPY — NEVER LEAVES THE MAC ─────────────────────
+         *
+         * The debug app wired to the LOCAL stack that
+         * ~/zipper-release/qa/local-stack.command starts: the Firebase emulators
+         * (Auth 9099, Firestore 8080, Storage 9199, Functions 5001) under the
+         * `demo-zipper` project, and the backend on port 8000 — all reached from
+         * the Android emulator through its host alias 10.0.2.2. A demo- project
+         * exists only inside the emulators, so nothing this build does can reach
+         * the production project: Firebase is initialised by ZipperApp with the
+         * demo project id (src/emu/AndroidManifest.xml removes the automatic
+         * initialiser that would use the production id from google-services.json),
+         * Analytics and Crashlytics collection are off, and the in-app updater is
+         * off. Built only by `./gradlew :app:assembleEmu`; never published (60
+         * reads the prod APKs only).
+         */
+        create("emu") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+            isDebuggable = true
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+            buildConfigField("boolean", "OTA_ENABLED", "false")
+            buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
+            buildConfigField("String", "ZIPPER_API_BASE", "\"http://10.0.2.2:8000\"")
+            buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "true")
+            buildConfigField("String", "EMULATOR_HOST", "\"10.0.2.2\"")
+            buildConfigField("String", "EMULATOR_PROJECT_ID", "\"demo-zipper\"")
         }
     }
 
@@ -454,6 +492,9 @@ dependencies {
 
     // Lottie
     implementation(libs.lottie.compose)
+
+    // B13: SVGA player (gifts, entrances, avatar frames built by tools/decor)
+    implementation(libs.svgaplayer)
 
     // CameraX
     implementation(libs.camerax.core)

@@ -71,11 +71,27 @@ class HostFunctions @Inject constructor(
          * server sends its sentence (until when, and why) as `message`.
          */
         HOST_SUSPENDED,
+        /**
+         * QA #51: the code is real but its agency is suspended, revoked or not
+         * yet approved — the code no longer works. The server sends the sentence.
+         */
+        AGENCY_INACTIVE,
         UNKNOWN,
     }
 
     sealed interface CodeCheck {
-        data class Valid(val agencyName: String) : CodeCheck
+        /**
+         * QA #51: [needsVerification] lists the contacts this account must still
+         * verify before the Host role can start ("phone" / "email"), and
+         * [contactHint] the masked value the agency registered for each — so a
+         * new phone sign-up is told which e-mail to add instead of "details
+         * don't match".
+         */
+        data class Valid(
+            val agencyName: String,
+            val needsVerification: List<String> = emptyList(),
+            val contactHint: Map<String, String> = emptyMap(),
+        ) : CodeCheck
         /** [message] is the server's own sentence when it sent one (a suspended Host role), else "". */
         data class Invalid(val reason: ReferralRefusal, val message: String = "") : CodeCheck
         data class Failed(val message: String) : CodeCheck
@@ -102,7 +118,11 @@ class HostFunctions @Inject constructor(
         is Result.Ok -> {
             val m = res.value
             if (m["valid"] == true) {
-                CodeCheck.Valid(m["agencyName"] as? String ?: "")
+                CodeCheck.Valid(
+                    agencyName = m["agencyName"] as? String ?: "",
+                    needsVerification = stringList(m["needsVerification"]),
+                    contactHint = stringMap(m["contactHint"]),
+                )
             } else {
                 CodeCheck.Invalid(
                     when (m["reason"] as? String) {
@@ -115,6 +135,7 @@ class HostFunctions @Inject constructor(
                         "other_agency"     -> ReferralRefusal.OTHER_AGENCY
                         "guest"            -> ReferralRefusal.GUEST
                         "role_revoked"     -> ReferralRefusal.ROLE_REVOKED
+                        "agency_inactive"  -> ReferralRefusal.AGENCY_INACTIVE
                         HostSuspension.REFERRAL_REASON -> ReferralRefusal.HOST_SUSPENDED
                         else               -> ReferralRefusal.UNKNOWN
                     },
@@ -127,7 +148,20 @@ class HostFunctions @Inject constructor(
 
     // ── Activation ───────────────────────────────────────────────────────────
 
-    data class Activation(val agencyId: String, val callRateBeans: Long, val alreadyActivated: Boolean)
+    /**
+     * QA #51: [awaitingVerification] — the code was accepted and the invitation
+     * is now this account's, but the Host role waits for [missing] contacts
+     * ("phone" / "email") to be verified; it then starts by itself. Nothing is
+     * granted on this answer.
+     */
+    data class Activation(
+        val agencyId: String,
+        val callRateBeans: Long,
+        val alreadyActivated: Boolean,
+        val awaitingVerification: Boolean = false,
+        val missing: List<String> = emptyList(),
+        val contactHint: Map<String, String> = emptyMap(),
+    )
 
     /**
      * Redeem the code and become a host.
@@ -149,8 +183,20 @@ class HostFunctions @Inject constructor(
             agencyId = m["agencyId"] as? String ?: "",
             callRateBeans = (m["callRateBeans"] as? Number)?.toLong() ?: 0L,
             alreadyActivated = m["alreadyActivated"] as? Boolean ?: false,
+            awaitingVerification = m["awaitingVerification"] == true,
+            missing = stringList(m["missing"]),
+            contactHint = stringMap(m["contactHint"]),
         )
     }
+
+    private fun stringList(v: Any?): List<String> =
+        (v as? List<*>)?.mapNotNull { it as? String }?.filter { it.isNotBlank() }.orEmpty()
+
+    private fun stringMap(v: Any?): Map<String, String> =
+        (v as? Map<*, *>)?.entries
+            ?.mapNotNull { (k, value) -> if (k is String && value is String && value.isNotBlank()) k to value else null }
+            ?.toMap()
+            .orEmpty()
 
     // ── Call rate ────────────────────────────────────────────────────────────
 

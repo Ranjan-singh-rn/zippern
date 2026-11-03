@@ -45,6 +45,13 @@ data class UserNotification(
      * …) and the canonical shape names it `relatedId`; both are read.
      */
     val relatedId: String = "",
+    /**
+     * The reason the decision was taken, when the notice carries one (a ban, a
+     * suspension, a rejection — `notices.py` writes it as its own `reason`
+     * field, apart from the body). QA (3 Nov 2026): never read, so "Your Zipper
+     * account is banned" arrived without the reason the email gave.
+     */
+    val reason: String = "",
 ) {
     /**
      * A warning is the one kind of notice that is a moderation decision rather

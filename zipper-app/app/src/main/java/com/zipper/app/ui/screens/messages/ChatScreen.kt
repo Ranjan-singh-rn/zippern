@@ -171,5 +171,6 @@ private fun MessageRow(msg: ChatMessage, isMe: Boolean, onJoinLive: (String) -> 
     }
 }
 
-private val timeFmt = SimpleDateFormat("h:mm a", Locale.getDefault())
+// QA #54: message times in IST, whatever the handset's zone.
+private val timeFmt = SimpleDateFormat("h:mm a", Locale.getDefault()).apply { timeZone = com.zipper.app.util.IstTime.ZONE }
 private fun timeOf(ms: Long): String = if (ms <= 0) "" else timeFmt.format(Date(ms))

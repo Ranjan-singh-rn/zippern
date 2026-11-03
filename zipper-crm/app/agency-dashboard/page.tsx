@@ -10,6 +10,7 @@ import { AgencyMoney } from './AgencyMoney'
 import HostReports from './HostReports'
 import { auth, db, storage } from '@/lib/firebase'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { KYC_MAX_MB, kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
 import {
   collection,
   query,
@@ -39,7 +40,7 @@ import {
 import { duplicateSubAgencyMessage, findDuplicateSubAgency, isAddressInUse, reappliedMessage, reapplyFormFrom } from '@/lib/subAgencyCreation'
 import { partnerOps } from '@/lib/apiPartners'
 import { currentRosterRows, hostsFromRoster, rosterRowUid } from '@/lib/agencyDashboardHosts'
-import { duplicateInvitationMessage, findOpenInvitation, isWithdrawableInvitation, runInvitationCreate } from '@/lib/hostInvitation'
+import { duplicateInvitationMessage, findOpenInvitation, invitationStageLabel, isApprovedInvitationStatus, isWithdrawableInvitation, runInvitationCreate } from '@/lib/hostInvitation'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -1621,7 +1622,7 @@ function AgencyProfileCard({ agency, agencyId }: { agency: Agency; agencyId: str
 
 // ── AddSubAgencyModal ──────────────────────────────────────────────────────────
 
-type UploadState = { file: File | null; url: string; progress: number; uploading: boolean }
+type UploadState = { file: File | null; url: string; progress: number; uploading: boolean; error?: string }
 const emptyUpload = (): UploadState => ({ file: null, url: '', progress: 0, uploading: false })
 
 function DocUploadField({
@@ -1638,16 +1639,28 @@ function DocUploadField({
   onChange: (next: UploadState) => void
 }) {
   function handleFile(file: File) {
+    // QA #29 / #32: what the Storage rules would refuse is refused here, with
+    // the reason; a failure is SAID (it used to reset the field in silence),
+    // and the next attempt starts clean.
+    const problem = kycFileProblem(file)
+    if (problem) {
+      onChange({ file: null, url: '', progress: 0, uploading: false, error: problem })
+      return
+    }
     onChange({ file, url: '', progress: 0, uploading: true })
     const storageRef = ref(storage, storagePath)
     const task = uploadBytesResumable(storageRef, file)
     task.on(
       'state_changed',
       (snap) => onChange({ file, url: '', progress: Math.round((snap.bytesTransferred / snap.totalBytes) * 100), uploading: true }),
-      () => onChange({ file, url: '', progress: 0, uploading: false }),
+      (err) => onChange({ file: null, url: '', progress: 0, uploading: false, error: kycUploadErrorText(err) }),
       async () => {
-        const url = await getDownloadURL(task.snapshot.ref)
-        onChange({ file, url, progress: 100, uploading: false })
+        try {
+          const url = await getDownloadURL(task.snapshot.ref)
+          onChange({ file, url, progress: 100, uploading: false })
+        } catch (err) {
+          onChange({ file: null, url: '', progress: 0, uploading: false, error: kycUploadErrorText(err) })
+        }
       }
     )
   }
@@ -1690,11 +1703,14 @@ function DocUploadField({
             <Upload size={18} className="text-slate-400 shrink-0" />
             <div>
               <p className="text-slate-300 text-sm">Click to upload</p>
-              <p className="text-slate-500 text-xs">JPG, PNG or PDF</p>
+              <p className="text-slate-500 text-xs">JPG, PNG or PDF · up to {KYC_MAX_MB} MB</p>
             </div>
           </>
         )}
       </label>
+      {state.error && !state.uploading && !done && (
+        <p className="text-red-400 text-xs mt-1.5">{state.error}</p>
+      )}
     </div>
   )
 }
@@ -2266,7 +2282,10 @@ export default function AgencyDashboardPage() {
         // and had no way to see the same documents once they joined.
         setAllHostApps(apps)
         setPendingHostApps(apps.filter((a) => a.status === 'pending'))
-        setApprovedHostApps(apps.filter((a) => a.status === 'approved' && !a.isActivated))
+        // QA #51: an invitation whose code the host has entered but whose Host
+        // role waits for a contact to be verified is still the agency's
+        // approved invitation — it must not drop out of every list.
+        setApprovedHostApps(apps.filter((a) => isApprovedInvitationStatus(a.status) && !a.isActivated))
         setRejectedHostApps(apps.filter((a) => a.status === 'rejected'))
       }).catch((err: unknown) => {
         setFailures((f) => ({ ...f, applications: toFailure(err, 'host applications') }))
@@ -2509,7 +2528,7 @@ export default function AgencyDashboardPage() {
   // that carries one of your hosts' own contact, is not somebody new.
   const separateRows = reconciledHosts.rows.applicationRows
   const shownPending = separateRows.filter((r) => r.app.status === 'pending')
-  const shownApproved = separateRows.filter((r) => r.app.status === 'approved')
+  const shownApproved = separateRows.filter((r) => isApprovedInvitationStatus(r.app.status))
   const totalHostCount = hosts.length + reconciledHosts.rows.separateApplicants
 
   return (
@@ -2818,7 +2837,7 @@ export default function AgencyDashboardPage() {
                       <td className="px-6 py-4">
                         <div className="flex flex-col gap-1">
                           <span className="text-xs bg-blue-500/20 text-blue-300 border border-blue-500/30 px-2 py-1 rounded font-medium w-fit">
-                            Awaiting Activation
+                            {invitationStageLabel(app)}
                           </span>
                           <span className="text-xs text-purple-300 font-mono font-semibold">{app.referralCode}</span>
                         </div>

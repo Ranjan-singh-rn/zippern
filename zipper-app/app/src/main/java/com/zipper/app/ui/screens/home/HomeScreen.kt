@@ -16,12 +16,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.outlined.Explore
-import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.PersonSearch
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -68,7 +67,7 @@ fun HomeScreen(
     onNavigateToProfile: (uid: String) -> Unit = {},
     onWatchLive: (roomId: String) -> Unit = {},
     onNavigateToDiamondShop: () -> Unit = {},
-    onNavigateToPartyRooms: () -> Unit = {},
+    onNavigateToRankings: () -> Unit = {},
     viewModel: HomeViewModel = hiltViewModel(),
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -77,25 +76,21 @@ fun HomeScreen(
 
     ZipperScreen(
         topBar = {
-            Column {
-                HomeTopBar(
-                    showSearch = state.showSearchBar,
-                    query = state.searchQuery,
-                    filterActive = state.filters.isActive,
-                    diamonds = state.currentUserDiamonds,
-                    onSearchToggle = viewModel::toggleSearchBar,
-                    onQueryChange = viewModel::onSearchQueryChange,
-                    onSearchSubmit = { focusManager.clearFocus(); viewModel.searchByUid(state.searchQuery) },
-                    onClearSearch = viewModel::clearSearch,
-                    onFilterTap = viewModel::toggleFilterSheet,
-                    onDiamondsTap = onNavigateToDiamondShop,
-                )
-                // Party rooms have no tab of their own, and "Party Rooms" in the
-                // interests filter is a thing to be matched on rather than a way
-                // in. Discover is where people already are, so the way in lives
-                // here — one row, no media, above the feed.
-                if (!state.showSearchBar) PartyRoomsEntry(onNavigateToPartyRooms)
-            }
+            // Party rooms are reached from the Live tab's "Party" page now
+            // (owner's request, 3 Nov 2026) — Home is the people feed only.
+            HomeTopBar(
+                showSearch = state.showSearchBar,
+                query = state.searchQuery,
+                filterActive = state.filters.isActive,
+                diamonds = state.currentUserDiamonds,
+                onSearchToggle = viewModel::toggleSearchBar,
+                onQueryChange = viewModel::onSearchQueryChange,
+                onSearchSubmit = { focusManager.clearFocus(); viewModel.searchByUid(state.searchQuery) },
+                onClearSearch = viewModel::clearSearch,
+                onFilterTap = viewModel::toggleFilterSheet,
+                onDiamondsTap = onNavigateToDiamondShop,
+                onRankingsTap = onNavigateToRankings,
+            )
         },
     ) { _ ->
         when {
@@ -192,38 +187,6 @@ private fun DiscoverGrid(
     }
 }
 
-// ── Party rooms entry ────────────────────────────────────────────────────────
-
-@Composable
-private fun PartyRoomsEntry(onClick: () -> Unit) {
-    val c = ZipperTheme.colors
-    Column(Modifier.fillMaxWidth().background(c.bgRaised)) {
-        Row(
-            Modifier.fillMaxWidth().clickableNoRipple(onClick)
-                .padding(start = Space.lg, end = Space.lg, top = Space.sm, bottom = Space.sm),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(Space.md),
-        ) {
-            Box(
-                Modifier.size(36.dp).background(c.tintVioletSubtle, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Outlined.Groups, null, tint = c.brandSecondary, modifier = Modifier.size(Size.Icon.md))
-            }
-            Column(Modifier.weight(1f)) {
-                Text("Party Rooms", style = ZipperTheme.type.labelM, color = c.textPrimary)
-                Text(
-                    "Audio and video rooms you can join and take a seat in",
-                    style = ZipperTheme.type.caption, color = c.textSecondary,
-                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                )
-            }
-            Icon(Icons.Default.ChevronRight, null, tint = c.textMuted, modifier = Modifier.size(Size.Icon.md))
-        }
-        HairlineDivider()
-    }
-}
-
 // ── Top bar ──────────────────────────────────────────────────────────────────
 
 @Composable
@@ -238,6 +201,7 @@ private fun HomeTopBar(
     onClearSearch: () -> Unit,
     onFilterTap: () -> Unit,
     onDiamondsTap: () -> Unit,
+    onRankingsTap: () -> Unit = {},
 ) {
     val c = ZipperTheme.colors
     val focus = remember { FocusRequester() }
@@ -249,7 +213,7 @@ private fun HomeTopBar(
             horizontalArrangement = Arrangement.spacedBy(Space.sm),
         ) {
             if (showSearch) {
-                LaunchedEffect(Unit) { focus.requestFocus() }
+                LaunchedEffect(Unit) { focus.requestFocusAfterLayout() }
                 Row(
                     Modifier.weight(1f).height(40.dp).background(c.bgElevated, CircleShape)
                         .border(1.dp, c.borderSubtle, CircleShape).padding(start = 14.dp, end = 8.dp),
@@ -275,6 +239,7 @@ private fun HomeTopBar(
                 Text("Zipper", style = ZipperTheme.type.headingL, color = c.brandPrimary)
                 Spacer(Modifier.weight(1f))
                 CurrencyPill(Currency.Diamond, diamonds, onClick = onDiamondsTap)
+                IconButtonCircle(Icons.Default.EmojiEvents, "Rankings", onRankingsTap, background = androidx.compose.ui.graphics.Color.Transparent)
                 Box {
                     IconButtonCircle(Icons.Default.FilterList, "Filter", onFilterTap, background = androidx.compose.ui.graphics.Color.Transparent)
                     if (filterActive) {

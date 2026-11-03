@@ -1,4 +1,5 @@
 import { db } from '@/lib/firebase'
+import { giftPatch } from '@/lib/decorAssets'
 import {
   collection, getDocs, doc, addDoc, updateDoc, deleteDoc,
   query, orderBy, Timestamp, serverTimestamp,
@@ -35,6 +36,7 @@ export interface Gift {
   emoji: string
   imageUrl?: string          // Firebase Storage URL for the gift thumbnail shown in-app grid
   lottieAsset?: string       // Bundled asset path ("gifts/g1_rose.json") OR remote Lottie URL
+  svgaUrl?: string           // B13: SVGA animation (tools/decor) — played full screen when the gift lands; preferred
   diamondCost: number
   // earningRate: % of diamondCost that host earns as beans
   // beanValue = floor(diamondCost * earningRate / 100)
@@ -71,6 +73,7 @@ export async function createGift(data: Omit<Gift, 'id' | 'createdAt'>): Promise<
     emoji:       data.emoji,
     imageUrl:    data.imageUrl    ?? '',
     lottieAsset: data.lottieAsset ?? '',
+    svgaUrl:     data.svgaUrl     ?? '',
     diamondCost: data.diamondCost,
     earningRate: data.earningRate,
     category:    data.category,
@@ -82,7 +85,8 @@ export async function createGift(data: Omit<Gift, 'id' | 'createdAt'>): Promise<
 }
 
 export async function updateGift(id: string, data: Partial<Omit<Gift, 'id' | 'createdAt'>>): Promise<void> {
-  await updateDoc(doc(db, 'gifts', id), { ...data, updatedAt: serverTimestamp() })
+  // B13: through giftPatch — the SDK refuses `undefined`, and a cleared animation must be cleared, not kept.
+  await updateDoc(doc(db, 'gifts', id), { ...giftPatch(data as Record<string, unknown>), updatedAt: serverTimestamp() })
 }
 
 export async function deleteGift(id: string): Promise<void> {

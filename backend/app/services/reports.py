@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
@@ -180,6 +181,10 @@ class Rates:
     missing: list[str]
     note: str
     fetched_at: datetime
+    #: B9 (3 Nov 2026): priced seller tiers — `{tierId: {"name", "price_per_lakh"}}` from
+    #: `appConfig/economy.sellerTiers` (seller_business.parse_seller_tiers). Empty: every seller pays the published
+    #: wholesale price.
+    seller_tiers: dict = field(default_factory=dict)
 
     @property
     def seller_margin_inr_per_lakh(self) -> float:
@@ -238,6 +243,28 @@ def _read_economy_doc() -> dict:
     if not snapshot.exists:
         return {}
     return snapshot.to_dict() or {}
+
+
+def parse_seller_tiers(raw: Any, retail_per_lakh: float) -> dict:
+    """B9: `{tierId: {name, wholesalePriceInr}}` → `{tierId: {"name", "price_per_lakh"}}`, valid tiers only.
+
+    A price must be above zero and not above retail: a "wholesale" price above what a user pays is a typo, and
+    charging a seller more than their own customers pay is not a tier.
+    """
+    out: dict = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for tier_id, spec in raw.items():
+        if not isinstance(spec, Mapping) or not re.fullmatch(r"[a-z0-9_-]{1,32}", str(tier_id)):
+            continue
+        try:
+            price = float(spec.get("wholesalePriceInr"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or (retail_per_lakh > 0 and price > retail_per_lakh):
+            continue
+        out[str(tier_id)] = {"name": str(spec.get("name") or tier_id)[:40], "price_per_lakh": price}
+    return out
 
 
 async def load_rates() -> Rates:
@@ -303,6 +330,7 @@ async def load_rates() -> Rates:
             missing=[],
             note="Rates read from Firestore appConfig/economy.",
             fetched_at=datetime.now(timezone.utc),
+            seller_tiers=parse_seller_tiers(data.get("sellerTiers"), diamond),
         )
 
     if len(missing) == 2:
@@ -322,6 +350,7 @@ async def load_rates() -> Rates:
             f"{', '.join(missing)}. Those figures use the documented fallback."
         ),
         fetched_at=datetime.now(timezone.utc),
+        seller_tiers=parse_seller_tiers(data.get("sellerTiers"), diamond),
     )
 
 
@@ -1240,6 +1269,218 @@ def _bucket_label(start: datetime | None, unit: str) -> str:
         iso = start.isocalendar()
         return f"{iso[0]}-W{iso[1]:02d}"
     return start.date().isoformat()
+
+
+# ── Promotions: what Zipper gave away (B2c, 3 Nov 2026) ───────────────────────
+#
+# Daily rewards credited diamonds and free call cards into users' wallets and nowhere else, so no figure on this
+# portal ever counted them ("daily rewards are not updating CRM numbers"). The app now writes one
+# `promoCredits/{id}` document per grant, in the same transaction as the credit:
+#
+#   kind = daily_reward             diamonds, videoCards        (issued: a liability until spent)
+#   kind = free_call_card_redeemed  minutes, diamondValue,      (a card spent on a call: the host was paid
+#                                   beansCredited                beansCredited for minutes nobody paid for)
+#
+# Promotional diamonds are never revenue (see DEFINITIONS["revenue"]); this report is where they are counted.
+
+PROMO_KINDS = ("daily_reward", "free_call_card_redeemed")
+
+
+def summarise_promotions(docs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pure roll-up of `promoCredits` rows. Unknown kinds are counted, never silently dropped."""
+    out: dict[str, Any] = {
+        "daily_reward_claims": 0,
+        "promo_diamonds_issued": 0,
+        "call_cards_issued": 0,
+        "call_cards_redeemed": 0,
+        "card_minutes": 0,
+        "card_diamond_value": 0,
+        "card_host_beans": 0,
+        "leaderboard_rewards": 0,
+        "leaderboard_diamonds": 0,
+        "leaderboard_beans": 0,
+        "claimants": 0,
+        "other_kinds": {},
+    }
+    claimants: set[str] = set()
+    for d in docs:
+        kind = str(d.get("kind") or "")
+        if kind == "daily_reward":
+            out["daily_reward_claims"] += 1
+            out["promo_diamonds_issued"] += max(0, _int(d.get("diamonds"), 0))
+            out["call_cards_issued"] += max(0, _int(d.get("videoCards"), 0))
+            if d.get("uid"):
+                claimants.add(str(d.get("uid")))
+        elif kind == "free_call_card_redeemed":
+            out["call_cards_redeemed"] += max(0, _int(d.get("cards"), 1))
+            out["card_minutes"] += max(0, _int(d.get("minutes"), 0))
+            out["card_diamond_value"] += max(0, _int(d.get("diamondValue"), 0))
+            out["card_host_beans"] += max(0, _int(d.get("beansCredited"), 0))
+        elif kind == "leaderboard_reward":
+            # B8: a ranking reward the Owner set — diamonds to a supporter, diamonds or beans to a host.
+            out["leaderboard_rewards"] += 1
+            out["leaderboard_diamonds"] += max(0, _int(d.get("diamonds"), 0))
+            out["leaderboard_beans"] += max(0, _int(d.get("beans"), 0))
+        else:
+            out["other_kinds"][kind or "?"] = out["other_kinds"].get(kind or "?", 0) + 1
+    out["claimants"] = len(claimants)
+    return out
+
+
+async def promotions_summary(
+    since: datetime | None = None,
+    until: datetime | None = None,
+    rates: Rates | None = None,
+) -> Report:
+    """Daily-reward diamonds and free call cards issued, and cards redeemed on calls, in the period.
+
+    The cost line is the host beans paid for card minutes — beans become cash at payout — valued at the bean
+    rate; issued promotional diamonds are a liability until spent and are shown in diamonds, never as revenue.
+    """
+    since, until = resolve_window(since, until)
+    rt = await _rates(rates)
+    docs = await _fs_scan("promoCredits", "createdAt", since, until)
+    s = summarise_promotions(docs)
+    by_day: dict[str, dict[str, int]] = {}
+    for d in docs:
+        at = d.get("createdAt")
+        day = _utc(at).date().isoformat() if isinstance(at, datetime) else "?"
+        row = by_day.setdefault(day, {"daily_reward_claims": 0, "promo_diamonds_issued": 0,
+                                      "call_cards_issued": 0, "call_cards_redeemed": 0, "card_host_beans": 0,
+                                      "leaderboard_diamonds": 0, "leaderboard_beans": 0})
+        one = summarise_promotions([d])
+        for k in row:
+            row[k] += one[k]
+    rows = [{"day": day, **vals} for day, vals in sorted(by_day.items())]
+    totals = {**s}
+    # Beans become rupees at payout, at the economy's bean rate (rupees per bean → paise).
+    bean_inr = float(getattr(rt, "bean_to_inr", 0) or 0)
+    totals["card_host_cost_inr_minor"] = int(round(s["card_host_beans"] * bean_inr * 100))
+    totals["leaderboard_bean_cost_inr_minor"] = int(round(s["leaderboard_beans"] * bean_inr * 100))
+    report = Report(
+        name="promotions",
+        title="Promotions — daily rewards and free call cards",
+        period=_period(since, until),
+        columns=[
+            ("day", "Day (UTC)"),
+            ("daily_reward_claims", "Daily-reward claims"),
+            ("promo_diamonds_issued", "Promotional diamonds issued"),
+            ("call_cards_issued", "Free call cards issued"),
+            ("call_cards_redeemed", "Free call cards used"),
+            ("card_host_beans", "Host beans paid for card minutes"),
+            ("leaderboard_diamonds", "Ranking rewards (diamonds)"),
+            ("leaderboard_beans", "Ranking rewards (host beans)"),
+        ],
+        rows=rows,
+        totals=totals,
+        definitions={
+            "promo_diamonds_issued": "Diamonds credited by daily rewards. Not revenue; a liability until spent.",
+            "call_cards_redeemed": "Free call cards spent on calls: each paid the first minute; the payer paid nothing.",
+            "card_host_beans": "Beans credited to hosts for card minutes — Zipper's cost of the free minutes.",
+            "leaderboard_diamonds": "Diamonds paid as ranking rewards when a period closed. Not revenue; a liability until spent.",
+            "leaderboard_beans": "Beans paid to hosts as ranking rewards — a cash cost at payout, valued at the bean rate.",
+        },
+        rates=rt.as_dict(),
+    )
+    if s["other_kinds"]:
+        report.warnings.append(f"Unrecognised promotion kinds in this period: {s['other_kinds']}.")
+    report.note_if_empty("No daily rewards were claimed and no free call cards were used in this period.")
+    return report
+
+
+# ── Games: entries, payouts, fees, refunds (B6, 3 Nov 2026) ───────────────────
+#
+# Every diamond a game moves has a row in Firestore `gameLedger` (functions/src/games/ledger.ts), keyed by match
+# or round. This report is the money side of the Games CRM: what went in, what came out, Zipper's fee, and the
+# reconciliation — for every match in the window, entries = payouts + fee + refunds, exactly.
+#
+# Player losses are NOT labelled revenue here: an instant game's net is shown as "net retained" (stakes − wins),
+# a multiplayer game's as the platform fee, and both stay separate from cash revenue (DEFINITIONS["revenue"]).
+
+GAME_KINDS_IN = ("entry", "stake")
+GAME_KINDS_OUT = ("payout", "win", "refund")
+
+
+def summarise_games(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pure roll-up of `gameLedger` rows by game, and the per-match balance check."""
+    by_game: dict[str, dict[str, Any]] = {}
+    per_match: dict[str, dict[str, int]] = {}
+    for r in rows:
+        game = str(r.get("gameId") or "?")
+        kind = str(r.get("kind") or "?")
+        amt = max(0, _int(r.get("diamonds"), 0))
+        g = by_game.setdefault(game, {"entries": 0, "stakes": 0, "payouts": 0, "wins": 0, "refunds": 0, "fees": 0,
+                                      "rounds": set(), "players": set()})
+        key = {"entry": "entries", "stake": "stakes", "payout": "payouts", "win": "wins", "refund": "refunds",
+               "fee": "fees"}.get(kind)
+        if key:
+            g[key] += amt
+        ref = str(r.get("matchId") or r.get("roundId") or "")
+        if ref:
+            g["rounds"].add(ref)
+        if r.get("uid"):
+            g["players"].add(str(r.get("uid")))
+        if r.get("matchId"):
+            m = per_match.setdefault(str(r.get("matchId")), {"entries": 0, "payouts": 0, "fees": 0, "refunds": 0})
+            if kind in ("entry", "payout", "refund"):
+                m[{"entry": "entries", "payout": "payouts", "refund": "refunds"}[kind]] += amt
+            elif kind == "fee":
+                m["fees"] += amt
+    out_games = {}
+    for game, g in sorted(by_game.items()):
+        into = g["entries"] + g["stakes"]
+        back = g["payouts"] + g["wins"] + g["refunds"]
+        out_games[game] = {
+            "entries": g["entries"], "stakes": g["stakes"], "payouts": g["payouts"], "wins": g["wins"],
+            "refunds": g["refunds"], "fees": g["fees"], "sessions": len(g["rounds"]), "unique_players": len(g["players"]),
+            # Instant games: what the stakes kept (stakes − wins). Multiplayer: the fee. Neither is cash revenue.
+            "net_retained": (g["stakes"] - g["wins"]) + g["fees"],
+            "diamonds_in": into, "diamonds_out": back,
+        }
+    # A match whose rows are all in the window and that has settled (a fee or a refund) must balance exactly.
+    unbalanced = []
+    for mid, m in per_match.items():
+        settled = m["fees"] > 0 or m["refunds"] > 0 or m["payouts"] > 0
+        if settled and m["entries"] != m["payouts"] + m["fees"] + m["refunds"]:
+            unbalanced.append({"matchId": mid, **m, "difference": m["entries"] - m["payouts"] - m["fees"] - m["refunds"]})
+    return {"games": out_games, "unbalanced_matches": unbalanced, "matches_checked": len(per_match)}
+
+
+async def games_summary(since: datetime | None = None, until: datetime | None = None) -> Report:
+    """The Games CRM's money view: per game, diamonds in and out, Zipper's fee, sessions, players — and the
+    zero-difference check on every match in the window."""
+    since, until = resolve_window(since, until)
+    rows = await _fs_scan("gameLedger", "createdAt", since, until)
+    s = summarise_games(rows)
+    table = [{"game": g, **v} for g, v in s["games"].items()]
+    report = Report(
+        name="games",
+        title="Games — entries, payouts, fees and reconciliation",
+        period=_period(since, until),
+        columns=[
+            ("game", "Game"), ("sessions", "Matches / rounds"), ("unique_players", "Players"),
+            ("entries", "Match entries"), ("stakes", "Instant stakes"), ("payouts", "Match payouts"),
+            ("wins", "Instant wins"), ("refunds", "Refunds"), ("fees", "Platform fee"), ("net_retained", "Net retained"),
+        ],
+        rows=table,
+        totals={
+            "diamonds_in": sum(v["diamonds_in"] for v in s["games"].values()),
+            "diamonds_out": sum(v["diamonds_out"] for v in s["games"].values()),
+            "fees": sum(v["fees"] for v in s["games"].values()),
+            "net_retained": sum(v["net_retained"] for v in s["games"].values()),
+            "matches_checked": s["matches_checked"],
+            "unbalanced_matches": s["unbalanced_matches"],
+        },
+        definitions={
+            "net_retained": "Instant games: stakes less wins. Multiplayer games: the platform fee. In diamonds — not "
+                            "cash revenue, and player losses are not labelled revenue.",
+            "unbalanced_matches": "Matches settled in this period whose entries ≠ payouts + fee + refunds. Must be empty.",
+        },
+    )
+    if s["unbalanced_matches"]:
+        report.warnings.append(f"{len(s['unbalanced_matches'])} match(es) do not balance — see totals.unbalanced_matches.")
+    report.note_if_empty("No game was played in this period.")
+    return report
 
 
 async def payout_summary(
@@ -2848,6 +3089,19 @@ async def dashboard(
             "sellers",
             "Past their due date — blocked from new inventory",
         )
+        # B2c: what daily rewards and free call cards gave away. Read from Firestore `promoCredits`; a store that
+        # cannot be read is a warning on this screen, never a zero.
+        try:
+            promo = summarise_promotions(await _fs_scan("promoCredits", "createdAt", now - timedelta(days=30), now))
+            add("promotions", "promo_diamonds_issued_last_30_days", promo["promo_diamonds_issued"], "diamonds",
+                "Daily-reward diamonds credited — not revenue, a liability until spent")
+            add("promotions", "call_cards_issued_last_30_days", promo["call_cards_issued"], "cards")
+            add("promotions", "call_cards_used_last_30_days", promo["call_cards_redeemed"], "cards",
+                "Each paid the first minute of a call")
+            add("promotions", "card_host_beans_last_30_days", promo["card_host_beans"], "beans",
+                "Paid to hosts for minutes a free call card covered — Zipper's cost")
+        except DataUnavailable as exc:
+            warnings.append(f"Promotions could not be read: {exc}")
         if rt.provisional and rt.note not in warnings:
             warnings.append(rt.note)
 

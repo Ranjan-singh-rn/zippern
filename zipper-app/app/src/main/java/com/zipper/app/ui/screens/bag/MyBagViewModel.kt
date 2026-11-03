@@ -123,6 +123,7 @@ class MyBagViewModel @Inject constructor(
                             animationAsset = d.getString("animationAsset") ?: "",
                             animationUrl   = d.getString("animationUrl")   ?: "",
                             videoUrl       = d.getString("videoUrl")       ?: "",
+                            svgaUrl        = d.getString("svgaUrl")        ?: "",
                             targetGender   = d.getString("targetGender")  ?: "all",
                             targetRole     = d.getString("targetRole")    ?: "all",
                             targetUserId   = d.getString("targetUserId")  ?: "",

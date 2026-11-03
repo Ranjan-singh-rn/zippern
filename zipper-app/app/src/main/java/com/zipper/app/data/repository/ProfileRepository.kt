@@ -20,6 +20,7 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.tasks.await
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -107,8 +108,26 @@ class ProfileRepository @Inject constructor(
         }
     }
 
+    /**
+     * The signed-in account's uid as Firebase Auth holds it on this device, following sign-in, sign-out and an
+     * account switch — no Firestore read, so it cannot fail.
+     *
+     * A3 (3 Nov 2026): ProfileViewModel used to get this uid from [fetchCurrentUser], a one-shot `get()` of the
+     * users document, in five coroutines started from `init` with nothing catching. With the client offline —
+     * no network, or a session whose refresh token the server no longer accepts, so Firestore's watch stream is
+     * refused — and no cached copy, that `get()` throws "Failed to get document because the client is offline"
+     * and the app crashed seconds after launch (prod APK, emulator drop box, 2026-11-03 17:33:40 IST). The
+     * listeners below only ever needed the uid.
+     */
+    fun signedInUidFlow(): Flow<String?> = callbackFlow {
+        val listener = FirebaseAuth.AuthStateListener { trySend(it.currentUser?.uid) }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }.distinctUntilChanged()
+
     // ── One-shot fetch — own ──────────────────────────────────────────────────
 
+    /** Throws when the document cannot be read (offline with no cached copy, refused) — callers catch. */
     suspend fun fetchCurrentUser(): User? {
         val id = uid ?: return null
         return firestore.collection("users").document(id).get().await().let { User.from(it) }

@@ -63,6 +63,8 @@ FIRESTORE_KEEP: dict[str, str] = {
     "diamondPacks": "catalogue: diamond packs",
     "coinPackages": "catalogue: coin packages",
     "opsCanary": "ops: the Functions-side data canary (`opsCanary/target`)",
+    # Track B (3 Nov 2026)
+    "musicTracks": "catalogue: licensed party-room music (B7)",
 }
 
 FIRESTORE_DELETE: dict[str, str] = {
@@ -136,6 +138,19 @@ FIRESTORE_DELETE: dict[str, str] = {
     "feedback": "legacy feedback records",
     # ── legacy top-level copies seen in earlier resets ──
     "weeklyStatements": "legacy top-level weekly statements (money history)",
+    # ── Track B (3 Nov 2026): games, promotions, rankings, Party Pro, seller trades ──
+    "gameMatches": "multiplayer game tables (with private: seeds, hands, invite codes) — money movements",
+    "gameRounds": "instant game rounds (with private: hidden outcomes) — money movements",
+    "gameSeeds": "per-player provably-fair seeds",
+    "gameLedger": "game money ledger rows (money history)",
+    "gameIdempotency": "game replay guards",
+    "promoCredits": "promotions given away: daily rewards, free call cards, ranking rewards (money history)",
+    "leaderboards": "ranking boards (with entries) derived from gifts and calls",
+    "leaderboardSettlements": "ranking reward settlements (money history)",
+    "partySubscriptions": "Party Pro subscriptions per account (money history)",
+    "subscriptionPayments": "Party Pro payments (money history)",
+    "subscriptionIdempotency": "Party Pro replay guards",
+    "sellerTrades": "seller-to-seller trade mirror (money history)",
 }
 
 #: Subcollections the walker may meet UNDER A DELETE DOCUMENT, keyed by the
@@ -147,11 +162,16 @@ FIRESTORE_SUBCOLLECTIONS: dict[str, frozenset[str]] = {
         "followers", "following", "warnings", "diamondTransactions", "dailyStats",
         "weeklyEarnings", "weeklyStatements", "beanTransactions", "giftsSent", "giftsReceived",
         "notifications", "devices", "dailyClaims", "cardDebits",
+        "gameHistory",                      # Track B: finished games and rounds
     }),
     "agencies": frozenset({"agencyHosts", "commissionLedger"}),
     "sellers": frozenset({"rechargeHistory", "diamondLending"}),
     "liveRooms": frozenset({"comments", "gifts", "viewers"}),
-    "partyRooms": frozenset({"seats", "listeners", "messages", "seatRequests", "seatInvites", "gifts", "private"}),
+    "partyRooms": frozenset({"seats", "listeners", "messages", "seatRequests", "seatInvites", "gifts", "private",
+                             "admitted", "accessLog", "pinMisses"}),   # B2a / B7
+    "gameMatches": frozenset({"private"}),
+    "gameRounds": frozenset({"private"}),
+    "leaderboards": frozenset({"entries"}),
     "conversations": frozenset({"messages"}),
     "calls": frozenset({"messages"}),
     "giftPairs": frozenset({"gifts"}),
@@ -182,6 +202,7 @@ MONGO_DELETE: dict[str, str] = {
     "cards": "approval cards",
     "partners": "agencies and sellers",
     "partner_sales": "seller → buyer sales (money history)",
+    "seller_trades": "seller → seller trades (money history, B9)",
     "recharges": "recharges (money history)",
     "subagency_payouts": "sub-agency payouts (money history)",
     "weekly_business_reports": "weekly business reports (money history)",

@@ -3,8 +3,13 @@
  *
  * Quick Login means exactly one thing:
  *
- *     log back into the account that was most recently signed out
- *     from THIS physical device.
+ *     log back into an account that was recently signed in
+ *     on THIS physical device.
+ *
+ * B10 (4 Nov 2026, the account switcher): "an account", no longer only the
+ * most recent one — up to MAX_ACCOUNTS_PER_DEVICE (quickLogin.ts) per device
+ * key, each with its own credential, each bound, rotated and expired exactly as
+ * below. The narrowing that matters is unchanged: THIS device, proved by its key.
  *
  * It is not a persistent login, not a password, not account recovery, and not
  * transferable. Everything in this file exists to keep it that narrow.

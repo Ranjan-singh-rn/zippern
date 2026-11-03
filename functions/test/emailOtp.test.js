@@ -267,7 +267,11 @@ describe('verifyEmailBindCode', () => {
     expect(JSON.stringify(ev).includes('person@')).toBe(false)
   })
 
-  test('an anonymous session gets a same-uid custom token; a phone session does not', async () => {
+  test('every session gets a same-uid custom token after an email bind — a phone one too', async () => {
+    // Firebase expires an account's refresh tokens when its email address
+    // changes, so the session that bound the email cannot carry on whatever
+    // its provider (QA 3 Nov 2026: a phone session was signed out a second
+    // after binding). Anonymous and phone sessions are both re-issued.
     await request('a@example.com')
     const r = await verify('a@example.com', lastCode(), ANON)
     expect(r.customToken).toBe(`custom-${UID}`)
@@ -277,7 +281,16 @@ describe('verifyEmailBindCode', () => {
     await request('b@example.com', PHONE, 'P1')
     const p = await verify('b@example.com', lastCode(), PHONE, 'P1')
     expect(p.status).toBe('bound')
-    expect(p.customToken).toBe(undefined)
+    expect(p.customToken).toBe('custom-P1')
+    expect(authState.minted).toEqual([UID, 'P1'])
+  })
+
+  test('a refused verify (wrong code) mints nothing', async () => {
+    await request('w@example.com')
+    const code = lastCode()
+    const wrong = String((Number(code) + 1) % 1000000).padStart(6, '0')
+    await refusal(verify('w@example.com', wrong))
+    expect(authState.minted.length).toBe(0)
   })
 
   test('a wrong code is counted; the fifth wrong code locks the challenge', async () => {
@@ -501,14 +514,28 @@ describe('review fixes — the Auth record, cumulative limits, folding, replays'
     expect(outbox[0].to).toBe('victim+1@gmail.com')
   })
 
-  test('"already bound" hands an anonymous session its same-uid token (lost verify reply)', async () => {
+  // Security review (3 Nov 2026) of the QA #30 fix. This test used to expect a
+  // token for ANY provider on "already bound", with no proof of a recent bind —
+  // which let any still-live ID token keep minting fresh sessions after the
+  // account's sessions were revoked. The anonymous retry keeps its token; any
+  // other session gets one only right after the bind that expired it.
+  test('"already bound" (lost verify reply): the anonymous session gets its token; any other only right after its own bind', async () => {
     db.seed(`users/${UID}`, { name: 'g', email: 'me@example.com' })
     authState.records.set(UID, { uid: UID, email: 'me@example.com', emailVerified: true, providerData: [] })
     const anon = await request('me@example.com', ANON)
     expect(anon.status).toBe('already_bound')
     expect(anon.customToken).toBe(`custom-${UID}`)
-    const phone = await request('me@example.com', PHONE)
-    expect(phone.customToken).toBe(undefined)
+    // No record of when the address was bound: a phone session is NOT handed a sign-in.
+    const cold = await request('me@example.com', PHONE)
+    expect(cold.status).toBe('already_bound')
+    expect(cold.customToken).toBe(undefined)
+    // Bound a minute ago, by a session that predates it, nothing revoked since: rescued.
+    const boundAt = Date.now() - 60_000
+    db.seed(`emailOtpChallenges/${UID}`, { boundAtMs: boundAt })
+    authState.records.set(UID, { uid: UID, email: 'me@example.com', emailVerified: true, providerData: [],
+      tokensValidAfterTime: new Date(boundAt).toUTCString() })
+    const warm = await request('me@example.com', PHONE)
+    expect(warm.customToken).toBe(`custom-${UID}`)
   })
 
   test('a failed Auth write does NOT blank the document when the Auth side already holds the address', async () => {
@@ -548,6 +575,146 @@ describe('review fixes — the Auth record, cumulative limits, folding, replays'
     // Whatever the bind itself answers for a suspended account, no token is minted.
     await refusal(ID.bindVerifiedIdentity.run({ phone: '+919800000004' }, ctx(tok)))
     expect(authState.minted.length).toBe(0)
+  })
+})
+
+// ══════════════════════════════════════════════════════════════════════════
+// QA #30 (3 Nov 2026) — "Adding an e-mail signs phone users out". The bind
+// writes the address to the Auth record, Firebase expires the account's
+// refresh tokens on that change, and only the anonymous session used to be
+// re-issued. These pin the fix as a regression: the SAME account carries on,
+// with its data, and nobody else's session is ever minted.
+describe('QA #30 regression — a phone user who adds an e-mail stays signed in as the same account', () => {
+  const PUID = 'PH1'
+  beforeEach(() => {
+    db.seed(`users/${PUID}`, { name: 'Phone user', diamonds: 125, beans: 40, phoneNumber: '+919800000001' })
+    authState.records.set(PUID, { uid: PUID, phoneNumber: '+919800000001', providerData: [{ providerId: 'phone' }] })
+  })
+
+  test('the bind keeps the uid and the data, and hands back a token for that uid only', async () => {
+    await request('phone.user@example.com', PHONE, PUID)
+    const r = await verify('phone.user@example.com', lastCode(), PHONE, PUID)
+    expect(r.status).toBe('bound')
+    // a same-uid sign-in, never a new identity
+    expect(r.customToken).toBe(`custom-${PUID}`)
+    expect(authState.minted).toEqual([PUID])
+    // only this account's Auth record was written, and only with the address
+    expect(authState.updates.map((u) => u.uid)).toEqual([PUID])
+    expect(authState.records.get(PUID).phoneNumber).toBe('+919800000001')
+    // the account's own data is untouched
+    const doc = db.read(`users/${PUID}`)
+    expect(doc.diamonds).toBe(125)
+    expect(doc.beans).toBe(40)
+    expect(doc.name).toBe('Phone user')
+    expect(doc.email).toBe('phone.user@example.com')
+    // no second users document appeared
+    expect(db.all('users').length).toBe(2) // G1 (seeded for every test) and PH1
+  })
+
+  test('a DISPLACED phone session (another phone took the account) is refused: no bind, no token', async () => {
+    await request('late@example.com', PHONE, PUID)
+    const code = lastCode()
+    // Another device signed in after this one: the cut-off is newer than auth_time.
+    db.seed(`users/${PUID}`, { name: 'Phone user', diamonds: 125, credentialsValidAfter: 3000 })
+    const e = await refusal(verify('late@example.com', code, PHONE, PUID))
+    expect(e != null).toBe(true)
+    expect(e.code).toBe('permission-denied')
+    expect(authState.minted.length).toBe(0)
+    expect(authState.updates.length).toBe(0)
+    expect(db.read(`users/${PUID}`).email).toBe(undefined)
+  })
+
+  test('a SUSPENDED phone account is refused: no bind, no token', async () => {
+    await request('sus@example.com', PHONE, PUID)
+    const code = lastCode()
+    db.seed(`users/${PUID}`, { name: 'Phone user', isSuspended: true, accountState: 'suspended' })
+    const e = await refusal(verify('sus@example.com', code, PHONE, PUID))
+    expect(e.code).toBe('permission-denied')
+    expect(authState.minted.length).toBe(0)
+    expect(authState.updates.length).toBe(0)
+  })
+
+  test('the token is the caller\'s own uid even when the request names someone else', async () => {
+    db.seed('users/VICTIM', { name: 'v' })
+    await request('mine@example.com', PHONE, PUID)
+    const r = await OTP.verifyEmailBindCode.run(
+      { email: 'mine@example.com', code: lastCode(), uid: 'VICTIM' }, ctx(PHONE, PUID))
+    expect(r.customToken).toBe(`custom-${PUID}`)
+    expect(authState.minted).toEqual([PUID])
+    expect(db.read('users/VICTIM').email).toBe(undefined)
+  })
+
+  test('sameUidSessionToken: without afterEmailChange a phone session still gets nothing (other callers unchanged)', async () => {
+    expect(await ID.sameUidSessionToken(PUID, PHONE)).toBe('')
+    const facts = { nowMs: Date.now(), boundAtMs: Date.now(), authTimeSec: 2000, tokensValidAfterMs: 0, internal: false }
+    expect(await ID.sameUidSessionToken(PUID, PHONE, { afterEmailChange: true, rescue: facts })).toBe(`custom-${PUID}`)
+    // Security review: the caller's say-so alone is not enough any more.
+    expect(await ID.sameUidSessionToken(PUID, PHONE, { afterEmailChange: true })).toBe('')
+    expect(await ID.sameUidSessionToken(UID, ANON)).toBe(`custom-${UID}`)
+  })
+})
+
+// ══════════════════════════════════════════════════════════════════════════
+// Security review (3 Nov 2026) of the QA #30 fix: a same-uid sign-in after an
+// email change is handed out ONLY to the session that change expired, shortly
+// after it, and never once the account's sessions were revoked since (an
+// Observer MFA reset, a password change, a restriction) or to a staff identity.
+describe('security review — the post-email-change sign-in cannot outlive a revocation', () => {
+  const PUID = 'PH2'
+  beforeEach(() => {
+    db.seed(`users/${PUID}`, { name: 'Phone user', phoneNumber: '+919800000002' })
+    authState.records.set(PUID, { uid: PUID, phoneNumber: '+919800000002', providerData: [{ providerId: 'phone' }] })
+  })
+  const NOW = 1_800_000_000_000
+  const base = { nowMs: NOW, boundAtMs: NOW - 30_000, authTimeSec: (NOW - 3_600_000) / 1000, tokensValidAfterMs: NOW - 30_000, internal: false }
+  const why = (over) => ID.emailChangeRescueRefusal({ ...base, ...over })
+
+  test('the rule, case by case', () => {
+    expect(why({})).toBe('')
+    expect(why({ internal: true })).toBe('internal_identity')
+    expect(why({ boundAtMs: 0 })).toBe('no_bind_record')
+    expect(why({ boundAtMs: NOW - 11 * 60_000, tokensValidAfterMs: NOW - 11 * 60_000 })).toBe('bind_too_old')
+    expect(why({ authTimeSec: 0 })).toBe('no_auth_time')
+    // A session that started after the bind (beyond the clock skew) was never expired by it.
+    expect(why({ boundAtMs: NOW - 5 * 60_000, tokensValidAfterMs: NOW - 5 * 60_000, authTimeSec: (NOW - 60_000) / 1000 }))
+      .toBe('session_after_bind')
+    // The QA scenario: the Owner's sessions were revoked AFTER the bind.
+    expect(why({ tokensValidAfterMs: NOW - 5_000 })).toBe('revoked_after_bind')
+    // The email change itself moved the cut-off: within the skew, allowed.
+    expect(why({ tokensValidAfterMs: NOW - 30_000 + 10_000 })).toBe('')
+  })
+
+  test('a revocation after the bind (stolen phone, MFA reset): the retry gets NO token', async () => {
+    db.seed(`users/${PUID}`, { name: 'Phone user', email: 'p2@example.com' })
+    const boundAt = Date.now() - 120_000
+    db.seed(`emailOtpChallenges/${PUID}`, { boundAtMs: boundAt })
+    authState.records.set(PUID, { uid: PUID, email: 'p2@example.com', emailVerified: true, providerData: [],
+      tokensValidAfterTime: new Date(Date.now() - 10_000).toUTCString() })
+    const r = await request('p2@example.com', PHONE, PUID)
+    expect(r.status).toBe('already_bound')
+    expect(r.customToken).toBe(undefined)
+    expect(authState.minted.length).toBe(0)
+  })
+
+  test('a staff / Owner identity is never handed a token, even on the bind itself', async () => {
+    db.seed(`crmUsers/${PUID}`, { role: 'superadmin' })
+    await request('owner.phone@example.com', PHONE, PUID)
+    const r = await verify('owner.phone@example.com', lastCode(), PHONE, PUID)
+    expect(r.status).toBe('bound')
+    expect(r.customToken).toBe(undefined)
+    expect(authState.minted.length).toBe(0)
+  })
+
+  test('a partner login (agency / seller) is NOT staff: its bind is rescued as before', async () => {
+    db.seed(`crmUsers/${PUID}`, { role: 'agency' })
+    await request('agency.phone@example.com', PHONE, PUID)
+    const r = await verify('agency.phone@example.com', lastCode(), PHONE, PUID)
+    expect(r.customToken).toBe(`custom-${PUID}`)
+  })
+
+  test('isInternalCrmRole', () => {
+    expect(['superadmin', 'observer', 'ops_admin', 'support_member'].map(ID.isInternalCrmRole)).toEqual([true, true, true, true])
+    expect(['agency', 'seller', '', undefined].map(ID.isInternalCrmRole)).toEqual([false, false, false, false])
   })
 })
 

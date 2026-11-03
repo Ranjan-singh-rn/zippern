@@ -10,6 +10,8 @@ activityCompose = "1.9.3"
 coil = "2.7.0"
 media3 = "1.4.1"
 lottie = "6.5.0"
+# B13 (4 Nov 2026): SVGA — the gift / entrance / frame animation format live apps use (open source, JitPack).
+svgaplayer = "2.6.1"
 firebaseBom = "33.5.1"
 agora = "4.5.0"
 cameraX = "1.3.4"
@@ -88,6 +90,7 @@ media3-effect       = { group = "androidx.media3", name = "media3-effect",      
 
 # Lottie
 lottie-compose = { group = "com.airbnb.android", name = "lottie-compose", version.ref = "lottie" }
+svgaplayer = { group = "com.github.yyued", name = "SVGAPlayer-Android", version.ref = "svgaplayer" }
 
 # CameraX
 camerax-core = { group = "androidx.camera", name = "camera-core", version.ref = "cameraX" }

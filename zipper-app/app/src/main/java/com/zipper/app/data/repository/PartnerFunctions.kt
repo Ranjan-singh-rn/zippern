@@ -288,6 +288,13 @@ class PartnerFunctions @Inject constructor(
         val waiting: List<WaitingRole>,
         /** From `checkPartnerActivation`: the roles that started on this check. */
         val started: List<WaitingRole> = emptyList(),
+        /**
+         * From `checkPartnerActivation`: the server's sentence for each waiting
+         * role it could NOT start (`started[].refusal`), distinct, in order.
+         * E2E round 2 (QA #51): these used to be dropped, so an invited host who
+         * verified a different email was told "Your role is starting." for ever.
+         */
+        val refusals: List<String> = emptyList(),
     )
 
     /** What is verified on this account, and which approved roles wait for it. */
@@ -460,11 +467,16 @@ class PartnerFunctions @Inject constructor(
                     )
                 }
             }
+            val refusals = (m["started"] as? List<*>).orEmpty().mapNotNull { r ->
+                (r as? Map<*, *>)?.takeIf { it["activated"] != true }
+                    ?.get("refusal")?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            }.distinct()
             return VerificationState(
                 requirement = ActivationRequirement.fromVerification(m["verification"])
                     ?: ActivationRequirement(complete = false, missing = listOf("phone", "email"), emailUnproved = false),
                 waiting = roles(m["waiting"]),
                 started = started,
+                refusals = refusals,
             )
         }
 

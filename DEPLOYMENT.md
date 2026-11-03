@@ -196,7 +196,7 @@ gcloud run deploy zipper-api \
   --source . \
   --region asia-south1 \
   --allow-unauthenticated \
-  --set-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=zipper-83816,OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=314zipper@gmail.com,MAIL_FROM_NAME=Zipper,REPORT_TIMEZONE=Asia/Kolkata,PORTAL_URL=https://zipperlive.web.app,UNSUBSCRIBE_EMAIL=314zipper@gmail.com" \
+  --set-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=zipper-83816,OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=no-reply@zipperlive.org,MAIL_FROM_NAME=Zipper,REPORT_TIMEZONE=Asia/Kolkata,PORTAL_URL=https://zipperlive.web.app,UNSUBSCRIBE_EMAIL=support@zipperlive.org" \
   --set-secrets "MONGO_URI=MONGO_URI:latest,JWT_SECRET=JWT_SECRET:latest,SENDGRID_API_KEY=SENDGRID_API_KEY:latest,SERVICE_KEY_WEEKLY_ACCRUAL=SERVICE_KEY_WEEKLY_ACCRUAL:latest,SERVICE_KEY_REPORTING=SERVICE_KEY_REPORTING:latest,SERVICE_KEY_PARTNER_REGISTRATION=SERVICE_KEY_PARTNER_REGISTRATION:latest" \
   --min-instances 0 \
   --max-instances 10 \
@@ -234,23 +234,16 @@ watching. `./deploy.sh` warns when a half is missing.
 
 `PORTAL_URL` and `UNSUBSCRIBE_EMAIL` were also added above. `PORTAL_URL`
 defaults to `https://zipper.web.app`, which is not this site — leaving it
-unset points every link in every email at a domain you do not own. Unset,
-`UNSUBSCRIBE_EMAIL` derives `unsubscribe@gmail.com`, somebody else's address,
-and bulk mail with no working unsubscribe is itself a spam signal.
+unset points every link in every email at a domain you do not own.
+`UNSUBSCRIBE_EMAIL` is `support@zipperlive.org`; unset, it now falls back to
+the same support address (QA #47) rather than deriving an address nobody created.
 
-**`MAIL_FROM` must be an address verified as a sender in SendGrid.** It was
-`no-reply@zipper.app` here, which is not verified on that account, and SendGrid
-answers an unverified sender with `403 Forbidden` — so every email silently
-failed, including the observer's sign-in code. `314zipper@gmail.com` is the
-verified one. If you move to a business domain later, verify it in SendGrid
-*first*, then change this.
-
-**And `314zipper@gmail.com` is why all of it lands in spam.** Verified is not
-the same as authenticated: SendGrid will accept mail claiming a From it has
-verified, and every receiver will still see an unaligned Gmail address sent from
-a third party's servers. You cannot publish SPF or DKIM for `gmail.com`. **§ 11
-is the fix, and it is the only fix** — do it before you conclude the reports are
-not being sent, because they are.
+**Email identities (owner decision, 3 Nov 2026 — final; see § 11.7).** The
+domain is `zipperlive.org`, authenticated in SendGrid. `MAIL_FROM` is
+`no-reply@zipperlive.org` and sends every automated message; `support@` and
+`info@zipperlive.org` are the contact addresses people are told to write to.
+Earlier versions of this guide used a personal Gmail address as `MAIL_FROM`;
+that is history (§ 11.0) and must not be reintroduced.
 
 If `SERVICE_KEY_WEEKLY_ACCRUAL` does not exist yet, create it first — § 8. The
 deploy fails if the secret is missing.
@@ -1043,9 +1036,12 @@ domain and a domain is a thing you own. Do § 11.1 to § 11.5 in order. Until
 § 11.1 is done, **nothing else on this list will help**, and that is not a
 figure of speech — see § 11.0 for why.
 
-### 11.0 Why `314zipper@gmail.com` will always be treated as spam
+### 11.0 Why a Gmail sender is always treated as spam (history)
 
-The backend is currently deployed with `MAIL_FROM=314zipper@gmail.com` (§ 4).
+*Historical — kept for the reasoning. Production now sends from
+`no-reply@zipperlive.org` on an authenticated domain (§ 11.7).*
+
+The backend was once deployed with a personal Gmail address as `MAIL_FROM` (§ 4).
 Every report, alert and receipt therefore says it is *from* a Gmail address, and
 is *sent by* SendGrid. A receiving mail server checks three things:
 
@@ -1196,31 +1192,36 @@ Only now change the addresses. Three identities, all on the authenticated
 domain, so one DKIM key aligns all of them:
 
 ```bash
+# QA #47 (owner decision, 3 Nov 2026): exactly three addresses on zipperlive.org.
+# Do not add others (notifications@, reports@, unsubscribe@ … were examples in
+# earlier versions of this guide and are NOT Zipper addresses).
 gcloud run services update zipper-api --region asia-south1 \
   --update-env-vars "\
-MAIL_FROM=no-reply@<yourdomain>,\
+MAIL_FROM=no-reply@zipperlive.org,\
 MAIL_FROM_NAME=Zipper,\
-MAIL_FROM_TRANSACTIONAL=notifications@<yourdomain>,\
-MAIL_FROM_NAME_TRANSACTIONAL=Zipper,\
-MAIL_FROM_BULK=reports@<yourdomain>,\
-MAIL_FROM_NAME_BULK=Zipper reports,\
-MAIL_FROM_SUPPORT=support@<yourdomain>,\
-SUPPORT_EMAIL=support@<yourdomain>,\
-UNSUBSCRIBE_EMAIL=unsubscribe@<yourdomain>"
+CONTACT_SUPPORT_EMAIL=support@zipperlive.org,\
+CONTACT_INFO_EMAIL=info@zipperlive.org,\
+UNSUBSCRIBE_EMAIL=support@zipperlive.org"
 ```
+
+*Not run by the QA fix round — the Owner decides when production changes.*
 
 What each one is for:
 
-| Variable | Carries | Why separate |
+| Variable | Address | Carries |
 |---|---|---|
-| `MAIL_FROM_TRANSACTIONAL` | approvals, receipts, invitations, sign-in codes | One person's own event. Must never be held up by a reputation problem on report mail. |
-| `MAIL_FROM_BULK` | scheduled reports and alerts | Machine-generated, repeated, to a standing list. Carries the unsubscribe headers. |
-| `MAIL_FROM_SUPPORT` | nothing — it is the `Reply-To` on everything | So a partner who replies to a no-reply address still reaches a person. |
-| `UNSUBSCRIBE_EMAIL` | the `mailto:` in `List-Unsubscribe` | Must accept mail. Gmail checks that it does not hard-bounce. |
+| `MAIL_FROM` | `no-reply@zipperlive.org` | The SENDER of every automated message — OTPs, verification, password resets, security and system notices, receipts, reports. No `Reply-To` is ever set. |
+| `CONTACT_SUPPORT_EMAIL` | `support@zipperlive.org` | Where every email, notice, CRM page and app screen tells a person to write for help (appeals, privacy requests, a figure they question). Never a sender of automated mail. |
+| `CONTACT_INFO_EMAIL` | `info@zipperlive.org` | General business information. Never a sender of automated mail. |
+| `UNSUBSCRIBE_EMAIL` | `support@zipperlive.org` | The `mailto:` in `List-Unsubscribe`. Must accept mail — Gmail checks that it does not hard-bounce. |
 
-`support@` and `unsubscribe@` must be **real, monitored mailboxes** — Google
-Workspace, or free forwarding at your registrar. An address that bounces is
-worse than no address.
+`EMAIL_IDENTITY_INFO_ENABLED` / `EMAIL_IDENTITY_SUPPORT_ENABLED` stay **false**:
+automated mail must not appear to come from `info@` or `support@`.
+`MAIL_FROM_TRANSACTIONAL`, `MAIL_FROM_BULK` and `MAIL_FROM_SUPPORT` stay unset.
+
+`support@` and `info@` must be **real, monitored mailboxes** before they are
+published — see § 11.8: on 3 Nov 2026 `zipperlive.org` had no MX record, so
+neither could receive mail yet.
 
 Then confirm from the CRM: `/tech/email` → the Cause column is empty on new
 sends, and a delivery row's `sender.aligned` reads `true`. It reads `false` with
@@ -1244,6 +1245,25 @@ that one address and that one report, so forwarding the email gives nobody power
 over anyone else's subscription. It can mute a scheduled report and nothing
 else — it cannot silence an alert (8A.4: an exception is not switchable off) and
 it cannot stop a partner's own statement.
+
+### 11.8 zipperlive.org — what DNS said on 3 Nov 2026, and what is still needed
+
+Read from public DNS (Google DNS-over-HTTPS) during the QA fix round. Nothing
+was changed; DNS and SendGrid are the Owner's.
+
+| Record | Found | Status |
+|---|---|---|
+| DKIM `s1._domainkey` / `s2._domainkey` | CNAME → `s1/s2.domainkey.u110246415.wl166.sendgrid.net` | ✓ SendGrid domain authentication is in place (DKIM passed on the controlled send of 1 Nov) |
+| SPF | no TXT at the root; SendGrid's return-path subdomain carries it | ✓ for SendGrid mail (SPF passed on the controlled send). Add a root SPF record only when another service (a mailbox host) sends as `@zipperlive.org`, and then include that service. |
+| DMARC `_dmarc` | `v=DMARC1; p=quarantine; adkim=r; aspf=r; rua=mailto:dmarc_rua@onsecureserver.net` | ✓ present (the registrar's default reporting address). Optional: send aggregate reports to a mailbox you read. |
+| MX | **none** | ✗ **Nothing at `@zipperlive.org` can receive mail** — `support@` and `info@` (published in the app, the CRM, emails and the privacy policy) bounce until a mailbox or forwarding is set up at the registrar or a mail host. |
+
+Still required, in this order (all Owner actions; none were done in the fix round):
+
+1. Create mailboxes or forwarding for `support@zipperlive.org` and `info@zipperlive.org` (registrar email forwarding or a mail host), which publishes the MX records. Then add that host to a root SPF record if it sends mail.
+2. Confirm SendGrid → Settings → Sender Authentication still shows `zipperlive.org` **verified**. The From is `no-reply@zipperlive.org`; with domain authentication no single-sender verification is needed for it.
+3. Set the production env to the values in § 11.5 (`UNSUBSCRIBE_EMAIL=support@zipperlive.org`, `CONTACT_*`), and leave the two identity switches off.
+4. Send one controlled test to an address you own (never a real user) and check `Authentication-Results`: `spf=pass`, `dkim=pass header.d=zipperlive.org`, `dmarc=pass`.
 
 ### 11.7 Warm-up — and the thing that actually kills a domain
 
@@ -1516,16 +1536,19 @@ group; this is the complete list.
 | Variable | Default | What it does | Class |
 |---|---|---|---|
 | `SENDGRID_API_KEY` | *(empty)* | The provider credential. Empty is **not** silent: every send is still recorded, with outcome `not_configured` and the sentence "SENDGRID_API_KEY is not set in this environment, so nothing was delivered", visible on `/tech/email`. Nothing reaches a recipient. § 3 mints it. | **Must-set** |
-| `MAIL_FROM` | `no-reply@zipper.app` | The base From address and the fallback for every sender identity below. It is also the domain the unsubscribe mailbox is derived from when `UNSUBSCRIBE_EMAIL` is unset. The default is a domain this project does not own. | **Must-set** |
+| `MAIL_FROM` | `no-reply@zipperlive.org` | The SENDER of every automated message (QA #47, owner decision 3 Nov 2026). On the SendGrid-authenticated domain, so SPF and DKIM align. Never a contact address. | **Must-set** |
 | `MAIL_FROM_NAME` | `Zipper` | Display name paired with `MAIL_FROM`, and the fallback for the two per-stream display names. | Tunable |
 | `PORTAL_URL` | `https://zipper.web.app` | The link target in partner and staff mail — the "Open your portal" and "Set your password" buttons, and the base of the report-definitions URL. **No figure is derived from it; it is a link and nothing else.** The default does not match the Hosting site this repo actually deploys to — `.firebaserc` targets `zipperlive` and every command in this document uses `https://zipperlive.web.app` — and the § 4 deploy command does not set it. Until you do, every button in every email points at a host that is not yours. | **Must-set** |
-| `SUPPORT_EMAIL` | *(empty)* | The address a partner replies to. Empty falls back through `MAIL_FROM_SUPPORT` to `MAIL_FROM`. | Tunable |
+| `SUPPORT_EMAIL` | *(empty)* | Legacy. Only used as the From of the `support` identity if `EMAIL_IDENTITY_SUPPORT_ENABLED` were switched on — it stays off (automated mail never leaves from support@). Not a Reply-To: none is ever set. | Leave unset |
+| `CONTACT_SUPPORT_EMAIL` | `support@zipperlive.org` | QA #47: where every email footer, notice, CRM page and app screen tells a person to write for help. An override not on the official domain is ignored (`app/core/contacts.py`). | Tunable |
+| `CONTACT_INFO_EMAIL` | `info@zipperlive.org` | QA #47: general business information. Same rule. | Tunable |
+| `OFFICIAL_EMAIL_DOMAIN` | `zipperlive.org` | QA #47: the domain the contact overrides must be on. | Do not change |
 | `MAIL_FROM_TRANSACTIONAL` | *(empty)* | From address for a person's own event — approval, receipt, invitation, sign-in code. Empty falls back to `MAIL_FROM` — and if `MAIL_FROM_BULK` is empty too, both streams collapse onto that one address and a reputation problem on the reports can hold up a payout receipt. Must be on the same authenticated domain as `MAIL_FROM` or SPF/DKIM do not align; `email.sender_alignment()` checks this at send time and records the answer on the delivery row rather than leaving it to be guessed from a spam folder. | Tunable |
 | `MAIL_FROM_NAME_TRANSACTIONAL` | *(empty)* | Display name for that stream. Falls back to `MAIL_FROM_NAME`. | Tunable |
 | `MAIL_FROM_BULK` | *(empty)* | ⚠ From address for scheduled reports, alerts and every composed broadcast to more than one person — `broadcast.identity_for` forces the bulk identity on any multi-recipient send and tells the sender it did. Empty falls back to `MAIL_FROM`, so the stream keeps no address of its own and, if `MAIL_FROM_TRANSACTIONAL` is also unset, receipts and mailshots leave from one address and share one complaint rate. See § A.11. | ⚠ **Silent** |
 | `MAIL_FROM_NAME_BULK` | *(empty)* | Display name for the bulk stream. Falls back to `MAIL_FROM_NAME`. | Tunable |
-| `MAIL_FROM_SUPPORT` | *(empty)* | Used as `Reply-To` on **everything**, so a partner replying to a no-reply address still reaches a person. Empty falls back to `SUPPORT_EMAIL`, then `MAIL_FROM`. | Tunable |
-| `UNSUBSCRIBE_EMAIL` | *(empty)* | The mailbox the `mailto:` in `List-Unsubscribe` points at. Empty is **derived**, not omitted: `unsubscribe@<the MAIL_FROM domain>`. With a `MAIL_FROM` on a shared provider that derives an address on somebody else's domain, and Gmail checks that the mailbox does not hard-bounce. Set it to a real, monitored mailbox on your own domain. | **Must-set** |
+| `MAIL_FROM_SUPPORT` | *(empty)* | Legacy: the From of the `support` identity when its switch is on (it stays off). Never a `Reply-To` — none is ever set. | Leave unset |
+| `UNSUBSCRIBE_EMAIL` | *(empty)* | The mailbox the `mailto:` in `List-Unsubscribe` points at. Empty falls back to `CONTACT_SUPPORT_EMAIL` (QA #47 — it used to derive `unsubscribe@<domain>`, an address nobody created). Set it to `support@zipperlive.org`, and make sure that mailbox receives mail (§ 11.8). | **Must-set** |
 | `UNSUBSCRIBE_URL` | *(empty)* | ⚠ The RFC 8058 one-click endpoint. `List-Unsubscribe-Post` is emitted only when this is set — see § A.11. Set it to `https://<api host>/api/notifications/unsubscribe`; the route exists and is token-authenticated. | ⚠ **Silent** |
 | `EMAIL_TIMEOUT_SECONDS` | `20` | How long the SendGrid client waits. A timeout is recorded as a failed delivery rather than left hanging. | Tunable |
 | `EMAIL_MAX_ATTACHMENT_BYTES` | `5000000` | Per-file ceiling. A report CSV over it is omitted from the message with a stated reason and the mail tells the reader to fetch the whole table from the portal with `?format=csv`. | Tunable |
@@ -1723,7 +1746,7 @@ They are the reason this appendix exists.
 | **The house sets no loss ceiling.** Only a player's own limit, or one imposed on a review, applies — there is no business-wide daily or weekly cap on what one account can lose. Deliberate: the figure is a commercial and regulatory decision, not one this file should invent. But until it is set, the feature is not enforcing anything. | `PROTECTION_DEFAULT_DAILY_LOSS_LIMIT`, `PROTECTION_DEFAULT_WEEKLY_LOSS_LIMIT` |
 | **No machine may call anything.** Each of the three service credentials, empty, turns off its own path in full: no weekly accrual, nothing scheduled at all, and new agencies and sellers that never reach the approval queue. Each has a section above that says so (§ 8.9, § 9.9, § 10.9); they are repeated here because the shape is identical. | `SERVICE_KEY_WEEKLY_ACCRUAL`, `SERVICE_KEY_REPORTING`, `SERVICE_KEY_PARTNER_REGISTRATION` |
 | **Firestore-triggered email is dropped on the floor.** `SG_MAIL_KEY` is the Cloud Functions' own SendGrid credential, separate from the API's. Unset, `sendMail()` logs and returns; no recipient, and no row in the delivery log the API keeps, so `/tech/email` cannot tell you it happened. | `SG_MAIL_KEY` |
-| **The unsubscribe mailbox is derived, and may not be yours.** `UNSUBSCRIBE_EMAIL` empty is not omitted — it becomes `unsubscribe@<the MAIL_FROM domain>` and goes out in the `List-Unsubscribe` header of every report. While `MAIL_FROM` is on a shared provider, that header advertises an address on somebody else's domain. Gmail checks that it does not hard-bounce. | `UNSUBSCRIBE_EMAIL` |
+| **The unsubscribe and contact mailboxes must receive mail.** `UNSUBSCRIBE_EMAIL` empty falls back to the support address (QA #47), and `support@` / `info@zipperlive.org` are published everywhere — but on 3 Nov 2026 the domain had no MX record (§ 11.8), so mail to them bounces until a mailbox or forwarding exists. Gmail checks that an unsubscribe mailbox does not hard-bounce. | `UNSUBSCRIBE_EMAIL`, MX for `zipperlive.org` |
 | **Two settings do nothing at all, whatever you set them to.** `ALERT_AWAITING_SIGNATURE_HOURS` is declared and described and read by no code — the large-card detector has no age condition and queue ageing uses `ALERT_QUEUE_AGE_HOURS`. `API_PORT` and `FIREBASE_PROJECT_ID` are likewise read by nothing. | `ALERT_AWAITING_SIGNATURE_HOURS`, `API_PORT`, `FIREBASE_PROJECT_ID` |
 
 ## A.12 The must-set list, in one place

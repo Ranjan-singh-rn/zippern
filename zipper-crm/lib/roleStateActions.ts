@@ -149,10 +149,27 @@ export interface RoleActionContext {
    * the server answer.
    */
   canManageHostRole?: boolean
+  /**
+   * E2E round 2 (3 Nov 2026) — QA #41's rule, applied to the role rows: a
+   * Support Admin (no `can_approve_kyc`, no `can_approve_seller`) was offered
+   * Suspend / Revoke on a Sub-agency and a Coin Seller role, and Revoke Host
+   * role, and the API refused each one. Whether this reviewer holds
+   * `can_approve_kyc` or `can_approve_seller` — what suspending, resuming and
+   * revoking an Agency, Sub-agency or Coin Seller role costs on the server
+   * (`partner_ops._APPROVE_PARTNER`). `false` disables them with the reason;
+   * `undefined` (not known) offers them and lets the server answer.
+   */
+  canManagePartnerRole?: boolean
 }
 
 export const HOST_ROLE_PERMISSION_HINT =
   'Suspending or resuming the Host role needs the KYC-approval permission — the same as revoking it.'
+
+export const HOST_REVOKE_PERMISSION_HINT =
+  'Revoking the Host role needs the KYC-approval permission.'
+
+export const PARTNER_ROLE_PERMISSION_HINT =
+  'Suspending, resuming or revoking this role needs the KYC- or seller-approval permission.'
 
 /** Where a role row's record is reviewed. */
 export function roleRecordHref(r: RoleRow): string {
@@ -228,6 +245,10 @@ export function roleRowActions(r: RoleRow, ctx: RoleActionContext): RoleRowActio
       const hostLive = features.hostRoleSuspension
       const hostBlocked = hostLive && ctx.canManageHostRole === false
       const hostHint = (live: string) => !hostLive ? NEXT_RELEASE_NOTE : hostBlocked ? HOST_ROLE_PERMISSION_HINT : live
+      // Agency / Sub-agency / Coin Seller: POST /partner-ops/partners/{id}/
+      // deactivate | reactivate | revoke (`can_approve_kyc` or `can_approve_seller`).
+      const partnerBlocked = ctx.canManagePartnerRole === false
+      const partnerHint = (live: string) => partnerBlocked ? PARTNER_ROLE_PERMISSION_HINT : live
       if (state === 'approved') {
         if (r.role === 'host') {
           out.push(action(r, 'suspend_role', `Suspend ${label} role`, hostLive ? 'api' : 'stub', {
@@ -235,8 +256,10 @@ export function roleRowActions(r: RoleRow, ctx: RoleActionContext): RoleRowActio
             hint: hostHint('Only the Host role is paused — the account and its other roles stay. The person and their agency are told.'),
           }))
         } else if (addressable) {
-          out.push(action(r, 'suspend_role', `Suspend ${label} role`, 'api',
-            { hint: 'Temporary. The record keeps its place; the person is told.' }))
+          out.push(action(r, 'suspend_role', `Suspend ${label} role`, 'api', {
+            disabled: partnerBlocked,
+            hint: partnerHint('Temporary. The record keeps its place; the person is told.'),
+          }))
         }
       } else {
         if (r.role === 'host') {
@@ -245,14 +268,23 @@ export function roleRowActions(r: RoleRow, ctx: RoleActionContext): RoleRowActio
             hint: hostHint('Lifts the Host-role suspension — the same role, re-activated. The person and their agency are told.'),
           }))
         } else if (addressable) {
-          out.push(action(r, 'resume_role', `Resume ${label} role`, 'api',
-            { hint: 'Lifts the role-level suspension. The same record, re-activated.' }))
+          out.push(action(r, 'resume_role', `Resume ${label} role`, 'api', {
+            disabled: partnerBlocked,
+            hint: partnerHint('Lifts the role-level suspension. The same record, re-activated.'),
+          }))
         }
       }
       if (addressable) {
         const may = serverActions.has('revoke')
-        out.push(action(r, 'revoke_role', `Revoke ${label} role`, 'api',
-          { disabled: !may, hint: may ? 'Only this role is taken away; the account and its other roles stay.' : ONLY_ROLE_HINT }))
+        // POST /users/{uid}/revoke-host costs `can_approve_kyc` whatever the
+        // suspension flag says; a partner role, the partner permission.
+        const revokeBlocked = r.role === 'host' ? ctx.canManageHostRole === false : partnerBlocked
+        const revokeBlockedHint = r.role === 'host' ? HOST_REVOKE_PERMISSION_HINT : PARTNER_ROLE_PERMISSION_HINT
+        out.push(action(r, 'revoke_role', `Revoke ${label} role`, 'api', {
+          disabled: !may || revokeBlocked,
+          hint: revokeBlocked ? revokeBlockedHint
+            : may ? 'Only this role is taken away; the account and its other roles stay.' : ONLY_ROLE_HINT,
+        }))
       }
       break
     }

@@ -14,7 +14,7 @@ import java.util.TimeZone
  * a call, setting a rate, Host home — and every one of those server paths
  * refuses with `details.code = HOST_ROLE_SUSPENDED` and one sentence:
  *
- *   Your Host role is suspended until 04 Nov 2026, 10:15 UTC — reason: …
+ *   Your Host role is suspended until 4 Nov 2026, 3:45 pm IST — reason: …
  *
  * This object says the same sentence from the account's own document
  * (`users/{uid}.hostSuspended` / `hostSuspendedUntil` / `hostSuspendedReason`,
@@ -52,12 +52,19 @@ object HostSuspension {
     }
 
     /**
+     * QA #54 — `4 Nov 2026, 3:45 pm IST`: the backend's `email.when` and the
+     * Functions' `whenIst`, written out by hand (no locale formatter) so all
+     * three agree. People read times in India Standard Time; stored values stay UTC.
+     */
+    fun whenIst(epochMs: Long): String = IstTime.format(epochMs)
+
+    /**
      * The server's sentence, word for word. [untilMs] null or ≤ 0 means the
      * suspension runs until somebody resumes it; a blank [reason] drops the
      * `— reason: …` part rather than printing an empty one.
      */
     fun message(untilMs: Long?, reason: String?): String {
-        val until = if (untilMs != null && untilMs > 0L) whenUtc(untilMs) else "it is resumed"
+        val until = if (untilMs != null && untilMs > 0L) whenIst(untilMs) else "it is resumed"
         val why = reason?.trim().orEmpty()
         return "Your Host role is suspended until $until" + (if (why.isNotEmpty()) " — reason: $why" else "")
     }

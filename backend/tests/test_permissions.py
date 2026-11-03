@@ -742,6 +742,12 @@ EXPECTED: dict[tuple[str, str], set[str]] = {
     # ── C3 — transfers: requested by a KYC reviewer, decided by the Owner ──
     ("POST", "/partner-ops/transfers"): {"can_approve_kyc"},
     ("GET", "/partner-ops/transfers"): {"can_approve_kyc"},
+    # ── B9 (3 Nov 2026) — the coin-seller business: a tier (it sets the seller's wholesale price), a credit
+    # limit, and deciding a seller-to-seller trade are coin operations (and the Owner signs the money ones) ──
+    ("POST", "/partner-ops/sellers/{seller_id}/tier"): {"can_coin_operations"},
+    ("POST", "/partner-ops/sellers/{seller_id}/credit-limit"): {"can_coin_operations"},
+    ("POST", "/partner-ops/seller-trades/{trade_id}/approve"): {"can_coin_operations"},
+    ("POST", "/partner-ops/seller-trades/{trade_id}/reject"): {"can_coin_operations"},
 }
 
 for key, wanted in sorted(EXPECTED.items()):

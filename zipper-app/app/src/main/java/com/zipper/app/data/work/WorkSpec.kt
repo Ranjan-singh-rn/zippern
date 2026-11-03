@@ -7,9 +7,6 @@ import com.zipper.app.util.jsonMap
 import com.zipper.app.util.jsonPath
 import com.zipper.app.util.jsonText
 import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /*
  * The work screens are DECLARED, not hand-built one by one.
@@ -512,7 +509,8 @@ object WorkDisplay {
 
     fun date(v: Any?): String {
         val ms = millis(v) ?: return v.jsonText() ?: "—"
-        return SimpleDateFormat("d MMM yyyy, HH:mm", Locale.getDefault()).format(Date(ms))
+        // QA #54: the staff Work hub shows times in IST, like every notice.
+        return com.zipper.app.util.IstTime.format(ms)
     }
 
     fun value(v: Any?, kind: FieldKind): String = when (kind) {

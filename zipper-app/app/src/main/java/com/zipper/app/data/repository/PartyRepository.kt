@@ -69,12 +69,14 @@ data class PartyListener(
     val entranceItemId: String = "",
     val entranceVideoUrl: String = "",
     val entrancePosterUrl: String = "",
+    /** B13: an SVGA entrance — played with this person's photo and name in it. Preferred over the video. */
+    val entranceSvgaUrl: String = "",
     val idFrameItemId: String = "",
     val idFrameUrl: String = "",
     val joinedAt: Long = 0L,
 ) {
     /** Whether there is actually a clip to play for this arrival. */
-    val hasEntrance: Boolean get() = entranceVideoUrl.isNotBlank()
+    val hasEntrance: Boolean get() = entranceVideoUrl.isNotBlank() || entranceSvgaUrl.isNotBlank()
 
     companion object {
         fun from(doc: com.google.firebase.firestore.DocumentSnapshot): PartyListener? {
@@ -87,6 +89,7 @@ data class PartyListener(
                 entranceItemId    = doc.getString("entranceItemId") ?: "",
                 entranceVideoUrl  = doc.getString("entranceVideoUrl") ?: "",
                 entrancePosterUrl = doc.getString("entrancePosterUrl") ?: "",
+                entranceSvgaUrl   = doc.getString("entranceSvgaUrl") ?: "",
                 idFrameItemId     = doc.getString("idFrameItemId") ?: "",
                 idFrameUrl        = doc.getString("idFrameUrl") ?: "",
                 joinedAt          = doc.millis("joinedAt"),
@@ -108,6 +111,11 @@ data class PartyGiftEvent(
     val quantity: Int = 1,
     val diamondCost: Long = 0L,
     val timestamp: Long = 0L,
+    /** B7: who it was for, and the settlement it belongs to (server-written with the gift). */
+    val receiverUid: String = "",
+    val transactionId: String = "",
+    /** B13: the gift's SVGA animation, written by settleGift. */
+    val svgaUrl: String = "",
 ) {
     companion object {
         fun from(doc: com.google.firebase.firestore.DocumentSnapshot): PartyGiftEvent? {
@@ -124,6 +132,9 @@ data class PartyGiftEvent(
                 quantity       = (doc.getLong("quantity") ?: 1L).toInt(),
                 diamondCost    = doc.getLong("diamondCost") ?: 0L,
                 timestamp      = doc.millis("timestamp"),
+                receiverUid    = doc.getString("receiverUid") ?: "",
+                transactionId  = doc.getString("transactionId") ?: "",
+                svgaUrl        = doc.getString("svgaUrl") ?: "",
             )
         }
     }
@@ -142,7 +153,8 @@ class PartyRepository @Inject constructor(
     /** What a callable said. Mirrors [HostFunctions.Result] so call sites read alike. */
     sealed interface Result<out T> {
         data class Ok<T>(val value: T) : Result<T>
-        data class Failed(val code: String, val userMessage: String) : Result<Nothing>
+        /** [detail] is the server's own refusal code when it sent one: `PARTY_PIN_LOCKED`, `PRIVATE_ROOM_SUBSCRIPTION_REQUIRED` … */
+        data class Failed(val code: String, val userMessage: String, val detail: String = "") : Result<Nothing>
     }
 
     private val partyRoomsCol get() = firestore.collection("partyRooms")
@@ -505,6 +517,8 @@ class PartyRepository @Inject constructor(
         seatMode: String? = null,
         visibility: String? = null,
         password: String? = null,
+        theme: String? = null,
+        blockCalls: Boolean? = null,
     ): Result<Boolean> = call("updatePartyRoom", buildMap {
         put("roomId", roomId)
         title?.let { put("title", it) }
@@ -513,6 +527,8 @@ class PartyRepository @Inject constructor(
         seatMode?.let { put("seatMode", it) }
         visibility?.let { put("visibility", it) }
         password?.let { put("password", it) }
+        theme?.let { put("theme", it) }
+        blockCalls?.let { put("blockCalls", it) }
     }) { m -> m["updated"] as? Boolean ?: false }
 
     /**
@@ -665,13 +681,25 @@ class PartyRepository @Inject constructor(
     /**
      * Close the room.
      *
-     * The owner may always. Anybody else may only once the room has provably had
-     * nobody on a seat for two seconds — which is how the auto-close works
-     * without a server-side timer, and is why the last client out calls this.
+     * The owner may always. Anybody else only once nobody is in it — no one on a seat AND no one in the lobby
+     * (B2a). The app no longer closes a room by itself: the server's sweep closes one that nobody is in.
      */
     suspend fun endRoom(roomId: String): Result<Boolean> =
         call("endPartyRoom", mapOf("roomId" to roomId)) { m ->
             m["ended"] as? Boolean ?: true
+        }
+
+    /** What `partyHeartbeat` answered: is the room open, and is my listener row still there. */
+    data class Heartbeat(val active: Boolean, val present: Boolean)
+
+    /**
+     * "I am still in this room" — B2a. Sent every [PartyHeartbeatPolicy.EVERY_MS] while the room is open on this
+     * phone. A listener that goes quiet for three minutes is removed by the server, so a dead phone cannot keep a
+     * room alive; `present = false` means that happened and the room should be joined again.
+     */
+    suspend fun heartbeat(roomId: String): Result<Heartbeat> =
+        call("partyHeartbeat", mapOf("roomId" to roomId)) { m ->
+            Heartbeat(active = m["active"] as? Boolean ?: false, present = m["present"] as? Boolean ?: false)
         }
 
     // ── Plumbing ──────────────────────────────────────────────────────────────
@@ -688,8 +716,114 @@ class PartyRepository @Inject constructor(
     } catch (e: FirebaseFunctionsException) {
         // P0-1: a session refusal also signs this device out (SessionViewModel).
         ServerRefusals.report(e)
-        Result.Failed(e.code.name, e.message ?: "Something went wrong.")
+        Result.Failed(e.code.name, e.message ?: "Something went wrong.", ((e.details as? Map<*, *>)?.get("code") as? String).orEmpty())
     } catch (e: Exception) {
         Result.Failed("unavailable", "Could not reach the server. Check your connection.")
     }
+
+    // ── Party Pro: private rooms (B7, 3 Nov 2026) ─────────────────────────────
+
+    data class ProStatus(
+        val enabled: Boolean,
+        val required: Boolean,
+        val minLevel: Int,
+        val level: Int,
+        val eligible: Boolean,
+        val priceDiamonds: Long,
+        val priceInr: Double,
+        val days: Int,
+        val active: Boolean,
+        val expiresAtMs: Long,
+        val autoRenew: Boolean,
+        val diamonds: Long,
+    )
+
+    suspend fun proStatus(): Result<ProStatus> = call("privateRoomSubscriptionStatus", emptyMap()) { m ->
+        ProStatus(
+            enabled = m["enabled"] as? Boolean ?: true,
+            required = m["required"] as? Boolean ?: true,
+            minLevel = (m["minLevel"] as? Number)?.toInt() ?: 7,
+            level = (m["level"] as? Number)?.toInt() ?: 0,
+            eligible = m["eligible"] as? Boolean ?: false,
+            priceDiamonds = (m["priceDiamonds"] as? Number)?.toLong() ?: 0L,
+            priceInr = (m["priceInr"] as? Number)?.toDouble() ?: 200.0,
+            days = (m["days"] as? Number)?.toInt() ?: 30,
+            active = m["active"] as? Boolean ?: false,
+            expiresAtMs = (m["expiresAtMs"] as? Number)?.toLong() ?: 0L,
+            autoRenew = m["autoRenew"] as? Boolean ?: false,
+            diamonds = (m["diamonds"] as? Number)?.toLong() ?: 0L,
+        )
+    }
+
+    /** The server takes the diamonds and extends the subscription; [key] is made once per tap, kept for retries. */
+    suspend fun subscribePro(key: String): Result<Long> =
+        call("subscribePrivateRooms", mapOf("idempotencyKey" to key)) { m -> (m["expiresAtMs"] as? Number)?.toLong() ?: 0L }
+
+    /** Renewal off; access lasts to the end of the period paid for. */
+    suspend fun cancelPro(): Result<Long> =
+        call("cancelPrivateRoomSubscription", emptyMap()) { m -> (m["expiresAtMs"] as? Number)?.toLong() ?: 0L }
+
+    /** Zipper staff allowed into private rooms enter without the PIN — logged and shown in the room. */
+    suspend fun joinRoomAsOfficial(roomId: String): Result<JoinedRoom> =
+        call("joinPartyRoom", mapOf("roomId" to roomId, "official" to true)) { m ->
+            JoinedRoom(
+                role           = m["role"] as? String ?: "member",
+                seatCount      = (m["seatCount"] as? Number)?.toInt() ?: 0,
+                mode           = m["mode"] as? String ?: PartyRoom.MODE_AUDIO,
+                seatMode       = m["seatMode"] as? String ?: PartyRoom.SEAT_MODE_FREE,
+                welcomeMessage = m["welcomeMessage"] as? String ?: PartyRoom.DEFAULT_WELCOME,
+            )
+        }
+
+    // ── B7: room music ────────────────────────────────────────────────────────
+
+    data class MusicTrack(val id: String, val title: String, val artist: String, val url: String)
+
+    /** Zipper's licensed catalogue (enabled tracks only). Empty when the Owner has added none. */
+    fun musicTracksFlow(): kotlinx.coroutines.flow.Flow<List<MusicTrack>> = kotlinx.coroutines.flow.callbackFlow {
+        val reg = firestore.collection("musicTracks").whereEqualTo("enabled", true).limit(100)
+            .addSnapshotListener { snap, err ->
+                trySend(
+                    if (err != null || snap == null) emptyList()
+                    else snap.documents.map { MusicTrack(it.id, it.getString("title").orEmpty(), it.getString("artist").orEmpty(), it.getString("url").orEmpty()) },
+                )
+            }
+        awaitClose { reg.remove() }
+    }
+
+    /** Owner or admin: play a catalogue track ([trackId]) or stop ([trackId] null). The server checks both. */
+    suspend fun setMusic(roomId: String, trackId: String?, playing: Boolean = true): Result<Boolean> =
+        call("setPartyMusic", buildMap {
+            put("roomId", roomId)
+            if (trackId != null) { put("trackId", trackId); put("playing", playing) }
+        }) { m -> m["playing"] as? Boolean ?: false }
+
+    data class AccessEntry(val uid: String, val name: String, val result: String, val atMs: Long, val role: String)
+
+    /** The room's access log, newest first — the owner's (and staff's) to read. Empty on any error. */
+    fun accessLogFlow(roomId: String): kotlinx.coroutines.flow.Flow<List<AccessEntry>> = kotlinx.coroutines.flow.callbackFlow {
+        val reg = firestore.collection("partyRooms").document(roomId).collection("accessLog")
+            .orderBy("atMs", com.google.firebase.firestore.Query.Direction.DESCENDING).limit(100)
+            .addSnapshotListener { snap, err ->
+                trySend(
+                    if (err != null || snap == null) emptyList()
+                    else snap.documents.map {
+                        AccessEntry(it.getString("uid").orEmpty(), it.getString("name").orEmpty(), it.getString("result").orEmpty(),
+                            it.getLong("atMs") ?: 0L, it.getString("role").orEmpty())
+                    },
+                )
+            }
+        awaitClose { reg.remove() }
+    }
+
+    /** Whether this account may use official access — read from its own CRM record (false when it has none). */
+    suspend fun officialAccessAllowed(): Boolean = try {
+        val uid = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+        if (uid.isBlank()) false else {
+            val d = firestore.collection("crmUsers").document(uid).get().await()
+            val role = d.getString("role").orEmpty()
+            d.exists() && d.getBoolean("isActive") != false &&
+                (role == "superadmin" || (Regex("^(app|ops|support|tech|finance|marketing)_(admin|member)$").matches(role) && d.getBoolean("privateRoomAccess") == true))
+        }
+    } catch (_: Exception) { false }
 }

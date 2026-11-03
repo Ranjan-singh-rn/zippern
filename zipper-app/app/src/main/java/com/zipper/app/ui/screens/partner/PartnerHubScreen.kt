@@ -298,8 +298,11 @@ private fun Content(
                             Text("With a reviewer. You will be told here and in Messages.", style = ZipperTheme.type.caption, color = c.textSecondary)
                         }
                         if (a.status == PartnerHubRows.AWAITING) {
+                            // QA #34: say what is actually still missing — the
+                            // same line as the banner above, not always "both".
                             Text(
-                                "Approved. It starts once both your phone number and your email address are verified.",
+                                (state.activation ?: elig.activation)?.waitingLine
+                                    ?: "Approved. It starts once both your phone number and your email address are verified.",
                                 style = ZipperTheme.type.caption, color = c.textSecondary,
                             )
                         }

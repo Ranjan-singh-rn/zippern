@@ -68,6 +68,7 @@ import { db } from '@/lib/firebase'
 import { useAuth } from '@/components/AuthProvider'
 import { SecondRoleCard } from '@/components/SecondRoleCard'
 import { SellerHistoryPanel } from '@/components/SellerHistoryPanel'
+import SellerBusinessPanel from '@/components/SellerBusinessPanel'
 import { PendingChangesNotice } from '@/components/PendingChangesNotice'
 import {
   Denied, Empty, ErrorState, Loading, Unavailable, UnavailablePanel, Warning,
@@ -681,7 +682,11 @@ export default function SellerDashboardPage() {
           side can win. It holds its own read, so a slow history never delays
           the position above. */}
       {tab === 'everything' && (
-        <SellerHistoryPanel sellerId={partner.id} audience="seller" />
+        <>
+          <SellerHistoryPanel sellerId={partner.id} audience="seller" />
+          {/* B9: margin, borrowing, trades with other sellers, and self-use. */}
+          <SellerBusinessPanel sellerId={partner.id} audience="seller" />
+        </>
       )}
 
       {tab === 'purchases' && (

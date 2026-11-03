@@ -33,6 +33,7 @@ import { ApiError, publicAppeals, type PublicAppealLookup } from '@/lib/api'
 import {
   MAX_CONTACT, contactProblem, maskContact, presentPublicAppealRefusal, type RefusalView,
 } from '@/lib/publicAppealContact'
+import { SUPPORT_EMAIL } from '@/lib/contacts'  // QA #47
 
 const MIN_STATEMENT = 20
 const MAX_STATEMENT = 2000
@@ -301,8 +302,9 @@ export default function PublicAppealPage() {
               <p className="text-green-100 font-semibold">Your appeal has been sent.</p>
               <p className="text-green-100/90 mt-1">
                 Reference <span className="font-mono font-semibold">{reference}</span>. Keep it — quote it if you
-                contact support. A reviewer will look at the decision again; nothing changes on the account until
-                they decide.
+                write to {SUPPORT_EMAIL}. A reviewer will look at the decision again; nothing changes on the account
+                until they decide. The account&rsquo;s Official messages (and its verified email) confirm the appeal
+                was received.
               </p>
             </div>
           </div>

@@ -14,12 +14,17 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import {
-  AlertTriangle, CheckCircle2, Loader2, Mail, Plus, RefreshCw,
+  AlertTriangle, CheckCircle2, KeyRound, Loader2, Mail, Plus, RefreshCw,
   Shield, UserCog, UserX, X,
 } from 'lucide-react'
 import api, { ApiError, type ApiRole, type StaffMember } from '@/lib/api'
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
+import {
+  OWNER_MFA_RESET_EFFECTS, OWNER_MFA_RESET_MIN_REASON, canOfferInvite, canOfferRevoke, canResetOwnerMfa,
+  ownerMfaResetReady, teamAccessHeadline,
+} from '@/lib/teamAccess'
+import { inviteEmailProblem, inviteErrorText } from '@/lib/staffInvite'
 
 const MIN_REASON = 3
 
@@ -59,6 +64,8 @@ export default function TeamAccess() {
   const [inviting, setInviting] = useState(false)
   /** The member whose access is being revoked — drives the reason panel. */
   const [revoking, setRevoking] = useState<StaffMember | null>(null)
+  /** QA #45: the Owner whose authenticator the Observer is resetting. */
+  const [resettingMfa, setResettingMfa] = useState<StaffMember | null>(null)
 
   const load = useCallback(async () => {
     if (!apiReady) return
@@ -104,6 +111,25 @@ export default function TeamAccess() {
     }
   }
 
+  /**
+   * QA #45 — the Observer resets an Owner's authenticator (a lost phone and lost
+   * recovery codes). The API is the authority (`owner_mfa.reset_by_observer`:
+   * Observer only, a reason of ≥ 10 characters, every session of that Owner
+   * revoked, the factor deleted, audited, the Owner told).
+   */
+  async function resetOwnerMfa(m: StaffMember, reason: string) {
+    try {
+      await api.auth.mfaResetOwner(m.uid, reason.trim())
+      setNotice(`${m.name || m.email}'s two-step sign-in was reset and every session ended. ` +
+        'They set up a new authenticator at their next sign-in, and were told by email and in the app.')
+      setResettingMfa(null)
+      await load()
+    } catch (err) {
+      setResettingMfa(null)
+      setError(err instanceof ApiError ? err.message : 'Could not reset two-step sign-in.')
+    }
+  }
+
   const byTeam = rows.reduce<Record<string, StaffMember[]>>((acc, m) => {
     const key = m.team ?? (m.role === 'owner' || m.role === 'observer' ? 'governance' : 'other')
     ;(acc[key] ??= []).push(m)
@@ -138,9 +164,7 @@ export default function TeamAccess() {
             Team access
           </h1>
           <p className="text-slate-400 text-sm mt-1">
-            {myRole === 'owner'
-              ? 'You can invite anyone, including another owner.'
-              : `You can invite members of your own team.`}
+            {teamAccessHeadline(myRole, assignable.length)}
           </p>
         </div>
         <div className="flex gap-2">
@@ -150,7 +174,7 @@ export default function TeamAccess() {
           >
             <RefreshCw size={14} /> Refresh
           </button>
-          {assignable.length > 0 && (
+          {canOfferInvite(myRole, assignable.length) && (
             <button
               onClick={() => setInviting(true)}
               className="flex items-center gap-2 bg-pink-500 hover:bg-pink-600 text-white font-semibold rounded-lg px-4 py-2 text-sm transition-colors"
@@ -227,7 +251,17 @@ export default function TeamAccess() {
                     {ROLE_LABEL[m.role] ?? m.role}
                   </span>
 
-                  {m.is_active && m.role !== 'owner' && (
+                  {canResetOwnerMfa(myRole, m) && (
+                    <button
+                      onClick={() => { setError(''); setResettingMfa(m) }}
+                      title="Reset two-step sign-in"
+                      className="flex items-center gap-1.5 text-xs text-amber-300 hover:text-amber-200 border border-amber-500/30 hover:border-amber-400/60 rounded-lg px-2.5 py-1.5 transition-colors shrink-0"
+                    >
+                      <KeyRound size={13} /> Reset two-step sign-in
+                    </button>
+                  )}
+
+                  {canOfferRevoke(myRole, m, assignable) && (
                     <button
                       onClick={() => { setError(''); setRevoking(m) }}
                       title="Revoke access"
@@ -269,6 +303,107 @@ export default function TeamAccess() {
           onConfirm={(reason) => deactivate(revoking, reason)}
         />
       )}
+
+      {resettingMfa && (
+        <ResetOwnerMfaPanel
+          member={resettingMfa}
+          onCancel={() => setResettingMfa(null)}
+          onConfirm={(reason) => resetOwnerMfa(resettingMfa, reason)}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * QA #45 — confirm an Owner authenticator reset (Observer only).
+ *
+ * Says what it does before it is done, asks why (the audit log keeps it), and
+ * asks for the Owner's email to be typed back so a reset is never one click on
+ * the wrong row. Nothing secret is shown or asked for here.
+ */
+function ResetOwnerMfaPanel({
+  member, onCancel, onConfirm,
+}: {
+  member: StaffMember
+  onCancel: () => void
+  onConfirm: (reason: string) => Promise<void>
+}) {
+  const [reason, setReason] = useState('')
+  const [typed, setTyped] = useState('')
+  const [busy, setBusy] = useState(false)
+  const ready = ownerMfaResetReady(member, reason, typed)
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
+      <div className="relative w-full max-w-lg bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
+          <h2 className="text-white text-lg font-semibold flex items-center gap-2">
+            <KeyRound size={18} className="text-amber-300" /> Reset two-step sign-in
+          </h2>
+          <button onClick={onCancel} className="text-slate-400 hover:text-white">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="px-6 py-5 space-y-4">
+          <p className="text-slate-300 text-sm">
+            For <span className="text-white font-medium">{member.name || member.email}</span> ({member.email}),
+            an Owner who has lost their authenticator and their recovery codes:
+          </p>
+          <ul className="list-disc pl-5 space-y-1.5 text-slate-400 text-sm">
+            {OWNER_MFA_RESET_EFFECTS.map((line) => <li key={line}>{line}</li>)}
+          </ul>
+          <div>
+            <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+              Why <span className="text-pink-400">(recorded in the audit log)</span>
+            </label>
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              rows={3}
+              placeholder="Phone stolen on 3 November; recovery codes were on it. Confirmed by a call with the Owner."
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-amber-400"
+            />
+            <p className="text-slate-600 text-xs mt-1">
+              At least {OWNER_MFA_RESET_MIN_REASON} characters. It cannot be edited afterwards.
+            </p>
+          </div>
+          <div>
+            <label className="block text-slate-400 text-xs font-medium uppercase tracking-wide mb-1.5">
+              Type the Owner&apos;s email to confirm
+            </label>
+            <input
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              autoComplete="off"
+              placeholder={member.email}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-amber-400"
+            />
+          </div>
+        </div>
+
+        <div className="px-6 py-4 border-t border-slate-800 flex gap-3">
+          <button
+            onClick={onCancel}
+            className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg px-4 py-2.5 text-sm transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={async () => {
+              setBusy(true)
+              try { await onConfirm(reason) } finally { setBusy(false) }
+            }}
+            disabled={busy || !ready}
+            className="flex-1 flex items-center justify-center gap-2 bg-amber-600 hover:bg-amber-500 disabled:bg-slate-700 disabled:text-slate-500 text-white font-semibold rounded-lg px-4 py-2.5 text-sm transition-colors"
+          >
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />}
+            Reset and sign them out
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -364,13 +499,16 @@ function InvitePanel({
   const [err, setErr] = useState('')
 
   async function submit() {
+    // QA #39: see lib/staffInvite.
+    const problem = inviteEmailProblem(email)
+    if (problem) { setErr(problem); return }
     setBusy(true)
     setErr('')
     try {
       await api.staff.invite({ email: email.trim(), name: name.trim(), role, phone })
       onDone(email.trim())
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : 'Could not send the invitation.')
+      setErr(inviteErrorText(e instanceof ApiError ? e.message : 'Could not send the invitation.'))
     } finally {
       setBusy(false)
     }

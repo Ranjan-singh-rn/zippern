@@ -54,7 +54,7 @@ import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
 import { assertActiveSession } from './mobileSession'
-import { bindContactCore, emailKey, isObserverEmail, sameUidSessionToken } from './identity'
+import { bindContactCore, emailKey, isInternalCrmRole, isObserverEmail, sameUidSessionToken, type EmailChangeRescueFacts } from './identity'
 import { recordEvent } from './quickLogin'
 import { SENDGRID_KEY_ENV, mailDomain, sendTransactionalMail } from './mail'
 import { recordEmailProof } from './contactProof'
@@ -333,6 +333,28 @@ function requireUid(context: functions.https.CallableContext): string {
 const ACTIVE_HOLDER =
   'This email is already used by another Zipper account. Sign in to that account instead.'
 
+/**
+ * Security review (3 Nov 2026): what `emailChangeRescueRefusal` needs to decide
+ * whether this caller may be handed a same-uid sign-in after the email change.
+ * Read fresh from the Auth record (its `tokensValidAfterTime` moves when the
+ * email changes AND when anything else revokes the account's sessions) and
+ * from `crmUsers` (staff, Owners and the Observer always sign in again).
+ */
+async function rescueFacts(uid: string, token: Record<string, unknown>, boundAtMs: number): Promise<EmailChangeRescueFacts> {
+  const rec = await admin.auth().getUser(uid).catch(() => null)
+  const revokedAt = Date.parse(String(rec?.tokensValidAfterTime ?? ''))
+  const crm = await db().collection('crmUsers').doc(uid).get().catch(() => null)
+  return {
+    nowMs: Date.now(),
+    boundAtMs,
+    authTimeSec: Number(token['auth_time'] ?? 0),
+    tokensValidAfterMs: Number.isFinite(revokedAt) ? revokedAt : 0,
+    // Unknown is treated as internal: no token rather than a guess.
+    internal: crm === null ? true : (crm.exists ? isInternalCrmRole(crm.get('role')) : false),
+  }
+}
+
+// ── Callables ────────────────────────────────────────────────────────────────
 // ── Callables ────────────────────────────────────────────────────────────────
 
 export const requestEmailBindCode = functions
@@ -364,9 +386,17 @@ export const requestEmailBindCode = functions
       throw replacementRefused()
     }
     if (ownEmail === email && recEmail === email && rec?.emailVerified === true) {
-      // Already done — typically a retry after the verify reply was lost. An
-      // anonymous session gets the same-uid token it would have had then.
-      const customToken = await sameUidSessionToken(uid, token)
+      // Already done — typically a retry after the verify reply was lost. The
+      // caller gets the same-uid token it would have had then: the earlier
+      // bind changed the Auth record's email, which expired this session's
+      // refresh token whatever its provider (see `sameUidSessionToken`) — but
+      // only within minutes of that bind, for the session it expired, and not
+      // once anything has revoked the account since (`emailChangeRescueRefusal`).
+      const challenge = await db().collection(EMAIL_OTP_CHALLENGES).doc(uid).get().catch(() => null)
+      const boundAtMs = Number(challenge?.get('boundAtMs') ?? 0)
+      const customToken = await sameUidSessionToken(uid, token,
+        { afterEmailChange: true, rescue: await rescueFacts(uid, token, boundAtMs) })
+      if (customToken) await recordEvent('EMAIL_BIND_SESSION_RESCUED', { uid, via: 'already_bound' })
       return { status: 'already_bound', email: maskEmail(email), ...(customToken ? { customToken } : {}) }
     }
 
@@ -578,8 +608,11 @@ export const verifyEmailBindCode = functions
     // The Auth record is the side every guest check reads (`is_unverified_guest`,
     // `guestRefusal`, the rules' `tokenEmailVerified`). If it cannot be written,
     // the document write is taken back so nothing is left half-bound.
+    let changedAtMs = 0
     try {
       await admin.auth().updateUser(uid, { email, emailVerified: true })
+      // When the Auth record — and so its `tokensValidAfterTime` — changed.
+      changedAtMs = Date.now()
     } catch (err) {
       if (emailBefore === '') {
         // Take the document write back only if the Auth side really does not
@@ -610,13 +643,27 @@ export const verifyEmailBindCode = functions
         'Could not finish just now. Enter the same code again to retry.', { reason: 'ledger_failed', code: 'ledger_failed' })
     }
 
-    await challengeRef.set({ boundAtMs: nowMs }, { merge: true }).catch(() => undefined)
+    // When an earlier call bound this address (a replay) — read before it is
+    // overwritten, for the session rescue below.
+    const priorBoundAtMs = Number((await challengeRef.get().catch(() => null))?.get('boundAtMs') ?? 0)
+    // A replay (the Auth record already held the address) keeps the time of
+    // the bind that changed it; a fresh bind records when it did.
+    const boundAtMs = ownAuthEmail === email ? (priorBoundAtMs || changedAtMs) : changedAtMs
+    await challengeRef.set({ boundAtMs }, { merge: true }).catch(() => undefined)
     await recordEvent('EMAIL_BOUND', {
       uid, emailDomain, method: 'otp', replay: verdict.result === 'replay',
       releasedCount: bound.releasedFrom.length,
     })
 
-    const customToken = await sameUidSessionToken(uid, token)
+    // The email just written to the Auth record expired this session's refresh
+    // token, whatever its provider — so the caller, not only an anonymous one,
+    // is handed a same-uid sign-in: gated above by assertActiveSession, and by
+    // `emailChangeRescueRefusal` (this session predates the bind, nothing has
+    // revoked the account since, not a staff identity). A replay of a bind an
+    // earlier call already wrote dates from that bind.
+    const customToken = await sameUidSessionToken(uid, token,
+      { afterEmailChange: true, rescue: await rescueFacts(uid, token, boundAtMs) })
+    if (customToken) await recordEvent('EMAIL_BIND_SESSION_RESCUED', { uid, via: 'bound' })
     return {
       status: 'bound',
       email,

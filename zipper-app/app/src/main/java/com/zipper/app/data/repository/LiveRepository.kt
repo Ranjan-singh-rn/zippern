@@ -160,22 +160,94 @@ class LiveRepository @Inject constructor(
         // Presence and streamed time are derived server-side (syncLivePresence).
     }
 
-    // ── Viewer actions ────────────────────────────────────────────────────────
+    // ── B12 (4 Nov 2026): host controls ──────────────────────────────────────
+    //
+    // All of these write the host's OWN room, inside the fields `firestore.rules` lets a host change
+    // (`hostLiveFields()`); the heartbeat and the pause mark are the server's clock.
 
-    suspend fun joinRoom(roomId: String) {
-        liveRoomsCol.document(roomId)
-            .update("viewerCount", FieldValue.increment(1))
-            .await()
+    /**
+     * "I am still broadcasting." Every [LIVE_HEARTBEAT_MS] while the room is open on the host's phone; a room whose
+     * host has been silent for three minutes is closed by the server's sweep (a crash, a killed app, a dead phone
+     * never ran "end live", and the room used to stay in the list for ever).
+     */
+    suspend fun hostHeartbeat(roomId: String) {
+        liveRoomsCol.document(roomId).update("hostHeartbeatAt", FieldValue.serverTimestamp()).await()
     }
 
-    suspend fun leaveRoom(roomId: String) {
-        liveRoomsCol.document(roomId)
-            .update("viewerCount", FieldValue.increment(-1))
-            .await()
+    /** Pause (viewers see "back soon"; the server ends a pause longer than 15 minutes) or resume. */
+    suspend fun setPaused(roomId: String, paused: Boolean) {
+        val ref = liveRoomsCol.document(roomId)
+        if (paused) ref.update(mapOf("isPaused" to true, "pausedAt" to FieldValue.serverTimestamp())).await()
+        else ref.update("isPaused", false).await()
+    }
+
+    /** Camera off (still live and talking — viewers see the host's photo) or back on. */
+    suspend fun setCameraOff(roomId: String, off: Boolean) {
+        liveRoomsCol.document(roomId).update("isCameraOff", off).await()
+    }
+
+    /** The host's pinned announcement above the chat; blank removes it. At most [PINNED_MAX] characters. */
+    suspend fun setPinnedMessage(roomId: String, message: String) {
+        liveRoomsCol.document(roomId).update("pinnedMessage", message.trim().take(PINNED_MAX)).await()
+    }
+
+    /** Mute a viewer in the chat (they keep watching) — the rules refuse their comments — or unmute them. */
+    suspend fun setViewerMuted(roomId: String, targetUid: String, muted: Boolean) {
+        liveRoomsCol.document(roomId).update(
+            "mutedViewers", if (muted) FieldValue.arrayUnion(targetUid) else FieldValue.arrayRemove(targetUid),
+        ).await()
+    }
+
+    /** The host removes a comment from their own room. */
+    suspend fun deleteComment(roomId: String, commentId: String) {
+        liveRoomsCol.document(roomId).collection("comments").document(commentId).delete().await()
+    }
+
+    // ── Viewer actions ────────────────────────────────────────────────────────
+    //
+    // B12: there is no join/leave counter any more. `viewerCount` was a number every signed-in account could move
+    // by any amount; the server now recounts it from the presence rows below (`liveViewerCount`), keeps the peak,
+    // and the sweep removes a row whose phone stopped refreshing it.
+
+    /** "I am still watching" — every [LIVE_HEARTBEAT_MS] while the stream is open on this phone. */
+    suspend fun viewerHeartbeat(roomId: String) {
+        val uid = auth.currentUser?.uid ?: return
+        liveRoomsCol.document(roomId).collection("viewers").document(uid)
+            .update("lastSeenAt", FieldValue.serverTimestamp()).await()
+    }
+
+    /** B12: the host's level for the live screen's badge — from their public profile, never their full document. */
+    suspend fun hostLevel(hostUid: String): Int =
+        (firestore.collection("publicProfiles").document(hostUid).get().await().getLong("level") ?: 0L).toInt()
+
+    /**
+     * B12: what the end-of-live card shows, from the server — the room as the server closed it (measured duration,
+     * peak, earnings) and every gift settled in it (each row written by `settleGift` with its transaction id).
+     */
+    suspend fun sessionReport(roomId: String): LiveSessionReport {
+        val room = LiveRoom.from(liveRoomsCol.document(roomId).get().await())
+        val gifts = liveRoomsCol.document(roomId).collection("gifts")
+            .orderBy("timestamp", Query.Direction.DESCENDING).limit(200).get().await()
+            .documents.map { d ->
+                LiveSessionReport.GiftLine(
+                    senderUid = d.getString("uid").orEmpty(),
+                    senderName = d.getString("senderName").orEmpty(),
+                    giftName = d.getString("giftName").orEmpty(),
+                    emoji = d.getString("emoji").orEmpty(),
+                    quantity = (d.getLong("quantity") ?: 1L).toInt(),
+                    diamonds = d.getLong("diamondCost") ?: 0L,
+                    transactionId = d.getString("transactionId").orEmpty(),
+                    atMs = d.getLong("timestamp") ?: 0L,
+                )
+            }
+        return LiveSessionReport(room = room, gifts = gifts)
     }
 
     suspend fun sendComment(roomId: String, message: String) {
         val uid = auth.currentUser?.uid ?: return
+        // B12: the rules refuse an empty comment or one over 300 characters.
+        val text = message.trim().take(COMMENT_MAX)
+        if (text.isEmpty()) return
         val userSnap = firestore.collection("users").document(uid).get().await()
         val name = userSnap.getString("name") ?: ""
         val photoUrl = userSnap.getString("photoUrl") ?: ""
@@ -183,7 +255,7 @@ class LiveRepository @Inject constructor(
             "uid" to uid,
             "name" to name,
             "photoUrl" to photoUrl,
-            "message" to message,
+            "message" to text,
             "timestamp" to System.currentTimeMillis(),
             "isJoin" to false,
         )
@@ -259,8 +331,8 @@ class LiveRepository @Inject constructor(
     }
 
     /**
-     * Gift sent during PK. Identical settlement — the PK score is added
-     * separately by the caller via PKRepository.addPKScore.
+     * Gift sent during PK. Identical settlement — and (B12) the PK score is added by `settleGift` itself, in the
+     * same transaction, for whichever host the gift went to.
      */
     suspend fun sendGiftInLivePK(
         roomId: String,
@@ -293,6 +365,8 @@ class LiveRepository @Inject constructor(
                 "photoUrl" to user.photoUrl,
                 "level" to user.level,
                 "joinedAt" to System.currentTimeMillis(),
+                // B12: refreshed by [viewerHeartbeat]; the server's sweep removes a row left unrefreshed.
+                "lastSeenAt" to FieldValue.serverTimestamp(),
             )
         ).await()
     }
@@ -389,9 +463,9 @@ class LiveRepository @Inject constructor(
             false
         }
 
+        // B12: no count here — deleting the presence row is what the server recounts from.
         val roomUpdates = buildMap<String, Any> {
             put("kickedViewers", FieldValue.arrayUnion(targetUid))
-            if (stillPresent) put("viewerCount", FieldValue.increment(-1))
         }
 
         val batch = firestore.batch()
@@ -463,4 +537,35 @@ class LiveRepository @Inject constructor(
     suspend fun updateWelcomeMessage(roomId: String, message: String) {
         liveRoomsCol.document(roomId).update("welcomeMessage", message).await()
     }
+
+    companion object {
+        /** B12: how often the host's and each viewer's phone say they are still there (the server allows 3 min). */
+        const val LIVE_HEARTBEAT_MS = 60_000L
+        /** B12: the longest pinned message (the rules allow 140). */
+        const val PINNED_MAX = 140
+        /** B12: the longest comment (the rules allow 300). */
+        const val COMMENT_MAX = 300
+    }
+}
+
+/** B12: the end-of-live card's data, from the server. */
+data class LiveSessionReport(
+    val room: LiveRoom?,
+    val gifts: List<GiftLine>,
+) {
+    data class GiftLine(
+        val senderUid: String,
+        val senderName: String,
+        val giftName: String,
+        val emoji: String,
+        val quantity: Int,
+        val diamonds: Long,
+        val transactionId: String,
+        val atMs: Long,
+    )
+
+    /** Diamonds gifted in this live, summed from the settled rows. */
+    val giftDiamonds: Long get() = gifts.sumOf { it.diamonds }
+    /** Distinct gifters. */
+    val gifters: Int get() = gifts.map { it.senderUid.ifBlank { it.senderName } }.distinct().size
 }

@@ -429,18 +429,23 @@ describe('[source] a refusal destroys the credential only when it should', () =>
     return next < 0 ? rest : rest.slice(0, next + 1)
   }
 
+  // B10 (4 Nov 2026): a refusal forgets THAT account's credential through `forgetRefused(savedUid)` — never
+  // `quickLogin.clear()`, which would forget every account the phone remembers. "Forgets" below means either.
+  const forgets = (text) =>
+    text.includes('quickLogin.clear()') || text.includes('forgetRefused(') || text.includes('quickLogin.remove(')
+
   test('rate_limited keeps it', () => {
     // Five wrong attempts must not cost the real holder their credential.
-    expect(arm('rate_limited').includes('quickLogin.clear()')).toBe(false)
+    expect(forgets(arm('rate_limited'))).toBe(false)
   })
 
   test('device_banned keeps it', () => {
     // The handset is barred, not the credential. A lifted ban should find it.
-    expect(arm('device_banned').includes('quickLogin.clear()')).toBe(false)
+    expect(forgets(arm('device_banned'))).toBe(false)
   })
 
   test('legacy clears it — that is the migration', () => {
-    expect(arm('legacy').includes('quickLogin.clear()')).toBe(true)
+    expect(arm('legacy').includes('forgetRefused(savedUid)')).toBe(true)
   })
 
   test('banned does NOT clear it — the credential is the appeal proof', () => {
@@ -448,7 +453,18 @@ describe('[source] a refusal destroys the credential only when it should', () =>
     // `banned` as a payload. Either way it must not destroy the credential:
     // banning revokes the session, so the credential is the only identifier
     // left, and `AppealRepository.appealWithoutSession` needs it.
-    expect(arm('banned').includes('quickLogin.clear()')).toBe(false)
+    expect(forgets(arm('banned'))).toBe(false)
+  })
+
+  test('B10: a refusal forgets ONE account, never every account on the phone', () => {
+    // The refused credential is the account that was tried; the others this device remembers are untouched.
+    const at = body.indexOf('private suspend fun forgetRefused(')
+    expect(at).toBeGreaterThan(-1)
+    const helper = body.slice(at, body.indexOf('\n    }', at))
+    expect(helper.includes('quickLogin.remove(savedUid)')).toBe(true)
+    expect(helper.includes('quickLogin.forgetUnfiled()')).toBe(true)
+    expect(helper.includes('quickLogin.clear()')).toBe(false)
+    expect(fn.includes('quickLogin.clear()')).toBe(false)
   })
 
   test('an unknown detail keeps it', () => {

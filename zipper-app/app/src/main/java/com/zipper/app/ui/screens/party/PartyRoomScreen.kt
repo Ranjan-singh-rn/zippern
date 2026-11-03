@@ -40,10 +40,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -171,6 +174,8 @@ fun PartyRoomScreen(
     onBack: () -> Unit = {},
     onRecharge: () -> Unit = {},
     onOpenProfile: (uid: String) -> Unit = {},
+    /** B7: "Message" on a member's card. */
+    onOpenChat: (uid: String) -> Unit = {},
     viewModel: PartyRoomViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -373,6 +378,11 @@ fun PartyRoomScreen(
     val giftToAnimate = newestGift?.takeIf {
         it.id != animatedGiftId && it.timestamp >= openedAt - GIFT_FRESH_WINDOW_MS
     }
+    // B7: the same gift also flies from the sender's seat to the receiver's (server-written receiver only).
+    var travelledGiftId by remember { mutableStateOf("") }
+    val giftToFly = newestGift?.takeIf {
+        it.id != travelledGiftId && it.receiverUid.isNotBlank() && it.timestamp >= openedAt - GIFT_FRESH_WINDOW_MS
+    }
 
     // ── Entrance effects, one slot ───────────────────────────────────────────
     //
@@ -453,7 +463,9 @@ fun PartyRoomScreen(
 
     val room = state.room
 
-    Box(Modifier.fillMaxSize().background(c.bgBase)) {
+    // B7: the room's own background; seat positions for gift travel are forgotten when the room closes.
+    DisposableEffect(Unit) { onDispose { PartySeatCentres.centres.clear() } }
+    Box(Modifier.fillMaxSize().background(c.bgBase).background(roomThemeBrush(room?.theme))) {
         when {
             // A private room we have not been let into yet. The room document is
             // readable, so the card can say whose room it is.
@@ -463,6 +475,7 @@ fun PartyRoomScreen(
                 joining = state.joining,
                 onSubmit = { code -> viewModel.enterRoom(context, code) },
                 onBack = exit,
+                onOfficial = if (state.officialAllowed) ({ viewModel.enterAsOfficial(context) }) else null,
             )
 
             room == null -> LoadingState()
@@ -575,6 +588,14 @@ fun PartyRoomScreen(
         // whole window on any change, so without the id the same gift would
         // animate again every time a later one landed.
         if (!state.inPip) {
+            giftToFly?.let { g ->
+                GiftTravelOverlay(
+                    gift = g,
+                    seatOfUid = { uid -> state.seatByIndex.entries.firstOrNull { it.value.uid == uid }?.key },
+                    centres = PartySeatCentres.centres,
+                    onFinished = { travelledGiftId = g.id },
+                )
+            }
             giftToAnimate?.let { g ->
                 GiftAnimationOverlay(
                     giftEvent = g.asLiveGiftEvent(),
@@ -612,8 +633,14 @@ fun PartyRoomScreen(
                 photoUrl = room?.hostPhotoUrl,
                 name = room?.hostName ?: "The host",
                 title = "This room has closed",
-                body = "${room?.hostName ?: "The host"} ended the party. Have a look at what " +
-                    "else is open.",
+                // The owner who just pressed "End room" sees this card too, and
+                // "QA User One ended the party" read to them as if someone else had.
+                body = if (room != null && room.hostUid.isNotBlank() && room.hostUid == state.myUid) {
+                    "You ended the party. Start another whenever you like."
+                } else {
+                    "${room?.hostName ?: "The host"} ended the party. Have a look at what " +
+                        "else is open."
+                },
                 onExit = exit,
             )
             PartyGate.None, PartyGate.Password -> Unit
@@ -691,6 +718,8 @@ fun PartyRoomScreen(
             viewModel = viewModel,
             onOpenProfile = onOpenProfile,
             onDismiss = { showMembers = false },
+            onOpenChat = onOpenChat,
+            onGift = { showGifts = true },
         )
     }
 
@@ -834,6 +863,17 @@ private fun RoomHeader(
                     room.hostName, style = ZipperTheme.type.caption, color = c.textSecondary,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
+                // B7: what is playing, for everyone in the room.
+                room.music?.let { m ->
+                    Text("· ♫ ${m.title}", style = ZipperTheme.type.caption, color = c.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                // B7: an official who came in without the PIN is never a silent visitor.
+                if (room.officialPresentUids.isNotEmpty()) {
+                    Text(
+                        "· Zipper official present", style = ZipperTheme.type.caption, color = c.statusWarning,
+                        maxLines = 1,
+                    )
+                }
             }
         }
         // Somebody is waiting for a seat. Only a moderator can do anything about
@@ -901,12 +941,18 @@ private fun AudioSeat(
 
     Column(
         Modifier.fillMaxWidth()
+            .recordSeatCentre(PartySeatCentres.centres, index)
             .clickableNoRipple { onSeatTap(index) }
             .padding(vertical = Space.xs),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(Space.xxs),
     ) {
-        Box(contentAlignment = Alignment.Center) {
+        // 12dp wider than the disc, so the corner badges (lock toggle, role, mute)
+        // sit on the disc's edge. Wrapped tight, the 28dp lock toggle covered the
+        // top-right of a 44dp disc — including its centre — so it cut the "+" down
+        // to a stray "¬" on every empty seat, and an owner tapping the middle of a
+        // seat to sit on it LOCKED it instead (QA emulator run, 3 Nov 2026).
+        Box(Modifier.size(Size.Avatar.md + 12.dp), contentAlignment = Alignment.Center) {
             if (seat != null) {
                 Avatar(
                     seat.photoUrl,
@@ -928,7 +974,15 @@ private fun AudioSeat(
                     waiting = waiting,
                 )
                 if (state.canModerate) {
-                    SeatLockToggle(locked, Modifier.align(Alignment.TopEnd)) { onToggleLock(index) }
+                    // 22dp in the 56dp box's corner: clear of the seat's centre by
+                    // 6dp — but only if Compose does not quietly grow its touch
+                    // area to the 48dp minimum, which reaches back over the middle
+                    // of the seat and turned "sit here" taps into "lock this seat"
+                    // (QA, 3 Nov 2026). So the toggle keeps exactly its own bounds;
+                    // the whole seat is the primary target, this is the secondary.
+                    ExactTouchBounds {
+                        SeatLockToggle(locked, Modifier.align(Alignment.TopEnd), size = 22.dp) { onToggleLock(index) }
+                    }
                 }
             }
         }
@@ -1009,6 +1063,7 @@ private fun VideoTile(
     val shape = RoundedCornerShape(Radius.md)
     Box(
         modifier
+            .recordSeatCentre(PartySeatCentres.centres, index)
             .background(c.bgRaised, shape)
             .then(if (speaking) Modifier.border(2.dp, c.statusOnline, shape) else Modifier)
             .clickableNoRipple { onSeatTap(index) },
@@ -1182,10 +1237,15 @@ private fun SeatRoleBadge(room: PartyRoom, uid: String, modifier: Modifier = Mod
  * it is the secondary action on the cell, and the primary one is the whole cell.
  */
 @Composable
-private fun SeatLockToggle(locked: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun SeatLockToggle(
+    locked: Boolean,
+    modifier: Modifier = Modifier,
+    size: Dp = Size.Icon.xl,
+    onClick: () -> Unit,
+) {
     val c = ZipperTheme.colors
     Box(
-        modifier.size(Size.Icon.xl)
+        modifier.size(size)
             .clickableNoRipple(onClick)
             .padding(2.dp)
             .background(c.bgElevated, CircleShape)
@@ -1199,6 +1259,22 @@ private fun SeatLockToggle(locked: Boolean, modifier: Modifier = Modifier, onCli
             modifier = Modifier.size(11.dp),
         )
     }
+}
+
+/**
+ * Turns off Compose's minimum-touch-target expansion for [content]: a control
+ * smaller than 48dp otherwise also answers taps up to 48dp around it, even over
+ * a neighbouring target that the user was actually aiming at.
+ */
+@Composable
+private fun ExactTouchBounds(content: @Composable () -> Unit) {
+    val current = LocalViewConfiguration.current
+    val exact = remember(current) {
+        object : ViewConfiguration by current {
+            override val minimumTouchTargetSize: DpSize get() = DpSize.Zero
+        }
+    }
+    CompositionLocalProvider(LocalViewConfiguration provides exact, content = content)
 }
 
 private fun seatCaption(
@@ -1503,6 +1579,8 @@ private fun PasswordGate(
     joining: Boolean,
     onSubmit: (String) -> Unit,
     onBack: () -> Unit,
+    /** B7: Zipper staff allowed into private rooms — never silent: logged, and shown in the room. */
+    onOfficial: (() -> Unit)? = null,
 ) {
     val c = ZipperTheme.colors
     var code by remember { mutableStateOf("") }
@@ -1546,6 +1624,17 @@ private fun PasswordGate(
             "Join the room", { onSubmit(code) }, gradient = true, fullWidth = true,
             size = ButtonSize.Medium, enabled = code.length == 4 && !joining, loading = joining,
         )
+        if (onOfficial != null) {
+            Spacer(Modifier.height(Space.sm))
+            ZipperButton(
+                "Enter as Zipper official", onOfficial, style = ButtonStyle.Secondary, fullWidth = true,
+                size = ButtonSize.Medium, enabled = !joining,
+            )
+            Text(
+                "Your entry is recorded in the room's access log and shown to everyone in the room.",
+                style = ZipperTheme.type.caption, color = c.textMuted, textAlign = TextAlign.Center,
+            )
+        }
         Spacer(Modifier.height(Space.sm))
         ZipperButton(
             "Back", onBack, style = ButtonStyle.Secondary, fullWidth = true,
@@ -1609,4 +1698,5 @@ private fun PartyGiftEvent.asLiveGiftEvent(): LiveGiftEvent = LiveGiftEvent(
     imageUrl = imageUrl,
     quantity = quantity,
     timestamp = timestamp,
+    svgaUrl = svgaUrl,
 )

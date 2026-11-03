@@ -49,6 +49,9 @@
  * The transport is replaceable so the callables can run in tests without a
  * network, and the SendGrid endpoint can be pointed at a local test server.
  */
+import * as crypto from 'crypto'
+import * as fs from 'fs'
+import * as path from 'path'
 import * as functions from 'firebase-functions/v1'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { MailService } = require('@sendgrid/mail')
@@ -78,6 +81,34 @@ export const SENDGRID_KEY_ENV = 'ZIPPER_SENDGRID_API_KEY'
 
 const DEFAULT_FROM_EMAIL = 'no-reply@zipperlive.org'
 const DEFAULT_FROM_NAME = 'ZIPPER Live'
+
+/*
+ * QA #47 (3 Nov 2026) — the official domain and its three addresses (Owner
+ * decision, final): no-reply@ SENDS every automated message (above); info@
+ * and support@ are CONTACTS a person is told to write to, and nothing
+ * automated is sent from them (their identity switches stay off). The same
+ * three live in `backend/app/core/contacts.py`, `zipper-crm/lib/contacts.ts`
+ * and the app's `ZipperContacts`; `backend/tests/test_qa_email_identities.py`
+ * checks they agree. Partner emails from here used to say "Reach us at" a
+ * personal Gmail address.
+ */
+export const OFFICIAL_EMAIL_DOMAIN = 'zipperlive.org'
+export const SUPPORT_EMAIL = `support@${OFFICIAL_EMAIL_DOMAIN}`
+export const INFO_EMAIL = `info@${OFFICIAL_EMAIL_DOMAIN}`
+
+/** An override honoured only on the official domain — a typo cannot publish a stranger's mailbox. */
+function officialContact(override: string | undefined, fallback: string): string {
+  const v = String(override ?? '').trim().toLowerCase()
+  const at = v.lastIndexOf('@')
+  if (!v || at <= 0 || /\s/.test(v) || v.slice(at + 1) !== OFFICIAL_EMAIL_DOMAIN) return fallback
+  if (v === DEFAULT_FROM_EMAIL) return fallback // a sender is not a contact
+  return v
+}
+
+/** Where an email tells a person to write for help (CONTACT_SUPPORT_EMAIL may override, on the domain). */
+export function supportContact(): string {
+  return officialContact(process.env.CONTACT_SUPPORT_EMAIL, SUPPORT_EMAIL)
+}
 
 /** The default sender. `SENDGRID_FROM_EMAIL` / `SENDGRID_FROM_NAME` override it. */
 export const MAIL_FROM = Object.freeze({ email: DEFAULT_FROM_EMAIL, name: DEFAULT_FROM_NAME })
@@ -358,6 +389,37 @@ export function setMailTransportForTests(next: MailTransport | null): void {
   transport = next ?? sendGrid
 }
 
+// ── Local test copy: a mailbox on disk instead of a provider ─────────────────
+//
+// LOCAL TEST COPY ONLY. ~/zipper-release/qa/local-stack.command sets
+// LOCAL_MAILBOX_DIR for the Functions emulator; there, a message that would
+// have gone out is written to that folder as one JSON file instead, so the
+// local copy can finish the flows that wait for an emailed code (adding an
+// email to an app account, the email sign-in code). The backend does the same
+// (`email._local_mailbox_dir`). Never in production: the folder is used only
+// inside the Functions emulator (FUNCTIONS_EMULATOR=true) running a `demo-`
+// project; anywhere else this returns null and nothing below is reached.
+
+/** The local mailbox folder, or null — always null outside the emulator and a `demo-` project. */
+export function localMailboxDir(): string | null {
+  if (String(process.env.FUNCTIONS_EMULATOR ?? '') !== 'true') return null
+  const project = String(process.env.GCLOUD_PROJECT ?? process.env.GCP_PROJECT ?? '').trim()
+  if (!project.startsWith('demo-')) return null
+  const dir = String(process.env.LOCAL_MAILBOX_DIR ?? '').trim()
+  return dir || null
+}
+
+/** Writes one would-be message to [dir] (0600); returns the file name, which carries no address and no code. */
+async function writeLocalMailbox(dir: string, m: MailMessage): Promise<string> {
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '')
+  const identity = m.identity ?? 'transactional'
+  const name = `${stamp}-${crypto.randomBytes(3).toString('hex')}-functions-${identity}.json`
+  const body = { to: m.to, identity, subject: m.subject, text: m.text || textFromHtml(m.html), html: m.html }
+  await fs.promises.writeFile(path.join(dir, name), JSON.stringify(body, null, 1), { encoding: 'utf8', mode: 0o600 })
+  return name
+}
+
 /** Tests only: point the real SendGrid transport at another endpoint. `null` restores SendGrid's. */
 export function setSendGridBaseUrlForTests(url: string | null): void {
   testBaseUrl = url
@@ -388,6 +450,17 @@ function asSendError(err: unknown): MailSendError {
 /** A one-time code — identity `auth` unless the caller names another. Throws `MailUnavailable` when it could not be sent. */
 export async function sendTransactionalMail(message: MailMessage): Promise<void> {
   const toDomain = mailDomain(message.to)
+  const mailbox = localMailboxDir()
+  if (mailbox) {
+    try {
+      const file = await writeLocalMailbox(mailbox, { ...message, identity: message.identity ?? 'auth' })
+      functions.logger.info('transactional mail written to the local mailbox', { toDomain, file })
+      return
+    } catch {
+      functions.logger.error('transactional mail failed', { toDomain, reason: 'local_mailbox', attempts: 0, outcomeUnknown: false })
+      throw new MailUnavailable('local mailbox write failed')
+    }
+  }
   try {
     const info = await transport({ ...message, identity: message.identity ?? 'auth' })
     functions.logger.info('transactional mail sent', { toDomain, attempts: (info && info.attempts) || 1 })
@@ -418,6 +491,16 @@ export async function sendNotificationMail(
   identity: MailIdentity = 'transactional',
 ): Promise<'sent' | 'not_configured'> {
   const toDomain = mailDomain(to)
+  const mailbox = localMailboxDir()
+  if (mailbox) {
+    try {
+      const file = await writeLocalMailbox(mailbox, { to, subject, html, text: '', identity })
+      functions.logger.info('notification mail written to the local mailbox', { toDomain, identity, file })
+      return 'sent'
+    } catch {
+      throw new MailSendError('local_mailbox', null, 1, false)
+    }
+  }
   const hasKey = String(process.env[SENDGRID_KEY_ENV] ?? '').trim() !== ''
   functions.logger.info('sendMail called', { toDomain, hasKey, identity })
   if (!hasKey || providerProblem()) {

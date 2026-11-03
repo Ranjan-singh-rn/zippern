@@ -22,6 +22,8 @@ import { DataTable, type Column } from '@/components/ui/DataTable'
 import { Denied, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
+import { normaliseDaysInput, suspensionPreview, suspensionProblem } from '@/lib/suspensionTerm'
+import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'app_admin', 'app_member', 'support_admin',
@@ -99,7 +101,7 @@ const STATUS_TONES: Record<string, string> = {
 function fmt(value: string | null | undefined): string {
   if (!value) return '—'
   const d = new Date(value)
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString('en-IN')
+  return isNaN(d.getTime()) ? '—' : formatIst(d)
 }
 
 function millis(value: string | null | undefined): number | null {
@@ -533,7 +535,7 @@ export default function ReportsPage() {
                     </label>
                     <input
                       value={days}
-                      onChange={(e) => setDays(e.target.value.replace(/[^0-9]/g, ''))}
+                      onChange={(e) => setDays(normaliseDaysInput(e.target.value))}
                       inputMode="numeric"
                       placeholder="Blank = until somebody lifts it by hand"
                       className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm placeholder-slate-600 focus:outline-none focus:border-yellow-500"
@@ -541,6 +543,12 @@ export default function ReportsPage() {
                     <p className="text-slate-600 text-xs mt-1">
                       1 to 365. It lifts on the first daily run after it expires,
                       so give or take a few hours — not to the minute.
+                    </p>
+                    {/* QA #52: what the decision will do, before it is made — the
+                        end in IST, or that it has none. */}
+                    <p className="text-xs rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-slate-200 mt-2">
+                      {suspensionPreview({ timed: days.trim() !== '', days })
+                        ?? suspensionProblem({ timed: true, days })}
                     </p>
                   </div>
                 )}

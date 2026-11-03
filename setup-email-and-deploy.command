@@ -164,7 +164,7 @@ else
       --region "$API_REGION" \
       --allow-unauthenticated \
       --quiet \
-      --update-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=${PROJECT_ID},OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=no-reply@zipper.app,MAIL_FROM_NAME=Zipper" \
+      --update-env-vars "ENVIRONMENT=production,MONGO_DB=zipper,FIREBASE_PROJECT_ID=${PROJECT_ID},OBSERVER_EMAIL=314zipper@gmail.com,OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com,MAIL_FROM=no-reply@zipperlive.org,MAIL_FROM_NAME=Zipper" \
       --update-secrets "MONGO_URI=MONGO_URI:latest,JWT_SECRET=JWT_SECRET:latest,SENDGRID_API_KEY=SENDGRID_API_KEY:latest" \
       --min-instances 0 --max-instances 10 --memory 512Mi
     ok "API deployed to ${API_REGION}"

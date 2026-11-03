@@ -5,9 +5,6 @@
     <string name="get_otp">OTP பெறுக</string>
     <string name="continue_with_google">Google உடன் தொடரவும்</string>
     <string name="continue_as_guest">விருந்தினராக தொடரவும்</string>
-    <string name="verify_otp">OTP சரிபார்க்கவும்</string>
-    <string name="resend_otp">OTP மீண்டும் அனுப்பவும்</string>
-    <string name="set_up_profile">சுயவிவரத்தை அமைக்கவும்</string>
     <string name="male">ஆண்</string>
     <string name="female">பெண்</string>
     <string name="transgender">திருநங்கை</string>

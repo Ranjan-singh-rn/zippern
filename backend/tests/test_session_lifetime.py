@@ -646,6 +646,22 @@ check(
     "This account has been deactivated.",
 )
 check("…and no session was issued for them", len(live_sessions("uid-fired")), 1)
+
+# QA #44: a SUSPENDED member of staff (reversible) is told it is a suspension,
+# not that the account is "deactivated" — same refusal, same lack of a session.
+asyncio.run(WORLD[C.STAFF].update_one({"uid": "uid-fired"}, {"$set": {"is_active": False, "status": "suspended"}}))
+check(
+    "QA #44: a SUSPENDED staff member cannot renew, and is told it is a suspension",
+    refuses("a suspended staff member", lambda: sec.renew_session(fired_token)),
+    sec.STAFF_SUSPENDED_MESSAGE,
+)
+check("QA #44: …the sentence says it can be restored", "restore" in sec.STAFF_SUSPENDED_MESSAGE, True)
+check("QA #44: …and still no session", len(live_sessions("uid-fired")), 1)
+check("QA #44: a legacy inactive row (no status) still reads as deactivated",
+      sec.inactive_staff_message({"is_active": False}), "This account has been deactivated.")
+check("QA #44: an explicit deactivation reads as deactivated",
+      sec.inactive_staff_message({"is_active": False, "status": "deactivated"}), "This account has been deactivated.")
+asyncio.run(WORLD[C.STAFF].update_one({"uid": "uid-fired"}, {"$set": {"is_active": False}, "$unset": {"status": ""}}))
 ok(
     "…the one live session being the original, untouched",
     live_sessions("uid-fired")[0]["jti"] == claims_of(fired_token)["jti"],

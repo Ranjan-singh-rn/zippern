@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  EMU BUILDS ONLY (src/emu) — the local test copy, see the `emu` build type.
+
+  * FirebaseInitProvider is removed: it would initialise Firebase from
+    google-services.json, i.e. with the PRODUCTION project id, before any app
+    code runs. ZipperApp initialises it instead, with the demo-zipper project id
+    the local emulators use (LocalEmulators.kt).
+  * Analytics and Crashlytics collection are off: nothing from a test session is
+    reported anywhere.
+  * Plain HTTP only to the Android emulator's host alias and loopback, where the
+    local backend and the Firebase emulators listen.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application android:networkSecurityConfig="@xml/network_security_config">
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            android:authorities="${applicationId}.firebaseinitprovider"
+            tools:node="remove" />
+        <meta-data android:name="firebase_analytics_collection_deactivated" android:value="true" />
+        <meta-data android:name="firebase_crashlytics_collection_enabled" android:value="false" />
+    </application>
+</manifest>

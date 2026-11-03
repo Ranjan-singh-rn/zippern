@@ -78,6 +78,12 @@ export interface BagItem {
   source: 'level' | 'marketplace' | 'event'
   animationAsset: string   // Storage path, e.g. bag_items/entrances/en_bike.json
   animationUrl?: string    // Firebase Storage download URL (set by upload-bag-assets.mjs)
+  // B13: what the app actually plays. SVGA first (transparent, small), then the MP4.
+  svgaUrl?: string
+  videoUrl?: string        // MP4 entrance (scripts/upload-entrances.cjs, or the CRM)
+  svgaAvatarKey?: string   // entrance: the SVGA layer the app swaps for the user's photo ('' = "avatar")
+  svgaNameKey?: string     // entrance: the SVGA layer the app writes the user's name into ('' = "name")
+  frameScale?: number      // frame: drawn this many times the photo's size (default 1.3)
   targetGender:  'all' | 'male' | 'female'   // who can see/use this item
   targetRole:    'all' | 'user' | 'host'     // role restriction (Option A: strict exclusive)
   targetUserId?: string                       // if set, ONLY this account can have this item

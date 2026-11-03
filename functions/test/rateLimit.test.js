@@ -104,10 +104,20 @@ describe('bucketId — hashes only', () => {
 })
 
 describe('the policies are the documented conservative defaults', () => {
-  test('every unauthenticated callable has one; nothing else does', () => {
+  test('every unauthenticated callable has one; of the signed-in ones, only the invitation lookup', () => {
+    // QA #55 added the fifth unauthenticated callable, quickLoginRestriction —
+    // and with it, its own budget. The security review of the QA fixes
+    // (3 Nov 2026) added the one signed-in scope, hostInvitationLookup
+    // (checkReferralCode + activateHost; see qa51HostInvitation.test.js).
+    // B10 (4 Nov 2026) added the sixth unauthenticated callable, forgetQuickLogin
+    // (the account switcher's "Remove"), with its own budget — see
+    // b10AccountSwitch.test.js.
     expect(Object.keys(RL.RATE_LIMIT_POLICIES).sort()).toEqual([
-      'claimGuestIdentity', 'quickLoginChallenge', 'redeemQuickLogin', 'submitAccountAppeal',
+      'claimGuestIdentity', 'forgetQuickLogin', 'hostInvitationLookup', 'quickLoginChallenge', 'quickLoginRestriction',
+      'redeemQuickLogin', 'submitAccountAppeal',
     ])
+    expect(RL.RATE_LIMIT_POLICIES.quickLoginRestriction.perDevice).toEqual({ limit: 10, windowMs: 600_000 })
+    expect(RL.RATE_LIMIT_POLICIES.quickLoginRestriction.perIp).toEqual({ limit: 60, windowMs: 600_000 })
     expect(RL.RATE_LIMIT_POLICIES.quickLoginChallenge).toEqual({ perIp: { limit: 120, windowMs: 60_000 } })
     expect(RL.RATE_LIMIT_POLICIES.redeemQuickLogin.perDevice).toEqual({ limit: 10, windowMs: 60_000 })
     expect(RL.RATE_LIMIT_POLICIES.submitAccountAppeal.perDevice).toEqual({ limit: 5, windowMs: 600_000 })

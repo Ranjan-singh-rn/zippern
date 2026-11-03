@@ -1218,12 +1218,15 @@ async def partner_statements(
 
             recipient = await notify.partner_recipient(partner)
 
+            # QA #47: replies to no-reply@ are not read — say where to write.
+            from app.core import contacts
+
             intro = (
                 "Your statement for the period below, generated from the same "
                 "ledger the business runs on. If a figure here does not match "
-                "your own record, reply to this email with the reference and we "
-                "will show you the entries behind it — you should never have to "
-                "ask what you are owed (0.2.2 / 9.16)."
+                f"your own record, write to {contacts.support_email()} with the reference "
+                "and we will show you the entries behind it — you should never have to "
+                "ask what you are owed."
             )
 
             statement_files, statement_omitted = _attachments([section])
@@ -1571,6 +1574,115 @@ async def _sweep_credit_overdue() -> list[dict]:
 OWNER_NOTICE_SWEEP_MAX_ATTEMPTS = 12
 
 
+#: QA #53: how far back the appeal receipts look. An appeal is decided in days,
+#: and a receipt for a long-pending one would still be true, but nothing older
+#: than this is ever new.
+APPEAL_RECEIPT_WINDOW_DAYS = 7
+
+
+async def _sweep_appeal_receipts() -> list[dict]:
+    """QA #53 / §5 — "we received your appeal", for every PENDING account appeal.
+
+    The app (a banned or suspended account writing its own appeal) and the
+    device-key path (`submitAccountAppeal`) write `appeals` without the backend,
+    so nothing told the person it had arrived. This pass sends the receipt for
+    each `kind: ban` appeal still pending — once: the notice is keyed on the
+    appeal and `email_deliveries.dedupe_key` refuses a second email. An appeal
+    already decided is skipped; its decision notice says more.
+    """
+    import asyncio
+
+    from app.services import notices  # local: notices imports email, as this module does
+
+    since = _now() - timedelta(days=APPEAL_RECEIPT_WINDOW_DAYS)
+    out: list[dict] = []
+    for appeal_id, appeal in await asyncio.to_thread(_appeals_since, since):
+        if str(appeal.get("kind") or "") != "ban" or str(appeal.get("status") or "pending") != "pending":
+            continue
+        uid = str(appeal.get("subjectUid") or "").strip()
+        if not uid or not _receipt_source_ok(appeal, uid):
+            continue
+        # Security review (3 Nov 2026): only an account that IS restricted has
+        # anything to appeal — a receipt to anyone else is noise at best.
+        if not await asyncio.to_thread(_is_restricted, uid):
+            continue
+        # The reference is the server's own (public form) or none — never the
+        # document id, which a client chose.
+        result = await notices.appeal_receipt(uid, appeal_id, str(appeal.get("reference") or ""), show_id=False)
+        outcome = result.get("emailOutcome") or ("in_app_only" if result.get("inApp") else str(mail.Outcome.FAILED))
+        out.append({"appeal_id": appeal_id, "outcome": outcome, "in_app": bool(result.get("inApp"))})
+    return out
+
+
+def _receipt_source_ok(appeal: Mapping[str, Any], subject_uid: str) -> bool:
+    """Security review (3 Nov 2026): who wrote the appeal decides whether its
+    subject is written to.
+
+    * the account itself — `raisedByUid == subjectUid`. The app writes these
+      (the rules pin `raisedByUid` to the signed-in uid) and so does the
+      device-key path in the Functions;
+    * the public appeal form — written by THIS server with `raisedByUid` ""
+      and `raisedByRole` "public", which no client write can produce.
+
+    Anything else — an agency contesting on someone's behalf, which the rules
+    let it file for any subject — is not a receipt this person asked for, and
+    sending one would let a partner mail branded "appeal received" messages to
+    arbitrary users.
+    """
+    raised_by = str(appeal.get("raisedByUid") or "").strip()
+    if raised_by:
+        return raised_by == subject_uid
+    return str(appeal.get("raisedByRole") or "") == "public"
+
+
+def _is_restricted(uid: str) -> bool:
+    """Blocking: is `users/{uid}` banned or suspended right now?"""
+    from app.db import firebase
+
+    snap = firebase.firestore_client().collection("users").document(uid).get()
+    if not getattr(snap, "exists", False):
+        return False
+    d = snap.to_dict() or {}
+    state = str(d.get("accountState") or "")
+    return state in ("banned", "suspended") or bool(d.get("isBanned")) or bool(d.get("isSuspended"))
+
+
+#: The most appeals one sweep reads — a flood of documents cannot make it run unbounded.
+APPEAL_RECEIPT_MAX_SCAN = 5_000
+
+
+def _appeals_since(since: datetime) -> list[tuple[str, dict]]:
+    """Blocking: `(id, data)` of the appeals created at or after `since`, oldest
+    first, a page of 500 at a time (≤ APPEAL_RECEIPT_MAX_SCAN).
+
+    Paged, so a burst of documents cannot push genuine ones out of a single
+    `limit`. One single-field range filter and the same field's order, so no
+    composite index is needed. Raises when Firestore cannot be read — the sweep
+    is then reported `failed`, never as "nothing owed".
+    """
+    from google.cloud.firestore_v1.base_query import FieldFilter
+
+    from app.db import firebase
+
+    out: list[tuple[str, dict]] = []
+    last = None
+    while len(out) < APPEAL_RECEIPT_MAX_SCAN:
+        query = (
+            firebase.firestore_client().collection("appeals")
+            .where(filter=FieldFilter("createdAt", ">=", since))
+            .order_by("createdAt")
+            .limit(500)
+        )
+        if last is not None:
+            query = query.start_after(last)
+        page = list(query.stream())
+        out.extend((snap.id, snap.to_dict() or {}) for snap in page)
+        if len(page) < 500:
+            break
+        last = page[-1]
+    return out
+
+
 async def _sweep_owner_notices() -> list[dict]:
     """B1 / §8: re-attempt every Owner money notification still pending."""
     from app.services import owner_mail
@@ -1628,6 +1740,8 @@ SWEEPS: tuple[tuple[str, str, Callable[[], Awaitable[list[dict]]]], ...] = (
     ("payouts_paid", "8A.2.8", _sweep_payouts_paid),
     ("credit_due", "8A.2.10", _sweep_credit_due),
     ("credit_overdue", "8A.2.11", _sweep_credit_overdue),
+    # QA #53 — the receipt for an appeal written by the app or the device key.
+    ("appeal_receipts", "§5", _sweep_appeal_receipts),
     # B1 — not email owed by a record, but the same shape of job: something
     # the record says is still owed, retried until it is not.
     ("owner_notices", "§8 owner-alone", _sweep_owner_notices),

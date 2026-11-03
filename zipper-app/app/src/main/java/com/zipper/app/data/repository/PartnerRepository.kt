@@ -1,10 +1,17 @@
 package com.zipper.app.data.repository
 
+import android.content.Context
 import android.net.Uri
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.storage.FirebaseStorage
+import com.google.firebase.storage.StorageException
 import com.google.firebase.storage.StorageMetadata
+import com.zipper.app.util.MediaUtils
+import com.zipper.app.util.UploadLimits
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import java.security.SecureRandom
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -28,12 +35,18 @@ import javax.inject.Singleton
  * Names carry 128 random bits, as `lib/signupDocName.ts` does in the CRM, so
  * an object cannot be guessed and two applicants cannot collide. Content type
  * is set explicitly because the rules check it.
+ *
+ * QA #32: each of those paths takes at most 10 MB. A photo is compressed
+ * first (`MediaUtils.compressDocumentImage` — upright, readable, JPEG), and a
+ * file that still does not fit is refused HERE with its size, instead of
+ * being sent and refused by the rules as "does not have permission".
  */
 @Singleton
 class PartnerRepository @Inject constructor(
     private val auth: FirebaseAuth,
     private val storage: FirebaseStorage,
     private val functions: PartnerFunctions,
+    @ApplicationContext private val context: Context,
 ) {
 
     sealed interface Upload {
@@ -64,12 +77,35 @@ class PartnerRepository @Inject constructor(
         )
     }
 
-    private suspend fun upload(path: String, uri: Uri, contentType: String): Upload = try {
-        val ref = storage.reference.child(path)
-        ref.putFile(uri, StorageMetadata.Builder().setContentType(contentType).build()).await()
-        Upload.Ok(ref.downloadUrl.await().toString())
-    } catch (e: Exception) {
-        Upload.Failed(e.message ?: "The file could not be uploaded.")
+    /**
+     * One application document. A photo goes up compressed; a PDF (or an image
+     * that cannot be decoded) goes up as it is, after its size is checked.
+     */
+    private suspend fun upload(path: String, uri: Uri, contentType: String): Upload {
+        val metadata = StorageMetadata.Builder().setContentType(contentType).build()
+        return try {
+            val ref = storage.reference.child(path)
+            val photo = if (contentType.startsWith("image/")) {
+                withContext(Dispatchers.Default) { MediaUtils.compressDocumentImage(context, uri) }
+            } else null
+            if (photo != null) {
+                UploadLimits.documentTooLarge(photo.size.toLong())?.let { return Upload.Failed(it) }
+                ref.putBytes(photo, metadata).await()
+            } else {
+                val size = withContext(Dispatchers.IO) { MediaUtils.sizeOf(context, uri) }
+                UploadLimits.documentTooLarge(size)?.let { return Upload.Failed(it) }
+                ref.putFile(uri, metadata).await()
+            }
+            Upload.Ok(ref.downloadUrl.await().toString())
+        } catch (e: StorageException) {
+            // The rules answer a refusal as "not authorized" whatever its cause.
+            Upload.Failed(
+                if (e.errorCode == StorageException.ERROR_NOT_AUTHORIZED) UploadLimits.DOCUMENT_REFUSED
+                else e.message ?: "The file could not be uploaded.",
+            )
+        } catch (e: Exception) {
+            Upload.Failed(e.message ?: "The file could not be uploaded.")
+        }
     }
 
     /** One identity document for an Agency / Sub-agency application. [slot] is doc1/doc2/doc3. */

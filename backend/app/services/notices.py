@@ -729,6 +729,84 @@ async def partner_rejected(uid: str, kind: str, partner_id: str, reason: str) ->
     )
 
 
+#: QA #50: the words for the fields a partner may propose a change to
+#: (`partner_ops.APPLICABLE_FIELDS`). Names only — a notice never repeats the
+#: values, which are bank details and identity documents.
+_DETAIL_LABELS = {
+    "accountHolderName": "account holder name", "accountNumber": "bank account number",
+    "bankAccount": "bank account number", "ifscCode": "IFSC code", "bankName": "bank name",
+    "branch": "branch", "upiId": "UPI ID", "binanceUid": "Binance UID",
+    "paymentType": "payment method", "currency": "payout currency",
+    "kycDocUrls": "identity documents", "idDocUrls": "identity documents",
+    "registrationProofUrl": "government photo ID", "dob": "date of birth", "country": "country",
+    "agencyName": "agency name", "displayName": "name", "hostName": "name", "ownerName": "name",
+    "phone": "phone number", "applicantPhone": "phone number", "ownerPhone": "phone number",
+    "email": "email address", "applicantEmail": "email address", "ownerEmail": "email address",
+    "address": "address",
+}
+
+#: The payout fields — a change to one of these is a change to where money goes.
+_PAYOUT_DETAILS = frozenset({
+    "accountHolderName", "accountNumber", "bankAccount", "ifscCode", "bankName", "branch",
+    "upiId", "binanceUid", "paymentType", "currency",
+})
+
+
+def detail_labels(fields: Sequence[str]) -> list[str]:
+    """The fields of a proposed change in words, each once, in the order given.
+
+    A key this list does not know is "other details" — never the key itself: a
+    proposal's keys are written by whoever proposed it (security review,
+    3 Nov 2026), and a notice must not repeat text somebody else chose.
+    """
+    out: list[str] = []
+    for f in fields:
+        label = _DETAIL_LABELS.get(str(f), "other details")
+        if label not in out:
+            out.append(label)
+    return out
+
+
+async def partner_details_decided(
+    uid: str, kind: str, partner_id: str, *, applied: bool, fields: Sequence[str],
+    reason: str = "", decision_id: str = "",
+) -> bool:
+    """QA #50 — a partner is told when the bank or KYC change they proposed is
+    applied or refused. Nothing used to tell them: an applied change simply
+    appeared, a refused one silently reverted (the reason sat on a dashboard
+    they had no reason to open). Keyed on the decision's audit entry, so a
+    second proposal decided later is a second notice."""
+    label = role_label(kind)
+    names = detail_labels(fields)
+    what = ", ".join(names) if names else "details"
+    key = f"partner_details_{'applied' if applied else 'rejected'}_{decision_id or partner_id}"
+    if applied:
+        body = f"The change you proposed to your {label} details has been reviewed and applied: {what}."
+        if any(str(f) in _PAYOUT_DETAILS for f in fields):
+            body += " Payouts go to the new details from now on."
+        title = f"{label} details updated"
+    else:
+        body = (
+            f"The change you proposed to your {label} details was not applied."
+            + (f" Reason: {reason}" if reason else "")
+            + " Your current details stay as they were. You can propose the change again "
+              "once the point above is addressed."
+        )
+        title = f"{label} detail change not applied"
+    return await deliver(
+        uid, key,
+        type="partner_details_decided",
+        title=title,
+        body=body,
+        reason="" if applied else reason,
+        meta={"role": str(kind), "partnerId": partner_id, "status": "applied" if applied else "rejected",
+              "fields": list(names)},
+        related_id=decision_id or partner_id,
+        email=_partner_leg("partner.details_decided", kind, partner_id,
+                           rows=[("Change", "Applied" if applied else "Not applied"), ("Details", what)]),
+    )
+
+
 async def partner_suspended(uid: str, kind: str, partner_id: str, reason: str) -> bool:
     label = role_label(kind)
     return await deliver(
@@ -1237,6 +1315,13 @@ async def account_restriction(
     with the reason, keyed on the audit entry so a retry delivers once."""
     title, body = _RESTRICTION_TEXT.get(change, (f"Your Zipper account was {change}", f"Your account was {change}."))
     body = body.format(until=f" until {mail.when(until)}" if until else "")
+    # QA (3 Nov 2026, E1b): the ban notice reached the app without its reason —
+    # it rode only in the `reason` field, which no shipped app build displayed.
+    # Said in the sentence now, as every other decision notice does; the email
+    # shows it once (`email._notice_body` skips the Reason box when the body
+    # already carries it) and the app shows it once (`MessagesTabs.reasonLine`).
+    if change in ("suspended", "banned") and safe_text(reason):
+        body += f" Reason: {safe_text(reason)}"
     next_steps = (
         "If you believe this is a mistake you can appeal: open the appeal form from the "
         "sign-in screen or the Zipper website and quote your account id."
@@ -1258,8 +1343,16 @@ async def account_restriction(
 
 # ── Appeals (§5) ────────────────────────────────────────────────────────────
 
-async def appeal_received(uid: str, appeal_id: str, reference: str = "") -> bool:
-    return await deliver(
+async def appeal_receipt(uid: str, appeal_id: str, reference: str = "", *, show_id: bool = True) -> dict:
+    """QA #53 — "we received your appeal", in the app and by email.
+
+    The notice and its template existed and nothing sent them. Keyed on the
+    appeal (`appeal_received_{id}`), so the public form's immediate call and the
+    transactional sweep's later pass (which covers the app's and the device
+    key's appeals, written without the backend) deliver it once. Returns
+    `deliver_notice`'s state; never raises.
+    """
+    return await deliver_notice(
         uid, f"appeal_received_{appeal_id}",
         type="appeal_received",
         title="Your appeal has been received",
@@ -1270,8 +1363,15 @@ async def appeal_received(uid: str, appeal_id: str, reference: str = "") -> bool
         ),
         meta={"appealId": appeal_id, "status": "pending", **({"reference": reference} if reference else {})},
         related_id=appeal_id,
-        email=EmailLeg(template="appeal.received", rows=[("Reference", reference or appeal_id)]),
+        # Security review: the email quotes the server's reference, or nothing —
+        # an appeal written by a client has an id the client chose.
+        email=EmailLeg(template="appeal.received",
+                       rows=[("Reference", reference or (appeal_id if show_id else ""))]),
     )
+
+
+async def appeal_received(uid: str, appeal_id: str, reference: str = "") -> bool:
+    return bool((await appeal_receipt(uid, appeal_id, reference))["inApp"])
 
 
 async def appeal_decided(uid: str, appeal_id: str, verdict: str, reason: str) -> bool:

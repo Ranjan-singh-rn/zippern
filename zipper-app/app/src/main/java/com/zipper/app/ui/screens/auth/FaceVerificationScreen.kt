@@ -369,7 +369,7 @@ fun FaceVerificationScreen(
                                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                                     .build()
                                 imgAnalysis.setAnalyzer(cameraExecutor) { proxy ->
-                                    val mediaImg = proxy.image
+                                    val mediaImg = proxy.mediaImageForMlKit()
                                     if (mediaImg != null && step != LivenessStep.CAPTURE && step != LivenessStep.PROCESSING) {
                                         val inputImg = InputImage.fromMediaImage(mediaImg, proxy.imageInfo.rotationDegrees)
                                         detector.process(inputImg)
@@ -440,6 +440,16 @@ fun FaceVerificationScreen(
         }
     }
 }
+
+/**
+ * The camera frame as the `media.Image` ML Kit reads.
+ *
+ * CameraX marks `ImageProxy.getImage()` `@ExperimentalGetImage`. The opt-in covers this one read and nothing
+ * else (lint UnsafeOptInUsageError) — the usage CameraX and ML Kit document. The caller still owns the proxy
+ * and closes it.
+ */
+@androidx.annotation.OptIn(ExperimentalGetImage::class)
+private fun ImageProxy.mediaImageForMlKit(): android.media.Image? = image
 
 // ── Gender classifier (TFLite) ────────────────────────────────────────────────
 // Model expects: [1, 224, 224, 3] float32 input (RGB normalized 0..1)

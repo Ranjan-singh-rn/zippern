@@ -3,7 +3,7 @@
 Every other moderation path in this system runs one way: somebody with
 authority decides, and the person it happened to finds out. This is the return
 path, and until it existed the product's honest description of a wrongful ban
-was "email support@zipperlive.app and hope".
+was "email support and hope".
 
 ── WHO MAY RAISE ONE, AND WHY TWO KINDS OF RAISER ────────────────────────────
 

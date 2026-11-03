@@ -88,6 +88,7 @@ fun WatchLiveScreen(
     var showMore by remember { mutableStateOf(false) }
     var showShare by remember { mutableStateOf(false) }
     var giftTargetRoom by remember { mutableStateOf<String?>(null) }
+    var confirmBlock by remember { mutableStateOf(false) }
 
     // ── PIP ────────────────────────────────────────────────────────────────
     var isInPip by remember { mutableStateOf(false) }
@@ -126,6 +127,10 @@ fun WatchLiveScreen(
     // from a sheet that dismisses itself, so this line is the only thing that
     // tells the viewer their report exists.
     LaunchedEffect(state.toastMessage) { state.toastMessage?.let { snackbar.showSnackbar(it); viewModel.clearToast() } }
+    // B12: the PK's verdict, as the server recorded it on this room.
+    LaunchedEffect(state.pkVerdict) { state.pkVerdict?.let { snackbar.showSnackbar(it); viewModel.clearPkVerdict() } }
+    // B12: blocked the host — they are gone from this viewer's app, so is this screen.
+    LaunchedEffect(state.blockedHost) { if (state.blockedHost) onBack() }
 
     val listState = rememberLazyListState()
     LaunchedEffect(state.comments.size) { if (state.comments.isNotEmpty()) listState.animateScrollToItem(state.comments.size - 1) }
@@ -144,6 +149,20 @@ fun WatchLiveScreen(
             }
         }
         AndroidView(factory = { remoteSurface }, modifier = Modifier.fillMaxSize())
+
+        // B12: camera off or paused — the host's photo over the (black) video, never a frozen frame.
+        if (room != null && state.remoteUid != 0 && (state.isCameraOff || state.isPaused)) {
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF2A1A4A), Color(0xFF0E0F21)))))
+            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.md)) {
+                Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName)
+                if (state.isPaused) {
+                    Text(LiveRoomUi.PAUSED_TITLE, style = ZipperTheme.type.headingM, color = c.textPrimary)
+                    Text(LiveRoomUi.PAUSED_BODY, style = ZipperTheme.type.bodyM, color = c.textSecondary)
+                } else {
+                    Text("Camera off", style = ZipperTheme.type.bodyM, color = c.textSecondary)
+                }
+            }
+        }
 
         if (isInPip) return@Box
 
@@ -177,7 +196,12 @@ fun WatchLiveScreen(
                         // sheet already lists. `room.viewerCount` is a counter
                         // that drifts, and showed a different number right next
                         // to the list it disagreed with.
-                        Text("${compactCount(state.viewers.size.toLong())} watching", style = ZipperTheme.type.caption, color = c.textSecondary, maxLines = 1)
+                        // B12: the server's count (recounted from these presence rows), with the host's level.
+                        Text(
+                            (if (state.hostLevel > 0) "Lv ${state.hostLevel} · " else "") +
+                                "${compactCount(maxOf(state.viewers.size, room?.viewerCount ?: 0).toLong())} watching",
+                            style = ZipperTheme.type.caption, color = c.textSecondary, maxLines = 1,
+                        )
                     }
                     if (!state.isFollowing) {
                         Box(
@@ -218,9 +242,28 @@ fun WatchLiveScreen(
                     }
                 }
             }
-            AnimatedVisibility(state.isRejoining, enter = fadeIn(), exit = fadeOut()) {
+            // B12: the connection, from the engine — and the host's video leaving the channel.
+            val linkNote = when {
+                state.isRejoining || state.link == AgoraManager.Link.Reconnecting -> LiveRoomUi.RECONNECTING
+                state.link == AgoraManager.Link.Failed -> LiveRoomUi.CONNECTION_LOST
+                state.hostVideoLost && !state.isLiveEnded -> LiveRoomUi.HOST_VIDEO_LOST
+                else -> null
+            }
+            AnimatedVisibility(linkNote != null, enter = fadeIn(), exit = fadeOut()) {
                 Box(Modifier.padding(horizontal = Space.md).background(c.tintBrandMedium, CircleShape).padding(horizontal = Space.md, vertical = 6.dp)) {
-                    Text("Reconnecting…", style = ZipperTheme.type.labelS, color = c.textPrimary)
+                    Text(linkNote.orEmpty(), style = ZipperTheme.type.labelS, color = c.textPrimary)
+                }
+            }
+            // B12: the host's pinned announcement.
+            if (state.pinnedMessage.isNotBlank()) {
+                Row(
+                    Modifier.padding(horizontal = Space.md).fillMaxWidth(0.8f)
+                        .background(c.scrimMedium, RoundedCornerShape(Radius.md)).border(1.dp, c.glassMid, RoundedCornerShape(Radius.md))
+                        .padding(horizontal = Space.md, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                ) {
+                    Icon(Icons.Default.PushPin, null, tint = c.brandVip, modifier = Modifier.size(14.dp))
+                    Text(state.pinnedMessage, style = ZipperTheme.type.bodyS, color = c.textPrimary, maxLines = 3, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
@@ -260,12 +303,19 @@ fun WatchLiveScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     BasicTextField(
-                        value = state.commentInput, onValueChange = viewModel::onCommentInput, singleLine = true,
+                        // B12: at most 300 characters (the rules refuse more); a muted viewer cannot type at all.
+                        value = state.commentInput, onValueChange = { v -> viewModel.onCommentInput(v.take(LiveRoomUi.COMMENT_MAX)) }, singleLine = true,
+                        enabled = !state.isMutedInChat,
                         textStyle = ZipperTheme.type.bodyS.copy(color = c.textPrimary), cursorBrush = SolidColor(c.brandPrimary),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(onSend = { viewModel.sendComment() }),
                         modifier = Modifier.weight(1f),
-                        decorationBox = { inner -> if (state.commentInput.isEmpty()) Text("Say something…", style = ZipperTheme.type.bodyS, color = c.textMuted); inner() },
+                        decorationBox = { inner ->
+                            if (state.commentInput.isEmpty()) {
+                                Text(if (state.isMutedInChat) LiveRoomUi.MUTED_PLACEHOLDER else "Say something…", style = ZipperTheme.type.bodyS, color = c.textMuted)
+                            }
+                            inner()
+                        },
                     )
                     Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = if (state.commentInput.isBlank()) c.textMuted else c.brandPrimary,
                         modifier = Modifier.size(20.dp).clickableNoRipple { viewModel.sendComment() })
@@ -323,12 +373,23 @@ fun WatchLiveScreen(
     if (showViewers) ViewerListSheet(state.viewers, onOpenProfile) { showViewers = false }
     if (showLeaderboard) LeaderboardSheet(state.giftLeaderboard, onOpenProfile) { showLeaderboard = false }
     if (showShare) LiveShareSheet(roomId = roomId, hostName = room?.hostName ?: "", onDismiss = { showShare = false })
+    // B12: block the host — asked first, because it also stops their calls and messages.
+    if (confirmBlock) {
+        AlertDialog(
+            onDismissRequest = { confirmBlock = false }, containerColor = c.bgElevated,
+            title = { Text("Block ${room?.hostName ?: "this host"}?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text("You'll leave this live, and they won't be able to call or message you. Unblock any time in Settings → Blocked users.", style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+            confirmButton = { TextButton({ confirmBlock = false; viewModel.blockHost() }) { Text("Block", color = c.statusDanger) } },
+            dismissButton = { TextButton({ confirmBlock = false }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
     if (showMore) {
         MoreSheet(
             showComments = state.showComments, quality = state.streamQuality,
             onToggleComments = { viewModel.toggleShowComments(); showMore = false },
             onQuality = { viewModel.setStreamQuality(it); showMore = false },
             onReport = { reason -> viewModel.reportHost(reason); showMore = false },
+            onBlock = { showMore = false; confirmBlock = true },
             onDismiss = { showMore = false },
         )
     }
@@ -430,7 +491,10 @@ private fun LeaderboardSheet(entries: List<GiftLeaderboardEntry>, onOpen: (Strin
 @Composable
 private fun MoreSheet(
     showComments: Boolean, quality: String,
-    onToggleComments: () -> Unit, onQuality: (String) -> Unit, onReport: (String) -> Unit, onDismiss: () -> Unit,
+    onToggleComments: () -> Unit, onQuality: (String) -> Unit, onReport: (String) -> Unit,
+    /** B12: block the host from the live screen. */
+    onBlock: () -> Unit,
+    onDismiss: () -> Unit,
 ) {
     val c = ZipperTheme.colors
     var reporting by remember { mutableStateOf(false) }
@@ -458,6 +522,10 @@ private fun MoreSheet(
             Row(Modifier.fillMaxWidth().clickableNoRipple { reporting = true }.padding(horizontal = Space.xl, vertical = Space.md), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
                 Icon(Icons.Default.Flag, null, tint = c.statusDanger, modifier = Modifier.size(22.dp))
                 Text("Report", style = ZipperTheme.type.bodyL, color = c.statusDanger)
+            }
+            Row(Modifier.fillMaxWidth().clickableNoRipple(onBlock).padding(horizontal = Space.xl, vertical = Space.md), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
+                Icon(Icons.Default.Block, null, tint = c.statusDanger, modifier = Modifier.size(22.dp))
+                Text("Block host", style = ZipperTheme.type.bodyL, color = c.statusDanger)
             }
         }
     }

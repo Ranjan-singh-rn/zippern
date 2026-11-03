@@ -75,7 +75,7 @@ import {
   ArrowRightLeft,
   Lock,
   MonitorSmartphone,
-  ShieldCheck,
+  ShieldCheck, Gamepad2, Trophy, Music, Crown,
 } from 'lucide-react'
 
 // Every screen below reads an endpoint behind `_require_oversight` or
@@ -164,6 +164,7 @@ const navGroups: NavGroup[] = [
       // inventory down. The endpoints existed for a while with no screen, so in
       // the running CRM inventory never decremented at all.
       { href: '/sales',          label: 'Seller Sales',    icon: ShoppingCart, roles: ['superadmin', 'ops_admin', 'ops_member', 'finance_admin', 'finance_member'] },
+      { href: '/seller-trades',  label: 'Seller Trades',   icon: Package,     roles: ['superadmin', 'finance_admin', 'finance_member'] },
       // Buyer-filed recharges through a Coin Seller: staff verify the payment
       // here; the API credits through the ledger, once. There is no gateway.
       { href: '/recharges',      label: 'Recharges',       icon: Coins,        roles: ['superadmin', 'ops_admin', 'ops_member', 'finance_admin', 'finance_member'] },
@@ -311,6 +312,10 @@ const navGroups: NavGroup[] = [
       { href: '/app-config/bag-items',       label: 'Bag Items',      icon: Package,     roles: ['superadmin'] },
       { href: '/app-config/packages',        label: 'Packages',       icon: ShoppingBag, roles: ['superadmin'] },
       { href: '/app-config/daily-rewards',   label: 'Daily Rewards',  icon: Gift,        roles: ['superadmin'] },
+      { href: '/app-config/games',           label: 'Games',          icon: Gamepad2,    roles: ['superadmin'] },
+      { href: '/leaderboards',               label: 'Leaderboards',   icon: Trophy,      roles: ['superadmin'] },
+      { href: '/app-config/music',           label: 'Room music',     icon: Music,       roles: ['superadmin', 'tech_admin', 'tech_member'] },
+      { href: '/app-config/party-pro',       label: 'Party Pro',      icon: Crown,       roles: ['superadmin'] },
       { href: '/app-config/profile-options', label: 'Profile Options', icon: UserCog,    roles: ['superadmin'] },
       { href: '/app-config/levels',          label: 'Levels',         icon: BarChart3,   roles: ['superadmin'] },
       { href: '/app-config/payment-creds',   label: 'Payment Creds',  icon: CreditCard,  roles: ['superadmin'] },

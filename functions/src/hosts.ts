@@ -6,18 +6,32 @@ import { getHostLadder, hostLevelFor } from './hostStats'
 // be required from a test without an initialised Firebase app. See the header
 // of ./hostEligibility.
 import {
-  heldByAnotherAgency, restrictionOn, decisionRefusal, agencyCodeRefusal, guestRefusal,
+  heldByAnotherAgency, restrictionOn, decisionRefusal, agencyCodeRefusal, guestRefusal, AGENCY_NOT_ACCEPTING,
   hostRoleRevoked, hostOfSameAgency, activeHostRefusal, HOST_REVOKED_REFUSAL, ROLE_REVOKED,
   hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails, refusalDetails,
   HOST_ROLE_SUSPENDED,
 } from './hostEligibility'
-import { sameNumber } from './phone'
+import { digitsOf, hasCountryCode, sameNumber, sameNumberStrict } from './phone'
 import { hostBlockedFor } from './crmRoles'
 import { assertActiveSession } from './mobileSession'
 import { CONTACT_VERIFICATION_REQUIRED, contactProofFor } from './contactProof'
 import { ROSTER_ACTIVE, ROSTER_REMOVED_AT, ROSTER_REMOVED_REASON } from './roster'
+import { clientIpOf, enforceRateLimit } from './rateLimit'
+import { recordEvent } from './quickLogin'
 
 const db = admin.firestore()
+
+/**
+ * Security review of the QA fixes (3 Nov 2026): one budget for the two calls
+ * that look an invitation up by code — see `hostInvitationLookup` in
+ * rateLimit.ts. Keyed by the signed-in account and the client address.
+ */
+async function limitInvitationLookups(uid: string, rawRequest: unknown): Promise<void> {
+  await enforceRateLimit('hostInvitationLookup', {
+    deviceId: `uid:${uid}`,
+    ip: clientIpOf(rawRequest as Parameters<typeof clientIpOf>[0]),
+  })
+}
 
 
 /**
@@ -236,6 +250,8 @@ export const activateHost = functions
     if (guest) throw new functions.https.HttpsError('permission-denied', guest)
     // Phase 1A (SESSION-001/003): a protected operation.
     await assertActiveSession(uid, data, 'activateHost', context.auth?.token)
+    // Before any invitation is read (security review, 3 Nov 2026).
+    await limitInvitationLookups(uid, context.rawRequest)
 
     // Token first, then what was saved at profile setup, then the form. See
     // `identityFor` — the stored half is what lets somebody redeem a code with
@@ -245,11 +261,15 @@ export const activateHost = functions
     // Chosen, not taken. See `applicationsFor` — a referral code belongs to an
     // agency, so several applications share it, and `docs[0]` was redeeming
     // whichever one the index happened to return.
-    const { anyForCode, mine } = await applicationsFor(code, { phone, email })
+    const { anyForCode, mine, claimedByOther } = await applicationsFor(code, { phone, email }, uid)
     if (!anyForCode) {
       throw new functions.https.HttpsError('not-found', 'That referral code does not exist.')
     }
     if (mine.length === 0) {
+      // QA #51: another account claimed the invitation for these contacts.
+      if (claimedByOther) {
+        throw new functions.https.HttpsError('failed-precondition', 'That referral code has already been used.')
+      }
       throw new functions.https.HttpsError(
         'permission-denied',
         'This code was issued to a different phone number or email address.',
@@ -268,7 +288,13 @@ export const activateHost = functions
     // without our own code. See contactProof.ts.
     const proof = await contactProofFor(uid)
 
-    return db.runTransaction(async (tx) => {
+    // Security review of the QA fixes (3 Nov 2026): a QA #51 claim makes the
+    // invitation this account's without starting anything, so no other record
+    // of it exists until the role starts. It is recorded once the transaction
+    // has committed (`authEvents`, closed to clients — see `recordEvent`). The
+    // callback RETURNS that it claimed (`claimedNow`, taken off the answer
+    // below) — it changes nothing outside itself (transactionPurity.test.js).
+    const outcome = await db.runTransaction(async (tx) => {
       const [appSnap, userSnap, crmSnap] = await Promise.all([
         tx.get(appRef), tx.get(userRef), tx.get(db.collection('crmUsers').doc(uid)),
       ])
@@ -401,6 +427,28 @@ export const activateHost = functions
       }
 
       /*
+       * ── QA #51: CLAIMED, WAITING FOR THE OTHER CONTACT ─────────────────────
+       *
+       * Re-entering the code after an earlier claim. The invitation is this
+       * account's and starts through the backend once both contacts are
+       * verified (`checkPartnerActivation`); activating it here as well could
+       * grant the role twice, so this only reports where it stands. Another
+       * account's claim is a spent code.
+       */
+      if (app.status === AWAITING_VERIFICATION) {
+        if (String(app.applicantUid ?? '').trim() !== uid) {
+          throw new functions.https.HttpsError('failed-precondition', 'That referral code has already been used.')
+        }
+        return {
+          alreadyActivated: false,
+          awaitingVerification: true,
+          agencyId,
+          missing: proof.missing,
+          contactHint: contactHintFor(app, proof.missing),
+        }
+      }
+
+      /*
        * ── B09: ALREADY A HOST OF THIS AGENCY ─────────────────────────────────
        *
        * An agency that invites one of its own Hosts again — a re-invite after a
@@ -467,16 +515,55 @@ export const activateHost = functions
       )
       if (badAgency) throw new functions.https.HttpsError('failed-precondition', badAgency)
 
-      // The contact match computed above (see "Both must match").
-      if (!phoneOk || !emailOk) {
+      // The contact match (see "Both must match" and QA #51 above). A verified
+      // contact that names somebody else is refused outright.
+      const match = invitationContactMatch(app, { phone, email })
+      if (match.mismatch || !match.ok) {
         throw new functions.https.HttpsError(
           'permission-denied',
           'This code was issued to a different phone number or email address.',
         )
       }
 
-      // Decision 15 (RC): the role starts only with BOTH contacts verified on
-      // this account, by the definition every service shares.
+      /*
+       * Decision 15 (RC): the role starts only with BOTH contacts verified on
+       * this account, by the definition every service shares — and (QA #51)
+       * both equal to the invitation's.
+       *
+       * When one is still missing, the invitation is CLAIMED instead of refused:
+       * it becomes this account's application, approved and waiting, and starts
+       * by itself through the backend once the missing contact is verified —
+       * the same path as an approved self-application. The claim itself is
+       * written only after every check above has passed (restriction, revoked
+       * or suspended role, another agency, the server's approval, the agency's
+       * real code), so it carries no authority the activation would not have.
+       */
+      if (match.missing.length > 0) {
+        // The account has not verified one of its contacts at all (a new phone
+        // sign-up has no e-mail; a Google sign-up no phone): claim and wait.
+        const missing: Contact[] = Array.from(new Set<Contact>([...match.missing, ...proof.missing]))
+        tx.update(appRef, invitationClaimStamp(uid, missing, admin.firestore.FieldValue.serverTimestamp()))
+        return {
+          alreadyActivated: false,
+          awaitingVerification: true,
+          agencyId,
+          missing,
+          contactHint: contactHintFor(app, missing),
+          requirement: 'both',
+          code: CONTACT_VERIFICATION_REQUIRED,
+          claimedNow: true,   // internal: taken off before the answer is sent
+        }
+      }
+      // Both contacts are present: they must both be the invited ones…
+      if (!phoneOk || !emailOk) {
+        throw new functions.https.HttpsError(
+          'permission-denied',
+          'This code was issued to a different phone number or email address.',
+        )
+      }
+      // …and both proved by the definition every service shares (an address
+      // Firebase marked verified on a password account is not proof without
+      // our own code — see contactProof.ts). Unchanged by QA #51.
       if (!proof.complete) {
         throw new functions.https.HttpsError(
           'failed-precondition',
@@ -555,6 +642,15 @@ export const activateHost = functions
 
       return { alreadyActivated: false, agencyId, callRateBeans, supersededApplications: supersede }
     })
+
+    const { claimedNow, ...answer } = outcome as typeof outcome & { claimedNow?: boolean; missing?: Contact[] }
+    if (claimedNow === true) {
+      // Ids and which contacts are missing — never the code, a contact or a hint.
+      await recordEvent('HOST_INVITATION_CLAIMED', {
+        uid, applicationId: appRef.id, agencyId: String(answer.agencyId ?? ''), missing: answer.missing ?? [],
+      })
+    }
+    return answer
   })
 
 // ── setCallRate ──────────────────────────────────────────────────────────────
@@ -728,6 +824,124 @@ function samePhone(a: unknown, b: unknown): boolean {
   return sameNumber(a, b)
 }
 
+/*
+ * ── QA #51: AN INVITED HOST WHO HAS PROVED ONLY ONE CONTACT ─────────────────
+ *
+ * An agency invites a host by phone AND e-mail; the host arrives with ONE of
+ * them proved — a phone OTP sign-up has a verified number and no e-mail, a
+ * Google sign-up the reverse. `applicationsFor` used to look the invitation up
+ * by the verified e-mail only, so every new phone sign-up found nothing and was
+ * told "Details don't match the agency record for this code" — every host an
+ * agency invited, at the very first step.
+ *
+ * The identity rule is unchanged: only VERIFIED contacts count (`identityFor`),
+ * and nothing typed into a form is ever compared. What changes is what one
+ * proved contact may do:
+ *
+ *   * it may FIND and CLAIM the invitation when it matches what the agency
+ *     registered, and no other verified contact of the account contradicts the
+ *     invitation (`invitationContactMatch`);
+ *   * it may NOT start the Host role. Decision 15 still holds — the role starts
+ *     only when BOTH contacts are verified and BOTH equal the invitation's. The
+ *     claimed invitation waits in `awaiting_verification`, owned by this
+ *     account, exactly like an approved self-application, and the backend
+ *     starts it once the missing contact is verified
+ *     (`users.activate_host_if_verified`, which re-checks the invitation's
+ *     contacts — see `_invitation_contact_problem`).
+ *
+ * A phone alone proves the invitation only when the agency's number is
+ * unambiguous: international and equal digit for digit. A bare national number
+ * matches the tail of several countries' numbers (./phone), so for such an
+ * invitation the e-mail has to be the contact that finds it.
+ */
+
+/** The contacts a person must still verify, in a fixed order. */
+export type Contact = 'phone' | 'email'
+
+export interface InvitationContactMatch {
+  /** The invitation may be claimed by this account. */
+  ok: boolean
+  /** A verified contact of the account names a different phone or e-mail. */
+  mismatch: boolean
+  /** Both of the invitation's contacts equal verified contacts of the account. */
+  full: boolean
+  /** Contacts this account has not verified yet. */
+  missing: Contact[]
+}
+
+export function invitationContactMatch(
+  app: Record<string, unknown> | null | undefined,
+  who: { phone?: string; email?: string },
+): InvitationContactMatch {
+  const a = app ?? {}
+  const invitedEmail = String(a.applicantEmail ?? '').trim().toLowerCase()
+  const invitedPhone = String(a.applicantPhone ?? '').trim()
+  const phone = String(who.phone ?? '').trim()
+  const email = String(who.email ?? '').trim().toLowerCase()
+
+  const missing: Contact[] = []
+  if (!phone) missing.push('phone')
+  if (!email) missing.push('email')
+
+  // An invitation names both contacts (the Invite Host form requires both).
+  // One that does not cannot be redeemed — as before — so it never matches.
+  const complete = invitedEmail !== '' && digitsOf(invitedPhone) !== ''
+
+  const emailMatch = email !== '' && invitedEmail !== '' && email === invitedEmail
+  const phoneMatch = phone !== '' && samePhone(invitedPhone, phone)
+  const mismatch =
+    (email !== '' && invitedEmail !== '' && !emailMatch) ||
+    (phone !== '' && digitsOf(invitedPhone) !== '' && !phoneMatch)
+
+  // What a proved phone may claim on its own: an unambiguous invited number.
+  const phoneProves = phoneMatch && hasCountryCode(invitedPhone) && sameNumberStrict(invitedPhone, phone)
+
+  return {
+    ok: complete && !mismatch && (emailMatch || phoneProves),
+    mismatch,
+    full: complete && emailMatch && phoneMatch,
+    missing,
+  }
+}
+
+/** `p•••@example.com` — the shape `contact_verification.mask_email` uses. */
+export function maskInvitedEmail(email: unknown): string {
+  const e = String(email ?? '').trim().toLowerCase()
+  const at = e.indexOf('@')
+  if (at <= 0) return ''
+  return `${e.slice(0, 1)}•••${e.slice(at)}`
+}
+
+/** `••••0004` — the shape `contact_verification.mask_phone` uses. */
+export function maskInvitedPhone(phone: unknown): string {
+  const d = digitsOf(phone)
+  if (!d) return ''
+  return d.length >= 4 ? `••••${d.slice(-4)}` : '••••'
+}
+
+/** The registered (masked) value of each contact the person still has to verify. */
+export function contactHintFor(app: Record<string, unknown>, missing: Contact[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (missing.includes('email')) out.email = maskInvitedEmail(app.applicantEmail)
+  if (missing.includes('phone')) out.phone = maskInvitedPhone(app.applicantPhone)
+  return out
+}
+
+/** The stamp a claim writes: the invitation now belongs to this account and waits for its contacts. */
+export function invitationClaimStamp(uid: string, missing: Contact[], now: unknown): Record<string, unknown> {
+  return {
+    applicantUid: uid,
+    status: 'awaiting_verification',
+    claimedVia: 'invitation_code',
+    claimedAt: now,
+    activationPending: missing,
+    updatedAt: now,
+  }
+}
+
+/** The status a claimed invitation carries while its contacts are missing. */
+export const AWAITING_VERIFICATION = 'awaiting_verification'
+
 /**
  * The phone and email this account is known by, from the best source available.
  *
@@ -799,8 +1013,19 @@ function candidateRank(app: Record<string, any>): number {
   if (app.isActivated === true) return 40
   if (app.status === 'rejected') return 30
   if (app.status === 'approved') return 0
+  // QA #51: already claimed by this account and waiting for its contacts.
+  if (app.status === AWAITING_VERIFICATION) return 5
   return 10 // pending, or anything unrecognised: usable, but not preferred
 }
+
+/**
+ * QA #51: how many of an agency's invitations a phone-only lookup reads. The
+ * phone is stored as the agency typed it, so it cannot be queried directly;
+ * the code's invitations are read and compared in memory. Bounded: an agency
+ * with more OPEN invitations than this under one code is not a real case, and
+ * the e-mail path below has no such limit.
+ */
+export const PHONE_SCAN_LIMIT = 300
 
 /**
  * Applications for [code] that belong to [who], best first.
@@ -821,28 +1046,80 @@ function candidateRank(app: Record<string, any>): number {
  * otherwise look identical, and "no such code" on a valid code sends people to
  * support for no reason.
  */
-async function applicationsFor(code: string, who: Applicant) {
-  const byEmail = who.email
-    ? await db.collection('hostApplications')
-        .where('applicantEmail', '==', who.email)
-        .limit(25)
-        .get()
-    : null
+async function applicationsFor(code: string, who: Applicant, uid = '') {
+  type Snap = admin.firestore.QueryDocumentSnapshot
+  const found = new Map<string, Snap>()
+  let anyForCode = false
 
-  const mine = (byEmail?.docs ?? []).filter((d) => {
-    if (String(d.get('referralCode') ?? '').trim().toUpperCase() !== code) return false
-    return samePhone(d.get('applicantPhone'), who.phone)
+  // By the verified e-mail: an address belongs to one applicant, so this
+  // returns a handful at most (see above).
+  if (who.email) {
+    const byEmail = await db.collection('hostApplications')
+      .where('applicantEmail', '==', who.email)
+      .limit(25)
+      .get()
+    for (const d of byEmail.docs) {
+      if (String(d.get('referralCode') ?? '').trim().toUpperCase() !== code) continue
+      anyForCode = true
+      found.set(d.id, d)
+    }
+  }
+
+  // QA #51: by the verified phone, for the person who has not proved an e-mail
+  // yet (a new phone sign-up). The number is stored as the agency typed it, so
+  // the code's OPEN invitations are compared in memory.
+  if (who.phone) {
+    const byCode = await db.collection('hostApplications')
+      .where('referralCode', '==', code)
+      .where('isActivated', '==', false)
+      .limit(PHONE_SCAN_LIMIT)
+      .get()
+    if (!byCode.empty) anyForCode = true
+    if (byCode.size >= PHONE_SCAN_LIMIT) {
+      // The agency, not its code: a referral code is what a host types to join
+      // an agency, so it stays out of the logs (security review, 3 Nov 2026).
+      functions.logger.warn('host invitation phone scan hit its limit', {
+        agencyId: String(byCode.docs[0]?.get('agencyId') ?? ''), limit: PHONE_SCAN_LIMIT,
+      })
+    }
+    for (const d of byCode.docs) {
+      if (samePhone(d.get('applicantPhone'), who.phone)) found.set(d.id, d)
+    }
+  }
+
+  // Never another account's: a self-application of somebody else, or an
+  // invitation another account has already claimed (QA #51), is not offered.
+  let claimedByOther = false
+  const candidates = [...found.values()].filter((d) => {
+    const owner = String(d.get('applicantUid') ?? '').trim()
+    if (owner && owner !== uid) {
+      claimedByOther = true
+      return false
+    }
+    return true
+  })
+
+  // Each candidate must be this person's by the rule above: no verified
+  // contact contradicts it, and at least one proves it.
+  let mismatched = false
+  const mine = candidates.filter((d) => {
+    const m = invitationContactMatch(d.data(), who)
+    if (m.mismatch) mismatched = true
+    return m.ok
   })
 
   mine.sort((a, b) => candidateRank(a.data()) - candidateRank(b.data()))
-  if (mine.length > 0) return { anyForCode: true, mine }
+  if (mine.length > 0) return { anyForCode: true, mine, claimedByOther, mismatched }
 
-  const exists = await db
-    .collection('hostApplications')
-    .where('referralCode', '==', code)
-    .limit(1)
-    .get()
-  return { anyForCode: !exists.empty, mine }
+  if (!anyForCode) {
+    const exists = await db
+      .collection('hostApplications')
+      .where('referralCode', '==', code)
+      .limit(1)
+      .get()
+    anyForCode = !exists.empty
+  }
+  return { anyForCode, mine, claimedByOther, mismatched }
 }
 
 export const checkReferralCode = functions
@@ -854,6 +1131,10 @@ export const checkReferralCode = functions
     const code = String(data?.referralCode ?? '').trim().toUpperCase()
     if (!code) return { valid: false, reason: 'not_found' }
     if (guestRefusal(context.auth?.token)) return { valid: false, reason: 'guest' }
+    // Before any invitation is read (security review, 3 Nov 2026): the answer
+    // tells a code nobody has from one issued to somebody else, and a phone
+    // caller's lookup reads up to PHONE_SCAN_LIMIT invitations.
+    await limitInvitationLookups(uid, context.rawRequest)
 
     // The same three sources, in the same order, as redemption. If this check
     // resolved the applicant differently from `activateHost` the code would go
@@ -861,9 +1142,12 @@ export const checkReferralCode = functions
     // host signup look broken rather than blocked.
     const { phone, email } = await identityFor(uid, context.auth?.token, data)
 
-    const { anyForCode, mine } = await applicationsFor(code, { phone, email })
+    const { anyForCode, mine, claimedByOther } = await applicationsFor(code, { phone, email }, uid)
     if (!anyForCode) return { valid: false, reason: 'not_found' }
     if (mine.length === 0) {
+      // QA #51: the invitation for these contacts exists but another account
+      // has already claimed it — the code is spent for this person.
+      if (claimedByOther) return { valid: false, reason: 'already_used' }
       // The code exists but no invitation under it was issued to this person.
       // Deliberately does not say which of phone or email differs: "your email
       // does not match" confirms the phone number does, which turns a guessed
@@ -907,18 +1191,40 @@ export const checkReferralCode = functions
 
     if (app.isActivated === true) return { valid: false, reason: 'already_used' }
     if (app.status === 'rejected') return { valid: false, reason: 'rejected' }
+    // QA #51: an invitation THIS account claimed earlier was approved before it
+    // was claimed; its decision stamp is unchanged. Anything else must carry
+    // the server's approval.
+    const claimedByMe = app.status === AWAITING_VERIFICATION && String(app.applicantUid ?? '') === uid
     // The check has to ask the same question redemption does, or the code goes
     // green and is then refused on save — which is precisely the mismatch that
     // made host signup look broken for a week.
-    if (decisionRefusal(app)) return { valid: false, reason: 'not_approved' }
-    // Phase 1A: the same agency/code check redemption makes.
+    if (!claimedByMe && decisionRefusal(app)) return { valid: false, reason: 'not_approved' }
+    // Phase 1A: the same agency/code check redemption makes. A code that no
+    // longer belongs to the agency (it was changed) or an agency that stopped
+    // taking hosts is a code that no longer works — "expired" in the person's
+    // terms; invitations themselves carry no expiry date.
     const agencyId = String(app.agencyId ?? '').trim()
     const agencySnap = agencyId ? await db.collection('agencies').doc(agencyId).get() : null
-    if (agencyCodeRefusal(agencySnap && agencySnap.exists ? (agencySnap.data() as Record<string, any>) : null, code)) {
-      return { valid: false, reason: 'not_found' }
+    const badAgency = agencyCodeRefusal(
+      agencySnap && agencySnap.exists ? (agencySnap.data() as Record<string, any>) : null, code)
+    if (badAgency) {
+      return agencySnap && agencySnap.exists && badAgency === AGENCY_NOT_ACCEPTING
+        ? { valid: false, reason: 'agency_inactive', message: badAgency }
+        : { valid: false, reason: 'not_found' }
     }
 
-    return { valid: true, agencyName: app.agencyName ?? '' }
+    // QA #51: the code is this person's, but the Host role needs BOTH contacts
+    // verified. Say which one is missing, and which address or number the
+    // agency registered for it (masked), so the right one gets verified.
+    const proof = await contactProofFor(uid)
+    const needs = proof.missing
+    return {
+      valid: true,
+      agencyName: app.agencyName ?? '',
+      ...(needs.length > 0
+        ? { needsVerification: needs, contactHint: contactHintFor(app, needs) }
+        : {}),
+    }
   })
 
 // ── submitHostCapture ────────────────────────────────────────────────────────

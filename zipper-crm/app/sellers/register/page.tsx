@@ -86,6 +86,7 @@ import {
   createPartnerLoginThen, createSellerAccount, generateCrmId, canAccess,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
 import {
   ArrowLeft, User, Phone, Mail, MapPin, AlignLeft, FileText,
   Upload, CheckCircle, Shield, X, Loader2, Receipt, AlertTriangle, Clock,
@@ -224,6 +225,11 @@ export default function RegisterSellerPage() {
   }
 
   function addDocFile(file: File, label: string) {
+    // QA #29 / #32: refuse what the Storage rules would refuse, saying why,
+    // and clear a previous upload's error.
+    const problem = kycFileProblem(file)
+    if (problem) { setError(problem); return }
+    setError('')
     const idx = docs.length
     setDocs(prev => [...prev, { file, progress: 0, url: '', label }])
     // Path matches the /sellerDocs/crm/{fileName} storage rule (CRM write allowed)
@@ -234,7 +240,7 @@ export default function RegisterSellerPage() {
       snap => setDocs(prev => prev.map((d, i) => i === idx
         ? { ...d, progress: Math.round(snap.bytesTransferred / snap.totalBytes * 100) }
         : d)),
-      err => { console.error(err); setError('Document upload failed.') },
+      err => { console.error(err); setError(kycUploadErrorText(err)) },
       async () => {
         const url = await getDownloadURL(task.snapshot.ref)
         setDocs(prev => prev.map((d, i) => i === idx ? { ...d, url } : d))

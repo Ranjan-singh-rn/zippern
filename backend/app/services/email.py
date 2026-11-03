@@ -72,6 +72,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from app.config import settings
+from app.core import ist as _ist
+from app.core import contacts as _contacts  # QA #47: the three official addresses
 from app.core import roles as R
 from app.core.compat import StrEnum
 from app.core.roles import Role
@@ -87,6 +89,45 @@ log = logging.getLogger(__name__)
 logging.getLogger("python_http_client").setLevel(logging.WARNING)
 
 PROVIDER = "sendgrid"
+
+
+# ── Local test copy: a mailbox on disk instead of a provider ─────────────────
+#
+# Outside production nothing is ever sent (isolation.disable_outbound_email_
+# outside_production), so a local test copy could not finish any flow that waits
+# for an emailed code or link — adding an email to an app account, the
+# Observer's sign-in code, a partner's set-password link. With LOCAL_MAILBOX_DIR
+# set (only ~/zipper-release/qa/local-stack.command sets it) the message that
+# would have gone out is written there as one JSON file instead, readable by the
+# tester. In production the setting is ignored and nothing is ever written.
+
+
+def _local_mailbox_dir() -> str | None:
+    from app.core import isolation  # local import: isolation imports nothing from here
+
+    if isolation.is_production(settings):
+        return None
+    path = str(getattr(settings, "local_mailbox_dir", "") or "").strip()
+    return path or None
+
+
+def _write_local_mailbox(directory: str, kind: str, address: str, subject: str, html: str) -> str:
+    """Write one would-be message to [directory]; returns the file name."""
+    folder = Path(directory)
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    name = f"{stamp}-{re.sub(r'[^A-Za-z0-9_.-]', '_', str(kind or 'mail'))[:60]}.json"
+    target = folder / name
+    target.write_text(
+        json.dumps(
+            {"to": address, "kind": kind, "subject": subject, "text": text_alternative(html), "html": html},
+            ensure_ascii=False,
+            indent=1,
+        ),
+        encoding="utf-8",
+    )
+    target.chmod(0o600)
+    return name
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -494,6 +535,9 @@ def render(template: str, /, **values: Any) -> str:
     `template`.
     """
     text = _template(template)
+    # QA #47: every template may say where to write — the official support /
+    # info addresses — without each caller having to pass them.
+    values = {"support_email": _contacts.support_email(), "info_email": _contacts.info_email(), **values}
 
     missing: list[str] = []
 
@@ -521,17 +565,41 @@ def render(template: str, /, **values: Any) -> str:
     return out
 
 
-def page(*, title: str, preheader: str, body: str, footer: str = "") -> str:
-    """Wrap a rendered body in the branded shell (8A.6.6)."""
+def page(*, title: str, preheader: str, body: str, footer: str = "", figures: bool = True) -> str:
+    """Wrap a rendered body in the branded shell (8A.6.6).
+
+    `figures` — does this email carry money or counts a person may question?
+    QA #27 / #47 (3 Nov 2026): every email ended "Questions about a figure in
+    this email? Reply to it…", including an approval with no figure in it, and
+    a reply goes to no-reply@, which nobody reads. Now an email with figures
+    says where to ask about them (support@ and the portal); one without says
+    where to write for help.
+    """
+    support = _contacts.support_email()
+    mailto = f'<a href="mailto:{esc(support)}" style="color:#3f3f46">{esc(support)}</a>'
+    if figures:
+        portal = str(settings.portal_url or "")
+        extra = (
+            "<br>Questions about a figure in this email? Write to " + mailto
+            + (f', or open <a href="{esc(portal)}" style="color:#3f3f46">{esc(portal)}</a> —'
+               " every number here traces back to the entries that produced it." if portal else ".")
+        )
+    else:
+        extra = "<br>Need help? Write to " + mailto + "."
+    # QA #27, found again in the E2E re-run: the default footer line also spoke
+    # of figures ("Figures are generated from the ledger…") on emails with none.
+    default_footer = (
+        "Sent automatically by the Zipper business portal. Figures are "
+        "generated from the ledger at the time this email was built."
+        if figures else "Sent automatically by Zipper."
+    )
     return render(
         "base",
         title=title,
         preheader=preheader,
         body=body,
-        portal_url=settings.portal_url,
-        footer=footer
-        or "Sent automatically by the Zipper business portal. Figures are "
-        "generated from the ledger at the time this email was built.",
+        footer=footer or default_footer,
+        footer_extra=extra,
     )
 
 
@@ -558,8 +626,36 @@ def quantity(value: int | float | None, unit: str) -> str:
     return f"{value:,} {unit}"
 
 
+#: QA #54 — the zone every time a PERSON reads is shown in (UTC+05:30); stored
+#: values stay UTC. The words live in `app.core.ist`, shared with the Host-role
+#: refusal and the Owner lock-out.
+IST = _ist.IST
+
+
 def when(value: Any, *, with_time: bool = True) -> str:
-    """A timestamp a person can read, always in UTC and saying so."""
+    """A timestamp a person can read: "4 Nov 2026, 3:45 pm IST" (QA #54).
+
+    It used to be UTC ("04 Nov 2026, 10:15 UTC"), which every recipient — in
+    India — had to convert. The same words are produced by
+    `functions/src/hostEligibility.ts::whenIst` and the app's
+    `IstTime.format`, so the phone, the in-app notice and the email agree.
+    """
+    return _ist.when(value, with_time=with_time)
+
+
+def dedupe_stamp(value: Any, *, with_time: bool = True) -> str:
+    """A moment as it is written into an email's `dedupe_key` — never shown to a person.
+
+    E2E round 2 (3 Nov 2026). Four senders built their dedupe key from `when()`,
+    the words a person reads. QA #54 changed those words from UTC to IST, so the
+    keys changed with them and the transactional sweep sent again every
+    "approved", "not approved", "deactivated" and "credit due soon" email still
+    inside its window (seen on the local copy: a rejection mailed on 2 Nov went
+    out a second time on 3 Nov). The key keeps the exact text it was recorded
+    with before QA #54 — "02 Nov 2026, 22:03 UTC" — so the keys already in
+    `email_deliveries` still match after the deploy, and it no longer follows
+    the display format.
+    """
     if value is None:
         return "—"
     if not isinstance(value, datetime):
@@ -1420,11 +1516,14 @@ def unsubscribe_token_valid(address: str, report: str, cadence: str, token: str)
 
 
 def unsubscribe_mailbox() -> str:
-    """The mailbox a `mailto:` unsubscribe reaches. Must not bounce."""
+    """The mailbox a `mailto:` unsubscribe reaches. Must not bounce.
+
+    QA #47: UNSUBSCRIBE_EMAIL when set, else the support address. It used to be
+    derived as `unsubscribe@<the mail_from domain>` — an address nobody created.
+    """
     if settings.unsubscribe_email:
         return settings.unsubscribe_email
-    domain = _domain_of(settings.mail_from)
-    return f"unsubscribe@{domain}" if domain else ""
+    return _contacts.support_email()
 
 
 def unsubscribe_url_for(address: str, target: Unsubscribe) -> str:
@@ -2312,6 +2411,15 @@ async def deliver(
     doc["id"] = str(record_id)
     attempt_patch = _retry_bookkeeping(resend_of)
 
+    mailbox = _local_mailbox_dir()
+    if mailbox is not None:
+        name = await asyncio.to_thread(_write_local_mailbox, mailbox, kind, address, subject, html)
+        patch = {"outcome": str(Outcome.SENT), "attempts": 1, "local_mailbox": name, **attempt_patch}
+        await _close_record(record_id, patch)
+        doc.update(patch)
+        log.info("Email '%s' to %s written to the local mailbox (%s).", kind, _masked(address), name)
+        return doc
+
     problem = _provider_problem()
     if problem is not None:
         patch = {
@@ -2716,6 +2824,15 @@ def _deliver_blocking(
         _record_blocking(doc)
         return False
 
+    mailbox = _local_mailbox_dir()
+    if mailbox is not None:
+        doc["local_mailbox"] = _write_local_mailbox(mailbox, kind, doc["to"], subject, html)
+        doc["outcome"] = str(Outcome.SENT)
+        doc["attempts"] = 1
+        _record_blocking(doc)
+        log.info("Email '%s' to %s written to the local mailbox (%s).", kind, _masked(doc["to"]), doc["local_mailbox"])
+        return True
+
     problem = _provider_problem()
     if problem is not None:
         doc["outcome"] = str(Outcome.NOT_CONFIGURED)
@@ -2798,6 +2915,7 @@ def send_staff_invitation(
             title="Welcome to Zipper",
             preheader=f"{invited_by} has added you as {role_label}.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.CREDENTIAL,
         meta={"role_label": role_label},
@@ -2840,6 +2958,7 @@ def send_staff_access_added(
             title="Your Zipper access has changed",
             preheader=f"{invited_by} has added you as {role_label}.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.OPERATIONAL,
         meta={"role_label": role_label},
@@ -2870,6 +2989,7 @@ def send_observer_otp(code: str, ttl_minutes: int) -> bool:
             title="Zipper — Observer sign-in",
             preheader="Your one-time sign-in code.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.CREDENTIAL,
         meta={"ttl_minutes": ttl_minutes},
@@ -2929,6 +3049,7 @@ async def send_partner_application_received(
             title="Application received",
             preheader=f"Reference {_reference(partner_id)}. We will write either way.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
         identity=SenderIdentity.TRANSACTIONAL,
@@ -2963,10 +3084,11 @@ async def send_partner_approved(
             title="You are approved",
             preheader="Your account is active. Here is what you get from today.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
         identity=SenderIdentity.TRANSACTIONAL,
-        dedupe_key=f"partner.approved:{partner_id}:{when(approved_at)}",
+        dedupe_key=f"partner.approved:{partner_id}:{dedupe_stamp(approved_at)}",
         meta={"partner_id": partner_id, "kind": kind},
     )
 
@@ -3043,10 +3165,11 @@ async def send_partner_rejected(
             title="Your application was not approved",
             preheader="The reason is in this email, in full.",
             body=body,
+            figures=False,  # QA #27: no figure in this email
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
         identity=SenderIdentity.TRANSACTIONAL,
-        dedupe_key=f"partner.rejected:{partner_id}:{when(rejected_at)}",
+        dedupe_key=f"partner.rejected:{partner_id}:{dedupe_stamp(rejected_at)}",
         meta={"partner_id": partner_id, "kind": kind, "may_reapply": may_reapply},
     )
 
@@ -3082,8 +3205,8 @@ async def send_account_deactivated(
             ]
         ),
         next_steps=(
-            "Reply to this email if you want the decision reviewed. State the "
-            "reference above. If you are owed money, it stays owed and is paid "
+            f"Write to {_contacts.support_email()} if you want the decision reviewed, "
+            "quoting the reference above. If you are owed money, it stays owed and is paid "
             "on the published schedule — deactivation does not cancel it."
         ),
     )
@@ -3096,10 +3219,11 @@ async def send_account_deactivated(
             title="Your account has been deactivated",
             preheader="The grounds are in this email. Your balance is untouched.",
             body=body,
+            figures=False,
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
         identity=SenderIdentity.TRANSACTIONAL,
-        dedupe_key=f"partner.deactivated:{partner_id}:{when(deactivated_at)}",
+        dedupe_key=f"partner.deactivated:{partner_id}:{dedupe_stamp(deactivated_at)}",
         meta={"partner_id": partner_id, "kind": kind},
     )
 
@@ -3264,7 +3388,7 @@ async def send_credit_due(
         ),
         sensitivity=Sensitivity.PARTNER_OWN,
         identity=SenderIdentity.TRANSACTIONAL,
-        dedupe_key=f"credit.due_soon:{seller_id}:{when(due_at, with_time=False)}",
+        dedupe_key=f"credit.due_soon:{seller_id}:{dedupe_stamp(due_at, with_time=False)}",
         meta={"seller_id": seller_id, "outstanding_coins": outstanding_coins},
     )
 
@@ -3297,11 +3421,11 @@ async def send_credit_overdue_to_seller(
         ),
         next_steps=(
             "Repay the outstanding amount and the block lifts as soon as the "
-            "payment is recorded. If you cannot clear it in full, reply to this "
-            "email and say so — a stated plan is treated differently from "
-            "silence. Unrepaid credit is recoverable from your balance with the "
-            "penalty stated in your terms (9.10), and you get notice before "
-            "that happens (0.4.4)."
+            "payment is recorded. If you cannot clear it in full, write to "
+            f"{_contacts.support_email()} and say so — a stated plan is treated differently "
+            "from silence. Unrepaid credit is recoverable from your balance with the "
+            "penalty stated in your terms, and you get notice before "
+            "that happens."
         ),
         footnote=(
             "This is one email per overdue period, not one per day. Your full "
@@ -3485,6 +3609,8 @@ TEMPLATES: dict[str, Template] = {t.name: t for t in (
        heading="Verify to start"),
     _t("partner.held", "RC D17", _TX, "partner", "partner_ops: active legacy role paused for verification",
        tone="warning", heading="Role paused"),
+    _t("partner.details_decided", "QA #50", _TX, "partner",
+       "partner_ops.apply_pending_changes / reject_pending_changes", heading="Details review"),
     # ── role changes, per role (§12 "role changes")
     _t("role.suspended", "§4", _TX, "role holder",
        "a non-partner role suspended (agency/seller deactivation: the 8A.2.13 sweep)",
@@ -3573,7 +3699,10 @@ def _notice_body(template: Template, params: Mapping[str, Any]) -> str:
     rows = _rows_of(params.get("rows"))
     if rows:
         parts.append(facts(rows))
-    if params.get("reason"):
+    # A reason the sentence above already carries is not repeated in a box of
+    # its own (QA, 3 Nov 2026: the role-revoked and host-suspended emails
+    # printed it twice).
+    if params.get("reason") and str(params["reason"]) not in body:
         parts.append(callout(str(params["reason"]), "neutral", heading="Reason"))
     if params.get("next_steps"):
         parts.append(
@@ -3622,6 +3751,9 @@ def build_template(name: str, params: Mapping[str, Any], *, related_id: str = ""
             "Sent automatically by Zipper. This message was also placed in your "
             "Zipper inbox (Messages → Official)."
         )),
+        # QA #27: a notice — an approval, a ban, a receipt — carries no figure
+        # to question. A catalogue template that does says so in its params.
+        figures=bool(params.get("figures")),
     )
     return BuiltMessage(
         template=template.name,
@@ -3807,6 +3939,7 @@ def preview(name: str) -> tuple[str, str]:
                     role_label="Finance Admin",
                     button=button("Set your password", settings.portal_url),
                 ),
+                figures=False,
             ),
         ),
         "observer_otp": lambda: (
@@ -3820,6 +3953,7 @@ def preview(name: str) -> tuple[str, str]:
                     code="418302",
                     ttl_minutes=settings.otp_ttl_minutes,
                 ),
+                figures=False,
             ),
         ),
         "partner_received": lambda: (
@@ -3835,6 +3969,7 @@ def preview(name: str) -> tuple[str, str]:
                         [("Reference", "ag_4821"), ("Applied", when(_SAMPLE_AT))]
                     ),
                 ),
+                figures=False,
             ),
         ),
         "partner_approved": lambda: (
@@ -3851,6 +3986,7 @@ def preview(name: str) -> tuple[str, str]:
                     ),
                     button=button("Open your portal", settings.portal_url),
                 ),
+                figures=False,
             ),
         ),
         "partner_rejected": lambda: (
@@ -3879,6 +4015,7 @@ def preview(name: str) -> tuple[str, str]:
                         ]
                     ),
                 ),
+                figures=False,
             ),
         ),
         "account_deactivated": lambda: (
@@ -3893,8 +4030,9 @@ def preview(name: str) -> tuple[str, str]:
                     reason="Credit outstanding for 46 days with no repayment plan.",
                     at=when(_SAMPLE_AT),
                     facts=facts([("Reference", "sl_119"), ("Status", "Deactivated")]),
-                    next_steps="Reply to this email to have the decision reviewed.",
+                    next_steps=f"Write to {_contacts.support_email()} to have the decision reviewed.",
                 ),
+                figures=False,
             ),
         ),
         "payout_approved": lambda: (

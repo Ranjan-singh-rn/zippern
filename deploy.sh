@@ -60,20 +60,22 @@ API_ENV=(
   "FIREBASE_PROJECT_ID=${GCP_PROJECT}"
   "OBSERVER_EMAIL=314zipper@gmail.com"
   "OBSERVER_OTP_DELIVERY_EMAIL=soumyars675@gmail.com"
-  # Must be verified as a sender in SendGrid. An unverified From gets a 403 and
-  # every email fails silently — including the observer's sign-in code, which
-  # locks the observer out with no way to self-diagnose.
-  "MAIL_FROM=314zipper@gmail.com"
+  # QA #47 (owner decision, 3 Nov 2026): the official automated sender, on the
+  # SendGrid-authenticated domain zipperlive.org. An unauthenticated From gets a
+  # 403 and every email fails silently — including the observer's sign-in code.
+  "MAIL_FROM=no-reply@zipperlive.org"
   "MAIL_FROM_NAME=Zipper"
   "REPORT_TIMEZONE=Asia/Kolkata"
   # Defaults to https://zipper.web.app, which is not this site. Every link in
   # every email — sign-in codes, approvals, report links — would point at a
   # domain you do not control.
   "PORTAL_URL=${CRM_URL}"
-  # Unset, the List-Unsubscribe header derives unsubscribe@gmail.com: an
-  # address belonging to somebody else. Bulk mail without a working
-  # unsubscribe is also what pushes a sender into spam folders.
-  "UNSUBSCRIBE_EMAIL=314zipper@gmail.com"
+  # QA #47: the support mailbox (it must receive mail — see DEPLOYMENT.md
+  # § 11.8). Bulk mail without a working unsubscribe is what pushes a sender
+  # into spam folders.
+  "UNSUBSCRIBE_EMAIL=support@zipperlive.org"
+  "CONTACT_SUPPORT_EMAIL=support@zipperlive.org"
+  "CONTACT_INFO_EMAIL=info@zipperlive.org"
 )
 
 # The three service credentials, as `CloudRunSecret:FunctionsSecret`. Both sides

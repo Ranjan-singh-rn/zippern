@@ -133,10 +133,13 @@ export function agencyCodeRefusal(
   }
   const status = String(agency.status ?? '')
   if (status !== 'approved' || agency.isActive === false) {
-    return 'This agency is not currently accepting hosts.'
+    return AGENCY_NOT_ACCEPTING
   }
   return ''
 }
+
+/** The refusal for a real code whose agency is suspended, revoked or not yet approved. */
+export const AGENCY_NOT_ACCEPTING = 'This agency is not currently accepting hosts.'
 
 /**
  * A guest is not a host applicant (AUTH-002). Decided from the VERIFIED token
@@ -308,14 +311,31 @@ export function whenUtc(ms: number): string {
     `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`
 }
 
+/** IST is UTC+05:30 all year (no daylight saving). */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000
+
+/**
+ * QA #54 — `4 Nov 2026, 3:45 pm IST`: the backend's `email.when` and the app's
+ * `HostSuspension.formatWhen`, written out by hand so all three agree. People
+ * read times in India Standard Time; what is STORED stays UTC.
+ */
+export function whenIst(ms: number): string {
+  const d = new Date(ms + IST_OFFSET_MS)
+  const h24 = d.getUTCHours()
+  const h12 = h24 % 12 || 12
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}, ` +
+    `${h12}:${String(d.getUTCMinutes()).padStart(2, '0')} ${h24 < 12 ? 'am' : 'pm'} IST`
+}
+
 /**
  * The sentence the suspended host is shown, word for word the one the backend
  * and the app use: `Your Host role is suspended until <when> — reason: <reason>`,
  * `<when>` being "it is resumed" for a suspension with no end date; with no
  * reason on record the `— reason:` part is left off rather than left empty.
+ * The time is IST (QA #54).
  */
 export function hostSuspendedMessage(s: HostSuspension): string {
-  const when = s.untilMs === null ? 'it is resumed' : whenUtc(s.untilMs)
+  const when = s.untilMs === null ? 'it is resumed' : whenIst(s.untilMs)
   return `Your Host role is suspended until ${when}` + (s.reason ? ` — reason: ${s.reason}` : '')
 }
 

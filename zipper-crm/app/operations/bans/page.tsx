@@ -45,6 +45,7 @@ import { useAuth } from '@/components/AuthProvider'
 import { canAccess, type CrmRole } from '@/lib/auth'
 import { nameOrReference, type IdentityFacts } from '@/lib/identity'
 import { useIdentities } from '@/lib/useIdentities'
+import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'app_admin', 'app_member',
@@ -94,7 +95,7 @@ function heldBy(d: DeviceBanRecord): string[] {
 function fmt(value: string | null | undefined): string {
   if (!value) return '—'
   const d = new Date(value)
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString('en-IN')
+  return isNaN(d.getTime()) ? '—' : formatIst(d)
 }
 
 function millis(value: string | null | undefined): number | null {

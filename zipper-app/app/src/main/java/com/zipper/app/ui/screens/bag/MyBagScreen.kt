@@ -546,6 +546,16 @@ private fun Notice(title: String, body: String, tint: Color, modifier: Modifier 
 
 @Composable
 private fun ItemPreviewLarge(item: BagItem) {
+    // B13: an SVGA item previews as itself — a frame loops, an entrance plays with a sample name.
+    if (item.svgaUrl.isNotBlank()) {
+        com.zipper.app.ui.components.Svga(
+            source = item.svgaUrl,
+            modifier = Modifier.fillMaxHeight().aspectRatio(if (item.category == "entrance") 750f / 1334f else 1f),
+            loops = 0,
+            dynamicTexts = mapOf("name" to "You"),
+        )
+        return
+    }
     /*
      * The sheet is the one place an entrance actually animates, and it is
      * exactly one at a time — which is what makes a decoder session affordable

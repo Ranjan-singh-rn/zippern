@@ -233,6 +233,16 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # 4.3.5 — "Seller buys inventory." The card is verified, signed and only
         # then executed by an owner (4.3.6): nothing here credits a coin.
         ("POST", "/api/partner-ops/sellers/{seller_id}/coin-purchases"),
+        # B9 (3 Nov 2026): a seller asks to borrow within their limit, files a trade with another seller (as the
+        # BUYER), disputes a trade they were not paid for (as the SELLER — it stops approval; staff decide), uses
+        # their own inventory where Zipper allows it, and reads their own trades and profit. Every write scoped by
+        # `own_partner_id_or_403`; none of them approves, rejects, signs or executes anything.
+        ("POST", "/api/partner-ops/sellers/{seller_id}/borrow-requests"),
+        ("POST", "/api/partner-ops/seller-trades"),
+        ("GET", "/api/partner-ops/seller-trades"),
+        ("POST", "/api/partner-ops/seller-trades/{trade_id}/dispute"),
+        ("POST", "/api/partner-ops/sellers/{seller_id}/self-use"),
+        ("GET", "/api/partner-ops/sellers/{seller_id}/profit"),
         # 4.3.8 — "Seller sells diamonds to users and files a record of each
         # sale." Filing leaves the sale at `pending`; approval is owner-only and
         # debits the seller's inventory first (4.3.9).

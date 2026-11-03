@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.zipper.app.ui.components.*
@@ -33,6 +34,7 @@ import com.zipper.app.ui.screens.profile.GlassCard
 import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
+import com.zipper.app.util.SellerRecordId
 import kotlinx.coroutines.tasks.await
 
 data class SellerFirestoreItem(
@@ -73,6 +75,8 @@ fun ResellerListScreen(
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var qrSeller by remember { mutableStateOf<SellerFirestoreItem?>(null) }
+    /** B2b: the signed-in person's own seller listing was in the list and has been left out. */
+    var hidOwnListing by remember { mutableStateOf(false) }
     val c = ZipperTheme.colors
 
     LaunchedEffect(Unit) {
@@ -119,6 +123,19 @@ fun ResellerListScreen(
                     binanceUid = doc.getString("binanceUid") ?: "",
                     paymentMethods = (doc.get("paymentMethods") as? List<*>).orEmpty().map { it.toString() },
                 )
+            }.let { all ->
+                /*
+                 * B2b (3 Nov 2026): never offer a Coin Seller their OWN listing. Buying from your own stock is
+                 * refused by the server at filing and at approval; listing it here invited exactly that. The
+                 * login's linked seller record is read the way the seller dashboard reads it.
+                 */
+                val me = FirebaseAuth.getInstance().currentUser?.uid.orEmpty()
+                val linked = if (me.isBlank()) null else try {
+                    Firebase.firestore.collection("crmUsers").document(me).get().await().getString("sellerId")
+                } catch (_: Exception) { null }
+                val mine = all.filter { SellerRecordId.isOwnListing(it.uid, me, linked) }
+                hidOwnListing = mine.isNotEmpty()
+                all - mine.toSet()
             }
         } catch (e: Exception) {
             errorMessage = e.message ?: "Failed to load sellers"
@@ -137,6 +154,15 @@ fun ResellerListScreen(
                 ) {
                     Icon(Icons.Outlined.Info, null, tint = c.currencyCoin, modifier = Modifier.size(18.dp))
                     Text("Pay only verified resellers. Zipper never asks for OTPs or passwords.", style = ZipperTheme.type.bodyS, color = c.textSecondary)
+                }
+            }
+            if (hidOwnListing) {
+                item {
+                    Text(
+                        "Your own seller listing isn't shown — a seller can't buy diamonds from their own stock. " +
+                            "Buy wholesale stock from Zipper on your seller dashboard.",
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                    )
                 }
             }
             when {

@@ -1288,7 +1288,9 @@ async def suspend_user(
         )
 
     if days is not None:
-        if days < 1 or days > 365:
+        # QA #52: a whole number of days, 1–365 — a bool (True == 1) or a float
+        # is refused rather than read as a day count.
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 365:
             raise UserError("A suspension runs from 1 to 365 days.")
 
     before = {
@@ -2185,7 +2187,12 @@ async def grant_host(
     rate = app.get("callRate")
     if rate and not user.get("callRateBeans"):
         try:
-            patch["callRateBeans"] = int(rate)
+            # Security review (3 Nov 2026): clamped to the economy band, as
+            # `activateHost` in the Functions does. The agency writes this field
+            # and the rules put no bound on it; an invitation claimed in the app
+            # (QA #51) and a self-application both start here.
+            low, high = await _host_call_rate_band()
+            patch["callRateBeans"] = min(max(int(rate), low), high)
         except (TypeError, ValueError):
             pass
 
@@ -2393,6 +2400,73 @@ SUPERSEDED_REASON = (
 )
 
 
+#: QA #51 — how an agency invitation became this account's waiting application:
+#: claimed in the app with the one contact the person had verified
+#: (`functions/src/hosts.ts`, `invitationClaimStamp`).
+INVITATION_CLAIM = "invitation_code"
+
+
+def _phone_digits(raw) -> str:
+    return "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+
+def _has_country_code(raw) -> bool:
+    s = str(raw or "").strip()
+    return s.startswith("+") or len(_phone_digits(s).lstrip("0")) > 10
+
+
+def _same_number(a, b) -> bool:
+    """`functions/src/phone.ts::sameNumber`, the comparison `activateHost` uses."""
+    x, y = _phone_digits(a), _phone_digits(b)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    ax, by = _has_country_code(a), _has_country_code(b)
+    if ax == by:
+        return False
+    bare, full = (y, x) if ax else (x, y)
+    if not full.endswith(bare):
+        return False
+    return 1 <= len(full) - len(bare) <= 3
+
+
+#: The id prefix of an agency's invitation (`zipper-crm/lib/hostInvitation.ts`).
+INVITATION_ID_PREFIX = "inv_"
+
+
+def _invitation_contact_problem(app: dict, verification, app_id: str = "") -> str:
+    """'' unless this is a claimed invitation whose verified contacts are not the invited ones.
+
+    Pure. Only an invitation is compared: a self-application carries the
+    applicant's own verified contacts, written by the server when it was filed.
+    An invitation is one claimed in the app (`claimedVia`) OR one whose id is
+    an invitation id — so an edit that drops `claimedVia` from the document
+    (the rules do not protect that field) cannot switch this check off
+    (security review, 3 Nov 2026).
+    """
+    claimed = str(app.get("claimedVia") or "") == INVITATION_CLAIM
+    if not claimed and not str(app_id or "").startswith(INVITATION_ID_PREFIX):
+        return ""
+    from app.services import contact_verification  # local: keeps the import graph acyclic
+
+    want_email = str(app.get("applicantEmail") or "").strip().lower()
+    want_phone = str(app.get("applicantPhone") or "").strip()
+    if not want_email or not _phone_digits(want_phone):
+        return "This invitation does not name both a phone number and an email address. Ask your agency to send a new one."
+    if verification.email_verified and str(verification.email or "").strip().lower() != want_email:
+        return (
+            f"Your agency invited you with another email address ({contact_verification.mask_email(want_email)}). "
+            "Verify that address to start your Host role, or ask your agency to send a new invitation."
+        )
+    if verification.phone_verified and not _same_number(want_phone, verification.phone):
+        return (
+            f"Your agency invited you with another phone number ({contact_verification.mask_phone(want_phone)}). "
+            "Verify that number to start your Host role, or ask your agency to send a new invitation."
+        )
+    return ""
+
+
 async def activate_host_if_verified(uid: str, actor: dict) -> list[dict]:
     """Decision 15 (RC) — start a Host role the Owner approved while contacts were pending.
 
@@ -2425,6 +2499,14 @@ async def activate_host_if_verified(uid: str, actor: dict) -> list[dict]:
             out.append({"application_id": snap.id, "activated": False,
                         "refusal": contact_verification.refusal_detail(
                             verification, "The Host role starts once both contacts are verified.")})
+            continue
+        # QA #51: an agency's invitation claimed in the app with the one contact
+        # the person had verified. It starts only when BOTH verified contacts
+        # are the ones the agency registered — the rule `activateHost` applies
+        # to a redemption made with both in hand.
+        problem = _invitation_contact_problem(app, verification, snap.id)
+        if problem:
+            out.append({"application_id": snap.id, "activated": False, "refusal": problem})
             continue
         app_ref = _host_application_ref(snap.id)
         try:
@@ -3004,10 +3086,12 @@ def _utc_moment(value: Any) -> datetime | None:
 
 
 def _host_term(until: Any) -> str:
-    """'until 04 Nov 2026, 10:15 UTC' or 'until it is resumed' — the wording the
-    Functions refusal and the email use."""
+    """'until 4 Nov 2026, 3:45 pm IST' or 'until it is resumed' — the wording the
+    Functions refusal and the email use (QA #54: shown in IST; stored in UTC)."""
     moment = _utc_moment(until)
-    return f"until {moment.strftime('%d %b %Y, %H:%M UTC')}" if moment else "until it is resumed"
+    from app.core import ist  # local: pure, and keeps this module's imports as they were
+
+    return f"until {ist.when(moment)}" if moment else "until it is resumed"
 
 
 def host_suspension_view(user: dict) -> dict:
@@ -3847,6 +3931,28 @@ async def _decide_host_application_under_lease(
 # agency proposing a change to a host it recruited must certainly not.
 
 
+#: The band `activateHost` (functions/src/hosts.ts) clamps an agreed call rate
+#: to, read from `appConfig/economy` with the same defaults.
+DEFAULT_MIN_HOST_CALL_RATE = 100
+DEFAULT_MAX_HOST_CALL_RATE = 700
+
+
+async def _host_call_rate_band() -> tuple[int, int]:
+    """`(minHostCallRate, maxHostCallRate)` from `appConfig/economy`, or the
+    Functions' defaults when it cannot be read or holds nonsense."""
+    low, high = DEFAULT_MIN_HOST_CALL_RATE, DEFAULT_MAX_HOST_CALL_RATE
+    try:
+        snap = await _fs(firebase.firestore_client().collection("appConfig").document("economy").get)
+        cfg = (snap.to_dict() or {}) if getattr(snap, "exists", False) else {}
+        lo = int(cfg.get("minHostCallRate", low))
+        hi = int(cfg.get("maxHostCallRate", high))
+        if 0 < lo <= hi:
+            low, high = lo, hi
+    except Exception:  # noqa: BLE001 — the defaults are the Functions' own
+        log.warning("appConfig/economy unreadable; the host call-rate band uses its defaults")
+    return low, high
+
+
 def _host_pending_changes_of(app: dict) -> dict:
     """The proposal on a host application, or `{}`."""
     block = app.get("pendingChanges")
@@ -3996,12 +4102,30 @@ async def decide_host_pending_changes(
         },
     )
 
+    # QA #50: the host is told — the account the change is about, by its own
+    # Official inbox and verified email. A host has no dashboard to read a
+    # stored reason on, so before this a refused change was simply invisible.
+    notified = False
+    host_uid = str(app.get("activatedByUid") or app.get("applicantUid") or "").strip()
+    if host_uid:
+        from app.services import notices  # local: notices imports email, which imports settings
+
+        try:
+            notified = bool(await notices.partner_details_decided(
+                host_uid, "host", application_id, applied=approve,
+                fields=sorted(allowed) if approve else sorted(str(k) for k in fields),
+                reason="" if approve else reason, decision_id=str(audit_id or ""),
+            ))
+        except Exception:  # noqa: BLE001 — the decision is written and audited
+            log.exception("host application %s: the detail-change notice was not delivered", application_id)
+
     return {
         "application_id": application_id,
         "approved": approve,
         "applied": sorted(allowed) if approve else [],
         "refused": refused,
         "audit_id": audit_id,
+        "notified": notified,
         "note": (
             (
                 ""

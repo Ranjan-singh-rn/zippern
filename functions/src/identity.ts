@@ -41,7 +41,7 @@ import {
 } from './mobileSession'
 import * as crypto from 'crypto'
 import { STATE_ACTIVE, STATE_PERMANENTLY_DEACTIVATED, STATE_RECOVERY_PENDING, recoveryExpired } from './accounts'
-import { normaliseCrmRole, deriveRoleFlags, PARTNER_ROLES } from './crmRoles'
+import { normaliseCrmRole, deriveRoleFlags, PARTNER_ROLES, DEPARTMENT_ROLES, OBSERVER_ROLE, OWNER_ROLE } from './crmRoles'
 import { bindingPayload, decideGuestClaim, GuestClaimStatus } from './guestBinding'
 import { AdoptionCandidate, decideEmailAdoption } from './emailAdoption'
 import { appCheckRuntimeOptions, clientIpOf, enforceRateLimit, RATE_LIMITS, refuseWithoutAppCheck } from './rateLimit'
@@ -1206,20 +1206,95 @@ export async function bindContactCore(
  * token is minted only for the caller, only for their own uid. It is what
  * `claimGuestIdentity` already does for every returning guest. Best effort:
  * no token means the old session simply carries on, as it did before.
+ *
+ * `afterEmailChange` — EVERY session, not only an anonymous one, once the
+ * server has written a new email to the Auth record. Firebase treats an email
+ * address update as a major account change and EXPIRES the account's refresh
+ * tokens ("Manage User Sessions"), so the caller's session does NOT carry on:
+ * its ID token works until it lapses, then the next refresh fails and the SDK
+ * signs the device out. QA (local copy, 3 Nov 2026): a phone-signed-in person
+ * who added an email was signed out a second later — on the very step a
+ * partner role waits for — and the app sat on an empty Me tab. Callers pass it
+ * only after `assertActiveSession` has passed, so a displaced or restricted
+ * session is never handed a fresh sign-in.
  */
 export async function sameUidSessionToken(
   uid: string,
   token: Record<string, unknown>,
+  opts: { afterEmailChange?: boolean; rescue?: EmailChangeRescueFacts } = {},
 ): Promise<string> {
   const provider = String((token['firebase'] as { sign_in_provider?: string } | undefined)
     ?.sign_in_provider ?? '')
-  if (provider !== 'anonymous') return ''
+  if (provider !== 'anonymous') {
+    if (opts.afterEmailChange !== true) return ''
+    // Security review (3 Nov 2026): never on the caller's say-so alone. Only
+    // the session the email change itself expired, only shortly after it, and
+    // never once anything revoked the account's sessions since (an Owner MFA
+    // reset, a password change, a restriction) — see `emailChangeRescueRefusal`.
+    const refusal = opts.rescue ? emailChangeRescueRefusal(opts.rescue) : 'no_facts'
+    if (refusal) {
+      functions.logger.info('same-uid session token withheld', { reason: refusal })
+      return ''
+    }
+  }
   try {
     return await admin.auth().createCustomToken(uid)
   } catch (err) {
     functions.logger.warn('same-uid session token not minted', { err: String(err) })
     return ''
   }
+}
+
+/**
+ * Security review (3 Nov 2026) of the QA #30 fix — WHEN a non-anonymous session
+ * may be handed a same-uid sign-in after an email change.
+ *
+ * The fix gave every provider a fresh custom token on the bind and on the
+ * "already bound" retry, gated only by `assertActiveSession`. That gate reads
+ * restrictions and `credentialsValidAfter`, not Firebase revocation — so any
+ * still-live ID token (up to an hour) could keep minting fresh sessions after
+ * the account's sessions were revoked: a stolen phone after an Observer MFA
+ * reset, or after a password change. The rescue now needs all of:
+ *
+ *   * the account is not staff, an Owner or the Observer (they sign in again);
+ *   * the bind happened, recently ([EMAIL_CHANGE_RESCUE_WINDOW_MS]);
+ *   * the caller's session predates the bind — it is the one the change expired;
+ *   * nothing revoked the account's tokens AFTER the bind: the Auth record's
+ *     `tokensValidAfterTime` is the email change itself (within the skew).
+ *
+ * Pure: `emailOtp.test.js` drives it. Returns '' when allowed, else why not.
+ */
+export interface EmailChangeRescueFacts {
+  nowMs: number
+  /** When this account's email was bound (0 = no record of it). */
+  boundAtMs: number
+  /** The caller's ID token `auth_time`, in seconds. */
+  authTimeSec: number
+  /** The Auth record's `tokensValidAfterTime`, in ms (0 = never revoked). */
+  tokensValidAfterMs: number
+  /** The uid holds a staff, Owner or Observer identity. */
+  internal: boolean
+}
+
+export const EMAIL_CHANGE_RESCUE_WINDOW_MS = 10 * 60 * 1000
+/** Clock skew between this process and Firebase Auth, and the time an update takes. */
+export const EMAIL_CHANGE_SKEW_MS = 15 * 1000
+
+export function emailChangeRescueRefusal(f: EmailChangeRescueFacts): string {
+  if (f.internal) return 'internal_identity'
+  if (!(f.boundAtMs > 0)) return 'no_bind_record'
+  if (f.boundAtMs - f.nowMs > EMAIL_CHANGE_SKEW_MS) return 'bind_in_future'
+  if (f.nowMs - f.boundAtMs > EMAIL_CHANGE_RESCUE_WINDOW_MS) return 'bind_too_old'
+  if (!(f.authTimeSec > 0)) return 'no_auth_time'
+  if (f.authTimeSec * 1000 > f.boundAtMs + EMAIL_CHANGE_SKEW_MS) return 'session_after_bind'
+  if (f.tokensValidAfterMs > f.boundAtMs + EMAIL_CHANGE_SKEW_MS) return 'revoked_after_bind'
+  return ''
+}
+
+/** Is `crmUsers/{uid}` a staff, Owner or Observer identity? (A partner login is not.) */
+export function isInternalCrmRole(role: unknown): boolean {
+  const r = normaliseCrmRole(role)
+  return r === OWNER_ROLE || r === OBSERVER_ROLE || DEPARTMENT_ROLES.has(r)
 }
 
 // ── Google sign-in for an email that already has an account ──────────────────

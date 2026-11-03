@@ -108,7 +108,12 @@ class PartnerHubViewModel @Inject constructor(
             if (value != null && PartnerHubRows.hasAwaiting(value)) {
                 val checked = repo.checkActivation()
                 if (checked is PartnerFunctions.Result.Ok) {
-                    activation = checked.value.requirement
+                    // E2E round 2 (QA #51): both contacts verified and a role still not
+                    // started — say the server's reason, not "Your role is starting."
+                    activation = checked.value.requirement.let { r ->
+                        val why = checked.value.refusals.firstOrNull()
+                        if (r.complete && why != null) r.copy(notStarted = why) else r
+                    }
                     if (checked.value.started.isNotEmpty()) {
                         startedNotice = checked.value.started.joinToString(", ") { s -> PartnerHubRows.label(s.kind) } +
                             " started — both your contacts are verified."

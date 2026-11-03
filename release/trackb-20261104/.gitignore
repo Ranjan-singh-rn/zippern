@@ -1,0 +1,7 @@
+# Evidence of every run (masked operator, revision names, saved rules/Android records), the RELEASE.txt written for
+# the reviewed commit, the rules emulator results and the local harness runs stay on the Mac and never make the
+# working tree dirty (require_release refuses a dirty tree).
+/production/
+/RELEASE.txt
+/rules-results/
+/tools/scripts-mac-*/

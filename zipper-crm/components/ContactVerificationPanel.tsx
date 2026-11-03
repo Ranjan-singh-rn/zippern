@@ -17,16 +17,22 @@
  *     (`/me/verification/conflict`), and nothing is merged.
  *
  * After each step the API is asked to check (`/me/verification/check`). It
- * re-reads both contacts itself — nothing here starts a role — and if the role
- * started, the page reloads so the new session carries it.
+ * re-reads both contacts itself — nothing here starts a role. When the role
+ * starts, the server ends this login's sessions so a new one carries it; the
+ * check therefore runs inside `handOverSession` (QA #26), which signs in again
+ * through the ordinary door and adopts the new session BEFORE the page reloads
+ * into the dashboard. It used to reload on the revoked session, and the person
+ * landed on /login with "Session has been revoked".
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getFunctions, httpsCallable } from 'firebase/functions'
+import { httpsCallable } from 'firebase/functions'
 import { RecaptchaVerifier, linkWithPhoneNumber, type ConfirmationResult } from 'firebase/auth'
 import { CheckCircle2, Mail, Phone, ShieldAlert, Loader2 } from 'lucide-react'
-import { app, auth } from '@/lib/firebase'
+import { auth, crmFunctions } from '@/lib/firebase'
 import { myVerification } from '@/lib/apiPartners'
+import { useAuth } from '@/components/AuthProvider'
+import { SessionHandoverError } from '@/lib/sessionHandover'
 import {
   missingPhrase, phoneE164, phoneLinkOutcome, startedAny,
   type VerificationOverview,
@@ -38,6 +44,7 @@ function errorText(err: unknown, fallback: string): string {
 }
 
 export default function ContactVerificationPanel() {
+  const { handOverSession } = useAuth()
   const [overview, setOverview] = useState<VerificationOverview | null>(null)
   const [loadError, setLoadError] = useState('')
   const [notice, setNotice] = useState('')
@@ -73,24 +80,31 @@ export default function ContactVerificationPanel() {
     try {
       // A fresh ID token, so every reader sees the Auth record as it is now.
       await auth.currentUser?.getIdToken(true).catch(() => undefined)
-      const out = await myVerification.check()
+      // QA #26: the server ends this session when the role starts; the
+      // handover signs in again and adopts the new one before we reload.
+      const { result: out, handedOver } = await handOverSession(() => myVerification.check(), startedAny)
       setOverview(out)
-      if (startedAny(out)) {
+      if (handedOver) {
         setNotice('Your role has started. Opening your dashboard…')
         setTimeout(() => window.location.reload(), 1200)
       }
     } catch (err) {
-      setNotice(errorText(err, 'Could not check just now. Try again in a minute.'))
+      if (err instanceof SessionHandoverError) {
+        setOverview(err.result as VerificationOverview)
+        setNotice(err.message)
+      } else {
+        setNotice(errorText(err, 'Could not check just now. Try again in a minute.'))
+      }
     } finally {
       setBusy('')
     }
-  }, [])
+  }, [handOverSession])
 
   // ── Email ────────────────────────────────────────────────────────────────
   const sendEmailCode = async () => {
     setBusy('email-send'); setEmailError('')
     try {
-      await httpsCallable(getFunctions(app, 'asia-south1'), 'requestLoginEmailCode')({})
+      await httpsCallable(crmFunctions(), 'requestLoginEmailCode')({})
       setEmailSent(true)
     } catch (err) {
       setEmailError(errorText(err, 'We could not send the code just now.'))
@@ -101,7 +115,7 @@ export default function ContactVerificationPanel() {
   const verifyEmailCode = async () => {
     setBusy('email-verify'); setEmailError('')
     try {
-      await httpsCallable(getFunctions(app, 'asia-south1'), 'verifyLoginEmailCode')({ code: emailCode.trim() })
+      await httpsCallable(crmFunctions(), 'verifyLoginEmailCode')({ code: emailCode.trim() })
       setEmailSent(false); setEmailCode('')
       await check()
     } catch (err) {

@@ -309,7 +309,11 @@ async def submit_recharge(
         raise PartnerOpsError("Choose how you paid.")
     reference = str(reference or "").strip()[:128]
     proof_url = str(proof_url or "").strip()
-    if not reference and not proof_url.startswith("https://"):
+    from app.config import settings
+    from app.core import isolation
+
+    proof_ok = proof_url.startswith("https://") or isolation.is_local_emulator_media_url(settings, proof_url)
+    if not reference and not proof_ok:
         raise PartnerOpsError(
             "Add the payment reference (UTR / transaction id) or a screenshot "
             "of the payment, so it can be verified."
@@ -335,7 +339,8 @@ async def submit_recharge(
         or not seller.get("is_active", False)
     ):
         raise PartnerOpsError("That seller is not accepting recharges right now.")
-    if str(seller.get("owner_crm_uid") or "") == buyer_uid:
+    # B2b: the seller's own account, by its owner uid or by a record keyed with that uid (legacy `sellers/{uid}`).
+    if buyer_uid in {str(seller.get("owner_crm_uid") or ""), seller_id}:
         raise PartnerOpsError("A seller cannot recharge their own account this way.")
 
     if reference:
@@ -428,6 +433,17 @@ async def submit_recharge(
 
 # ── 2. Staff decide ─────────────────────────────────────────────────────────
 
+async def _seller_owner_uids(seller_id: str, recharge: dict) -> set[str]:
+    """Every account that IS this seller: the partner record's owner now, and the owner stamped on the request."""
+    owners = {str(recharge.get("seller_owner_uid") or "").strip()}
+    seller = await get_db()[C.PARTNERS].find_one({"_id": seller_id}) if seller_id else None
+    if seller is not None:
+        owners.add(str(seller.get("owner_crm_uid") or "").strip())
+    owners.add(str(seller_id or "").strip())  # a seller record keyed by its owner's uid (legacy `sellers/{uid}`)
+    owners.discard("")
+    return owners
+
+
 async def approve_recharge(recharge_id: str, reason: str, actor: dict) -> dict[str, Any]:
     """Staff have verified the payment. Seller coins → buyer diamonds, once.
 
@@ -450,6 +466,15 @@ async def approve_recharge(recharge_id: str, reason: str, actor: dict) -> dict[s
     if recharge.get("status") not in (str(RechargeStatus.PENDING), "approving"):
         raise PartnerOpsError(
             f"This recharge is {recharge.get('status')}, not pending. Nothing was moved."
+        )
+    # B2b (3 Nov 2026): a Coin Seller never buys from their own stock. `submit_recharge` refuses that at filing;
+    # this refuses it again at approval, against the seller AS IT IS NOW — a request filed before that check
+    # existed, written straight into Firestore by an old app, or a seller record whose owner has since changed
+    # would otherwise move the seller's inventory into the seller's own wallet.
+    if buyer_uid and buyer_uid in await _seller_owner_uids(seller_id, recharge):
+        raise PartnerOpsError(
+            "The buyer on this request is the seller's own account. A seller cannot buy from their own stock, "
+            "so nothing was moved. Reject the request."
         )
     # RC (confirmed, CRM-FLOW 9.48): a frozen Coin Seller's inventory does not
     # move until the Owner decides; the request stays pending.
@@ -527,9 +552,16 @@ async def approve_recharge(recharge_id: str, reason: str, actor: dict) -> dict[s
         }, "$push": {"history": {"at": now, "status": "approved", "by": _who(actor), "reason": reason}}},
         return_document=ReturnDocument.AFTER,
     )
-    await get_db()[C.PARTNERS].update_one(
-        {"_id": seller_id}, {"$inc": {"total_coins_sold": diamonds}, "$set": {"updated_at": now}}
+    seller_after = await get_db()[C.PARTNERS].find_one_and_update(
+        {"_id": seller_id}, {"$inc": {"total_coins_sold": diamonds}, "$set": {"updated_at": now}},
+        return_document=ReturnDocument.AFTER,
     )
+    # B9 (3 Nov 2026): the app's and the CRM's "Total sold" read `sellers/{id}.totalCoinsSold`, which only sales
+    # (approve_sale) used to move — a recharge approval updated Mongo alone, so recharges never showed as sold.
+    if seller_after:
+        from app.services.partner_ops import _sync_partner_doc  # local: partner_ops imports this module's peers
+
+        _sync_partner_doc(seller_after, {"totalCoinsSold": int(seller_after.get("total_coins_sold") or diamonds)})
 
     await audit.record(
         actor=actor, action=audit.Action.RECHARGE_APPROVED, subject_type="recharge",

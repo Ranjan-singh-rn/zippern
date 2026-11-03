@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /**
  * Decision 15 (RC) — a role the Owner approved while the account did not yet
@@ -98,5 +99,33 @@ class PartnerHubAwaitingTest {
         assertTrue(v.requirement.complete)
         assertEquals(listOf("agency"), v.waiting.map { it.kind })
         assertEquals(listOf("agency"), v.started.map { it.kind })
+        assertEquals("nothing was refused with a reason", emptyList<String>(), v.refusals)
+    }
+
+    /** E2E round 2 (3 Nov 2026, QA #51): the server's reason for a role it did not start is kept. */
+    @Test fun `the verification state parser keeps the server's reason for a role it did not start`() {
+        val why = "Your agency invited you with another email address (q•••@example.com). " +
+            "Verify that address to start your Host role, or ask your agency to send a new invitation."
+        val v = PartnerFunctions.parseVerificationState(
+            mapOf(
+                "verification" to mapOf("complete" to true, "missing" to emptyList<String>()),
+                "waiting" to listOf(mapOf("id" to "inv_1", "kind" to "host", "name" to "")),
+                "started" to listOf(
+                    mapOf("id" to "inv_1", "kind" to "host", "activated" to false, "refusal" to why),
+                    mapOf("id" to "inv_2", "kind" to "host", "activated" to false, "refusal" to "  "),
+                    mapOf("id" to "p_ag", "kind" to "agency", "activated" to true, "refusal" to "ignored"),
+                    mapOf("id" to "inv_3", "kind" to "host", "activated" to false, "refusal" to why),
+                ),
+            ),
+        )
+        assertEquals(listOf(why), v.refusals)
+        assertEquals(listOf("agency"), v.started.map { it.kind })
+    }
+
+    @Test fun `the hub says that reason in place of 'Your role is starting'`() {
+        val main = listOf(File("src/main/java"), File("app/src/main/java")).first { it.exists() }
+        val vm = File(main, "com/zipper/app/ui/screens/partner/PartnerHubViewModel.kt").readText()
+        assertTrue(vm.contains("val why = checked.value.refusals.firstOrNull()"))
+        assertTrue(vm.contains("if (r.complete && why != null) r.copy(notStarted = why) else r"))
     }
 }

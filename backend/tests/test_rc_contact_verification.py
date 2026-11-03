@@ -665,8 +665,124 @@ for p in src_files:
             if name == "create_user":
                 creates.append(f"{p.relative_to(ROOT)}:{node.lineno}")
 eq("nothing calls firebase.update_user_phone (comments do not count; calls do)", callers, [])
-eq("the only Auth phone write with a value is that dead helper's body", setters, ["app/db/firebase.py:163"])
+# Located by name, not by a fixed line number (E2E round 2, 3 Nov 2026: an unrelated addition above it in
+# firebase.py moved it from line 163): the one `update_user(phone_number=…)` call inside `update_user_phone`.
+_fb_tree = ast.parse((ROOT / "app" / "db" / "firebase.py").read_text())
+_helper_body = [
+    f"app/db/firebase.py:{n.lineno}"
+    for fn_def in ast.walk(_fb_tree)
+    if isinstance(fn_def, ast.FunctionDef) and fn_def.name == "update_user_phone"
+    for n in ast.walk(fn_def)
+    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "update_user"
+    and any(kw.arg == "phone_number" for kw in n.keywords)
+]
+eq("the dead helper update_user_phone still holds exactly one valued phone write", len(_helper_body), 1)
+eq("the only Auth phone write with a value is that dead helper's body", setters, _helper_body)
 eq("no account is created with a phone number", creates, [])
+
+# ══════════════════════════════════════════════════════════════════════════════
+print("10. QA #51 — an agency invitation claimed in the app by phone starts only with the INVITED email")
+
+# What `functions/src/hosts.ts::invitationClaimStamp` leaves on an approved
+# invitation when the invited host enters the code with only the phone verified
+# (a new phone sign-up). The original refusal ("Details don't match the agency
+# record") is pinned on the Functions side (functions/test/qa51HostInvitation.test.js).
+user("INV-HOST")
+auth("INV-HOST", phone="+919990010004")
+INV = "inv_qa51"
+fs.collection("hostApplications").docs[INV] = {
+    "referralCode": "MAINCODE1", "agencyId": "MAIN1", "agencyName": "Main One", "hostName": "Invited Host",
+    "applicantPhone": "+91 99900 10004", "applicantEmail": "invited.host@x.test", "callRate": 300,
+    "photoUrl": "https://x/agency-photo.jpg", "kycDocUrls": ["https://x/1", "https://x/2", "https://x/3"],
+    "kycStatus": "approved", "decidedByUid": "staff-1", "decidedAt": "t", "isActivated": False,
+    "applicantUid": "INV-HOST", "status": "awaiting_verification", "claimedVia": "invitation_code",
+    "claimedAt": "t", "activationPending": ["email"],
+}
+out = check_now("INV-HOST")
+eq("phone only: nothing starts", [s for s in out["started"] if s.get("activated")], [])
+eq("…the overview lists the claimed invitation as waiting",
+   [w["id"] for w in out["waiting"] if w.get("kind") == "host"], [INV])
+eq("…and says the email is what is missing", out["verification"]["missing"], ["email"])
+
+AUTH["INV-HOST"].email, AUTH["INV-HOST"].email_verified = "someone.else@x.test", True
+out = check_now("INV-HOST")
+eq("a DIFFERENT verified email: still nothing starts", [s.get("activated") for s in out["started"]], [False])
+why = str((out["started"] or [{}])[0].get("refusal") or "")
+ok("…the refusal names the invited address, masked", "i•••@x.test" in why and "invited.host" not in why, why)
+eq("…the invitation keeps waiting", fs.collection("hostApplications").docs[INV]["status"], "awaiting_verification")
+eq("…and the account is not a Host", fs.collection("users").docs["INV-HOST"].get("isHost"), None)
+
+AUTH["INV-HOST"].email = "invited.host@x.test"
+out = check_now("INV-HOST")
+eq("the invited email verified: the Host role starts", [s.get("activated") for s in out["started"]], [True])
+u = fs.collection("users").docs["INV-HOST"]
+eq("…a Host of the inviting agency", (u.get("isHost"), u.get("agencyId")), (True, "MAIN1"))
+eq("…at the rate the agency agreed", u.get("callRateBeans"), 300)
+inv = fs.collection("hostApplications").docs[INV]
+eq("…the invitation is approved and activated by this account",
+   (inv["status"], inv.get("isActivated"), inv.get("activatedByUid")), ("approved", True, "INV-HOST"))
+ver = fs.collection("hostVerification").docs.get("INV-HOST") or {}
+eq("…the face check compares against the agency's photograph", ver.get("agencyPhotoUrl"), "https://x/agency-photo.jpg")
+ok("…on the agency's roster", "INV-HOST" in fs.collection("agencies").document("MAIN1").collection("agencyHosts").docs)
+eq("…granted once, by the contact-verification system",
+   [a["actor"]["uid"] for a in AUDIT if a.get("subject_id") == "INV-HOST" and a["action"] == audit_mod.Action.HOST_GRANTED],
+   [activation.ACTIVATION_ACTOR_UID])
+
+# Security review (3 Nov 2026): the agency writes `callRate` and the rules put
+# no bound on it. A claimed invitation starts through `grant_host`, which now
+# clamps the rate to the economy band exactly as `activateHost` does.
+def _claimed_invitation(inv_id: str, uid: str, phone: str, email: str, rate) -> None:
+    """The same claimed invitation as INV above, for another person and rate,
+    with the invited email already verified."""
+    user(uid)
+    auth(uid, phone=phone)
+    fs.collection("hostApplications").docs[inv_id] = {
+        "referralCode": "MAINCODE1", "agencyId": "MAIN1", "agencyName": "Main One", "hostName": "Rate Host",
+        "applicantPhone": phone, "applicantEmail": email, "callRate": rate,
+        "photoUrl": "https://x/agency-photo.jpg", "kycDocUrls": ["https://x/1", "https://x/2", "https://x/3"],
+        "kycStatus": "approved", "decidedByUid": "staff-1", "decidedAt": "t", "isActivated": False,
+        "applicantUid": uid, "status": "awaiting_verification", "claimedVia": "invitation_code",
+        "claimedAt": "t", "activationPending": ["email"],
+    }
+    AUTH[uid].email, AUTH[uid].email_verified = email, True
+
+
+_claimed_invitation("inv_rate_high", "INV-RATE-1", "+919990010011", "rate.one@x.test", 999999)
+out = check_now("INV-RATE-1")
+eq("an agreed rate above the band starts at the band's top (Functions default 700)",
+   ([s.get("activated") for s in out["started"]], fs.collection("users").docs["INV-RATE-1"].get("callRateBeans")),
+   ([True], 700))
+fs.collection("appConfig").docs["economy"] = {"minHostCallRate": 150, "maxHostCallRate": 500}
+_claimed_invitation("inv_rate_low", "INV-RATE-2", "+919990010012", "rate.two@x.test", 5)
+check_now("INV-RATE-2")
+eq("…one below it starts at the configured floor", fs.collection("users").docs["INV-RATE-2"].get("callRateBeans"), 150)
+_claimed_invitation("inv_rate_ok", "INV-RATE-3", "+919990010013", "rate.three@x.test", 320)
+check_now("INV-RATE-3")
+eq("…one inside it is kept as agreed", fs.collection("users").docs["INV-RATE-3"].get("callRateBeans"), 320)
+fs.collection("appConfig").docs["economy"] = {"minHostCallRate": 900, "maxHostCallRate": 100}
+eq("…and a nonsense band falls back to the Functions' defaults",
+   run(users_svc._host_call_rate_band()), (users_svc.DEFAULT_MIN_HOST_CALL_RATE, users_svc.DEFAULT_MAX_HOST_CALL_RATE))
+del fs.collection("appConfig").docs["economy"]
+
+# The comparison itself, pure: a self-application is never compared; a claimed
+# invitation needs the invited phone too; an invitation missing a contact never starts.
+v = cv.Verification(uid="x", phone="+919990010004", email="invited.host@x.test", phone_verified=True, email_verified=True)
+eq("a self-application is not compared", users_svc._invitation_contact_problem({"source": "self_app"}, v), "")
+claimed = {"claimedVia": "invitation_code", "applicantPhone": "+91 99900 10004", "applicantEmail": "invited.host@x.test"}
+eq("the invited phone and email: no problem", users_svc._invitation_contact_problem(claimed, v), "")
+v_other_phone = cv.Verification(uid="x", phone="+919990019999", email="invited.host@x.test",
+                                phone_verified=True, email_verified=True)
+ok("another verified phone is refused, masked", "••••0004" in users_svc._invitation_contact_problem(claimed, v_other_phone))
+# Security review (3 Nov 2026): an invitation id is compared even if `claimedVia`
+# was edited away (the rules do not protect that field).
+_unmarked = {k: val for k, val in claimed.items() if k != "claimedVia"}
+ok("an invitation id is compared without claimedVia",
+   "••••0004" in users_svc._invitation_contact_problem(_unmarked, v_other_phone, "inv_abc123"))
+eq("…and a non-invitation id without claimedVia is not", users_svc._invitation_contact_problem(_unmarked, v_other_phone, "app_9"), "")
+ok("an invitation with no email never starts",
+   users_svc._invitation_contact_problem({**claimed, "applicantEmail": ""}, v) != "")
+ok("the comparison is the Functions one: a bare national number matches its +91 form",
+   users_svc._same_number("9990010004", "+919990010004") and not users_svc._same_number("+19990010004", "+919990010004"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 print()

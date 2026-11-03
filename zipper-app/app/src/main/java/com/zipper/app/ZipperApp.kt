@@ -16,6 +16,9 @@ import dagger.hilt.android.HiltAndroidApp
 @HiltAndroidApp
 class ZipperApp : Application() {
     override fun onCreate() {
+        // The `emu` build only (a compile-time no-op everywhere else): Firebase on
+        // the local emulators, before Hilt creates anything that uses it.
+        LocalEmulators.connectIfEmuBuild(this)
         super.onCreate()
         FirebaseApp.initializeApp(this)
         com.zipper.app.service.PushNotifications.createChannels(this)

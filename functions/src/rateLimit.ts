@@ -1,13 +1,18 @@
 /**
  * ABUSE LIMITS FOR THE UNAUTHENTICATED CALLABLES (audit 2026-11-01, F-8).
  *
- * Four callables run with no signed-in caller, by design: `quickLoginChallenge`,
- * `redeemQuickLogin`, `submitAccountAppeal` and `claimGuestIdentity`. Each one
+ * Six callables run with no signed-in caller, by design: `quickLoginChallenge`,
+ * `redeemQuickLogin`, `submitAccountAppeal`, `claimGuestIdentity`, (QA #55)
+ * `quickLoginRestriction` and (B10) `forgetQuickLogin`. Each one
  * costs Firestore reads and writes (a challenge is one document per call; a
  * guest claim is four to eight reads, Auth lookups and a transaction), and none
  * of them had anything between a script and that cost. This module is that
  * something: a budget per DEVICE and per client IP, kept in
  * `rateLimits/{bucket}`.
+ *
+ * One signed-in scope uses it too: `hostInvitationLookup`, shared by
+ * `checkReferralCode` and `activateHost` (security review, 3 Nov 2026), keyed
+ * by the account instead of a device id.
  *
  * ── What it is and is not ────────────────────────────────────────────────────
  *
@@ -96,6 +101,7 @@ const MINUTE = 60_000
  *   redeemQuickLogin     one or two per app start; retries on a bad network.
  *   submitAccountAppeal  one per restriction, by hand, with a statement.
  *   claimGuestIdentity   one or two per first launch.
+ *   hostInvitationLookup signed in; keyed by the account — see the entry.
  *
  * Per-device budgets are the tight ones; per-IP budgets are deliberately wide
  * for the NAT reason above and exist to bound a script that rotates device
@@ -112,9 +118,33 @@ export const RATE_LIMIT_POLICIES: Record<string, RateLimitPolicy> = {
     perDevice: { limit: 5, windowMs: 10 * MINUTE },
     perIp: { limit: 30, windowMs: 10 * MINUTE },
   },
+  // QA #55: asked once, after Firebase refuses a sign-in to a disabled (banned)
+  // account; a person retries a sign-in a few times, a script far more.
+  quickLoginRestriction: {
+    perDevice: { limit: 10, windowMs: 10 * MINUTE },
+    perIp: { limit: 60, windowMs: 10 * MINUTE },
+  },
+  // B10: "Remove" in the account switcher — by hand, one account at a time,
+  // and a device remembers at most five.
+  forgetQuickLogin: {
+    perDevice: { limit: 10, windowMs: 10 * MINUTE },
+    perIp: { limit: 60, windowMs: 10 * MINUTE },
+  },
   claimGuestIdentity: {
     perDevice: { limit: 10, windowMs: MINUTE },
     perIp: { limit: 60, windowMs: MINUTE },
+  },
+  // Security review of the QA fixes (3 Nov 2026): the one SIGNED-IN scope.
+  // `checkReferralCode` and `activateHost` share it. Since QA #51 a phone-only
+  // caller makes them read up to PHONE_SCAN_LIMIT invitations per call, and the
+  // answer still tells a code nobody has from one issued to somebody else — so
+  // a script with one account could walk codes at a few hundred reads a guess.
+  // The key is the ACCOUNT (passed as the device key: an account is the thing
+  // that cannot rotate here), plus the address. A person presses "Verify" and
+  // then "Continue" a few times; thirty in ten minutes is far above that.
+  hostInvitationLookup: {
+    perDevice: { limit: 30, windowMs: 10 * MINUTE },
+    perIp: { limit: 300, windowMs: 10 * MINUTE },
   },
 }
 

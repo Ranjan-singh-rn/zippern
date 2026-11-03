@@ -131,6 +131,20 @@ await no('S1: …nor a host KYC document',
   getBytes(S(ownerUnbound, 'kyc/AG7/hostX/aadhaar.pdf')))
 await no('S1: …nor upload a content asset',
   uploadBytes(S(ownerUnbound, 'contentAssets/frames/f2.json'), new TextEncoder().encode('{}'), json))
+// B13 — SVGA animations: octet-stream, but only for a .svga name and at most 5 MB
+const svga = { contentType: 'application/octet-stream' }
+await ok('B13: the bound Owner uploads an SVGA gift animation',
+  uploadBytes(S(owner, 'contentAssets/gifts/Rose/animation.svga'), new Uint8Array(64 * 1024), svga))
+await ok('B13: …and a bag item SVGA',
+  uploadBytes(S(owner, 'contentAssets/bag_items/entrance/en_bike/svga/1_bike.svga'), new Uint8Array(64 * 1024), svga))
+await no('B13: octet-stream under any other name is still refused (no arbitrary binaries)',
+  uploadBytes(S(owner, 'contentAssets/gifts/Rose/payload.bin'), new Uint8Array(1024), svga))
+await no('B13: an SVGA over 5 MB is refused',
+  uploadBytes(S(owner, 'contentAssets/gifts/Rose/huge.svga'), new Uint8Array(5 * MiB + 1), svga))
+await no('B13: an unbound owner cannot upload an SVGA either',
+  uploadBytes(S(ownerUnbound, 'contentAssets/gifts/Rose/animation.svga'), new Uint8Array(1024), svga))
+await no('B13: an app user cannot upload an SVGA',
+  uploadBytes(S(appUser, 'contentAssets/gifts/Rose/animation.svga'), new Uint8Array(1024), svga))
 await no('S1: a custom-token session naming a sid with NO binding holds nothing either',
   getBytes(S(ownerWrongSid, 'evidence/expense/receipt.pdf')))
 await no('S1: an unbound owner claim is not even a role claim (crmProfilePhotos write needs one)',

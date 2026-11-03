@@ -37,6 +37,8 @@ data class BagItem(
      * CRM does not have to be migrated in the same breath as the app.
      */
     val videoUrl: String = "",
+    /** B13: the SVGA animation (tools/decor) — frames and entrances that move over live video, transparent. */
+    val svgaUrl: String = "",
 
     // ── This account's copy of the item, and the terms on offer ──────────────
     //

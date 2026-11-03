@@ -35,6 +35,7 @@ import { UserActions } from './UserActions'
 import HostRecord from './HostRecord'
 import PartnerApplications from './PartnerApplications'
 import { profilePhotoSrc } from '@/lib/profilePhoto'
+import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member',
@@ -122,7 +123,7 @@ const ACTION_LABELS: Record<string, string> = {
 
 function fmtStamp(ts: Timestamp | null): string {
   if (!ts) return '—'
-  try { return new Date(ts.toMillis()).toLocaleString('en-IN') } catch { return '—' }
+  try { return formatIst(ts.toMillis()) || '—' } catch { return '—' }
 }
 
 function stampMillis(ts: Timestamp | null): number | null {
@@ -133,7 +134,7 @@ function stampMillis(ts: Timestamp | null): number | null {
 function fmtIso(iso: string | null | undefined): string {
   if (!iso) return '—'
   const d = new Date(iso)
-  return isNaN(d.getTime()) ? '—' : d.toLocaleString('en-IN')
+  return isNaN(d.getTime()) ? '—' : formatIst(d)
 }
 
 /**

@@ -39,6 +39,11 @@ function expect(actual) {
     toHaveLength: (e) =>
       assert.strictEqual(actual == null ? undefined : actual.length, e),
     toThrow: (match) => assert.throws(actual, match ? matcher(match) : undefined),
+    /** Every key of `e` is present in `actual` with a deep-equal value (other keys of `actual` are ignored). */
+    toMatchObject: (e) => {
+      assert.ok(actual != null && typeof actual === 'object', `expected an object, got ${format(actual)}`)
+      for (const k of Object.keys(e)) assert.deepStrictEqual(actual[k], e[k], `key ${k}`)
+    },
     /** Async: the promise must reject, optionally with a message that matches. */
     rejects: (match) => assert.rejects(actual, match ? matcher(match) : undefined),
   }

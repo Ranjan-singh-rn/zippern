@@ -66,6 +66,7 @@ import { storageLink } from '@/lib/safeLink'
 import { Denied, Empty, ErrorState, Loading } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess, hasPermission, type CrmRole } from '@/lib/auth'
+import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'ops_admin', 'ops_member', 'app_admin', 'app_member', 'support_admin',
@@ -122,7 +123,7 @@ function age(value: Appeal['createdAt']): string {
 }
 
 function when(ms: number | null): string {
-  return ms === null ? 'time not recorded' : new Date(ms).toLocaleString('en-IN')
+  return ms === null ? 'time not recorded' : formatIst(ms)
 }
 
 /** Anything waiting longer than this is somebody locked out for too long. */

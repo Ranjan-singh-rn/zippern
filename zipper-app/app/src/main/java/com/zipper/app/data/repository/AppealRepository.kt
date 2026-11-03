@@ -103,7 +103,14 @@ class AppealRepository @Inject constructor(
                 signedIn = true, hasQuickLoginCredential = false, hasDeviceKey = false,
             )
         }
-        val credential = try { quickLogin.load() != null } catch (_: Exception) { false }
+        // QA #55: a restriction found by a refused sign-in, whose account this
+        // phone's key could not be shown to be, is appealed on the web — the
+        // key would file the appeal for its own account, maybe another one.
+        if (!com.zipper.app.util.PublicAppeal.deviceKeyAppealAllowed) {
+            return com.zipper.app.util.AppealRoute.Route.Web
+        }
+        // B10: the credential that speaks for THE restricted account — never another one this device remembers.
+        val credential = try { appealCredential() != null } catch (_: Exception) { false }
         val key = try { deviceKey.hasKey() } catch (_: Exception) { false }
         return com.zipper.app.util.AppealRoute.decide(
             signedIn = false, hasQuickLoginCredential = credential, hasDeviceKey = key,
@@ -309,8 +316,19 @@ class AppealRepository @Inject constructor(
      * rather than failing with something that sounds like a bug they could retry
      * their way out of.
      */
+    /**
+     * B10: which saved credential files the appeal. This device may remember several accounts, and the server
+     * files a session-less appeal for whichever account the credential belongs to — so it must be the restricted
+     * account's own (the uid the refused sign-in proved, [com.zipper.app.util.PublicAppeal.lastRestrictedUid]).
+     * With no uid known, only a device that remembers exactly one account can say whose it is.
+     */
+    private suspend fun appealCredential(): com.zipper.app.util.QuickLoginStore.Saved? {
+        val all = quickLogin.loadAll().ifEmpty { listOfNotNull(quickLogin.load()) }
+        return com.zipper.app.util.QuickLoginStore.credentialFor(all, com.zipper.app.util.PublicAppeal.lastRestrictedUid)
+    }
+
     private suspend fun appealWithoutSession(text: String): Result {
-        val saved = quickLogin.load()
+        val saved = appealCredential()
         if (saved == null || !deviceKey.hasKey()) {
             return Result.Failed(
                 "This device can no longer prove which account it belongs to, so " +

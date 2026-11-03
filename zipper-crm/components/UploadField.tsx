@@ -4,6 +4,7 @@ import { useRef, useState } from 'react'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
 import { storage } from '@/lib/firebase'
 import { Loader2, Upload, ExternalLink, AlertTriangle } from 'lucide-react'
+import { uploadContentType } from '@/lib/decorAssets'
 
 /**
  * A file field that accepts a file.
@@ -70,7 +71,8 @@ export default function UploadField({
     try {
       const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
       const sRef = ref(storage, `${storagePath.replace(/\/+$/, '')}/${Date.now()}_${safe}`)
-      const task = uploadBytesResumable(sRef, file)
+      const ct = uploadContentType(file.name)  // B13: .svga has no browser MIME type; storage.rules wants octet-stream
+      const task = ct ? uploadBytesResumable(sRef, file, { contentType: ct }) : uploadBytesResumable(sRef, file)
       await new Promise<void>((resolve, reject) =>
         task.on(
           'state_changed',

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.zipper.app.data.model.User
 import com.zipper.app.data.model.BeanTransaction
 import com.zipper.app.data.model.DiamondTransaction
+import com.zipper.app.data.repository.GiftHistoryEntry
 import com.zipper.app.data.repository.GiftRepository
 import com.zipper.app.data.repository.HostStatsRepository
 import com.zipper.app.data.repository.MAX_IMAGE_SIZE_BYTES
@@ -16,6 +17,7 @@ import com.zipper.app.data.repository.ProfileResult
 import com.zipper.app.util.UserLanguage
 // GiftSummaryItem is in the same package — no import needed
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -151,65 +153,75 @@ class ProfileViewModel @Inject constructor(
             }
         }
 
+        /*
+         * Everything below belongs to ONE account, and which account is decided by Firebase Auth on this device
+         * — no network read.
+         *
+         * A3 (3 Nov 2026): each of these five blocks used to start with `repo.fetchCurrentUser()?.uid`, a one-shot
+         * `get()` of the users document, with nothing catching it. Offline (no network, or a session the server
+         * no longer accepts, so Firestore's watch stream is refused) and with no cached copy, that `get()` throws
+         * "Failed to get document because the client is offline" — and because MainActivity creates this view
+         * model at launch, the app crashed a few seconds after opening (prod APK, emulator drop box,
+         * 2026-11-03 17:33:40 IST). The listeners only ever needed the uid.
+         *
+         * Following the auth state also fixes two quieter faults of the same blocks: MainActivity's instance
+         * lives for the whole process, so a sign-in after launch never started them; and a sign-out or an
+         * account switch left the previous account's gifts, wallet history and counts in the state.
+         */
         viewModelScope.launch {
-            val uid = repo.fetchCurrentUser()?.uid ?: return@launch
-            val followers = repo.getFollowerCount(uid)
-            val following = repo.getFollowingCount(uid)
-            _state.update { it.copy(followerCount = followers, followingCount = following) }
-        }
-
-        viewModelScope.launch {
-            val uid = repo.fetchCurrentUser()?.uid ?: return@launch
-            giftRepo.giftsSentFlow(uid).collect { entries ->
-                val summary = entries
-                    .groupBy { it.giftId }
-                    .map { (giftId, items) ->
-                        GiftSummaryItem(
-                            giftId   = giftId,
-                            name     = items.first().giftName,
-                            emoji    = items.first().emoji,
-                            imageUrl = items.first().imageUrl,
-                            count    = items.sumOf { it.quantity },
-                        )
+            repo.signedInUidFlow().collectLatest { uid ->
+                _state.update {
+                    it.copy(
+                        followerCount = 0, followingCount = 0,
+                        giftsSent = emptyList(), giftsReceived = emptyList(),
+                        diamondTransactions = emptyList(), beanTransactions = emptyList(),
+                    )
+                }
+                if (uid == null) return@collectLatest
+                coroutineScope {
+                    launch {
+                        val followers = repo.getFollowerCount(uid)
+                        val following = repo.getFollowingCount(uid)
+                        _state.update { it.copy(followerCount = followers, followingCount = following) }
                     }
-                    .sortedByDescending { it.count }
-                _state.update { it.copy(giftsSent = summary) }
-            }
-        }
-
-        viewModelScope.launch {
-            val uid = repo.fetchCurrentUser()?.uid ?: return@launch
-            giftRepo.giftsReceivedFlow(uid).collect { entries ->
-                val summary = entries
-                    .groupBy { it.giftId }
-                    .map { (giftId, items) ->
-                        GiftSummaryItem(
-                            giftId   = giftId,
-                            name     = items.first().giftName,
-                            emoji    = items.first().emoji,
-                            imageUrl = items.first().imageUrl,
-                            count    = items.sumOf { it.quantity },
-                        )
+                    launch {
+                        giftRepo.giftsSentFlow(uid).collect { entries ->
+                            _state.update { it.copy(giftsSent = entries.toGiftSummary()) }
+                        }
                     }
-                    .sortedByDescending { it.count }
-                _state.update { it.copy(giftsReceived = summary) }
-            }
-        }
-
-        viewModelScope.launch {
-            val uid = repo.fetchCurrentUser()?.uid ?: return@launch
-            repo.diamondTransactionsFlow(uid).collect { txs ->
-                _state.update { it.copy(diamondTransactions = txs) }
-            }
-        }
-
-        viewModelScope.launch {
-            val uid = repo.fetchCurrentUser()?.uid ?: return@launch
-            repo.beanTransactionsFlow(uid).collect { txs ->
-                _state.update { it.copy(beanTransactions = txs) }
+                    launch {
+                        giftRepo.giftsReceivedFlow(uid).collect { entries ->
+                            _state.update { it.copy(giftsReceived = entries.toGiftSummary()) }
+                        }
+                    }
+                    launch {
+                        repo.diamondTransactionsFlow(uid).collect { txs ->
+                            _state.update { it.copy(diamondTransactions = txs) }
+                        }
+                    }
+                    launch {
+                        repo.beanTransactionsFlow(uid).collect { txs ->
+                            _state.update { it.copy(beanTransactions = txs) }
+                        }
+                    }
+                }
             }
         }
     }
+
+    /** One row per gift, its quantities added up, most-given first. */
+    private fun List<GiftHistoryEntry>.toGiftSummary(): List<GiftSummaryItem> =
+        groupBy { it.giftId }
+            .map { (giftId, items) ->
+                GiftSummaryItem(
+                    giftId   = giftId,
+                    name     = items.first().giftName,
+                    emoji    = items.first().emoji,
+                    imageUrl = items.first().imageUrl,
+                    count    = items.sumOf { it.quantity },
+                )
+            }
+            .sortedByDescending { it.count }
 
     // ── Edit field mutations ──────────────────────────────────────────────────
 

@@ -346,7 +346,10 @@ function sellerDocsOf(profile: Record<string, unknown>): DocRef[] {
     return { label: textOf(o.label) || `Document ${i + 1}`, url: textOf(o.url) }
   })
   const proof = textOf(profile.registrationProofUrl)
-  if (proof) docs.push({ label: 'Registration proof', url: proof })
+  // QA #35: the app and /seller-signup both ask for a "Government photo ID"
+  // (Aadhaar, PAN, Voter ID, passport); the queue called it "Registration
+  // proof", so a reviewer looked for a business document that was never asked for.
+  if (proof) docs.push({ label: 'Government photo ID', url: proof })
   return docs.filter((d) => d.url)
 }
 

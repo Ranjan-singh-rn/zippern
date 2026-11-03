@@ -44,7 +44,8 @@ beforeEach(() => {
   db._docs.clear()
   for (const uid of ['OWNER', 'GUEST', 'OTHER']) {
     db.seed(`users/${uid}`, { name: uid, accountState: 'active', photoUrl: '' })
-  }
+  }  // B7: a private room is Party Pro — the owner holds an unexpired subscription (partySubscription.test.js tests the gate).
+  db.seed('partySubscriptions/OWNER', { uid: 'OWNER', expiresAtMs: Date.now() + 30 * 86_400_000, autoRenew: true })
 })
 
 async function privateRoom(pin = '1234') {

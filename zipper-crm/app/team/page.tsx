@@ -36,16 +36,17 @@
  * — with this page no longer writing there, nothing in the browser has any
  * business creating a staff document at all.
  *
- * ── This screen and /team-access now do the same job ────────────────────────
+ * ── This screen and /team-access ─────────────────────────────────────────────
  *
  * They read the same list from the same endpoint and perform the same three
- * mutations. See the banner below: /team-access is the one to keep. Nothing is
- * deleted here — that is a call for the owner.
+ * mutations. Whether one of them goes is the Owner's call; it is recorded in
+ * qa/QA-FINDINGS.md (#42), not on the screen — QA (3 Nov 2026) found this
+ * design note printed to Owners as a banner.
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import {
-  AlertTriangle, Building, CheckCircle2, Info, KeyRound, Loader2, Mail, Plus,
+  AlertTriangle, Building, CheckCircle2, KeyRound, Loader2, Mail, Plus,
   PauseCircle, RefreshCw, RotateCcw, Search, Shield, ShieldCheck, UserCog, UserX, X,
 } from 'lucide-react'
 import api, { ApiError, staffStatus, type ApiRole, type StaffMember } from '@/lib/api'
@@ -56,6 +57,9 @@ import {
 import { useAuth } from '@/components/AuthProvider'
 import { ErrorState } from '@/components/ui/States'
 import { sendCrmPasswordReset } from '@/lib/auth'
+import { roleChangeReady, roleChangeSummary, rolePickerInitial, rolePickerOptions } from '@/lib/rolePicker'
+import { teamAccessHeadline } from '@/lib/teamAccess'
+import { inviteEmailProblem, inviteErrorText } from '@/lib/staffInvite'
 
 /** The API refuses a shorter one, so the requirement is shown before they act. */
 const MIN_REASON = 3
@@ -308,9 +312,10 @@ export default function TeamPage() {
             Team Management
           </h1>
           <p className="text-slate-400 text-sm mt-1">
+            {/* QA #40: only say "you can invite" to somebody who has the button. */}
             {isOwner
               ? 'You can invite anyone, change any role and revoke any access.'
-              : 'You can invite members of your own team.'}
+              : teamAccessHeadline(me?.role ?? '', assignable.length)}
           </p>
         </div>
         <div className="flex gap-2">
@@ -331,29 +336,13 @@ export default function TeamPage() {
         </div>
       </div>
 
-      {/* Two screens, one job. Said here rather than left for somebody to find. */}
-      <div className="mb-5 flex items-start gap-3 bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-3">
-        <Info size={16} className="text-slate-400 shrink-0 mt-0.5" />
-        <div className="text-sm">
-          <p className="text-slate-200 font-medium">
-            This screen and <span className="font-mono text-xs">/team-access</span> now do the same job
-          </p>
-          <p className="text-slate-400 mt-0.5 leading-relaxed">
-            Both read the same roster from the API and perform the same three changes —
-            invite, change role, revoke access. This one groups by department and adds a
-            search; that one is the smaller screen. One of them should go, and it is not a
-            decision this page can make.
-          </p>
-        </div>
-      </div>
-
+      {/* QA #42: an internal design note ("this screen and /team-access do the
+          same job… one of them should go") used to sit here, shown to Owners. */}
       <div className="mb-5 flex items-start gap-3 bg-slate-800/40 border border-slate-700/60 rounded-xl px-4 py-3">
         <ShieldCheck size={16} className="text-green-400 shrink-0 mt-0.5" />
         <p className="text-slate-400 text-sm leading-relaxed">
-          Every change here is written to both halves of a staff account — the CRM record
-          the sign-in screen reads, and the API record that authorises every money and
-          audit screen. Each one takes a reason, and the reason is what the audit log
-          stores.
+          Every change here takes a reason, and the reason is kept in the audit log. A role
+          change or a removal signs the person out, so it applies straight away.
         </p>
       </div>
 
@@ -667,6 +656,10 @@ function InvitePanel({ roles, onClose, onDone }: {
   const ready = email.includes('@') && name.trim().length > 1
 
   async function submit() {
+    // QA #39: an obviously wrong address is caught here, and the API's
+    // validator text is worded as an instruction (lib/staffInvite).
+    const problem = inviteEmailProblem(email)
+    if (problem) { setErr(problem); return }
     setBusy(true)
     setErr('')
     try {
@@ -682,7 +675,7 @@ function InvitePanel({ roles, onClose, onDone }: {
       // Verbatim. When the API creates the staff row and cannot write the CRM
       // record, the message says exactly that and carries the repair command —
       // truncating it would hide the one thing worth reading.
-      setErr(saidWhy(e, 'Could not send the invitation.'))
+      setErr(inviteErrorText(saidWhy(e, 'Could not send the invitation.')))
     } finally {
       setBusy(false)
     }
@@ -762,13 +755,17 @@ function RolePanel({ member, roles, onCancel, onConfirm }: {
   onCancel: () => void
   onConfirm: (role: ApiRole, reason: string) => Promise<void>
 }) {
-  const choices = roles.filter((r) => r !== member.role)
-  const [role, setRole] = useState<ApiRole>(choices[0] ?? member.role)
+  // QA #43: the picker opens on the CURRENT role (it used to pre-select the
+  // first assignable one, "App Admin"), and Change role stays disabled until
+  // a different role is chosen. See lib/rolePicker.
+  const options = rolePickerOptions(member.role, roles)
+  const [role, setRole] = useState<ApiRole>(rolePickerInitial(member.role) as ApiRole)
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
 
-  const ready = reason.trim().length >= MIN_REASON && role !== member.role
+  const ready = roleChangeReady(member.role, role, reason, MIN_REASON)
+  const label = (r: string) => ROLE_LABEL[r] ?? r
 
   return (
     <Modal title="Change role" onClose={onCancel}>
@@ -780,11 +777,14 @@ function RolePanel({ member, roles, onCancel, onConfirm }: {
 
         <Field label="New role">
           <select value={role} onChange={(e) => setRole(e.target.value as ApiRole)} className={INPUT}>
-            {choices.map((r) => (
-              <option key={r} value={r}>{ROLE_LABEL[r] ?? r}</option>
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>{label(o.value)}{o.current ? ' (current role)' : ''}</option>
             ))}
           </select>
         </Field>
+        <p className={`text-sm ${role === member.role ? 'text-slate-500' : 'text-amber-200'}`}>
+          {roleChangeSummary(member.role, role, label)}
+        </p>
 
         <Field
           label="Why"

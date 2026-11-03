@@ -19,6 +19,7 @@ import com.zipper.app.data.repository.PartyMessage
 import com.zipper.app.data.repository.PartyRepository
 import com.zipper.app.data.repository.ProfileRepository
 import com.zipper.app.ui.screens.live.AgoraManager
+import com.zipper.app.util.PartyHeartbeatPolicy
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.agora.rtc2.IRtcEngineEventHandler
 import kotlinx.coroutines.CoroutineScope
@@ -70,6 +71,8 @@ data class PartyRoomUiState(
     val gate: PartyGate = PartyGate.None,
     /** Wrong password, or "this room needs a password" on first sight. */
     val passwordError: String? = null,
+    /** B7: this account may enter private rooms as a Zipper official (its own CRM record says so). */
+    val officialAllowed: Boolean = false,
     val joining: Boolean = false,
     val isConnected: Boolean = false,
 
@@ -136,13 +139,14 @@ data class PartyRoomUiState(
     /** Members a moderator can act on: seated and unseated alike. */
     val memberList: List<PartyMember>
         get() {
+            val levels = listeners.associate { it.uid to it.level }
             val seated = seats.map {
-                PartyMember(it.uid, it.name, it.photoUrl, seatIndex = it.index)
+                PartyMember(it.uid, it.name, it.photoUrl, seatIndex = it.index, level = levels[it.uid] ?: 0)
             }
             val seatedUids = seated.map { it.uid }.toSet()
             val rest = listeners
                 .filter { it.uid !in seatedUids }
-                .map { PartyMember(it.uid, it.name, it.photoUrl, seatIndex = 0) }
+                .map { PartyMember(it.uid, it.name, it.photoUrl, seatIndex = 0, level = it.level) }
             return seated + rest
         }
 
@@ -192,6 +196,8 @@ data class PartyMember(
     val name: String,
     val photoUrl: String,
     val seatIndex: Int,
+    /** B7: shown on the member's profile card. */
+    val level: Int = 0,
 )
 
 @HiltViewModel
@@ -200,6 +206,7 @@ class PartyRoomViewModel @Inject constructor(
     private val repo: PartyRepository,
     private val profileRepo: ProfileRepository,
     private val giftRepo: GiftRepository,
+    private val liveRepo: com.zipper.app.data.repository.LiveRepository,
     private val agoraTokenRepo: AgoraTokenRepository,
     private val auth: FirebaseAuth,
 ) : ViewModel() {
@@ -256,18 +263,13 @@ class PartyRoomViewModel @Inject constructor(
     @Volatile private var admitted = false
 
     /**
-     * Whether anybody has occupied a seat while this client has been watching.
+     * "Still here" to the server every [PartyHeartbeatPolicy.EVERY_MS] — B2a.
      *
-     * Load-bearing for the auto-close. A room opens with every seat empty — the
-     * owner's included, which is the point of the rebuild — so "no seats taken"
-     * is also the state of a brand-new room whose owner is still reading the
-     * settings sheet. Arming the close timer on that would have the owner's own
-     * client destroy the room two seconds after creating it. Only the transition
-     * from occupied to empty counts, and this is what distinguishes them.
+     * This replaced the client-side auto-close: a room used to be closed by any client two seconds after its last
+     * seat emptied, with people still listening in the lobby. The server now keeps a room open while anybody is in
+     * it and removes a listener whose heartbeat stops.
      */
-    @Volatile private var everHadOccupants = false
-
-    private var emptyRoomJob: Job? = null
+    private var heartbeatJob: Job? = null
 
     init {
         if (roomId.isNotBlank()) {
@@ -307,7 +309,6 @@ class PartyRoomViewModel @Inject constructor(
                 val mine = seats.firstOrNull { it.uid == myUid }
                 _state.update { it.copy(seats = seats) }
                 reconcileRole(mine)
-                watchForEmptyRoom(seats.isEmpty())
             }
         }
     }
@@ -407,6 +408,7 @@ class PartyRoomViewModel @Inject constructor(
                     _state.update { it.copy(joining = false, gate = PartyGate.None) }
                     announceArrival()
                     connectAgora(context)
+                    startHeartbeat()
                 }
                 is PartyRepository.Result.Failed -> {
                     /*
@@ -425,9 +427,15 @@ class PartyRoomViewModel @Inject constructor(
                     val kicked = message.contains("removed", ignoreCase = true)
                     val ended = message.contains("closed", ignoreCase = true)
                     val needsPassword = message.contains("password", ignoreCase = true)
+                    // B7: five wrong PINs lock this account out of this room for a while — said on the PIN screen.
+                    val locked = res.detail == "PARTY_PIN_LOCKED"
+                    if (needsPassword && !_state.value.officialAllowed) {
+                        viewModelScope.launch { if (repo.officialAccessAllowed()) _state.update { it.copy(officialAllowed = true) } }
+                    }
 
                     _state.update { st ->
                         when {
+                            locked -> st.copy(joining = false, gate = PartyGate.Password, passwordError = message)
                             needsPassword -> st.copy(
                                 joining = false,
                                 gate = PartyGate.Password,
@@ -444,6 +452,82 @@ class PartyRoomViewModel @Inject constructor(
                     if (kicked) onKicked() else if (ended) onRoomEnded()
                 }
             }
+        }
+    }
+
+    /** B7: enter a private room as a Zipper official — no PIN, but logged in the room and shown to everyone in it. */
+    fun enterAsOfficial(context: android.content.Context) {
+        if (roomId.isBlank() || hasLeft || _state.value.joining) return
+        _state.update { it.copy(joining = true, passwordError = null) }
+        viewModelScope.launch {
+            when (val res = repo.joinRoomAsOfficial(roomId)) {
+                is PartyRepository.Result.Ok -> {
+                    admitted = true
+                    _state.update { it.copy(joining = false, gate = PartyGate.None) }
+                    announceArrival()
+                    connectAgora(context)
+                    startHeartbeat()
+                }
+                is PartyRepository.Result.Failed -> _state.update { it.copy(joining = false, passwordError = res.userMessage) }
+            }
+        }
+    }
+
+    /** B7: the room's access log (the owner's to read). */
+    fun accessLogFlow() = repo.accessLogFlow(roomId)
+
+    // ── B7: room music ──────────────────────────────────────────────────────
+    fun musicTracksFlow() = repo.musicTracksFlow()
+    private var mixingTrackId: String? = null
+
+    /** Owner/admin: play a catalogue track into the room — this phone mixes it into what it publishes. */
+    fun playMusic(track: PartyRepository.MusicTrack) {
+        viewModelScope.launch {
+            when (val r = repo.setMusic(roomId, track.id)) {
+                is PartyRepository.Result.Ok -> {
+                    AgoraManager.stopMusic()
+                    if (AgoraManager.startMusic(track.url) == 0) mixingTrackId = track.id
+                    else _state.update { it.copy(error = "Could not play that track on this phone.") }
+                }
+                is PartyRepository.Result.Failed -> _state.update { it.copy(error = r.userMessage) }
+            }
+        }
+    }
+
+    fun pauseMusic(pause: Boolean) { if (pause) AgoraManager.pauseMusic() else AgoraManager.resumeMusic() }
+    fun musicVolume(v: Int) = AgoraManager.setMusicVolume(v)
+
+    fun stopMusic() {
+        AgoraManager.stopMusic()
+        mixingTrackId = null
+        viewModelScope.launch { repo.setMusic(roomId, null) }
+    }
+
+    // ── B7: the member card's social actions — the same calls the profile screen makes ──
+
+    /** Whether I follow [uid] (for the card's button). False on any error. */
+    suspend fun isFollowing(uid: String): Boolean = try { profileRepo.isFollowing(uid) } catch (_: Exception) { false }
+
+    fun follow(uid: String, follow: Boolean) {
+        viewModelScope.launch {
+            try { if (follow) profileRepo.followUser(uid) else profileRepo.unfollowUser(uid) }
+            catch (e: Exception) { _state.update { it.copy(error = e.localizedMessage ?: "Could not update follow.") } }
+        }
+    }
+
+    fun block(member: PartyMember) {
+        viewModelScope.launch {
+            when (val r = profileRepo.blockUser(member.uid, member.name, member.photoUrl)) {
+                is com.zipper.app.data.repository.ProfileResult.Error -> _state.update { it.copy(error = r.message) }
+                else -> _state.update { it.copy(notice = "${member.name.ifBlank { "They" }} is blocked.") }
+            }
+        }
+    }
+
+    fun report(uid: String, reason: String) {
+        viewModelScope.launch {
+            try { liveRepo.reportUser(uid, reason); _state.update { it.copy(notice = "Thanks — our team will review this.") } }
+            catch (e: Exception) { _state.update { it.copy(error = e.localizedMessage ?: "Could not send the report.") } }
         }
     }
 
@@ -912,6 +996,8 @@ class PartyRoomViewModel @Inject constructor(
         seatMode: String? = null,
         visibility: String? = null,
         password: String? = null,
+        theme: String? = null,
+        blockCalls: Boolean? = null,
     ) {
         if (!_state.value.isOwner) return
         welcomeMessage?.let { text ->
@@ -930,6 +1016,8 @@ class PartyRoomViewModel @Inject constructor(
                 seatMode = seatMode,
                 visibility = visibility,
                 password = password,
+                theme = theme,
+                blockCalls = blockCalls,
             )) {
                 is PartyRepository.Result.Ok ->
                     _state.update { it.copy(savingSettings = false, notice = "Saved.") }
@@ -1055,41 +1143,49 @@ class PartyRoomViewModel @Inject constructor(
     fun clearNotice() { _state.update { it.copy(notice = null) } }
     fun setPip(inPip: Boolean) { _state.update { it.copy(inPip = inPip) } }
 
-    // ── Closing the room ─────────────────────────────────────────────────────
+    // ── Staying in the room ──────────────────────────────────────────────────
 
     /**
-     * The two-second auto-close.
+     * Tell the server every [PartyHeartbeatPolicy.EVERY_MS] that this phone is still in the room — B2a.
      *
-     * ── WHY IT IS HERE AND NOT ON A SERVER TIMER ─────────────────────────────
-     *
-     * Two seconds is far below what a cron can do — the fastest useful schedule is
-     * one a minute, and a room lingering in the list for up to sixty seconds with
-     * nobody in it is the ghost-room defect this is meant to fix. So the last
-     * client still watching closes the door, and `sweepEmptyPartyRooms` is the
-     * backstop for when there is no last client: a crash, a killed process, a dead
-     * network.
-     *
-     * `endPartyRoom` lets a non-owner do this only when the server's own
-     * `emptySince` is more than two seconds old, so this cannot be used to close a
-     * room out from under anybody — and a brand-new room has `emptySince: null`,
-     * which is why [everHadOccupants] gates the timer at all. Without that gate
-     * the owner's own client would destroy the room two seconds after creating it,
-     * since a new room's seats are all empty by design.
+     * This replaced the client-side auto-close, which closed a room two seconds after its last SEAT emptied, from
+     * every client still watching — throwing out people who were listening in the lobby. The server now keeps a room
+     * open while anybody is in it and closes it, within a minute, once nobody is; a listener whose heartbeat stops
+     * for three minutes is removed by its sweep. If that happened to us (a long time in the background), the room is
+     * joined again quietly: for a private room this phone was already let into, no PIN is asked.
      */
-    private fun watchForEmptyRoom(empty: Boolean) {
-        if (!empty) {
-            everHadOccupants = true
-            emptyRoomJob?.cancel()
-            emptyRoomJob = null
-            return
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch {
+            while (!hasLeft) {
+                delay(PartyHeartbeatPolicy.EVERY_MS)
+                if (hasLeft) break
+                val beat = repo.heartbeat(roomId)
+                if (beat !is PartyRepository.Result.Ok) continue   // a network blip: the next beat tries again
+                when (PartyHeartbeatPolicy.actionFor(beat.value.active, beat.value.present)) {
+                    PartyHeartbeatPolicy.Action.NOTHING -> Unit
+                    PartyHeartbeatPolicy.Action.ROOM_ENDED -> onRoomEnded()
+                    PartyHeartbeatPolicy.Action.REJOIN -> rejoinQuietly()
+                }
+            }
         }
-        if (!everHadOccupants || hasLeft || emptyRoomJob != null) return
-        emptyRoomJob = viewModelScope.launch {
-            delay(EMPTY_ROOM_GRACE_MS)
-            // Re-check: somebody may have sat down during the grace period, and
-            // the cancel above races with this coroutine being resumed.
-            if (_state.value.seats.isNotEmpty() || hasLeft) return@launch
-            repo.endRoom(roomId)
+    }
+
+    /** Back into a room the server dropped us from for silence. The Agora channel never left. */
+    private suspend fun rejoinQuietly() {
+        when (val res = repo.joinRoom(roomId, "")) {
+            is PartyRepository.Result.Ok -> admitted = true
+            is PartyRepository.Result.Failed -> {
+                val message = res.userMessage
+                when {
+                    message.contains("removed", ignoreCase = true) -> onKicked()
+                    message.contains("closed", ignoreCase = true) -> onRoomEnded()
+                    // The owner changed the PIN since we were let in: ask for the new one.
+                    message.contains("password", ignoreCase = true) ->
+                        _state.update { it.copy(gate = PartyGate.Password, passwordError = null) }
+                    else -> Unit   // try again on the next beat
+                }
+            }
         }
     }
 
@@ -1116,13 +1212,13 @@ class PartyRoomViewModel @Inject constructor(
      * else can take.
      *
      * The owner is deliberately NOT ended here. A back press is not a decision to
-     * close a room with ten people in it — that is the explicit End room control,
-     * and if they were the last one on a seat the auto-close handles it.
+     * close a room with ten people in it — that is the explicit End room control.
+     * If they were the last person in the room, the server closes it (B2a).
      */
     fun leave() {
         if (roomId.isBlank() || hasLeft) return
         hasLeft = true
-        emptyRoomJob?.cancel()
+        heartbeatJob?.cancel()
         val wasAdmitted = admitted
         admitted = false
         releaseAgora()
@@ -1146,7 +1242,7 @@ class PartyRoomViewModel @Inject constructor(
         if (hasLeft) return
         hasLeft = true
         admitted = false
-        emptyRoomJob?.cancel()
+        heartbeatJob?.cancel()
         releaseAgora()
     }
 
@@ -1157,7 +1253,7 @@ class PartyRoomViewModel @Inject constructor(
         if (hasLeft) return
         hasLeft = true
         admitted = false
-        emptyRoomJob?.cancel()
+        heartbeatJob?.cancel()
         releaseAgora()
     }
 
@@ -1191,9 +1287,6 @@ class PartyRoomViewModel @Inject constructor(
          * echo; a ring that lights for those is noise rather than signal.
          */
         const val SPEAKING_VOLUME = 20
-
-        /** Matches EMPTY_GRACE_MS in functions/src/party.ts. Both must agree. */
-        const val EMPTY_ROOM_GRACE_MS = 2_000L
 
         val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }

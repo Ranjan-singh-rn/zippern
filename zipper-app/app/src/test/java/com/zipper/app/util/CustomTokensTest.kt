@@ -29,4 +29,20 @@ class CustomTokensTest {
         assertEquals("", CustomTokens.uidOf("a.%%%.c"))
         assertEquals("", CustomTokens.uidOf(jwt("{\"sub\":\"x\"}")))
     }
+
+    // QA #30: after an e-mail bind EVERY session (phone too) is handed a same-uid
+    // token. The device continues only as the account already signed in.
+    @Test fun `a phone session adopts the same-uid token handed back after an email bind`() {
+        val t = jwt("{\"uid\":\"PH1\",\"iat\":1,\"exp\":2}")
+        assertEquals(true, CustomTokens.adoptable(t, "PH1"))
+    }
+
+    @Test fun `a token for any other account is never adopted`() {
+        val t = jwt("{\"uid\":\"VICTIM\",\"iat\":1,\"exp\":2}")
+        assertEquals(false, CustomTokens.adoptable(t, "PH1"))
+        assertEquals(false, CustomTokens.adoptable(t, null))
+        assertEquals(false, CustomTokens.adoptable(t, ""))
+        assertEquals(false, CustomTokens.adoptable("garbage", "PH1"))
+        assertEquals(false, CustomTokens.adoptable(jwt("{\"uid\":\"\"}"), ""))
+    }
 }

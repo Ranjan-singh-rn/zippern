@@ -76,4 +76,23 @@ class ActivationRequirementTest {
         val none = ActivationRequirement(complete = false, missing = emptyList(), emailUnproved = false)
         assertTrue(none.waitingLine.contains("both your phone number and your email address"))
     }
+
+    /**
+     * E2E round 2 (3 Nov 2026, QA #51): an invited host verified an email that
+     * is not the one the agency registered. Both contacts are verified, the
+     * server refused to start the role and said why — the line said "Your role
+     * is starting." for ever.
+     */
+    @Test fun `contacts verified but the role refused - the server's reason, not 'starting'`() {
+        val why = "Your agency invited you with another email address (q•••@example.com). " +
+            "Verify that address to start your Host role, or ask your agency to send a new invitation."
+        val refused = ActivationRequirement(complete = true, missing = emptyList(), emailUnproved = false, notStarted = why)
+        assertEquals(why, refused.waitingLine)
+        assertFalse(refused.waitingLine.contains("starting"))
+        val plain = ActivationRequirement(complete = true, missing = emptyList(), emailUnproved = false)
+        assertEquals("Both contacts are verified. Your role is starting.", plain.waitingLine)
+        // A contact still missing is said as before, whatever else was sent.
+        val missing = ActivationRequirement(complete = false, missing = listOf("email"), emailUnproved = false, notStarted = why)
+        assertTrue(missing.waitingLine.contains("your email address is verified"))
+    }
 }

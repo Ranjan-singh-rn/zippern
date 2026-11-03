@@ -581,7 +581,10 @@ async def invite(inv: Invitation, actor: dict, reason: str = "") -> dict:
     # whenever the link could not be generated — so an account could exist in
     # both stores, be audited as created, be announced as invited, and nobody
     # had been written to at all. The only trace was a log line.
-    role_label = str(inv.role).replace("_", " ").title()
+    # QA #39: the CRM's words for the role ("Support Team"), not the role id.
+    from app.core.role_labels import staff_role_label
+
+    role_label = staff_role_label(inv.role)
     invited_by = actor.get("name", "your administrator")
     notified = ""
     try:
@@ -2034,7 +2037,9 @@ async def notify_access_change(*, person: Mapping, change: str, actor: dict, aud
 
     uid = str(person.get("uid", ""))
     title, body = _CHANGE_TEXT[change]
-    role_label = (new_role or str(person.get("role", ""))).replace("_", " ").title()
+    from app.core.role_labels import staff_role_label  # QA #39: the CRM's words
+
+    role_label = staff_role_label(new_role or str(person.get("role", "")))
     body = body.format(role=role_label)
     key = f"staff_{change}_{audit_id or uid}"
 

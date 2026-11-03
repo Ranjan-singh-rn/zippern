@@ -1106,6 +1106,22 @@ export const auth = {
     } catch {
       return ''
     }
+    return auth.refusalForLogin(idToken)
+  },
+
+  /**
+   * QA #49 — the same question, asked with the ID token captured AT sign-in.
+   *
+   * `refusalForCurrentLogin` read `getAuth().currentUser`, and by the time the
+   * door asked, the user was usually gone: `AuthProvider`'s `crmUsers`
+   * listener signs the browser out the moment it sees `isActive: false`, and
+   * the door's own `crmUsers` read is a network round trip — so the listener
+   * won the race, the question was never sent, and a rejected applicant was
+   * told "This account has been deactivated" (reproduced on the local copy,
+   * 3 Nov 2026). The token in hand does not depend on who is signed in now.
+   */
+  async refusalForLogin(idToken: string): Promise<string> {
+    if (!idToken) return ''
     try {
       const issued = await post<SessionResponse>('/auth/signin', { id_token: idToken }, false)
       await request('/auth/signout', {

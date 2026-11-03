@@ -5,6 +5,24 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import com.zipper.app.data.repository.LiveRepository
+import com.zipper.app.data.repository.LiveSessionReport
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import javax.inject.Inject
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -65,6 +83,30 @@ object LiveSummaryGifters {
     fun handOff(gifters: List<GiftLeaderboardEntry>) { rows = gifters }
 }
 
+/**
+ * B12 (4 Nov 2026): the card's figures from the SERVER once they are in — the room as the server closed it
+ * (measured duration, peak audience, earnings) and every gift settled in it, each with its transaction id. The
+ * phone's own figures (the route) show until then, and stay if the server cannot be reached.
+ */
+@HiltViewModel
+class LiveSummaryViewModel @Inject constructor(private val repo: LiveRepository) : ViewModel() {
+    private val _report = MutableStateFlow<LiveSessionReport?>(null)
+    val report: StateFlow<LiveSessionReport?> = _report.asStateFlow()
+    private var loaded = false
+
+    fun load(roomId: String) {
+        if (loaded || roomId.isBlank()) return
+        loaded = true
+        viewModelScope.launch {
+            // The server measures the duration a moment after the room closes (a trigger): wait for it, briefly.
+            withTimeoutOrNull(15_000) {
+                repo.roomFlow(roomId).first { room -> room != null && !room.isActive && room.serverDurationSeconds > 0 }
+            }
+            _report.value = try { repo.sessionReport(roomId) } catch (_: Exception) { null }
+        }
+    }
+}
+
 /*
  * Post-live summary — a glass card over the ambient glows: beans earned
  * (numeric L, mint) with duration · peak viewers · gifters, then the top three
@@ -72,6 +114,8 @@ object LiveSummaryGifters {
  */
 @Composable
 fun LiveSummaryScreen(
+    /** B12: the room, so the card can show the server's figures and the gift transactions. "" = phone figures only. */
+    roomId: String = "",
     durationSeconds: Long,
     totalBeans: Long,
     peakViewers: Int,
@@ -79,16 +123,26 @@ fun LiveSummaryScreen(
     topGifters: List<GiftLeaderboardEntry>,
     onDone: () -> Unit,
     modifier: Modifier = Modifier,
+    viewModel: LiveSummaryViewModel = hiltViewModel(),
 ) {
     val c = ZipperTheme.colors
+    LaunchedEffect(roomId) { viewModel.load(roomId) }
+    val report by viewModel.report.collectAsStateWithLifecycle()
+    val room = report?.room
+    // B12: the server's figure wherever it has one; the phone's otherwise.
+    val shownDuration = room?.serverDurationSeconds?.takeIf { it > 0 } ?: durationSeconds
+    val shownBeans = room?.totalBeansEarned?.takeIf { it > 0 } ?: totalBeans
+    val shownPeak = maxOf(peakViewers, room?.peakViewers ?: 0)
+    val shownGifters = report?.gifters?.takeIf { it > 0 } ?: gifterCount
     Box(modifier.fillMaxSize().background(c.bgBase)) {
         AmbientGlows()
         Column(
-            Modifier.fillMaxSize().statusBarsPadding().padding(horizontal = Space.lg, vertical = Space.x3l),
+            Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState())
+                .padding(horizontal = Space.lg, vertical = Space.x3l),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(Space.xl),
         ) {
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(Space.xl))
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.xs)) {
                 Text("Live ended", style = ZipperTheme.type.displayM, color = c.textPrimary, textAlign = TextAlign.Center)
                 Text("Here's how it went", style = ZipperTheme.type.bodyM, color = c.textSecondary, textAlign = TextAlign.Center)
@@ -99,12 +153,12 @@ fun LiveSummaryScreen(
                     Text("Beans earned", style = ZipperTheme.type.caption, color = c.textSecondary)
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
                         CurrencyDisc(Currency.Bean, 24.dp)
-                        Text(indianGrouping(totalBeans), style = ZipperTheme.type.numericL, color = c.currencyBean)
+                        Text(indianGrouping(shownBeans), style = ZipperTheme.type.numericL, color = c.currencyBean)
                     }
                 }
                 HairlineDivider()
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    Stat("Duration", formatDuration(durationSeconds))
+                    Stat("Duration", formatDuration(shownDuration))
                     /*
                      * "Peak viewers", not "Viewers".
                      *
@@ -115,12 +169,36 @@ fun LiveSummaryScreen(
                      * the dozen who were still there at the end as the whole
                      * night's audience, and conclude nobody came.
                      */
-                    Stat("Peak viewers", indianGrouping(peakViewers.toLong()))
+                    Stat("Peak viewers", indianGrouping(shownPeak.toLong()))
                     // Distinct gifters, counted before the leaderboard was cut
                     // to 20 — topGifters.size would say 20 for a room where a
                     // hundred people gifted, and 0 whenever the rows went
                     // missing in transit.
-                    Stat("Gifters", indianGrouping(gifterCount.toLong()))
+                    Stat("Gifters", indianGrouping(shownGifters.toLong()))
+                }
+                if (room != null) {
+                    Text("Checked with Zipper's records", style = ZipperTheme.type.caption, color = c.textMuted)
+                }
+            }
+
+            // B12: every gift settled in this live, as the server recorded it (newest first).
+            val lines = report?.gifts.orEmpty()
+            if (lines.isNotEmpty()) {
+                GlassCard {
+                    Text("Gifts received · ${indianGrouping(report?.giftDiamonds ?: 0L)} diamonds", style = ZipperTheme.type.headingS, color = c.textPrimary)
+                    lines.take(20).forEach { g ->
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+                            Text(g.emoji.ifBlank { "🎁" }, style = ZipperTheme.type.bodyM)
+                            Column(Modifier.weight(1f)) {
+                                Text("${g.senderName.ifBlank { "Someone" }} · ${g.giftName} ×${g.quantity}", style = ZipperTheme.type.labelM, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (g.transactionId.isNotBlank()) {
+                                    Text("Txn ${g.transactionId.take(10)}", style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 1)
+                                }
+                            }
+                            Price(Currency.Diamond, g.diamonds, color = c.currencyDiamond)
+                        }
+                    }
+                    if (lines.size > 20) Text("…and ${lines.size - 20} more", style = ZipperTheme.type.caption, color = c.textMuted)
                 }
             }
 
@@ -132,7 +210,7 @@ fun LiveSummaryScreen(
             }
 
             Text("Thank you for streaming — keep up the great content.", style = ZipperTheme.type.bodyM, color = c.textSecondary, textAlign = TextAlign.Center)
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.height(Space.lg))
             ZipperButton("Done", onDone, gradient = true, fullWidth = true)
             Spacer(Modifier.navigationBarsPadding())
         }

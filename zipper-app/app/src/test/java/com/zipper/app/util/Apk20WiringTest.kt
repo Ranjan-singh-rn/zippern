@@ -59,9 +59,11 @@ class Apk20WiringTest {
         assertTrue(report.contains("val col = if (uid == myUid) \"users\" else \"publicProfiles\""))
     }
 
-    @Test fun `build 20 ships a non-debuggable prod type on the debug key and reads its channel by name`() {
-        assertTrue(gradle.contains("versionCode = 20"))
-        assertTrue(gradle.contains("versionName = \"1.2.6\""))
+    // Track B release (4 Nov 2026): APK 21 / 1.2.7 — release/trackb-20261104 publishes it with minSupported 21.
+    // The prod-type checks below are unchanged from build 20.
+    @Test fun `build 21 ships a non-debuggable prod type on the debug key and reads its channel by name`() {
+        assertTrue(gradle.contains("versionCode = 21"))
+        assertTrue(gradle.contains("versionName = \"1.2.7\""))
         val prod = gradle.substring(gradle.indexOf("create(\"prod\")"))
         assertTrue(prod.contains("initWith(getByName(\"release\"))"))
         assertTrue(prod.contains("isDebuggable = false"))
@@ -71,8 +73,13 @@ class Apk20WiringTest {
         assertTrue(prod.contains("buildConfigField(\"String\", \"OTA_CHANNEL\", \"\\\"debug\\\"\")"))
         assertTrue(prod.contains("buildConfigField(\"String\", \"ZIPPER_API_BASE\", \"\\\"\$zipperApiBaseRelease\\\"\")"))
         assertTrue(gradle.contains("val zipperApiBaseProduction = \"https://zipperlive.web.app\""))
-        // Every build type declares its channel; nothing inherits a guess.
-        assertEquals(3, Regex("buildConfigField\\(\"String\", \"OTA_CHANNEL\"").findAll(gradle).count())
+        // Every build type declares its channel; nothing inherits a guess. Four build types:
+        // release, debug, prod — and emu, the local test copy (3 Nov 2026), which never
+        // updates itself and is never published.
+        assertEquals(4, Regex("buildConfigField\\(\"String\", \"OTA_CHANNEL\"").findAll(gradle).count())
+        val emu = gradle.substring(gradle.indexOf("create(\"emu\")"))
+        assertTrue(emu.contains("buildConfigField(\"boolean\", \"OTA_ENABLED\", \"false\")"))
+        assertTrue(emu.contains("buildConfigField(\"String\", \"EMULATOR_PROJECT_ID\", \"\\\"demo-zipper\\\"\")"))
         // Nothing about the signing identity changed.
         assertFalse(gradle.contains("storeFile = file(\"zipper-release.jks\")"))
         assertTrue(gradle.contains("applicationId = \"com.zipper.app\""))

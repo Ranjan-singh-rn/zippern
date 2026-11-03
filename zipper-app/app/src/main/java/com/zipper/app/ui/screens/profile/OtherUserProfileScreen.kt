@@ -259,7 +259,7 @@ private fun ProfileBody(
             Avatar(
                 user.photoUrl, size = AvatarSize.XL,
                 ring = when { user.isLive -> AvatarRing.Live; user.isOnline -> AvatarRing.Online; else -> AvatarRing.None },
-                initial = user.name, frameUrl = user.equippedFrame.ifBlank { null },
+                initial = user.name, frameItemId = user.equippedFrame.ifBlank { null }, animatedFrame = true,
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
         }

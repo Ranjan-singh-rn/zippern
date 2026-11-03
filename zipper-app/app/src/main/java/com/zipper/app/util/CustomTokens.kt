@@ -26,4 +26,19 @@ object CustomTokens {
     } catch (_: Exception) {
         ""
     }
+
+    /**
+     * QA #30 — may the device continue its session from [token]?
+     *
+     * Only when somebody is signed in and the token names exactly that uid. The
+     * server now hands a same-uid token to EVERY session that binds an e-mail
+     * (Firebase expires the account's refresh tokens when the address changes),
+     * so this is the one check standing between that answer and a different
+     * account: a phone user adding an e-mail must carry on as themselves.
+     */
+    fun adoptable(token: String, currentUid: String?): Boolean {
+        val current = currentUid?.trim().orEmpty()
+        if (current.isEmpty()) return false
+        return uidOf(token) == current
+    }
 }

@@ -43,6 +43,7 @@ import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
 import { assertActiveSession } from './mobileSession'
+import { privateRoomGate } from './partySubscription'
 
 const db = admin.firestore()
 
@@ -67,11 +68,63 @@ export const SEAT_MODE_CONSENT = 'consent'
 export const VISIBILITY_PUBLIC = 'public'
 export const VISIBILITY_PRIVATE = 'private'
 
+/**
+ * B7 (3 Nov 2026): room backgrounds. Zipper's own designs, drawn by the app from these ids — the server keeps the
+ * list so a room can only carry a theme every app knows how to draw.
+ */
+export const ROOM_THEMES = ['classic', 'sunset', 'ocean', 'forest', 'royal', 'neon', 'rose'] as const
+export function themeOf(raw: unknown): string {
+  const t = String(raw ?? '')
+  return (ROOM_THEMES as readonly string[]).includes(t) ? t : 'classic'
+}
+
 const DEFAULT_WELCOME = 'welcome to my room have fun'
 const WELCOME_MAX = 250
 
-/** Longest a room may sit with no one on a seat before it closes itself. */
+/**
+ * Longest a room may sit with NOBODY in it — no one on a seat AND no one in the lobby — before it may be closed.
+ *
+ * B2a (3 Nov 2026): this used to start the moment the last SEAT emptied, and every client still watching closed
+ * the room two seconds later — including people listening in the lobby, who were thrown out of a room they were
+ * still in. A room is now empty only when nobody is present at all.
+ */
 const EMPTY_GRACE_MS = 2_000
+
+/**
+ * A listener whose app has not said "still here" for this long is gone (killed process, dead network).
+ *
+ * The app calls `partyHeartbeat` every [PARTY_HEARTBEAT_EVERY_MS]; three missed beats is a person who left
+ * without leaving. `sweepEmptyPartyRooms` removes them — and any seat they held — so a crashed phone can no longer
+ * keep a room open for ever, now that lobby presence keeps rooms alive.
+ */
+export const LISTENER_STALE_MS = 3 * 60 * 1000
+export const PARTY_HEARTBEAT_EVERY_MS = 60 * 1000
+/** A listener row from before heartbeats (no `lastSeenAt`) is judged by `joinedAt`, with a longer fuse. */
+export const LEGACY_LISTENER_STALE_MS = 6 * 60 * 60 * 1000
+
+/** When this listener row last showed signs of life: the heartbeat, else the join. */
+export function listenerLastSeenMs(row: { lastSeenAt?: unknown; joinedAt?: unknown }): number {
+  const ms = (v: unknown): number =>
+    v instanceof admin.firestore.Timestamp ? v.toMillis() : typeof v === 'number' && Number.isFinite(v) ? v : 0
+  return ms(row.lastSeenAt) || ms(row.joinedAt)
+}
+
+/** Is this listener row stale at [nowMs]? A row with a heartbeat uses the short fuse, a legacy row the long one. */
+export function listenerIsStale(row: { lastSeenAt?: unknown; joinedAt?: unknown }, nowMs: number): boolean {
+  const seen = listenerLastSeenMs(row)
+  if (!seen) return true
+  const fuse = row.lastSeenAt != null ? LISTENER_STALE_MS : LEGACY_LISTENER_STALE_MS
+  return nowMs - seen >= fuse
+}
+
+/**
+ * Is the room empty once this change lands? Both counts are what remains AFTER it.
+ *
+ * Pure, so the rule the whole lifecycle hangs on can be tested on its own: seats alone never decide it.
+ */
+export function roomIsEmpty(remainingSeated: number, remainingListeners: number): boolean {
+  return remainingSeated <= 0 && remainingListeners <= 0
+}
 
 function modeOf(raw: unknown): string {
   return raw === MODE_VIDEO ? MODE_VIDEO : MODE_AUDIO
@@ -285,6 +338,65 @@ function isWrongPassword(err: unknown): boolean {
   return (err as { details?: { code?: unknown } } | null)?.details?.code === WRONG_PASSWORD
 }
 
+// ── B7 (3 Nov 2026): per-person PIN lockout, the access log, official access ─
+//
+// The room's own `passwordAttempts` counter makes guessing VISIBLE but stops nobody (deliberately: locking a room
+// because a stranger guessed at it would hand any passer-by a way to shut it). What stops a guesser is a lockout
+// on the GUESSER: five wrong PINs for one room inside fifteen minutes and that account is refused for that room
+// for fifteen minutes — before its PIN is even compared. Four digits is still ten thousand combinations; at five
+// tries a quarter-hour a script needs weeks per room, and the owner sees every miss in the access log.
+//
+// Official access: Zipper staff whose CRM record allows it (the Owner, or `privateRoomAccess: true` on an active
+// staff record) may enter a private room without its PIN — for moderation. It is never silent: the entry is in
+// the room's access log, the listener row says `official`, and the room shows it.
+
+export const PIN_MAX_MISSES = 5
+export const PIN_WINDOW_MS = 15 * 60_000
+export const PIN_LOCK_MS = 15 * 60_000
+const PIN_LOCKED = 'PARTY_PIN_LOCKED'
+
+export interface PinMisses { count: number; windowStartMs: number; lockedUntilMs: number }
+
+/** Pure: is this person locked out of this room now, and for how long. */
+export function pinLockState(raw: Partial<PinMisses> | undefined, nowMs: number): { locked: boolean; retryAfterMs: number } {
+  const until = Number(raw?.lockedUntilMs ?? 0) || 0
+  return until > nowMs ? { locked: true, retryAfterMs: until - nowMs } : { locked: false, retryAfterMs: 0 }
+}
+
+/** Pure: the misses after one more wrong PIN — a new window when the old one has passed; a lock at the limit. */
+export function nextPinMisses(raw: Partial<PinMisses> | undefined, nowMs: number): PinMisses {
+  const start = Number(raw?.windowStartMs ?? 0) || 0
+  const fresh = !start || nowMs - start > PIN_WINDOW_MS
+  const count = (fresh ? 0 : Number(raw?.count ?? 0) || 0) + 1
+  const windowStartMs = fresh ? nowMs : start
+  return { count, windowStartMs, lockedUntilMs: count >= PIN_MAX_MISSES ? nowMs + PIN_LOCK_MS : Number(raw?.lockedUntilMs ?? 0) || 0 }
+}
+
+function pinLocked(retryAfterMs: number): functions.https.HttpsError {
+  const minutes = Math.max(1, Math.ceil(retryAfterMs / 60_000))
+  return new functions.https.HttpsError(
+    'resource-exhausted',
+    `Too many wrong PINs for this room. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+    { code: PIN_LOCKED, retryAfterMs },
+  )
+}
+function isPinLocked(err: unknown): boolean {
+  return (err as { details?: { code?: unknown } } | null)?.details?.code === PIN_LOCKED
+}
+
+/** Staff whose CRM record allows them into private rooms (the Owner always). */
+export function officialAccessOf(crm: Record<string, unknown> | undefined): { allowed: boolean; role: string } {
+  const role = String(crm?.role ?? '')
+  if (!crm || crm.isActive === false || crm.disabled === true) return { allowed: false, role }
+  if (role === 'superadmin') return { allowed: true, role }
+  const staff = /^(app|ops|support|tech|finance|marketing)_(admin|member)$/.test(role)
+  return { allowed: staff && crm.privateRoomAccess === true, role }
+}
+
+function accessLogRef(roomRef: admin.firestore.DocumentReference): admin.firestore.DocumentReference {
+  return roomRef.collection('accessLog').doc()
+}
+
 // ── Roles inside a room ──────────────────────────────────────────────────────
 
 type RoomRole = 'owner' | 'admin' | 'member'
@@ -364,6 +476,8 @@ async function resolveCosmetics(
     idFrameItemId: idFrameId,
     entranceVideoUrl: '',
     entrancePosterUrl: '',
+    // B13: an SVGA entrance (tools/decor) — played over the room with the arriving user's photo and name.
+    entranceSvgaUrl: '',
     idFrameUrl: '',
   }
 
@@ -376,6 +490,7 @@ async function resolveCosmetics(
       if (!snap.exists) continue
       if (snap.id === entranceId) {
         out.entranceVideoUrl = String(snap.get('videoUrl') ?? '')
+        out.entranceSvgaUrl = String(snap.get('svgaUrl') ?? '')
         // `previewUrl` is what the CRM calls the still frame; it is the poster
         // the player shows until the first video frame decodes.
         out.entrancePosterUrl = String(snap.get('previewUrl') ?? snap.get('imageUrl') ?? '')
@@ -420,6 +535,7 @@ export const createPartyRoom = functions
       visibility?: string
       password?: string
       welcomeMessage?: string
+      theme?: string
     },
     context,
   ) => {
@@ -435,6 +551,8 @@ export const createPartyRoom = functions
 
     // Validated before anything is written, so a bad PIN costs nothing.
     const password = visibility === VISIBILITY_PRIVATE ? validPassword(data?.password) : ''
+    // B7: a private room is Party Pro — level 7 and a paid, unexpired subscription (partySubscription.ts).
+    if (visibility === VISIBILITY_PRIVATE) await privateRoomGate(uid, Number(userSnap.get('level') ?? 0) || 0)
 
     // Close anything this host left behind. A crash never runs endParty, and a
     // ghost room keeps showing in the list with nobody in it — the same defect
@@ -487,6 +605,7 @@ export const createPartyRoom = functions
       seatCount,
       seatMode,
       visibility,
+      theme: themeOf(data?.theme),
       // F-7: no `passwordHash` / `passwordSalt` here, ever again. The count of
       // wrong guesses is not a secret and stays where ops can see it.
       passwordAttempts: 0,
@@ -539,6 +658,9 @@ export const updatePartyRoom = functions
       seatMode?: string
       visibility?: string
       password?: string
+      theme?: string
+      /** B7: the owner's "no incoming calls while I am in this room". */
+      blockCalls?: boolean
     },
     context,
   ) => {
@@ -567,6 +689,16 @@ export const updatePartyRoom = functions
     if (data?.welcomeMessage !== undefined) {
       updates.welcomeMessage = await cleanWelcome(data.welcomeMessage, { allowEmpty: false })
     }
+
+    // B7: a background every app knows how to draw; anything else is refused rather than stored.
+    if (data?.theme !== undefined) {
+      if (!(ROOM_THEMES as readonly string[]).includes(String(data.theme))) {
+        throw new functions.https.HttpsError('invalid-argument', 'Choose one of the room themes.')
+      }
+      updates.theme = String(data.theme)
+    }
+    // B7: the owner may stop incoming calls while they are in their own room (startCall reads this).
+    if (data?.blockCalls !== undefined) updates.ownerBlocksCalls = data.blockCalls === true
 
     if (data?.seatCount !== undefined) {
       const mode = String(roomSnap.get('mode') ?? MODE_AUDIO)
@@ -617,6 +749,11 @@ export const updatePartyRoom = functions
     if (data?.visibility !== undefined) {
       const visibility = data.visibility === VISIBILITY_PRIVATE ? VISIBILITY_PRIVATE : VISIBILITY_PUBLIC
       updates.visibility = visibility
+      // B7: making a room private is Party Pro, exactly as opening one private is (a public room is free to stay so).
+      if (visibility === VISIBILITY_PRIVATE && roomSnap.get('visibility') !== VISIBILITY_PRIVATE) {
+        const owner = await db.collection('users').doc(uid).get()
+        await privateRoomGate(uid, Number(owner.get('level') ?? 0) || 0)
+      }
       if (visibility === VISIBILITY_PRIVATE) {
         // A room going private needs a password now — either a new one, or the
         // one it already had. Going private with no password would be a lock
@@ -703,7 +840,7 @@ export const updatePartyRoom = functions
  */
 export const joinPartyRoom = functions
   .region('asia-south1')
-  .https.onCall(async (data: { roomId?: string; password?: string }, context) => {
+  .https.onCall(async (data: { roomId?: string; password?: string; official?: boolean }, context) => {
     const uid = requireAuth(context)
     await assertActiveSession(uid, data, 'joinPartyRoom', context.auth?.token)   // Phase 1A (SESSION-001/003)
     const roomId = String(data?.roomId ?? '')
@@ -717,6 +854,9 @@ export const joinPartyRoom = functions
     // transaction has no other business with, and Firestore forbids a read
     // after a write.
     const cosmetics = await resolveCosmetics(userSnap)
+    const missesRef = roomRef.collection('pinMisses').doc(uid)
+    const displayName = String(userSnap.get('name') ?? '').trim() || 'Guest'
+    const nowMs = Date.now()
 
     let joined
     try {
@@ -737,7 +877,28 @@ export const joinPartyRoom = functions
          * again on every process restart would be unusable.
          */
         const isPrivate = roomSnap.get('visibility') === VISIBILITY_PRIVATE
-        const needsPassword = isPrivate && !listenerSnap.exists && role === 'member'
+        /*
+         * B2a: somebody this room already let in with the PIN is not asked again. The listener row used to be the
+         * only memory of that, and the sweep now removes a listener whose app went quiet (three missed
+         * heartbeats) — a phone that slept for five minutes would otherwise come back to a PIN prompt. The
+         * admission is server-only (`partyRooms/{id}/admitted/{uid}`), written below on a correct PIN.
+         */
+        const admittedRef = roomRef.collection('admitted').doc(uid)
+        const admittedSnap = isPrivate && !listenerSnap.exists && role === 'member' ? await tx.get(admittedRef) : null
+        const gated = isPrivate && !listenerSnap.exists && role === 'member' && !admittedSnap?.exists
+        // B7: official access — asked for explicitly, checked against the caller's own CRM record.
+        const crmSnap = gated && data?.official === true ? await tx.get(db.collection('crmUsers').doc(uid)) : null
+        const official = crmSnap ? officialAccessOf(crmSnap.exists ? (crmSnap.data() as Record<string, unknown>) : undefined) : null
+        if (crmSnap && !official?.allowed) {
+          throw new functions.https.HttpsError('permission-denied', 'Your Zipper role does not allow entering private rooms.')
+        }
+        const needsPassword = gated && !official?.allowed
+        // B7: a person locked out of this room is refused before the PIN is even compared.
+        const missesSnap = needsPassword ? await tx.get(missesRef) : null
+        if (missesSnap?.exists) {
+          const lock = pinLockState(missesSnap.data() as Partial<PinMisses>, nowMs)
+          if (lock.locked) throw pinLocked(lock.retryAfterMs)
+        }
         // F-7: the secret is read from the server-only document, inside the
         // transaction and before any write (Firestore forbids a read after one).
         const secretSnap = needsPassword ? await tx.get(secretRef) : null
@@ -760,8 +921,25 @@ export const joinPartyRoom = functions
           tx.set(secretRef, { ...migrateLegacy, migratedAt: admin.firestore.FieldValue.serverTimestamp() })
           Object.assign(roomUpdates, legacySecretCleared())
         }
+        if (needsPassword) {
+          // The PIN was right (a wrong one threw above). Remembered, so a reconnect is not a second prompt.
+          tx.set(admittedRef, { uid, via: 'pin', admittedAt: admin.firestore.FieldValue.serverTimestamp() })
+          if (missesSnap?.exists) tx.delete(missesRef)
+          tx.set(accessLogRef(roomRef), { uid, name: displayName, result: 'admitted', via: 'pin', atMs: nowMs, at: admin.firestore.FieldValue.serverTimestamp() })
+        }
+        if (official?.allowed) {
+          tx.set(admittedRef, { uid, via: 'official', role: official.role, admittedAt: admin.firestore.FieldValue.serverTimestamp() })
+          tx.set(accessLogRef(roomRef), {
+            uid, name: displayName, result: 'official', role: official.role, atMs: nowMs, at: admin.firestore.FieldValue.serverTimestamp(),
+          })
+          roomUpdates.officialPresentUids = admin.firestore.FieldValue.arrayUnion(uid)
+        }
+        // B2a: somebody is in the room, so it is not empty — whatever the seats say.
+        if (roomSnap.get('emptySince') != null) roomUpdates.emptySince = null
 
-        if (!listenerSnap.exists) {
+        if (listenerSnap.exists) {
+          tx.update(listenerRef, { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
+        } else {
           tx.set(listenerRef, {
             uid,
             name: String(userSnap.get('name') ?? '').trim() || 'Guest',
@@ -782,7 +960,11 @@ export const joinPartyRoom = functions
              * without caring where the asset lives.
              */
             ...cosmetics,
+            // B7: an official in the room is shown as one — never a silent visitor.
+            ...(official?.allowed ? { official: true, officialRole: official.role } : {}),
             joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+            // B2a: presence, refreshed by `partyHeartbeat`; the sweep removes a row that goes quiet.
+            lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
           })
           roomUpdates.listenerCount = admin.firestore.FieldValue.increment(1)
         }
@@ -801,7 +983,27 @@ export const joinPartyRoom = functions
         }
       })
     } catch (err) {
+      if (isPinLocked(err)) {
+        await accessLogRef(roomRef)
+          .set({ uid, name: displayName, result: 'locked', atMs: nowMs, at: admin.firestore.FieldValue.serverTimestamp() })
+          .catch(() => undefined)
+        throw err
+      }
       if (!isWrongPassword(err)) throw err
+      // B7: this person's misses for this room — five in fifteen minutes locks them out of it for fifteen.
+      const lockedNow = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(missesRef)
+        const next = nextPinMisses(snap.exists ? (snap.data() as Partial<PinMisses>) : undefined, nowMs)
+        tx.set(missesRef, { ...next, uid, updatedAt: admin.firestore.FieldValue.serverTimestamp() })
+        tx.set(accessLogRef(roomRef), {
+          uid, name: displayName, result: 'wrong_pin', misses: next.count, atMs: nowMs, at: admin.firestore.FieldValue.serverTimestamp(),
+        })
+        return next.lockedUntilMs > nowMs
+      }).catch(() => false)
+      if (lockedNow) {
+        await roomRef.update({ passwordAttempts: admin.firestore.FieldValue.increment(1) }).catch(() => undefined)
+        throw pinLocked(PIN_LOCK_MS)
+      }
       /*
        * Count the misses. Four digits is ten thousand guesses, which a script
        * gets through in minutes, and the counter is what makes that visible
@@ -830,8 +1032,79 @@ export const leavePartyRoom = functions
     const roomRef = db.collection('partyRooms').doc(roomId)
     await vacateAndDrop(roomRef, uid, { alsoListener: true })
     await db.collection('users').doc(uid).set(presence(''), { merge: true })
+    // B7: an official who leaves is no longer "present" (the access log keeps the visit).
+    const roomNow = await roomRef.get()
+    if (((roomNow.get('officialPresentUids') as string[] | undefined) ?? []).includes(uid)) {
+      await roomRef.update({ officialPresentUids: admin.firestore.FieldValue.arrayRemove(uid) }).catch(() => undefined)
+    }
     return { left: true }
   })
+
+/**
+ * "I am still in this room." B2a (3 Nov 2026).
+ *
+ * The app sends it every [PARTY_HEARTBEAT_EVERY_MS] while the room screen is open (also in picture-in-picture).
+ * It only refreshes the caller's own listener row — nothing else can be moved through it. `present: false` means
+ * the row is gone (the sweep took it after a long silence, or a kick did): the app joins again, which for a private
+ * room it was already admitted to does not ask for the PIN (see `admitted/{uid}`), and which a kick refuses.
+ */
+export const partyHeartbeat = functions
+  .region('asia-south1')
+  .https.onCall(async (data: { roomId?: string }, context) => {
+    const uid = requireAuth(context)
+    const roomId = String(data?.roomId ?? '')
+    if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
+
+    const roomRef = db.collection('partyRooms').doc(roomId)
+    const listenerRef = roomRef.collection('listeners').doc(uid)
+    const [roomSnap, listenerSnap] = await Promise.all([roomRef.get(), listenerRef.get()])
+    if (!roomSnap.exists || roomSnap.get('isActive') === false) return { active: false, present: false }
+    if (!listenerSnap.exists) return { active: true, present: false }
+    await listenerRef.update({ lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
+    return { active: true, present: true, nextInMs: PARTY_HEARTBEAT_EVERY_MS }
+  })
+
+/**
+ * Remove people who left without leaving — B2a.
+ *
+ * Lobby presence now keeps a room open, so a listener row whose app died (killed process, dead network, a phone
+ * thrown in a drawer) would keep it open for ever. A row is stale when its heartbeat is older than
+ * [LISTENER_STALE_MS], or — for a row written before heartbeats existed — when it joined more than
+ * [LEGACY_LISTENER_STALE_MS] ago. Each stale person goes through `vacateAndDrop`, the one path that moves the seat
+ * count, the listener count and the empty-room clock together, so a seat they still held is freed as well.
+ *
+ * Their presence flag is cleared only if it still names THIS room — they may have walked into another one since.
+ */
+export async function pruneStaleListeners(nowMs: number, maxRooms = 100): Promise<number> {
+  const rooms = await db.collection('partyRooms').where('isActive', '==', true).limit(maxRooms).get()
+  let pruned = 0
+  for (const room of rooms.docs) {
+    const listeners = room.ref.collection('listeners')
+    const [quiet, legacy] = await Promise.all([
+      listeners.where('lastSeenAt', '<', admin.firestore.Timestamp.fromMillis(nowMs - LISTENER_STALE_MS)).limit(50).get(),
+      listeners.where('joinedAt', '<', admin.firestore.Timestamp.fromMillis(nowMs - LEGACY_LISTENER_STALE_MS)).limit(50).get(),
+    ])
+    const seen = new Set<string>()
+    for (const row of [...quiet.docs, ...legacy.docs]) {
+      if (seen.has(row.id)) continue
+      seen.add(row.id)
+      // The legacy query also returns old joiners who ARE heartbeating — those stay.
+      if (!listenerIsStale(row.data() as Record<string, unknown>, nowMs)) continue
+      try {
+        await vacateAndDrop(room.ref, row.id, { alsoListener: true })
+        const userRef = db.collection('users').doc(row.id)
+        const user = await userRef.get()
+        if (user.exists && String(user.get('partyRoomId') ?? '') === room.id) {
+          await userRef.set(presence(''), { merge: true })
+        }
+        pruned++
+      } catch (err) {
+        functions.logger.error(`pruneStaleListeners: ${room.ref.path}/listeners/${row.id}`, err)
+      }
+    }
+  }
+  return pruned
+}
 
 /**
  * The shared body of every "this person is no longer on a seat" path.
@@ -856,10 +1129,16 @@ async function vacateAndDrop(
       tx.get(seatsCol),
     ])
 
-    mySeats.docs.forEach((d) => tx.delete(d.ref))
-
+    /*
+     * Every read BEFORE the first write. B2a: the listener row used to be read after the seat deletes, and Firestore
+     * refuses a read after a write in a transaction ("Firestore transactions require all reads to be executed
+     * before all writes") — so leaving a room, or being kicked, while sitting on a seat failed outright and left a
+     * ghost seat behind. Found by running this path in the optimistic fake.
+     */
     const listenerRef = roomRef.collection('listeners').doc(target)
     const listenerSnap = opts.alsoListener || opts.kick ? await tx.get(listenerRef) : null
+
+    mySeats.docs.forEach((d) => tx.delete(d.ref))
 
     const roomUpdates: Record<string, any> = {}
     if (mySeats.size > 0) {
@@ -884,7 +1163,14 @@ async function vacateAndDrop(
      * there minus the ones belonging to this person.
      */
     const remaining = allSeats.docs.filter((d) => String(d.get('uid') ?? '') !== target).length
-    const roomEmpty = remaining === 0
+    /*
+     * B2a: and is anybody still in the lobby? Seats alone used to decide it, which closed rooms full of listeners.
+     * `listenerCount` is the server-maintained count (join +1, leave/kick/stale −1); this person's row, if it was
+     * just removed, is taken off it.
+     */
+    const listenersBefore = Math.max(0, Number(roomSnap.get('listenerCount') ?? 0) || 0)
+    const listenersLeft = listenersBefore - (listenerSnap?.exists ? 1 : 0)
+    const roomEmpty = roomIsEmpty(remaining, listenersLeft)
     if (roomEmpty) {
       roomUpdates.emptySince = admin.firestore.FieldValue.serverTimestamp()
     }
@@ -1476,6 +1762,40 @@ export const setPartyAdmin = functions
 // ── endPartyRoom ─────────────────────────────────────────────────────────────
 
 /**
+ * B7 (3 Nov 2026): room music. The owner or an admin picks a track from Zipper's own catalogue
+ * (`musicTracks/{id}` — licensed tracks the Owner adds in the CRM; an empty catalogue plays nothing) and plays it
+ * into the room: their phone mixes it into the audio they publish (Agora audio mixing), and the room document says
+ * what is playing so everybody sees it. Only a track from the catalogue can be named — never an arbitrary URL.
+ */
+export const setPartyMusic = functions
+  .region('asia-south1')
+  .https.onCall(async (data: { roomId?: string; trackId?: string | null; playing?: boolean }, context) => {
+    const uid = requireAuth(context)
+    const roomId = String(data?.roomId ?? '')
+    if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
+    const roomRef = db.collection('partyRooms').doc(roomId)
+    const roomSnap = await roomRef.get()
+    requireLiveRoom(roomSnap)
+    requireHostOrAdmin(roomSnap, uid)
+    const trackId = String(data?.trackId ?? '')
+    if (!trackId) {
+      await roomRef.update({ music: admin.firestore.FieldValue.delete() })
+      return { playing: false }
+    }
+    const track = await db.collection('musicTracks').doc(trackId).get()
+    const url = String(track.get('url') ?? '')
+    if (!track.exists || track.get('enabled') === false || !/^https:\/\//.test(url)) {
+      throw new functions.https.HttpsError('not-found', 'That track is not available.')
+    }
+    const music = {
+      trackId, title: String(track.get('title') ?? 'Music').slice(0, 80), artist: String(track.get('artist') ?? '').slice(0, 80),
+      url, playing: data?.playing !== false, by: uid, startedAtMs: Date.now(),
+    }
+    await roomRef.update({ music })
+    return { playing: music.playing, title: music.title }
+  })
+
+/**
  * Close the room.
  *
  * The owner may always close it. Anyone else may close it only once it is
@@ -1503,7 +1823,9 @@ export const endPartyRoom = functions
 
     if (roomSnap.get('hostUid') !== uid) {
       const emptySince = roomSnap.get('emptySince') as admin.firestore.Timestamp | null
+      // B2a: and nobody is in it — not on a seat, not in the lobby.
       const empty = emptySince != null && Date.now() - emptySince.toMillis() >= EMPTY_GRACE_MS
+        && roomIsEmpty(Number(roomSnap.get('occupantCount') ?? 0) || 0, Number(roomSnap.get('listenerCount') ?? 0) || 0)
       if (!empty) {
         throw new functions.https.HttpsError(
           'permission-denied',
@@ -1587,42 +1909,59 @@ async function closeRoom(roomRef: admin.firestore.DocumentReference): Promise<vo
  *     fuse — a room can legitimately sit open for a few minutes while its owner
  *     invites people before anyone takes a seat, and closing that out from under
  *     them would be worse than a ghost room.
+ *
+ * B2a (3 Nov 2026): first it removes people who left without leaving (`pruneStaleListeners`), and in BOTH cases a
+ * room with anybody still in its lobby stays open — empty seats are not an empty room.
  */
+export const NEVER_OCCUPIED_GRACE_MS = 10 * 60 * 1000
+
+export async function sweepPartyRoomsOnce(nowMs: number): Promise<{ pruned: number; closed: number }> {
+  const pruned = await pruneStaleListeners(nowMs)
+
+  const emptied = await db
+    .collection('partyRooms')
+    .where('isActive', '==', true)
+    .where('emptySince', '<', admin.firestore.Timestamp.fromMillis(nowMs - EMPTY_GRACE_MS))
+    .limit(50)
+    .get()
+
+  const neverSat = await db
+    .collection('partyRooms')
+    .where('isActive', '==', true)
+    .where('occupantCount', '==', 0)
+    .where('startedAt', '<', admin.firestore.Timestamp.fromMillis(nowMs - NEVER_OCCUPIED_GRACE_MS))
+    .limit(50)
+    .get()
+
+  const seen = new Set<string>()
+  let closed = 0
+  for (const doc of [...emptied.docs, ...neverSat.docs]) {
+    if (seen.has(doc.id)) continue
+    seen.add(doc.id)
+    // Read again: the counts are what decide it, and somebody may have walked in since the query ran.
+    const fresh = await doc.ref.get()
+    if (!fresh.exists || fresh.get('isActive') === false) continue
+    const seated = Math.max(0, Number(fresh.get('occupantCount') ?? 0) || 0)
+    const listening = Math.max(0, Number(fresh.get('listenerCount') ?? 0) || 0)
+    if (!roomIsEmpty(seated, listening)) continue
+    try {
+      await closeRoom(doc.ref)
+      closed++
+    } catch (err) {
+      functions.logger.error(`sweepEmptyPartyRooms: ${doc.ref.path}`, err)
+    }
+  }
+  return { pruned, closed }
+}
+
 export const sweepEmptyPartyRooms = functions
   .region('asia-south1')
   .pubsub.schedule('every 1 minutes')
   .timeZone('Asia/Kolkata')
   .onRun(async () => {
-    const now = Date.now()
-    const NEVER_OCCUPIED_GRACE_MS = 10 * 60 * 1000
-
-    const emptied = await db
-      .collection('partyRooms')
-      .where('isActive', '==', true)
-      .where('emptySince', '<', admin.firestore.Timestamp.fromMillis(now - EMPTY_GRACE_MS))
-      .limit(50)
-      .get()
-
-    const neverSat = await db
-      .collection('partyRooms')
-      .where('isActive', '==', true)
-      .where('occupantCount', '==', 0)
-      .where('startedAt', '<', admin.firestore.Timestamp.fromMillis(now - NEVER_OCCUPIED_GRACE_MS))
-      .limit(50)
-      .get()
-
-    const seen = new Set<string>()
-    let closed = 0
-    for (const doc of [...emptied.docs, ...neverSat.docs]) {
-      if (seen.has(doc.id)) continue
-      seen.add(doc.id)
-      try {
-        await closeRoom(doc.ref)
-        closed++
-      } catch (err) {
-        functions.logger.error(`sweepEmptyPartyRooms: ${doc.ref.path}`, err)
-      }
+    const { pruned, closed } = await sweepPartyRoomsOnce(Date.now())
+    if (pruned > 0 || closed > 0) {
+      functions.logger.info(`sweepEmptyPartyRooms: ${pruned} stale listener(s) removed, ${closed} room(s) closed.`)
     }
-    if (closed > 0) functions.logger.info(`sweepEmptyPartyRooms closed ${closed} room(s).`)
     return null
   })

@@ -2,6 +2,7 @@ import * as functions from 'firebase-functions'
 import * as admin from 'firebase-admin'
 import { normaliseCrmRole, OWNER_ROLE } from './crmRoles'
 import { ownerMfaVerified, type OwnerMfaToken } from './ownerMfa'
+import { serverDurationSeconds } from './live'
 
 const db = admin.firestore()
 
@@ -275,16 +276,27 @@ export const syncLivePresence = functions
 
     // The user document mirrors presence too (it is owner-protected, so the
     // app cannot write it — this trigger is the only writer). Streamed time is
-    // accrued when the room closes, from the duration the host's app recorded.
+    // accrued when the room closes.
+    //
+    // B12 (4 Nov 2026): measured by the SERVER, not taken from the host's app.
+    // The room is stamped `serverStartedAt` here when it goes live, and its
+    // length at the close is from that stamp to now (`serverDurationSeconds`,
+    // written back on the room). A room older than the stamp falls back to the
+    // app's figure, capped at the room's own age.
     const userPatch: Record<string, any> = {
       isLive: isActive,
       liveRoomId: isActive ? roomId : '',
     }
+    const roomRef = change.after.exists ? change.after.ref : null
+    if (isActive && !wasActive && roomRef) {
+      await roomRef.update({ serverStartedAt: admin.firestore.FieldValue.serverTimestamp() })
+    }
     if (!isActive && wasActive) {
-      const secs = Number(after?.durationSeconds ?? 0)
-      if (Number.isFinite(secs) && secs > 0) {
-        userPatch.streamedTimeSeconds = admin.firestore.FieldValue.increment(Math.floor(secs))
+      const secs = serverDurationSeconds(after ?? {}, Date.now())
+      if (secs > 0) {
+        userPatch.streamedTimeSeconds = admin.firestore.FieldValue.increment(secs)
       }
+      if (roomRef) await roomRef.update({ serverDurationSeconds: secs })
     }
     await db.collection('users').doc(hostUid).set(userPatch, { merge: true })
     return null

@@ -142,6 +142,30 @@ export async function runInvitationCreate(
 }
 
 /**
+ * QA #51 — an approved invitation, from the agency's side: still waiting for
+ * the code (`approved`), or the code entered by the host whose Host role waits
+ * for a contact to be verified (`awaiting_verification`, written by
+ * `activateHost` when the host had verified only one of phone and e-mail).
+ */
+export function isApprovedInvitationStatus(status: unknown): boolean {
+  const s = String(status ?? '').trim()
+  return s === 'approved' || s === 'awaiting_verification'
+}
+
+/** The stage shown on an approved invitation's row. */
+export function invitationStageLabel(app: { status?: unknown; activationPending?: unknown }): string {
+  if (String(app.status ?? '').trim() !== 'awaiting_verification') return 'Awaiting Activation'
+  const missing = Array.isArray(app.activationPending)
+    ? app.activationPending.filter((m): m is string => m === 'phone' || m === 'email')
+    : []
+  const what = missing.length === 2 ? 'phone and email'
+    : missing[0] === 'phone' ? 'phone number'
+    : missing[0] === 'email' ? 'email'
+    : 'contacts'
+  return `Code entered — host verifying ${what}`
+}
+
+/**
  * RC — may the agency WITHDRAW this row? The same test `firestore.rules`
  * applies to an agency's delete of `hostApplications/{id}`: its own pending,
  * never-redeemed INVITATION. A person's self-filed application under the

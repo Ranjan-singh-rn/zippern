@@ -50,11 +50,28 @@ import java.util.Locale
 fun MessagesScreen(
     onNavigateToChat: (otherUid: String, convoId: String) -> Unit = { _, _ -> },
     onNavigateToFeedback: () -> Unit = {},
+    /** "official" / "feedback" / "chats" — a caller asking for one tab (a deep link). */
+    initialTab: String? = null,
     viewModel: MessagesViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val c = ZipperTheme.colors
-    var tab by remember { mutableIntStateOf(2) }
+    /*
+     * QA (3 Nov 2026): this was always Chats, so somebody just warned, banned
+     * or told an appeal's outcome landed on an empty chat list. The first tab
+     * is now decided once, when the lists have loaded (`MessagesTabs`), and is
+     * the person's own choice from then on — it never flips under them while
+     * they read.
+     */
+    var tab by remember { mutableIntStateOf(-1) }
+    // Both lists, not just the chats: they arrive separately, and a tab decided
+    // before the notices had come counted none of them.
+    LaunchedEffect(state.isLoading, state.notificationsLoaded) {
+        if (!state.isLoading && state.notificationsLoaded && tab < 0) {
+            tab = com.zipper.app.util.MessagesTabs.initialTab(initialTab, state.unreadOfficial, state.totalUnread)
+        }
+    }
+    val shown = if (tab >= 0) tab else com.zipper.app.util.MessagesTabs.initialTab(initialTab, state.unreadOfficial, state.totalUnread)
     val tabs = listOf("Official", "Feedback", "Chats")
 
     Column(Modifier.fillMaxSize().background(c.bgBase).statusBarsPadding()) {
@@ -74,20 +91,22 @@ fun MessagesScreen(
             horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             tabs.forEachIndexed { i, t ->
-                val on = tab == i
+                val on = shown == i
+                // An unread Official notice is said on its segment too.
+                val label = if (i == com.zipper.app.util.MessagesTabs.OFFICIAL && state.unreadOfficial > 0) "$t · ${state.unreadOfficial}" else t
                 Box(
                     Modifier.weight(1f).fillMaxHeight()
                         .then(if (on) Modifier.background(Brush.horizontalGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), CircleShape) else Modifier)
                         .clickableNoRipple { tab = i },
                     contentAlignment = Alignment.Center,
-                ) { Text(t, style = ZipperTheme.type.labelM, color = if (on) Color.White else c.textMuted) }
+                ) { Text(label, style = ZipperTheme.type.labelM, color = if (on) Color.White else c.textMuted) }
             }
         }
 
         when {
             state.isLoading -> LoadingState()
-            tab == 0 -> OfficialTab(state.broadcasts, state.notifications)
-            tab == 1 -> TicketsTab(state.tickets, onNavigateToFeedback)
+            shown == 0 -> OfficialTab(state.broadcasts, state.notifications)
+            shown == 1 -> TicketsTab(state.tickets, onNavigateToFeedback)
             else -> ConversationsTab(state.conversations, viewModel.myUid()) { convo -> onNavigateToChat(convo.otherUserUid, convo.id) }
         }
     }
@@ -193,6 +212,10 @@ private fun AnnouncementCard(b: BroadcastMessage) {
             }
             Text(b.title, style = ZipperTheme.type.labelL, color = c.textPrimary)
             Text(b.body, style = ZipperTheme.type.bodyM, color = c.textSecondary)
+            // QA: who sent it, as typed in the CRM.
+            com.zipper.app.util.MessagesTabs.senderLine(b.senderName)?.let {
+                Text(it, style = ZipperTheme.type.caption, color = c.textMuted)
+            }
         }
     }
 }
@@ -226,6 +249,11 @@ private fun PersonalNoticeCard(n: UserNotification) {
         }
         if (n.title.isNotBlank()) Text(n.title, style = ZipperTheme.type.labelL, color = c.textPrimary)
         Text(n.body, style = ZipperTheme.type.bodyM, color = c.textSecondary)
+        // QA: the decision's reason (a ban, a suspension, a rejection) — written
+        // by the server as its own field, and the line people most need.
+        com.zipper.app.util.MessagesTabs.reasonLine(n.body, n.reason)?.let {
+            Text(it, style = ZipperTheme.type.bodyM, color = c.textPrimary)
+        }
     }
 }
 
@@ -281,6 +309,7 @@ fun timeAgo(ms: Long): String {
         h < 24 -> "${h}h ago"
         d < 2 -> "Yesterday"
         d < 7 -> "${d}d ago"
-        else -> SimpleDateFormat("d MMM", Locale.getDefault()).format(Date(ms))
+        // QA #54: IST, whatever the handset's zone.
+        else -> SimpleDateFormat("d MMM", Locale.getDefault()).apply { timeZone = com.zipper.app.util.IstTime.ZONE }.format(Date(ms))
     }
 }

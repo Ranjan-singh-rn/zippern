@@ -1044,9 +1044,16 @@ reachable = [row for row in table if row[2] == "scoped"]
 # out everywhere". Both act on the session's OWN uid and take no id (asserted
 # above); an agency that sees a session it does not recognise is exactly who
 # needs to be able to end it. Nothing of the business is read or moved.
-check("exactly twenty-eight routes are partner-reachable", len(reachable), 28)
+# Thirty-four since B9 (3 Nov 2026): a coin seller asks to borrow within the limit Zipper set
+# (`POST …/sellers/{seller_id}/borrow-requests`), files a trade as the BUYER (`POST /seller-trades`), refuses a
+# trade they were not paid for as the SELLER (`POST /seller-trades/{trade_id}/reject`), moves their own coins to
+# their own wallet where Zipper allows it (`POST …/self-use`), and reads their own trades and profit (two GETs).
+# (A trade's SELLER may only DISPUTE it — `POST /seller-trades/{trade_id}/dispute` — which decides nothing; the
+# rejection stays with staff, so the rule below that no partner route ends in `reject` still holds.)
+# Every write is scoped to the caller's own seller record (asserted above); nothing executes or signs.
+check("exactly thirty-four routes are partner-reachable", len(reachable), 34)
 check(
-    "and they are the twenty-eight named in PARTNER_REACHABLE",
+    "and they are the thirty-four named in PARTNER_REACHABLE",
     {(row[0], row[1]) for row in reachable},
     set(deps.PARTNER_REACHABLE),
 )
@@ -1191,7 +1198,10 @@ writes = {(row[0], row[1]) for row in table if "require_write" in row[3].split("
 # `POST /users/{uid}/resume-host`, on revoke-host's gate (`can_approve_kyc`).
 # Each pauses or lifts a Host's role, so — like revoke-host beside them — no
 # agency may reach either, least of all for its own host.
-check("require_write guards sixty-two routes", len(writes), 62)
+# 63 since B9 (3 Nov 2026): `POST /partner-ops/seller-trades/{id}/reject` — staff refusing a seller-to-seller
+# trade. It decides a trade between two partners, so neither of them may reach it (the selling seller may only
+# DISPUTE, which decides nothing).
+check("require_write guards sixty-three routes", len(writes), 63)
 # The four moderation operations are four distinct routes on this guard. Named
 # rather than counted, so that collapsing resume back into unban — which is the
 # defect this pins shut — is a diff somebody reads rather than a number that
@@ -1249,15 +1259,22 @@ partner_writes = sorted(
     # `own_session_uid`, no id anywhere). It is not a business write.
     and not row[1].endswith("/sessions/revoke-all")
 )
+# B9 (3 Nov 2026): nine. Four more for the coin-seller business — a borrow request within the limit Zipper set,
+# a trade filed as its buyer, a dispute raised as its seller, and self-use where Zipper allows it. Each names the
+# caller's own seller record and is scoped to it (asserted above); none decides, signs or executes.
 check(
-    "the only five writes a partner may make",
+    "the only nine writes a partner may make",
     partner_writes,
     [
         ("POST", "/api/partner-ops/agencies/{agency_id}/sub-agencies/reapply"),
         ("POST", "/api/partner-ops/me/verification/check"),
         ("POST", "/api/partner-ops/me/verification/conflict"),
         ("POST", "/api/partner-ops/sales"),
+        ("POST", "/api/partner-ops/seller-trades"),
+        ("POST", "/api/partner-ops/seller-trades/{trade_id}/dispute"),
+        ("POST", "/api/partner-ops/sellers/{seller_id}/borrow-requests"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/coin-purchases"),
+        ("POST", "/api/partner-ops/sellers/{seller_id}/self-use"),
     ],
 )
 

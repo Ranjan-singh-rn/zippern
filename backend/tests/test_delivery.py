@@ -805,7 +805,10 @@ ok(
     "…with a one-click https route, because one is configured",
     headers["List-Unsubscribe"].startswith("<https://api.zipper.example/"),
 )
-ok("…and a mailto route as well", "<mailto:unsubscribe@zipper.example" in headers["List-Unsubscribe"])
+# QA #47 (owner decision, 3 Nov 2026): the mailto route goes to the official
+# support address. It used to be derived as `unsubscribe@<the mail_from
+# domain>` — an address nobody created, which the decision rules out.
+ok("…and a mailto route as well, to the support mailbox", "<mailto:support@zipperlive.org?subject=" in headers["List-Unsubscribe"])
 check(
     "…and the one-click POST header Gmail and Yahoo require of bulk senders",
     headers.get("List-Unsubscribe-Post"),

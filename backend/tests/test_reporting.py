@@ -627,6 +627,16 @@ DB.seed(
     ],
 )
 
+# QA #53: the appeal-receipt sweep reads `appeals` from Firestore. An empty
+# in-memory Firestore for the length of the sweep runs below — this module is
+# about the 8A.2 emails; the receipts have their own (tests/test_qa_appeal_receipts.py).
+from tests.fakes import FakeFirestore  # noqa: E402
+from app.db import firebase as _firebase_mod  # noqa: E402
+
+_REAL_FIRESTORE_CLIENT = _firebase_mod.firestore_client
+_SWEEP_FS = FakeFirestore()
+_firebase_mod.firestore_client = lambda: _SWEEP_FS  # type: ignore[assignment]
+
 PROVIDER.sent.clear()
 sweep = run(scheduling.transactional_sweep())
 check("every sweep ran", len(sweep["sections"]), len(scheduling.SWEEPS))
@@ -739,6 +749,8 @@ ok("…with the reason", "partners collection is unreachable" in section["reason
 ok("…and says it is unknown whether any email was owed",
    "unknown whether any was owed" in section["reason"])
 check("…and the run names it", broken_sweep["failed_sweeps"], ["rejections"])
+
+_firebase_mod.firestore_client = _REAL_FIRESTORE_CLIENT  # type: ignore[assignment]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

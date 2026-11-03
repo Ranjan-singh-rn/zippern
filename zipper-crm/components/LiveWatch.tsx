@@ -39,8 +39,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Loader2, VideoOff, X } from 'lucide-react'
-import { getFunctions, httpsCallable } from 'firebase/functions'
-import { app } from '@/lib/firebase'
+import { httpsCallable } from 'firebase/functions'
+import { crmFunctions } from '@/lib/firebase'
 
 /**
  * Pinned. An SDK that silently moves to a new major version behind a moderation
@@ -145,7 +145,7 @@ export default function LiveWatch({
         const call = httpsCallable<
           { channelName: string; uid: number },
           { token: string; appId: string }
-        >(getFunctions(app, 'asia-south1'), 'generateAgoraToken')
+        >(crmFunctions(), 'generateAgoraToken')
         const res = await call({ channelName: roomId, uid: 0 })
         if (cancelled) return
 

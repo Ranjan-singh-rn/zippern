@@ -69,7 +69,7 @@ const calls = require('../lib/calls')
 const index = require('../lib/index')
 
 const {
-  hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails, whenUtc, refusalDetails,
+  hostRoleSuspension, hostSuspendedMessage, hostSuspensionDetails, whenUtc, whenIst, refusalDetails,
   activeHostRefusal, HOST_ROLE_SUSPENDED, HOST_UNAVAILABLE, HOST_UNAVAILABLE_REFUSAL,
   ROLE_REVOKED, NOT_A_HOST, HOST_REVOKED_REFUSAL,
 } = E
@@ -78,10 +78,11 @@ const {
 const snap = (fields) => ({ get: (key) => fields[key] })
 const at = (ms) => ({ toMillis: () => ms })
 
-// 04 Nov 2026, 10:15 UTC — the end of a timed suspension.
+// 04 Nov 2026, 10:15 UTC — the end of a timed suspension; 3:45 pm in India.
 const UNTIL_MS = Date.UTC(2026, 10, 4, 10, 15)
 const WHY = 'Repeated no-shows on booked calls'
-const MSG_TIMED = `Your Host role is suspended until 04 Nov 2026, 10:15 UTC — reason: ${WHY}`
+// QA #54: the host reads the end in IST (it used to say "04 Nov 2026, 10:15 UTC").
+const MSG_TIMED = `Your Host role is suspended until 4 Nov 2026, 3:45 pm IST — reason: ${WHY}`
 const MSG_OPEN = `Your Host role is suspended until it is resumed — reason: ${WHY}`
 
 async function refusal(p) {
@@ -138,9 +139,16 @@ describe('the sentence and the details — word for word', () => {
     expect(hostSuspendedMessage({ until: null, untilMs: null, reason: '' }))
       .toBe('Your Host role is suspended until it is resumed')
     expect(hostSuspendedMessage({ until: '2026-11-04T10:15:00.000Z', untilMs: UNTIL_MS, reason: '' }))
-      .toBe('Your Host role is suspended until 04 Nov 2026, 10:15 UTC')
+      .toBe('Your Host role is suspended until 4 Nov 2026, 3:45 pm IST')
   })
-  test('the date is the backend\'s `email.when` format: zero-padded, UTC, 24-hour', () => {
+  test('QA #54: the date is the backend\'s `email.when` format — IST, 12-hour, saying so', () => {
+    expect(whenIst(Date.UTC(2027, 0, 5, 3, 7))).toBe('5 Jan 2027, 8:37 am IST')
+    // 23:59 UTC on 31 Dec is already the next day — and the next year — in India.
+    expect(whenIst(Date.UTC(2026, 11, 31, 23, 59))).toBe('1 Jan 2027, 5:29 am IST')
+    expect(whenIst(Date.UTC(2026, 10, 3, 18, 30))).toBe('4 Nov 2026, 12:00 am IST')
+    expect(whenIst(Date.UTC(2026, 10, 4, 6, 30))).toBe('4 Nov 2026, 12:00 pm IST')
+  })
+  test('the UTC spelling is still available for logs, unchanged', () => {
     expect(whenUtc(Date.UTC(2027, 0, 5, 3, 7))).toBe('05 Jan 2027, 03:07 UTC')
     expect(whenUtc(Date.UTC(2026, 11, 31, 23, 59))).toBe('31 Dec 2026, 23:59 UTC')
   })

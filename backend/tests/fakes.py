@@ -870,12 +870,23 @@ def _compare(left: Any, op: str, right: Any) -> bool:
     raise NotImplementedError(f"FakeFirestore does not implement '{op}'")
 
 
+class _LegacyFilter:
+    """`where(field, op, value)` in the shape of a FieldFilter (`field_path`, `op_string`, `value`)."""
+
+    def __init__(self, field_path: str, op_string: str, value: Any):
+        self.field_path, self.op_string, self.value = field_path, op_string, value
+
+
 class FakeQuery:
     def __init__(self, collection: "FakeFsCollection", rows: list[tuple[str, dict]]):
         self.collection = collection
         self.rows = rows
 
-    def where(self, filter: Any = None, **_kw) -> "FakeQuery":  # noqa: A002
+    def where(self, filter: Any = None, *legacy: Any, **_kw) -> "FakeQuery":  # noqa: A002
+        # The positional form `where(field, op, value)` — what `services/reports._fs_window` uses. Added
+        # deliberately (B2c): read as the FieldFilter it is equivalent to.
+        if legacy:
+            filter = _LegacyFilter(str(filter), str(legacy[0]), legacy[1] if len(legacy) > 1 else None)
         if filter is None:
             return self
         path = filter.field_path
@@ -1003,8 +1014,8 @@ class FakeFsCollection:
     #: Database-wide counter for `add()` ids.
     _auto_ids = 0
 
-    def where(self, filter: Any = None, **kw) -> FakeQuery:  # noqa: A002
-        return FakeQuery(self, list(self.docs.items())).where(filter, **kw)
+    def where(self, filter: Any = None, *legacy: Any, **kw) -> FakeQuery:  # noqa: A002
+        return FakeQuery(self, list(self.docs.items())).where(filter, *legacy, **kw)
 
     def order_by(self, field: str, direction: Any = "ASCENDING") -> FakeQuery:
         return FakeQuery(self, list(self.docs.items())).order_by(field, direction)

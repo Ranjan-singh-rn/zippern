@@ -602,6 +602,16 @@ async def _file(
     except Exception:  # noqa: BLE001 — the appeal is filed; the log entry is not a reason to fail it
         log.exception("public appeal %s: audit entry not written", appeal_id)
 
+    # QA #53: the account is told the appeal was received — in its Official
+    # inbox and at its verified email, never on this unauthenticated page (which
+    # already shows the reference). Never raises; the sweep retries a miss.
+    from app.services import notices  # local: notices imports email, which imports settings
+
+    try:
+        await notices.appeal_receipt(uid, appeal_id, reference)
+    except Exception:  # noqa: BLE001 — the appeal is filed; the notice is retried by the sweep
+        log.exception("public appeal %s: the receipt notice was not delivered", appeal_id)
+
     return {"reference": reference, "status": "pending"}
 
 

@@ -80,7 +80,7 @@ fun PrivacyPolicyScreen(onBack: () -> Unit) {
             item {
                 PolicySection(
                     title = "10. Your Rights",
-                    body  = "Depending on your jurisdiction, you may have the right to: access the personal data we hold about you; correct inaccurate data; request deletion of your data; restrict or object to our processing; data portability. To exercise these rights, contact us at privacy@zipper.app.",
+                    body  = "Depending on your jurisdiction, you may have the right to: access the personal data we hold about you; correct inaccurate data; request deletion of your data; restrict or object to our processing; data portability. To exercise these rights, contact us at ${com.zipper.app.util.ZipperContacts.SUPPORT}.",
                 )
             }
             item {
@@ -92,7 +92,7 @@ fun PrivacyPolicyScreen(onBack: () -> Unit) {
             item {
                 PolicySection(
                     title = "12. Contact Us",
-                    body  = "If you have questions or concerns about this Privacy Policy, please contact us at:\n\nZipper Support\nEmail: privacy@zipper.app",
+                    body  = "If you have questions or concerns about this Privacy Policy, please contact us at:\n\nZipper Support\nEmail: ${com.zipper.app.util.ZipperContacts.SUPPORT}",
                 )
             }
             item { Spacer(Modifier.navigationBarsPadding()) }

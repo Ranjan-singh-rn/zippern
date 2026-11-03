@@ -33,11 +33,11 @@ import {
   getFirestore,
 } from 'firebase/firestore'
 import { initializeApp, deleteApp } from 'firebase/app'
-import { auth, db, firebaseConfig } from './firebase'
+import { auth, db, firebaseConfig, connectEmulators } from './firebase'
 import type { PartnerRole, PartnerRoleStatus } from './partnerRouting'
 import { runSubAgencyCreation } from './subAgencyCreation'
 import { runLoginThenRecord } from './loginThenRecord'
-import { asksApiWhyInactive, inactiveLoginMessage } from './crmDoor'
+import { CrmDoorRefusal, asksApiWhyInactive, inactiveLoginMessage } from './crmDoor'
 import { auth as apiAuth } from './api'
 
 // One login can hold both partner capabilities — agency AND coin seller. The
@@ -59,6 +59,7 @@ export {
   primaryPartnerRole,
   resolvePartnerRedirect,
 } from './partnerRouting'
+import { SUPPORT_EMAIL } from './contacts'  // QA #47
 export type { PartnerRole, PartnerRoleStatus } from './partnerRouting'
 
 // ── Role definitions ────────────────────────────────────────────────────────
@@ -447,7 +448,7 @@ export const ACCOUNT_RESTRICTED_MESSAGE =
  * with that id. It never searches by email, and there is deliberately no
  * parameter through which an email could be passed in.
  */
-async function resolveCrmUser(uid: string): Promise<CrmUser> {
+async function resolveCrmUser(uid: string, idToken = ''): Promise<CrmUser> {
   const snap = await getDoc(doc(db, 'crmUsers', uid))
 
   // The superadmin "self-repair" branch that used to sit here has been removed.
@@ -468,14 +469,20 @@ async function resolveCrmUser(uid: string): Promise<CrmUser> {
 
   if (!data.isActive) {
     // Decision 16 (RC): a REJECTED partner's login is inactive too, and
-    // "deactivated" is untrue for them. Ask the API why — while the Firebase
-    // session still exists to ask with — and show its sentence (lib/crmDoor).
-    // No session is opened either way; the browser is signed out below.
+    // "deactivated" is untrue for them; QA #44: so is a SUSPENDED member of
+    // staff. Ask the API why and show its sentence (lib/crmDoor). No session is
+    // opened either way; the browser is signed out below.
+    //
+    // QA #49: asked with the ID token captured at sign-in, not with whoever is
+    // signed in now — AuthProvider's crmUsers listener signs the browser out as
+    // soon as it sees `isActive: false`, which used to beat this question to
+    // the network, so the API was never asked and every rejected applicant was
+    // told "deactivated".
     const apiRefusal = asksApiWhyInactive(data.role)
-      ? await apiAuth.refusalForCurrentLogin().catch(() => '')
+      ? await (idToken ? apiAuth.refusalForLogin(idToken) : apiAuth.refusalForCurrentLogin()).catch(() => '')
       : ''
     await firebaseSignOut(auth)
-    throw new Error(inactiveLoginMessage(data.role, apiRefusal))
+    throw new CrmDoorRefusal(inactiveLoginMessage(data.role, apiRefusal))
   }
 
   // GOV C4 (B06): the API refuses this login a session while the app account is
@@ -483,7 +490,7 @@ async function resolveCrmUser(uid: string): Promise<CrmUser> {
   // refuse its writes, so it is refused at the door with the API's sentence.
   if (data.accountRestricted === true) {
     await firebaseSignOut(auth)
-    throw new Error(ACCOUNT_RESTRICTED_MESSAGE)
+    throw new CrmDoorRefusal(ACCOUNT_RESTRICTED_MESSAGE)
   }
 
   // Two writes, not one, and only the first of them may fail loudly.
@@ -520,7 +527,10 @@ async function resolveCrmUser(uid: string): Promise<CrmUser> {
 export async function crmSignIn(email: string, password: string): Promise<CrmUser> {
   const emailLower = email.trim().toLowerCase()
   const cred = await signInWithEmailAndPassword(auth, emailLower, password)
-  return resolveCrmUser(cred.user.uid)
+  // QA #49: the token of THIS sign-in, taken before anything else can sign the
+  // browser out — see `resolveCrmUser`.
+  const idToken = await cred.user.getIdToken().catch(() => '')
+  return resolveCrmUser(cred.user.uid, idToken)
 }
 
 // ── Google ──────────────────────────────────────────────────────────────────
@@ -830,7 +840,7 @@ export async function crmSignInWithGoogle(): Promise<GoogleSignInOutcome> {
     }
   }
 
-  return { kind: 'signed-in', user: await resolveCrmUser(cred.user.uid) }
+  return { kind: 'signed-in', user: await resolveCrmUser(cred.user.uid, await cred.user.getIdToken().catch(() => '')) }
 }
 
 /**
@@ -881,7 +891,7 @@ export async function completeGoogleLink(
   // Confirm the CRM record before writing to the auth account, so a password
   // that is right for a Firebase user with no CRM access does not get a
   // Google provider attached as a consolation prize.
-  const user = await resolveCrmUser(res.user.uid)
+  const user = await resolveCrmUser(res.user.uid, await res.user.getIdToken().catch(() => ''))
 
   try {
     await linkWithCredential(res.user, credential)
@@ -989,7 +999,7 @@ export async function connectGoogleToCurrentAccount(): Promise<void> {
     } catch {
       throw new Error(
         'That address is the observer account. It could not be disconnected ' +
-        'automatically — contact support before signing in again.',
+        `automatically — write to ${SUPPORT_EMAIL} before signing in again.`,
       )
     }
     throw new Error('That address is the observer account and cannot be connected.')
@@ -1169,6 +1179,7 @@ export async function createPartnerLogin(params: {
 
   const secondaryApp = initializeApp(firebaseConfig, `${params.kind}_${Date.now()}`)
   const secondaryAuth = getAuth(secondaryApp)
+  connectEmulators({ auth: secondaryAuth })
   try {
     const cred = await createUserWithEmailAndPassword(secondaryAuth, emailLower, params.password)
     const uid = cred.user.uid
@@ -1216,6 +1227,7 @@ export async function createPartnerLoginThen<T>(
   const emailLower = params.email.trim().toLowerCase()
   const secondaryApp = initializeApp(firebaseConfig, `${params.kind}_${Date.now()}`)
   const secondaryAuth = getAuth(secondaryApp)
+  connectEmulators({ auth: secondaryAuth })
   let resetEmailSent = false
   const out = await runLoginThenRecord({
     createLogin: async () => {
@@ -1598,6 +1610,7 @@ export async function createSubAgencyAccount(params: {
   const secondaryApp = initializeApp(firebaseConfig, `subagency_${Date.now()}`)
   const secondaryAuth = getAuth(secondaryApp)
   const secondaryDb = getFirestore(secondaryApp)
+  connectEmulators({ auth: secondaryAuth, db: secondaryDb })
 
   return runSubAgencyCreation({
     createLogin: async () => {

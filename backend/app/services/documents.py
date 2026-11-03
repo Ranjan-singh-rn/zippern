@@ -166,7 +166,8 @@ def _collect(
         slot = _SLOT_OF.get(field, field)
         if stored and want(slot):
             label = {
-                "registrationProofUrl": "Registration proof",
+                # QA #35: what the app and /seller-signup ask the seller for.
+                "registrationProofUrl": "Government photo ID",
                 "photoUrl": "Reference photo",
                 "qrCodeUrl": "Payment QR",
                 "paymentProofUrl": "Payment proof",

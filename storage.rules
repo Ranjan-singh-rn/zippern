@@ -814,12 +814,19 @@ service firebase.storage {
       // base64 frames, and the H.264 re-encode of the same clip is under 2 MB.
       // Refusing the small one while admitting the enormous one would have been
       // exactly backwards.
+      // B13 (4 Nov 2026): SVGA animations (gifts, entrances, frames). A browser has no
+      // MIME type for .svga, so the CRM uploads them as application/octet-stream —
+      // admitted ONLY for a name ending in .svga, and at most 5 MB (a phone parses the
+      // whole file into memory before the first frame).
       allow write: if isInternal()
-                   && (isImage()
-                       || isVideo()
-                       || request.resource.contentType == 'application/json'
-                       || request.resource.contentType == 'text/plain')
-                   && maxSize(30);
+                   && (((isImage()
+                         || isVideo()
+                         || request.resource.contentType == 'application/json'
+                         || request.resource.contentType == 'text/plain')
+                        && maxSize(30))
+                       || (request.resource.contentType == 'application/octet-stream'
+                           && request.resource.name.matches('.*[.]svga$')
+                           && maxSize(5)));
       allow delete: if isInternal();
     }
 

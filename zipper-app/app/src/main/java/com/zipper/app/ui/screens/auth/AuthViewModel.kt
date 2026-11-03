@@ -105,6 +105,19 @@ data class AuthUiState(
     /** Shown as confirmation: "Joining <agency>". */
     val referralAgencyName: String = "",
     /**
+     * QA #51: the code is this person's, but these contacts ("phone" / "email")
+     * must still be verified before the Host role can start, and this is the
+     * masked value the agency registered for each. Empty when nothing is missing.
+     */
+    val referralNeeds: List<String> = emptyList(),
+    val referralHint: Map<String, String> = emptyMap(),
+    /**
+     * QA #51: the profile saved and the invitation was claimed, but the Host
+     * role waits for a contact. A dialog, so it is read before the screen moves
+     * on to Home (see [hostActivationError] for why a snackbar would be lost).
+     */
+    val hostAwaitingNotice: String? = null,
+    /**
      * The profile saved, but becoming a host did not.
      *
      * Its own field rather than `error`, because the two need opposite
@@ -158,10 +171,18 @@ class AuthViewModel @Inject constructor(
 
     // ── Phone OTP ─────────────────────────────────────────────────────────────
 
+    /**
+     * QA #55: the number the last code was sent to. If Firebase refuses the
+     * sign-in because the login is disabled (a ban), it tells the server which
+     * account was tried — see `AuthRepository.restrictionAfterDisabledSignIn`.
+     */
+    private var otpPhone: String = ""
+
     fun sendOtp(phoneNumber: String, activity: Activity, deviceId: String = "") {
         // FX-15: one verification at a time — a second tap during the delay
         // before this runs, or while it is in flight, sends no second SMS.
         if (!SubmitGuard.mayStart(_uiState.value.isLoading)) return
+        otpPhone = phoneNumber
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
             val banReason = repo.getDeviceBanReason(deviceId)
@@ -221,7 +242,7 @@ class AuthViewModel @Inject constructor(
              * choice, a host still owing us a phone number — and the screen
              * simply sat there with a spinner and no explanation.
              */
-            when (val result = repo.verifyOtp(verificationId, code, deviceId)) {
+            when (val result = repo.verifyOtp(verificationId, code, deviceId, otpPhone)) {
                 is AuthResult.Error -> handleAuthError(result.message)
                 else -> handleAuthResult(result)
             }
@@ -401,6 +422,8 @@ class AuthViewModel @Inject constructor(
         var activationError: String? = null
         /** Redeemed successfully — this person is a host as of now. */
         var becameHost = false
+        /** QA #51: the invitation is claimed; the role waits for a contact. */
+        var awaitingNotice: String? = null
         if (state.referralValid && state.referralCode.isNotBlank()) {
             // The server re-checks the code, the phone and the email
             // before granting host status — checkReferralCode above
@@ -420,8 +443,12 @@ class AuthViewModel @Inject constructor(
                 phone = phone.ifBlank { state.referralPhone },
                 email = email.ifBlank { state.referralEmail },
             )
-            if (res is AuthResult.Error) activationError = res.message
-            else becameHost = true
+            when (res) {
+                is com.zipper.app.data.repository.HostActivationOutcome.Started -> becameHost = true
+                is com.zipper.app.data.repository.HostActivationOutcome.Awaiting ->
+                    awaitingNotice = com.zipper.app.util.ReferralContacts.awaitingNotice(res.missing, res.contactHint)
+                is com.zipper.app.data.repository.HostActivationOutcome.Failed -> activationError = res.message
+            }
         }
         /*
          * A NEW HOST GOES STRAIGHT TO THE FACE CAPTURE. AN ORDINARY
@@ -450,11 +477,17 @@ class AuthViewModel @Inject constructor(
             it.copy(
                 isLoading = false,
                 hostActivationError = activationError,
+                hostAwaitingNotice = awaitingNotice,
                 navigateToFaceVerification = activationError == null && becameHost,
-                navigateToMain = activationError == null && !becameHost,
+                // QA #51: a claimed invitation shows its notice first; Home
+                // follows when it is acknowledged (acknowledgeHostAwaiting).
+                navigateToMain = activationError == null && !becameHost && awaitingNotice == null,
             )
         }
     }
+
+    /** QA #51: "OK" on the claimed-invitation notice — on to Home as a member, Host role pending. */
+    fun acknowledgeHostAwaiting() = _uiState.update { it.copy(hostAwaitingNotice = null, navigateToMain = true) }
 
     // ── Face Verification ─────────────────────────────────────────────────────
 
@@ -557,6 +590,8 @@ class AuthViewModel @Inject constructor(
                         referralPhone = overridePhone,
                         referralEmail = overrideEmail,
                         referralAgencyName = result.agencyName,
+                        referralNeeds = result.needsVerification,
+                        referralHint = result.contactHint,
                     ) }
                 }
                 is com.zipper.app.data.repository.ReferralResult.NotFound -> {
@@ -566,7 +601,9 @@ class AuthViewModel @Inject constructor(
                 is com.zipper.app.data.repository.ReferralResult.AlreadyUsed ->
                     _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "This code has already been used") }
                 is com.zipper.app.data.repository.ReferralResult.AccountMismatch ->
-                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "Details don't match the agency record for this code") }
+                    // A verified contact of this account contradicts the invitation
+                    // (QA #51: a contact that is merely missing no longer lands here).
+                    _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = "This code was issued to a different phone number or email address.") }
                 is com.zipper.app.data.repository.ReferralResult.Error ->
                     _uiState.update { it.copy(referralCheckLoading = false, referralValid = false, referralError = result.message) }
             }
@@ -589,6 +626,18 @@ class AuthViewModel @Inject constructor(
     suspend fun savedQuickLogin(): com.zipper.app.util.QuickLoginStore.Saved? =
         repo.savedQuickLogin()
 
+    /**
+     * B10: every account this device remembers, most recently used first — the login screen's list. Names,
+     * photos and IDs only; no token reaches the screen.
+     */
+    suspend fun savedAccounts(): List<com.zipper.app.data.repository.SavedAccount> =
+        try { repo.savedAccounts() } catch (_: Exception) { emptyList() }
+
+    /** B10: "Remove" on the login screen — this device forgets one account (and the server its credential). */
+    suspend fun forgetSavedAccount(deviceId: String, uid: String) {
+        try { repo.forgetSavedAccount(deviceId, uid) } catch (_: Exception) {}
+    }
+
     /** FX-21: this device's remembered guest account ("" when none) — see GuestLinkWarning. */
     suspend fun deviceGuestUid(): String = repo.deviceGuestUid()
 
@@ -598,11 +647,13 @@ class AuthViewModel @Inject constructor(
      * Three round trips inside: a challenge, a Keystore signature over it, and
      * the redemption. See `AuthRepository.signInWithQuickLogin`.
      */
-    fun quickLogin(deviceId: String) {
+    fun quickLogin(deviceId: String, uid: String? = null) {
         if (_uiState.value.isLoading) return
         _uiState.update { it.copy(isLoading = true, error = null) }
         viewModelScope.launch {
-            handleAuthResult(repo.signInWithQuickLogin(deviceId))
+            // B10: [uid] picks one of the accounts this device remembers; null (or the pre-B10 blob's "") is the
+            // single most-recent one, as the button always was.
+            handleAuthResult(repo.signInWithQuickLogin(deviceId, accountUid = uid?.takeIf { it.isNotBlank() }))
         }
     }
 
@@ -668,7 +719,7 @@ class AuthViewModel @Inject constructor(
     // ── Consume navigation events ─────────────────────────────────────────────
 
     /**
-     * Log out, Switch account, "Back to login" and profile setup's "Go back".
+     * Log out, the switcher's "Add account", "Back to login" and profile setup's "Go back".
      *
      * ── B11: LOGIN WAITS FOR THE SIGN-OUT ───────────────────────────────────
      *

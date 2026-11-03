@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,13 +21,17 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -52,6 +57,11 @@ import kotlinx.coroutines.launch
  * Now: the artwork large in the centre, sender and gift name underneath, with
  * a scale-overshoot entrance, a hold, and a fade out. One gift at a time; the
  * caller pops the queue in [onDismiss].
+ *
+ * B12 (4 Nov 2026): after the hold the gift TRAVELS to the host it was paid to —
+ * the host's pill, top-left on both the broadcaster's and the viewer's screen —
+ * shrinking as it goes, while the caption fades. It plays only for a gift the
+ * server settled (`liveRooms/{id}/gifts`, written by `settleGift`), never for a tap.
  */
 @Composable
 fun GiftAnimationOverlay(
@@ -59,29 +69,47 @@ fun GiftAnimationOverlay(
     onDismiss: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    // B13: a gift with an SVGA animation plays it full screen, once — with the caption underneath — and the
+    // static artwork below stays the fallback for every gift without one.
+    if (giftEvent.svgaUrl.isNotBlank()) {
+        SvgaGiftOverlay(giftEvent, onDismiss, modifier)
+        return
+    }
     val c = ZipperTheme.colors
 
     val scale = remember(giftEvent.id) { Animatable(0.6f) }
     val fade = remember(giftEvent.id) { Animatable(0f) }
+    /** 0 = centre stage, 1 = arrived at the host's pill. */
+    val travel = remember(giftEvent.id) { Animatable(0f) }
 
     LaunchedEffect(giftEvent.id) {
         launch { fade.animateTo(1f, tween(180)) }
         scale.animateTo(1.1f, tween(260, easing = FastOutSlowInEasing))
         scale.animateTo(1f, tween(140, easing = FastOutSlowInEasing))
-        delay(1600)
-        fade.animateTo(0f, tween(280))
+        delay(1300)
+        launch { scale.animateTo(0.25f, tween(480, easing = FastOutSlowInEasing)) }
+        travel.animateTo(1f, tween(480, easing = FastOutSlowInEasing))
+        fade.animateTo(0f, tween(160))
         onDismiss()
     }
 
-    Box(
+    BoxWithConstraints(
         modifier
             .fillMaxSize()
             .padding(horizontal = Space.xl),
         contentAlignment = Alignment.Center,
     ) {
+        // The host's pill sits near the top-left corner: about 38 % of the width left of centre, 42 % of the
+        // height above it.
+        val dxDp = -maxWidth.value * 0.38f
+        val dyDp = -maxHeight.value * 0.42f
         Column(
             Modifier
                 .fillMaxWidth()
+                .graphicsLayer {
+                    translationX = travel.value * dxDp.dp.toPx()
+                    translationY = travel.value * dyDp.dp.toPx()
+                }
                 .scale(scale.value)
                 .alpha(fade.value),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -109,6 +137,7 @@ fun GiftAnimationOverlay(
 
             Row(
                 Modifier
+                    .alpha(1f - travel.value)
                     .background(c.scrimStrong, CircleShape)
                     .border(1.dp, c.glassMid, CircleShape)
                     .padding(start = 2.dp, end = Space.md, top = 2.dp, bottom = 2.dp),
@@ -144,3 +173,52 @@ fun GiftAnimationOverlay(
         }
     }
 }
+
+
+/** B13: the SVGA path — the animation once, the sender caption, and a watchdog so a bad file never blocks the queue. */
+@Composable
+private fun SvgaGiftOverlay(giftEvent: LiveGiftEvent, onDismiss: () -> Unit, modifier: Modifier) {
+    val c = ZipperTheme.colors
+    var done by remember(giftEvent.id) { mutableStateOf(false) }
+    val finish = {
+        if (!done) {
+            done = true
+            onDismiss()
+        }
+    }
+    LaunchedEffect(giftEvent.id) {
+        delay(SVGA_GIFT_WATCHDOG_MS)
+        finish()
+    }
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        com.zipper.app.ui.components.Svga(
+            source = giftEvent.svgaUrl,
+            modifier = Modifier.fillMaxSize(),
+            loops = 1,
+            onFinished = finish,
+        )
+        Row(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 180.dp)
+                .background(c.scrimStrong, CircleShape)
+                .border(1.dp, c.glassMid, CircleShape)
+                .padding(start = 2.dp, end = Space.md, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Space.sm),
+        ) {
+            Avatar(giftEvent.senderPhotoUrl.ifBlank { null }, size = AvatarSize.SM, ring = AvatarRing.Vip, initial = giftEvent.senderName)
+            Text(
+                "${giftEvent.senderName.ifBlank { "Someone" }} sent ${giftEvent.giftName} ×${giftEvent.quantity}",
+                style = ZipperTheme.type.labelM,
+                color = c.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 260.dp),
+            )
+        }
+    }
+}
+
+/** The longest an SVGA gift may hold the queue, whatever its own length says. */
+private const val SVGA_GIFT_WATCHDOG_MS = 8_000L

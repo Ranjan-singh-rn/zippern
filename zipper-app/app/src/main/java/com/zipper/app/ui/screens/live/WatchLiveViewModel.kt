@@ -70,6 +70,25 @@ data class WatchLiveUiState(
     val pkPartnerUid: String = "",
     val pkEndTime: Long = 0L,
     val pkPartnerRemoteUid: Int = 0,
+    // ── B12 (4 Nov 2026) ─────────────────────────────────────────────────────
+    /** The host paused the live ("back soon"). */
+    val isPaused: Boolean = false,
+    /** The host's camera is off — show their photo, not a black frame. */
+    val isCameraOff: Boolean = false,
+    /** The host's pinned announcement. */
+    val pinnedMessage: String = "",
+    /** The host muted ME in the chat: the box says so instead of failing silently. */
+    val isMutedInChat: Boolean = false,
+    /** The host's level, from their public profile. */
+    val hostLevel: Int = 0,
+    /** The host's video left the channel (their network dropped) — waiting for it to come back. */
+    val hostVideoLost: Boolean = false,
+    /** This phone's own connection to the stream. */
+    val link: AgoraManager.Link = AgoraManager.Link.Idle,
+    /** I blocked the host: leave the screen. */
+    val blockedHost: Boolean = false,
+    /** The last PK's verdict, shown for a moment after it ends. */
+    val pkVerdict: String? = null,
 )
 
 @HiltViewModel
@@ -106,10 +125,27 @@ class WatchLiveViewModel @Inject constructor(
     private var lastShownGiftId: String? = null
     private val shownGiftIds = LinkedHashSet<String>()
 
+    /** B12: "still watching", every minute while connected. */
+    private var heartbeatJob: kotlinx.coroutines.Job? = null
+    private var hostLevelLoaded = false
+    private var lastPkSeen = 0L
+
     init {
         collectRoomData()
         loadCurrentUser()
         loadGiftCatalogue()
+        viewModelScope.launch { AgoraManager.link.collect { l -> _state.update { it.copy(link = l) } } }
+    }
+
+    private fun startHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(LiveRepository.LIVE_HEARTBEAT_MS)
+                if (hasLeft) break
+                try { repo.viewerHeartbeat(roomId) } catch (_: Exception) {}
+            }
+        }
     }
 
     /**
@@ -146,6 +182,12 @@ class WatchLiveViewModel @Inject constructor(
             repo.roomFlow(roomId).collect { room ->
                 if (room == null) return@collect
                 val isOffline = !room.isActive
+                val myUid = auth.currentUser?.uid.orEmpty()
+                // B12: a PK that ended while I watched — the server's verdict, said once.
+                val verdict = if (room.lastPkEndedAt > lastPkSeen && room.lastPkEndedAt > _state.value.joinedAt && _state.value.joinedAt > 0) {
+                    lastPkSeen = room.lastPkEndedAt
+                    LiveRoomUi.pkVerdict(room.hostName, room.hostUid, room.lastPkWinnerUid, room.lastPkMyScore, room.lastPkPartnerScore)
+                } else null
                 _state.update {
                     it.copy(
                         room = room,
@@ -160,12 +202,21 @@ class WatchLiveViewModel @Inject constructor(
                         pkPartnerId = room.pkPartnerId,
                         pkPartnerUid = room.pkPartnerUid,
                         pkEndTime = room.pkEndTime,
+                        isPaused = room.isPaused,
+                        isCameraOff = room.isCameraOff,
+                        pinnedMessage = room.pinnedMessage,
+                        isMutedInChat = myUid.isNotBlank() && myUid in room.mutedViewers,
+                        pkVerdict = verdict ?: it.pkVerdict,
                     )
+                }
+                if (!hostLevelLoaded && room.hostUid.isNotBlank()) {
+                    hostLevelLoaded = true
+                    val level = try { repo.hostLevel(room.hostUid) } catch (_: Exception) { 0 }
+                    _state.update { it.copy(hostLevel = level) }
                 }
                 // Kicked? Read the uid from auth, not from the profile flow —
                 // on a cold open `currentUser` is still null and the old
                 // `?: return@collect` skipped the check entirely.
-                val myUid = auth.currentUser?.uid.orEmpty()
                 if (myUid.isNotBlank() && room.kickedViewers.contains(myUid)) onKicked()
             }
         }
@@ -221,6 +272,11 @@ class WatchLiveViewModel @Inject constructor(
         if (roomId.isBlank()) return
         AgoraManager.init(context)
         AgoraManager.onUserJoined = { uid -> onRemoteUserJoined(uid) }
+        // B12: the host's video left the channel — their network, not the live, most of the time. Said on screen
+        // until it comes back or the room ends.
+        AgoraManager.onUserOffline = { uid ->
+            if (uid != 0 && uid == _state.value.remoteUid) _state.update { it.copy(hostVideoLost = true) }
+        }
         // A-6: the hour-long token is renewed in place by AgoraManager through
         // the same repository call that issued it.
         AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
@@ -248,7 +304,7 @@ class WatchLiveViewModel @Inject constructor(
         _state.update { it.copy(joinedAt = joinedAt) }
         viewModelScope.launch {
             try {
-                repo.joinRoom(roomId)
+                // B12: no counter to bump — the presence row below is what the server counts.
                 // currentUserFlow may not have emitted yet on a cold open.
                 val user = currentUser ?: try { profileRepo.fetchCurrentUser() } catch (_: Exception) { null }
                 if (user != null) {
@@ -258,6 +314,7 @@ class WatchLiveViewModel @Inject constructor(
                 }
                 _state.update { it.copy(isConnected = true, isRejoining = false) }
                 startCommentCollection(joinedAt)
+                startHeartbeat()
                 // Check follow status
                 if (user != null) {
                     val following = try { profileRepo.isFollowing(_state.value.room?.hostUid ?: "") } catch (_: Exception) { false }
@@ -280,22 +337,22 @@ class WatchLiveViewModel @Inject constructor(
         AgoraManager.leaveChannel()
         _state.update { it.copy(isConnected = false) }
         // viewModelScope may already be cancelled by the time the screen pops.
+        heartbeatJob?.cancel()
         teardownScope.launch {
-            try {
-                repo.leaveRoom(roomId)
-                repo.removeViewerPresence(roomId)
-            } catch (_: Exception) {}
+            // B12: removing the presence row is the leave — the server recounts from the rows.
+            try { repo.removeViewerPresence(roomId) } catch (_: Exception) {}
         }
     }
 
     /**
-     * The host removed us. The kick batch already deleted our presence doc and
-     * decremented the count, so we only tear down locally — and we mark the
-     * session left so nothing decrements a second time.
+     * The host removed us. The kick batch already deleted our presence doc (the
+     * server recounts from it), so we only tear down locally — and we mark the
+     * session left so nothing runs a second leave.
      */
     private fun onKicked() {
         if (_state.value.wasKicked) return
         hasLeft = true
+        heartbeatJob?.cancel()
         giftsJob?.cancel()
         AgoraManager.leaveChannel()
         _state.update { it.copy(wasKicked = true, isConnected = false, isRejoining = false) }
@@ -326,8 +383,9 @@ class WatchLiveViewModel @Inject constructor(
                     repo.addViewerPresence(roomId, user)
                 }
                 val joinedAt = System.currentTimeMillis()
-                _state.update { it.copy(joinedAt = joinedAt, isRejoining = false, isConnected = true) }
+                _state.update { it.copy(joinedAt = joinedAt, isRejoining = false, isConnected = true, hostVideoLost = false) }
                 startCommentCollection(joinedAt)
+                startHeartbeat()
             } catch (e: Exception) {
                 _state.update { it.copy(error = e.localizedMessage, isRejoining = false) }
             }
@@ -339,6 +397,11 @@ class WatchLiveViewModel @Inject constructor(
     fun sendComment() {
         val message = _state.value.commentInput.trim()
         if (message.isBlank() || roomId.isBlank()) return
+        // B12: muted by the host — the rules would refuse it; say why instead.
+        if (_state.value.isMutedInChat) {
+            _state.update { it.copy(toastMessage = LiveRoomUi.MUTED_NOTICE) }
+            return
+        }
         _state.update { it.copy(commentInput = "") }
         viewModelScope.launch {
             try { repo.sendComment(roomId, message) }
@@ -383,10 +446,7 @@ class WatchLiveViewModel @Inject constructor(
                     _state.update { it.copy(luckyWin = result) }
                 is com.zipper.app.data.repository.GiftResult.Success -> Unit
             }
-            if (_state.value.pkActive) {
-                val partnerRoomId = if (targetRoomId == roomId) _state.value.pkPartnerId else roomId
-                pkRepo.addPKScore(targetRoomId, partnerRoomId, qty.toLong())
-            }
+            // B12: the PK score is added by the server in the gift's own settlement — nothing to write here.
         }
     }
 
@@ -471,8 +531,13 @@ class WatchLiveViewModel @Inject constructor(
 
     fun onRemoteUserJoined(uid: Int) {
         val s = _state.value
+        if (uid == s.remoteUid) {
+            // B12: the host's video is back.
+            _state.update { it.copy(hostVideoLost = false) }
+            return
+        }
         if (s.remoteUid == 0) {
-            _state.update { it.copy(remoteUid = uid) }
+            _state.update { it.copy(remoteUid = uid, hostVideoLost = false) }
             if (s.streamQuality != "Auto") AgoraManager.setRemoteQuality(uid, s.streamQuality)
         } else if (s.pkActive && s.pkPartnerRemoteUid == 0) {
             _state.update { it.copy(pkPartnerRemoteUid = uid) }
@@ -493,6 +558,26 @@ class WatchLiveViewModel @Inject constructor(
                 pkPartnerId = "", pkEndTime = 0L, pkPartnerRemoteUid = 0)
         }
     }
+
+    /**
+     * B12: block the host from the live screen — the same block as a profile's, so they cannot call or message
+     * either — and leave.
+     */
+    fun blockHost() {
+        val room = _state.value.room ?: return
+        viewModelScope.launch {
+            when (val r = profileRepo.blockUser(room.hostUid, room.hostName, room.hostPhotoUrl)) {
+                is com.zipper.app.data.repository.ProfileResult.Error ->
+                    _state.update { it.copy(toastMessage = r.message) }
+                else -> {
+                    leave()
+                    _state.update { it.copy(blockedHost = true) }
+                }
+            }
+        }
+    }
+
+    fun clearPkVerdict() { _state.update { it.copy(pkVerdict = null) } }
 
     fun clearError() { _state.update { it.copy(error = null) } }
 

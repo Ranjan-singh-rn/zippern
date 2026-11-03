@@ -32,6 +32,7 @@ const MIN_INSTANCES = Number(process.env.WARM_INSTANCES ?? 0) || 0
 const HOT = { region: 'asia-south1' as const, minInstances: MIN_INSTANCES }
 const WARM = { region: 'asia-south1' as const }
 import { accrueWeeklyEarning } from './payouts'
+import { accrueBoards } from './leaderboards'
 import { accrueHostStats, applyHostLevel, getHostLadder } from './hostStats'
 
 const db = admin.firestore()
@@ -123,6 +124,19 @@ function billedMinutesOf(call: Record<string, any>): number {
   return Math.ceil(index / 6)
 }
 
+/**
+ * B2c (3 Nov 2026): does this payer hold a free call card that can pay a first minute?
+ *
+ * Daily rewards have granted `videoCards` for months, and no call ever used one — the cards sat in My Bag doing
+ * nothing. One card pays the FIRST minute of a paid call: the payer is charged nothing for it, the earner is paid
+ * for it as for any minute, and Zipper bears that cost (`promoCredits/card_{callId}`). A free call (rate 0) never
+ * spends a card.
+ */
+export function hasFreeCallCard(videoCards: unknown, perMin: number): boolean {
+  const cards = Number(videoCards ?? 0)
+  return perMin > 0 && Number.isFinite(cards) && cards >= 1
+}
+
 /** How many of `wanted` whole minutes a balance covers. A free call covers all of them. */
 function affordableMinutes(balance: number, perMin: number, wanted: number): number {
   if (wanted <= 0) return 0
@@ -188,14 +202,26 @@ function chargeMinutes(
     }
     /** Settlement only: counters folded into the same day-stats write (e.g. `calls: 1`). */
     statsExtra?: { calls?: number }
+    /**
+     * B2c: how many of `minutes` a FREE CALL CARD pays for (0 or 1 — one card, the first minute). The payer is
+     * not debited for them and one card is taken from `videoCards`; the earner is paid for them exactly as for a
+     * paid minute, and Zipper bears that cost — recorded in `promoCredits/card_{callId}` for the finance reports.
+     */
+    cardMinutes?: number
   },
 ): { diamonds: number; beans: number; tickIndex: number; billedThroughMs: number } {
   const perMin = Math.max(0, Number(p.call.perMinRateDiamonds ?? 0))
   const pct = Number(p.call.receiverPct ?? 50)
   const minutes = Math.max(0, Math.floor(p.minutes))
-  const diamonds = minutes * perMin
+  const cardMinutes = perMin > 0 ? Math.max(0, Math.min(minutes, Math.floor(Number(p.cardMinutes ?? 0)))) : 0
+  // The value of every minute charged, paid ones and card ones alike: the earner is paid on all of it.
+  const grossDiamonds = minutes * perMin
+  const cardDiamonds = cardMinutes * perMin
+  // What the PAYER pays.
+  const diamonds = grossDiamonds - cardDiamonds
   // Floor, not round: never credit a bean that was not paid for.
-  const beans = Math.floor((diamonds * pct) / 100)
+  const beans = Math.floor((grossDiamonds * pct) / 100)
+  const cardBeans = Math.floor((cardDiamonds * pct) / 100)
   const tickIndex = p.minutesAlready + minutes
   const billedThroughMs = p.startedAt.toMillis() + tickIndex * MINUTE_MS
   const now = admin.firestore.FieldValue.serverTimestamp()
@@ -207,6 +233,7 @@ function chargeMinutes(
     billedThroughMs,
     diamondsCharged: inc(diamonds),
     beansCredited: inc(beans),
+    ...(cardMinutes > 0 ? { cardMinutes: inc(cardMinutes), cardDiamonds: inc(cardDiamonds) } : {}),
     ...(p.callPatch ?? {}),
   })
 
@@ -215,8 +242,27 @@ function chargeMinutes(
   const payerUid = p.payerRef.id
   const earnerUid = p.earnerRef.id
 
+  if (cardMinutes > 0) {
+    tx.set(db.collection('promoCredits').doc(`card_${p.callId}`), {
+      kind: 'free_call_card_redeemed',
+      uid: payerUid,
+      hostUid: earnerUid,
+      callId: p.callId,
+      cards: 1,
+      minutes: cardMinutes,
+      diamondValue: cardDiamonds,
+      beansCredited: cardBeans,
+      ratePerMin: perMin,
+      receiverPct: pct,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+  }
+
   if (minutes > 0) {
-    tx.update(p.payerRef, { diamonds: inc(-diamonds) })
+    tx.update(p.payerRef, {
+      diamonds: inc(-diamonds),
+      ...(cardMinutes > 0 ? { videoCards: inc(-1) } : {}),
+    })
     tx.update(p.earnerRef, {
       beans: inc(beans),
       totalBeansEarned: inc(beans),
@@ -224,6 +270,14 @@ function chargeMinutes(
     })
     // Same transaction as the credit — they must not diverge.
     accrueWeeklyEarning(tx, p.earnerRef, beans, 'call')
+    // B8: a host's call earnings count on the Top hosts board, in the same transaction.
+    if (beans > 0 && p.earnerSnap.get('isHost') === true) {
+      accrueBoards(tx, [{
+        board: 'hosts', uid: earnerUid, score: beans,
+        name: String(p.earnerSnap.get('displayName') ?? p.earnerSnap.get('name') ?? '').trim() || 'Zipper user',
+        photoUrl: String(p.earnerSnap.get('photoUrl') ?? ''),
+      }])
+    }
   }
   // Seconds, not calls: the call is counted once when it ends (`statsExtra`),
   // but the time has to accumulate as it passes, or a host watching Host Home
@@ -237,7 +291,9 @@ function chargeMinutes(
 
   // ── Ledger. The gap that loses chargebacks. ──────────────────────────────
   const totals = p.ledgerFinal?.totals ?? null
-  const ledgerWorthWriting = totals ? totals.diamonds > 0 : (diamonds > 0 || (p.ledgerFinal != null && tickIndex > 0 && perMin > 0))
+  // B2c: a card minute charges the payer nothing but pays the earner — both rows are still written.
+  const ledgerWorthWriting = totals ? totals.diamonds > 0
+    : (diamonds > 0 || cardMinutes > 0 || (p.ledgerFinal != null && tickIndex > 0 && perMin > 0))
   if (!ledgerWorthWriting) return { diamonds, beans, tickIndex, billedThroughMs }
 
   const label = p.ledgerFinal
@@ -257,6 +313,8 @@ function chargeMinutes(
     minutesBilled: tickIndex,
     ratePerMin: perMin,
     context: 'call',
+    // B2c: minutes a free call card paid for — not part of `amount`, which is what the payer paid.
+    ...(cardMinutes > 0 ? { freeCardMinutes: inc(cardMinutes), freeCardsUsed: inc(1) } : {}),
     // The call's start, every time: a merge that re-sets the same value moves
     // nothing, and the row sorts where the call began.
     timestamp: p.startedAt,
@@ -394,6 +452,21 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
         throw new HttpsError('permission-denied', 'That account is unavailable.')
       }
 
+      // B7 (3 Nov 2026): somebody hosting their own party room may switch incoming calls off while they are in it.
+      // Read here, before any write, from the room the peer's presence names.
+      const peerRoomId = String(peer.partyRoomId ?? '')
+      if (peer.isInParty === true && peerRoomId) {
+        const roomSnap = await tx.get(db.collection('partyRooms').doc(peerRoomId))
+        if (roomSnap.exists && roomSnap.get('isActive') !== false && roomSnap.get('hostUid') === peerUid
+          && roomSnap.get('ownerBlocksCalls') === true) {
+          throw new HttpsError(
+            'failed-precondition',
+            `${peer.displayName ?? peer.name ?? 'They'} is hosting a party room and is not taking calls right now.`,
+            { code: 'PEER_IN_PARTY' },
+          )
+        }
+      }
+
       const { perMin, pct, earner, payer } = rateFor(cfg, caller, peer)
 
       /*
@@ -433,7 +506,8 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
       const payerIsCaller = payer === 'caller'
       const payerUser = payerIsCaller ? caller : peer
       const balance = Number(payerUser.diamonds ?? 0)
-      if (balance < perMin) {
+      // B2c: a free call card pays the first minute, so a payer holding one may ring with an empty wallet.
+      if (balance < perMin && !hasFreeCallCard(payerUser.videoCards, perMin)) {
         throw new HttpsError(
           'failed-precondition',
           payerIsCaller
@@ -607,7 +681,9 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
       }
 
       const balance = Number(payerSnap.get('diamonds') ?? 0)
-      if (balance < perMin) {
+      // B2c: one free call card pays the first minute when the payer holds one (it is taken in `chargeMinutes`).
+      const useCard = hasFreeCallCard(payerSnap.get('videoCards'), perMin)
+      if (balance < perMin && !useCard) {
         closeUnconnected('insufficient_diamonds')
         const payerName = payerSnap.get('displayName') ?? payerSnap.get('name') ?? 'They'
         return {
@@ -627,6 +703,7 @@ export const acceptCall = onCall(HOT, async (req: CallableRequest<CallIdRequest>
         startedAt,
         minutesAlready: 0,
         minutes: 1,
+        cardMinutes: useCard ? 1 : 0,
         callPatch: {
           status:     'connected',
           startedAt,
@@ -1029,6 +1106,9 @@ async function settleAndClose(
         grossDiamonds: totalDiamonds,
         payoutBeans: totalBeans,
         platformCut: totalDiamonds - totalBeans,
+        // B2c: the part of `payoutBeans` a free call card paid for (Zipper's promotional cost, also in
+        // `promoCredits/card_{callId}`). `platformCut` stays gross − payout, as the reconciliation recomputes it.
+        promoDiamonds: Number(call.cardDiamonds ?? 0) || 0,
         callId,
         timestamp: now,
       })

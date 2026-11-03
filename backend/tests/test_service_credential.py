@@ -452,6 +452,9 @@ install(
 # not under test here and need the real `PartnerStatus`; stubbed the same way.
 install("app.services.partner_applications", module("app.services.partner_applications"))
 install("app.services.recharges", module("app.services.recharges"))
+# B9 (3 Nov 2026): the router imports the seller-business service too (tiers, trades, borrowing, profit) — not
+# under test here, and it imports pymongo; stubbed the same way.
+install("app.services.seller_business", module("app.services.seller_business"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

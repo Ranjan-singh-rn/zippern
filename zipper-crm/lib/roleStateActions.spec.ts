@@ -12,7 +12,8 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import {
-  HOST_ROLE_PERMISSION_HINT, ONLY_ROLE_HINT, UNBAN_HINT, accountActions, roleRowActions, roleRows, roleStateOf,
+  HOST_REVOKE_PERMISSION_HINT, HOST_ROLE_PERMISSION_HINT, ONLY_ROLE_HINT, PARTNER_ROLE_PERMISSION_HINT, UNBAN_HINT,
+  accountActions, roleRowActions, roleRows, roleStateOf,
   type RoleRow,
 } from './roleStateActions'
 import { BACKEND_FEATURES, NEXT_RELEASE_NOTE } from './backendFeatures'
@@ -101,11 +102,44 @@ for (const s of ['pending', 'awaiting_verification', 'suspended', 'revoked', 're
   eq('…the same for Resume', [noKycResume[0].kind, noKycResume[0].disabled], ['resume_role', true])
   eq('unknown permission → offered; the server answers', roleRowActions({ role: 'host', status: 'active' },
     { ...staff, canManageHostRole: undefined })[0].disabled, false)
+  // E2E round 2 (3 Nov 2026): Revoke Host role costs the same permission (POST /users/{uid}/revoke-host).
+  eq('without can_approve_kyc → Revoke Host role is disabled too, with its own reason',
+    [noKyc[1].kind, noKyc[1].disabled, noKyc[1].hint], ['revoke_role', true, HOST_REVOKE_PERMISSION_HINT])
+  eq('…with it, revoke follows the server as before', roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] },
+    { ...staff, canManageHostRole: true })[1].disabled, false)
 
   // A rolled-back backend: one line puts the stub back.
   const off = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] },
     { isOwner: false, features: { hostRoleSuspension: false, departmentVacancy: true } })
   eq('flag off → the disabled stub that says when', [off[0].via, off[0].disabled, off[0].hint], ['stub', true, NEXT_RELEASE_NOTE])
+}
+
+// ── E2E round 2 (3 Nov 2026): QA #41's rule on the partner role rows ─────────
+// A Support Admin (no can_approve_kyc, no can_approve_seller) was offered Suspend / Revoke on a Sub-agency
+// and a Coin Seller role; the API refused each ("…does not have the 'can_approve_kyc' or
+// 'can_approve_seller' permission…").
+{
+  const support = { ...staff, canManageHostRole: false, canManagePartnerRole: false }
+  for (const role of ['agency', 'sub_agency', 'seller'] as const) {
+    const live = roleRowActions({ role, id: `${role}-1`, status: 'approved', is_active: true, actions: ['revoke'] }, support)
+    eq(`${role}, approved, no approval permission → Suspend and Revoke shown disabled with the reason`,
+      live.map((a) => [a.kind, a.disabled, a.hint]),
+      [['suspend_role', true, PARTNER_ROLE_PERMISSION_HINT], ['revoke_role', true, PARTNER_ROLE_PERMISSION_HINT]])
+    const paused = roleRowActions({ role, id: `${role}-1`, status: 'suspended', actions: ['revoke'] }, support)
+    eq(`${role}, suspended, no approval permission → Resume and Revoke disabled`,
+      paused.map((a) => [a.kind, a.disabled]), [['resume_role', true], ['revoke_role', true]])
+  }
+  const withSeller = roleRowActions({ role: 'seller', id: 's1', status: 'approved', is_active: true, actions: ['revoke'] },
+    { ...staff, canManagePartnerRole: true })
+  eq('with either approval permission → offered as before', withSeller.map((a) => a.disabled), [false, false])
+  const onlyRole = roleRowActions({ role: 'seller', id: 's1', status: 'approved', is_active: true, actions: [] },
+    { ...staff, canManagePartnerRole: true })
+  eq('…and a single role still says why it is not revoked on its own', [onlyRole[1].disabled, onlyRole[1].hint], [true, ONLY_ROLE_HINT])
+  eq('permission not known → offered; the server answers',
+    roleRowActions({ role: 'agency', id: 'a1', status: 'approved', is_active: true, actions: ['revoke'] }, staff)
+      .map((a) => a.disabled), [false, false])
+  const hostForSupport = roleRowActions({ role: 'host', status: 'active', actions: ['revoke'] }, support)
+  eq('the Host row for the same reviewer: Suspend and Revoke disabled', hostForSupport.map((a) => a.disabled), [true, true])
 }
 
 // ── suspended → Resume role / Revoke role ────────────────────────────────────
@@ -213,6 +247,9 @@ for (const s of ['pending', 'awaiting_verification', 'suspended', 'revoked', 're
   ok('…Suspend / Resume Host role call the API', detail.includes('api.users.suspendHost(uid, why, ') && detail.includes('api.users.resumeHost(uid, why)'))
   ok('…the "next backend release" refusal is gone', !detail.includes('available after the next backend release'))
   ok('…and the KYC permission is passed to the state machine', detail.includes('canManageHostRole:'))
+  ok('…and the partner approval permission (either one) too (E2E round 2)',
+    detail.includes("const canManagePartnerRole = canApproveKyc || hasPermission(crmUser, 'can_approve_seller')")
+    && /roleRows\(roles, \{[^}]*canManagePartnerRole/.test(detail))
   const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api.ts'), 'utf8')
   ok('lib/api.ts: suspend-host and resume-host', apiSrc.includes('/suspend-host`') && apiSrc.includes('/resume-host`'))
 

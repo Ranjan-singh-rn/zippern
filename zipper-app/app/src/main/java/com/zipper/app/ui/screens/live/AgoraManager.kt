@@ -14,9 +14,31 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 object AgoraManager {
+    /**
+     * B12 (4 Nov 2026): the engine's own view of the connection, for the "Reconnecting…" / "Connection lost" chip
+     * on both sides of a live. Agora's CONNECTION_STATE_* values: 1 disconnected, 2 connecting, 3 connected,
+     * 4 reconnecting, 5 failed. Nothing listened to it before, so a dropped stream looked like a frozen one.
+     */
+    enum class Link { Idle, Connecting, Connected, Reconnecting, Failed }
+
+    private val _link = MutableStateFlow(Link.Idle)
+    val link: StateFlow<Link> = _link.asStateFlow()
+
+    /** Pure, for tests: Agora's state code → [Link]. */
+    fun linkOf(state: Int): Link = when (state) {
+        2 -> Link.Connecting
+        3 -> Link.Connected
+        4 -> Link.Reconnecting
+        5 -> Link.Failed
+        else -> Link.Idle
+    }
+
     private var engine: RtcEngine? = null
     var onUserJoined: ((Int) -> Unit)? = null
     var onUserOffline: ((Int) -> Unit)? = null
@@ -141,6 +163,8 @@ object AgoraManager {
                     override fun onUserJoined(uid: Int, elapsed: Int) { onUserJoined?.invoke(uid) }
                     override fun onUserOffline(uid: Int, reason: Int) { onUserOffline?.invoke(uid) }
                     override fun onError(err: Int) { onError?.invoke(err) }
+                    // B12: the connection chip on both sides of a live.
+                    override fun onConnectionStateChanged(state: Int, reason: Int) { _link.value = linkOf(state) }
                     override fun onAudioVolumeIndication(
                         speakers: Array<out IRtcEngineEventHandler.AudioVolumeInfo>?,
                         totalVolume: Int,
@@ -297,6 +321,7 @@ object AgoraManager {
         engine?.leaveChannel()
         joinedChannel = ""
         lastJoin = null
+        _link.value = Link.Idle
         renewJob?.cancel()
         renewJob = null
     }
@@ -451,6 +476,15 @@ object AgoraManager {
      * it down without destroying something the next screen needs.
      */
     fun stopPreview() { engine?.stopPreview() }
+
+    // ── B7: room music — a catalogue track mixed into the audio this phone publishes ──
+    /** Start playing [url] into the channel (looped). 0 on success, an Agora error code otherwise. */
+    fun startMusic(url: String): Int = engine?.startAudioMixing(url, false, -1) ?: -1
+    fun pauseMusic() { engine?.pauseAudioMixing() }
+    fun resumeMusic() { engine?.resumeAudioMixing() }
+    fun stopMusic() { engine?.stopAudioMixing() }
+    /** 0–100: how loud the music is in the room, against the voices. */
+    fun setMusicVolume(volume: Int) { engine?.adjustAudioMixingVolume(volume.coerceIn(0, 100)) }
 
     fun muteLocalAudio(mute: Boolean) { engine?.muteLocalAudioStream(mute) }
 

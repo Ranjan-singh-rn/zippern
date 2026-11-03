@@ -33,6 +33,7 @@ import {
   Search, Filter, History, AlertTriangle, UserCheck, AlertCircle,
 } from 'lucide-react'
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
+import { formatIstDate } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 // ── The one vocabulary ────────────────────────────────────────────────────────
 //
@@ -163,7 +164,7 @@ function msOf(ts: Timestamp | null | undefined): number | null {
 function formatDate(ts: Timestamp | null | undefined): string {
   const ms = msOf(ts)
   if (ms == null) return '—'
-  return new Date(ms).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+  return formatIstDate(ms) || '—'
 }
 
 interface Age { label: string; overdue: boolean; targetHours: number; known: boolean }

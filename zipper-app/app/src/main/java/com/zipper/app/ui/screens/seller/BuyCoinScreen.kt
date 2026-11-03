@@ -137,6 +137,8 @@ fun BuyCoinScreen(
     var sellerName  by remember { mutableStateOf("") }
     var sellerEmail by remember { mutableStateOf("") }
     var coinBalance by remember { mutableStateOf(0L) }
+    // B9: the seller record this login sells as (written on the purchase request for staff to match it).
+    var sellerRecordId by remember { mutableStateOf("") }
 
     // Payment credentials — loaded from Firestore. There is no fallback.
     var payConfig        by remember { mutableStateOf(PaymentConfig()) }
@@ -166,8 +168,9 @@ fun BuyCoinScreen(
             val crmSellerId = try {
                 Firebase.firestore.collection("crmUsers").document(currentUid).get().await().getString("sellerId")
             } catch (_: Exception) { null }
+            sellerRecordId = com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)
             val snap = Firebase.firestore.collection("sellers")
-                .document(com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)).get().await()
+                .document(sellerRecordId).get().await()
             sellerName  = snap.getString("displayName") ?: currentUser?.displayName ?: ""
             sellerEmail = snap.getString("email") ?: currentUser?.email ?: ""
             coinBalance = snap.getLong("coinBalance") ?: 0L
@@ -219,6 +222,9 @@ fun BuyCoinScreen(
                 Firebase.firestore.collection("coinPurchaseRequests").add(
                     mapOf(
                         "sellerUid"       to currentUid,
+                        // B9 (3 Nov 2026): the seller RECORD this purchase is for, so staff no longer have to match
+                        // an app-filed request to a seller by hand (the login uid above is what the rules check).
+                        "sellerId"        to sellerRecordId,
                         "sellerName"      to sellerName,
                         "sellerEmail"     to sellerEmail,
                         "coinsRequested"  to selectedPackage.coins,

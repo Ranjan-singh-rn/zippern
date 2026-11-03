@@ -161,7 +161,8 @@ sealed class Screen(val route: String) {
     object LiveViewer    : Screen("live_viewer/{roomId}") {
         fun createRoute(roomId: String) = "live_viewer/$roomId"
     }
-    object LiveSummary   : Screen("live_summary/{durationSeconds}/{totalBeans}/{peakViewers}/{gifterCount}") {
+    // B12: `roomId` (optional) lets the card read the server's own figures for the session.
+    object LiveSummary   : Screen("live_summary/{durationSeconds}/{totalBeans}/{peakViewers}/{gifterCount}?roomId={roomId}") {
         // The host's session earnings are BEANS. This argument was named
         // totalDiamonds and carried beans, which is how the end-of-stream card
         // came to overstate a host's earnings by 20x.
@@ -174,13 +175,14 @@ sealed class Screen(val route: String) {
         //
         // `gifterCount` is new. The card used to count the gifter rows handed to
         // it, and those arrived as an empty list, so every host was told 0.
-        fun createRoute(durationSeconds: Long, totalBeans: Long, peakViewers: Int, gifterCount: Int) =
-            "live_summary/$durationSeconds/$totalBeans/$peakViewers/$gifterCount"
+        fun createRoute(durationSeconds: Long, totalBeans: Long, peakViewers: Int, gifterCount: Int, roomId: String = "") =
+            "live_summary/$durationSeconds/$totalBeans/$peakViewers/$gifterCount?roomId=$roomId"
         val navArguments = listOf(
             navArgument("durationSeconds") { type = NavType.LongType },
             navArgument("totalBeans")      { type = NavType.LongType },
             navArgument("peakViewers")     { type = NavType.IntType  },
             navArgument("gifterCount")     { type = NavType.IntType  },
+            navArgument("roomId")          { type = NavType.StringType; defaultValue = "" },
         )
     }
 
@@ -190,8 +192,20 @@ sealed class Screen(val route: String) {
         fun createRoute(roomId: String) = "party_room/$roomId"
     }
 
-    // Games
+    // Games (B4–B6, 3 Nov 2026)
     object Games         : Screen("games")
+    object GameLobby     : Screen("game_lobby/{gameId}") {
+        fun createRoute(gameId: String) = "game_lobby/$gameId"
+    }
+    object GameMatch     : Screen("game_match/{matchId}") {
+        fun createRoute(matchId: String) = "game_match/$matchId"
+    }
+    object InstantGame   : Screen("instant_game/{gameId}") {
+        fun createRoute(gameId: String) = "instant_game/$gameId"
+    }
+
+    // Rankings (B8, 3 Nov 2026)
+    object Leaderboards  : Screen("leaderboards")
 
     // Messages
     object Messages      : Screen("messages")
@@ -207,6 +221,8 @@ sealed class Screen(val route: String) {
     object DiamondShop   : Screen("diamond_shop")
     object BeansCenter   : Screen("beans_center")
     object Settings      : Screen("settings")
+    /** B10: the account switcher (Settings → Switch account). */
+    object AccountSwitcher : Screen("account_switcher")
     object CallHistory   : Screen("call_history")
     object DiamondHistory : Screen("diamond_history")
     object Earnings      : Screen("earnings")

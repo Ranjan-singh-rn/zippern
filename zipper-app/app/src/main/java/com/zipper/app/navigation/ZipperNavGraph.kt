@@ -336,7 +336,7 @@ fun ZipperNavGraph(
          * A suspension, which is not a ban and does not bar this phone.
          *
          * `onBackToLogin` is the graph's own `signOutAndGoToLogin` — the same
-         * call "Switch account" in Settings makes. That is the entire point of
+         * call Log out and the switcher's "Add account" make. That is the entire point of
          * the screen: the device is clean, so another eligible account may be
          * signed in here, and it has to be a real sign-out rather than a bare
          * navigation or Login would find the suspended credential still in place
@@ -426,7 +426,7 @@ fun ZipperNavGraph(
                     onNavigateToUserProfile  = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
                     onNavigateToGoLive       = { navController.navigate(Screen.LiveBroadcast.route) },
                     onNavigateToWatchLive    = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
-                    onNavigateToPartyRooms   = { navController.navigate(Screen.PartyList.route) },
+                    onNavigateToPartyRoom    = { roomId -> navController.navigate(Screen.PartyRoom.createRoute(roomId)) },
                     onNavigateToMyBag        = { navController.navigate(Screen.MyBag.route) },
                     onNavigateToEarnings     = { navController.navigate(Screen.Earnings.route) },
                     onNavigateToCallHistory  = { navController.navigate(Screen.CallHistory.route) },
@@ -445,6 +445,13 @@ fun ZipperNavGraph(
                         navController.navigate(Screen.FaceVerification.createRoute(gender))
                     },
                     onNavigateToPartnerHub = { navController.navigate(Screen.PartnerHub.route) },
+                    onOpenGame = { gameId, multiplayer ->
+                        navController.navigate(
+                            if (multiplayer) Screen.GameLobby.createRoute(gameId) else Screen.InstantGame.createRoute(gameId),
+                        )
+                    },
+                    onNavigateToRankings = { navController.navigate(Screen.Leaderboards.route) },
+                    onNavigateToSwitchAccount = { navController.navigate(Screen.AccountSwitcher.route) },
                     onLogout = signOutAndGoToLogin,
                 )
             }
@@ -538,6 +545,7 @@ fun ZipperNavGraph(
                             totalBeans      = summary.totalBeans,
                             peakViewers     = summary.peakViewers,
                             gifterCount     = summary.gifterCount,
+                            roomId          = summary.roomId,
                         )
                     ) {
                         popUpTo(Screen.LiveBroadcast.route) { inclusive = true }
@@ -554,7 +562,9 @@ fun ZipperNavGraph(
             val totalBeans      = backStack.arguments?.getLong("totalBeans")      ?: 0L
             val peakViewers     = backStack.arguments?.getInt("peakViewers")      ?: 0
             val gifterCount     = backStack.arguments?.getInt("gifterCount")      ?: 0
+            val summaryRoomId   = backStack.arguments?.getString("roomId")       ?: ""
             LiveSummaryScreen(
+                roomId          = summaryRoomId,
                 durationSeconds = durationSeconds,
                 totalBeans      = totalBeans,
                 peakViewers     = peakViewers,
@@ -594,6 +604,66 @@ fun ZipperNavGraph(
                 roomId        = roomId,
                 onBack        = { navController.popBackStack() },
                 onRecharge    = { navController.navigate(Screen.DiamondShop.route) },
+                onOpenProfile = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
+                onOpenChat    = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
+            )
+        }
+
+        // ── Games (B4–B6) ─────────────────────────────────────────────────
+        composable(
+            route = Screen.GameLobby.route,
+            arguments = listOf(navArgument("gameId") { type = NavType.StringType }),
+        ) {
+            com.zipper.app.ui.screens.games.GameLobbyScreen(
+                onBack = { navController.popBackStack() },
+                onEnterMatch = { matchId -> navController.navigate(Screen.GameMatch.createRoute(matchId)) },
+                onRecharge = { navController.navigate(Screen.DiamondShop.route) },
+            )
+        }
+        composable(
+            route = Screen.GameMatch.route,
+            arguments = listOf(navArgument("matchId") { type = NavType.StringType }),
+        ) {
+            com.zipper.app.ui.screens.games.GameMatchScreen(
+                onBack = { navController.popBackStack() },
+                onOpenMatch = { matchId ->
+                    navController.navigate(Screen.GameMatch.createRoute(matchId)) {
+                        popUpTo(Screen.GameMatch.route) { inclusive = true }
+                    }
+                },
+            )
+        }
+        composable(
+            route = Screen.InstantGame.route,
+            arguments = listOf(navArgument("gameId") { type = NavType.StringType }),
+        ) {
+            com.zipper.app.ui.screens.games.InstantGameScreen(
+                onBack = { navController.popBackStack() },
+                onRecharge = { navController.navigate(Screen.DiamondShop.route) },
+            )
+        }
+
+        // ── Rankings (B8) ──────────────────────────────────────────────────
+        // B10: switch between the accounts signed in on this device (Instagram/HiClub style).
+        composable(Screen.AccountSwitcher.route) {
+            com.zipper.app.ui.screens.auth.AccountSwitcherScreen(
+                onBack = { navController.popBackStack() },
+                // Restart as the other account: Splash runs every cold-start gate, and nothing of the account just
+                // left stays on the back stack.
+                onOpenApp = {
+                    navController.navigate(Screen.Splash.route) { popUpTo(0) { inclusive = true } }
+                },
+                onToLogin = {
+                    navController.navigate(Screen.Login.route) { popUpTo(0) { inclusive = true } }
+                },
+                // The ordinary sign-out (this account stays remembered), then Login — B11's wait included.
+                onAddAccount = signOutAndGoToLogin,
+            )
+        }
+
+        composable(Screen.Leaderboards.route) {
+            com.zipper.app.ui.screens.leaderboards.LeaderboardScreen(
+                onBack = { navController.popBackStack() },
                 onOpenProfile = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
             )
         }
@@ -841,7 +911,8 @@ fun ZipperNavGraph(
                 // on Settings with the reason instead of showing them a goodbye
                 // over an account that is still there.
                 onDeleteAccount               = { authVm.deleteAccount() },
-                onSwitchAccount               = signOutAndGoToLogin,
+                // B10: the switcher — the accounts on this device, one tap each. It used to be a plain sign-out.
+                onSwitchAccount               = { navController.navigate(Screen.AccountSwitcher.route) },
                 onFeedback                    = { navController.navigate(Screen.Feedback.route) },
                 onPrivacyPolicy               = { navController.navigate(Screen.LegalDoc.createRoute("privacy_policy")) },
                 onTerms                       = { navController.navigate(Screen.LegalDoc.createRoute("terms_of_service")) },

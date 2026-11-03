@@ -21,4 +21,17 @@ object SellerRecordId {
         val linked = crmSellerId?.trim().orEmpty()
         return if (linked.isNotEmpty()) linked else uid
     }
+
+    /**
+     * B2b (3 Nov 2026): is this reseller listing the signed-in person's OWN seller account?
+     *
+     * A Coin Seller must never buy diamonds from their own stock; the server refuses it at filing and again at
+     * approval. The reseller list used to offer the seller their own listing anyway. A listing is theirs when its
+     * id is their login's linked seller record or their uid (the uid-keyed legacy record).
+     */
+    fun isOwnListing(listingId: String, uid: String, crmSellerId: String?): Boolean {
+        val id = listingId.trim()
+        if (id.isEmpty() || uid.isBlank()) return false
+        return id == uid.trim() || id == crmSellerId?.trim().orEmpty().ifEmpty { null }
+    }
 }

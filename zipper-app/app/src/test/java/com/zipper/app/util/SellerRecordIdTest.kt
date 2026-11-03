@@ -47,7 +47,28 @@ class SellerRecordIdTest {
 
     @Test fun `buy coins reads the resolved record`() {
         val buy = src("ui/screens/seller/BuyCoinScreen.kt")
-        assertTrue(buy.contains(".document(com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)).get().await()"))
+        // B9 (3 Nov 2026): the resolved record is kept in `sellerRecordId` — read from it, and written on the
+        // purchase request so staff can match it — instead of being resolved inline in the read.
+        assertTrue(buy.contains("sellerRecordId = com.zipper.app.util.SellerRecordId.resolve(currentUid, crmSellerId)"))
+        assertTrue(buy.contains(".document(sellerRecordId).get().await()"))
+        assertTrue(buy.contains("\"sellerId\"        to sellerRecordId"))
         assertFalse(buy.contains("collection(\"sellers\").document(currentUid)"))
+    }
+
+    /** B2b (3 Nov 2026): a Coin Seller is never offered their own listing to buy from. */
+    @Test fun `a listing is the seller's own by the linked record or by the uid`() {
+        assertTrue(SellerRecordId.isOwnListing("SELL_1", "u1", "SELL_1"))
+        assertTrue("the uid-keyed legacy record", SellerRecordId.isOwnListing("u1", "u1", null))
+        assertTrue(SellerRecordId.isOwnListing(" u1 ", "u1", ""))
+        assertFalse(SellerRecordId.isOwnListing("SELL_2", "u1", "SELL_1"))
+        assertFalse("nobody signed in owns nothing", SellerRecordId.isOwnListing("SELL_1", "", "SELL_1"))
+        assertFalse("an empty linked id matches nothing", SellerRecordId.isOwnListing("", "u1", ""))
+    }
+
+    @Test fun `the reseller list leaves the seller's own listing out and says so`() {
+        val list = src("ui/screens/diamond/ResellerListScreen.kt")
+        assertTrue(list.contains("SellerRecordId.isOwnListing(it.uid, me, linked)"))
+        assertTrue(list.contains("all - mine.toSet()"))
+        assertTrue(list.contains("a seller can't buy diamonds from their own stock"))
     }
 }

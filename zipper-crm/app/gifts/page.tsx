@@ -14,6 +14,7 @@ import { getEconomyConfig, type EconomyConfig } from '@/lib/economyConfig'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
 import { ref as storageRef, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { uploadContentType } from '@/lib/decorAssets'
 import { storage } from '@/lib/firebase'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -90,6 +91,7 @@ interface FormState {
   emoji: string
   imageUrl: string       // Firebase Storage URL for the gift thumbnail shown in app grid
   lottieAsset: string    // Bundled asset key (e.g. "gifts/g1_rose.json") or remote URL
+  svgaUrl: string        // B13: SVGA animation URL — preferred over Lottie when both are set
   diamondCost: string
   earningRate: string
   category: GiftType['category']
@@ -98,14 +100,14 @@ interface FormState {
 }
 
 function emptyForm(): FormState {
-  return { name: '', emoji: '🎁', imageUrl: '', lottieAsset: '', diamondCost: '', earningRate: '50', category: 'normal', sortOrder: '99', isActive: true }
+  return { name: '', emoji: '🎁', imageUrl: '', lottieAsset: '', svgaUrl: '', diamondCost: '', earningRate: '50', category: 'normal', sortOrder: '99', isActive: true }
 }
 
 function fromGift(g: GiftType, rateRanges: Record<GiftType['category'], [number, number]>): FormState {
   // For fixed-rate categories, always use the config rate (not the stale stored value)
   const rate = g.category === 'exclusive' ? g.earningRate : rateRanges[g.category][0]
   return {
-    name: g.name, emoji: g.emoji, imageUrl: g.imageUrl ?? '', lottieAsset: g.lottieAsset ?? '',
+    name: g.name, emoji: g.emoji, imageUrl: g.imageUrl ?? '', lottieAsset: g.lottieAsset ?? '', svgaUrl: g.svgaUrl ?? '',
     diamondCost: String(g.diamondCost), earningRate: String(rate), category: g.category,
     sortOrder: String(g.sortOrder), isActive: g.isActive,
   }
@@ -116,16 +118,17 @@ function fromGift(g: GiftType, rateRanges: Record<GiftType['category'], [number,
 // Fixed filenames per gift so re-uploads overwrite the old file cleanly.
 async function uploadGiftAsset(
   file: File,
-  type: 'image' | 'lottie',
+  type: 'image' | 'lottie' | 'svga',
   giftName: string,
   onProgress: (pct: number) => void,
 ): Promise<string> {
   const safeName = giftName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'gift'
   const ext      = file.name.split('.').pop()?.toLowerCase() || (type === 'lottie' ? 'json' : 'png')
-  const fileName = type === 'lottie' ? 'lottie.json' : `image.${ext}`
+  const fileName = type === 'lottie' ? 'lottie.json' : type === 'svga' ? 'animation.svga' : `image.${ext}`
   const path     = `contentAssets/gifts/${safeName}/${fileName}`
   const sRef     = storageRef(storage, path)
-  const task     = uploadBytesResumable(sRef, file)
+  const ct       = uploadContentType(file.name)  // B13: label an .svga (storage.rules admits octet-stream only for .svga)
+  const task     = ct ? uploadBytesResumable(sRef, file, { contentType: ct }) : uploadBytesResumable(sRef, file)
   await new Promise<void>((resolve, reject) =>
     task.on('state_changed',
       snap => onProgress(Math.round(snap.bytesTransferred / snap.totalBytes * 100)),
@@ -193,6 +196,22 @@ function GiftModal({
     finally { setLottieUploading(false) }
   }
 
+  // B13: an SVGA file (tools/decor builds them). 2.x files are zlib, 1.x are zip — the player reads both.
+  const [svgaUploading, setSvgaUploading] = useState(false)
+  const [svgaProgress, setSvgaProgress] = useState(0)
+  const svgaInputRef = useRef<HTMLInputElement>(null)
+  async function handleSvgaUpload(file: File) {
+    if (!file.name.toLowerCase().endsWith('.svga')) { setErr('The animation must be an .svga file.'); return }
+    if (file.size > 5 * 1024 * 1024) { setErr('That SVGA is over 5 MB — too heavy for phones. Re-export it smaller.'); return }
+    if (!form.name.trim()) { setErr('Enter a gift name before uploading.'); return }
+    setSvgaUploading(true); setSvgaProgress(0)
+    try {
+      const url = await uploadGiftAsset(file, 'svga', form.name, setSvgaProgress)
+      set('svgaUrl', url)
+    } catch (e: unknown) { setErr(e instanceof Error ? e.message : 'SVGA upload failed.') }
+    finally { setSvgaUploading(false) }
+  }
+
   // When category changes, reset earningRate to default for that category
   function handleCategoryChange(cat: GiftType['category']) {
     set('category', cat)
@@ -218,6 +237,7 @@ function GiftModal({
         name: form.name.trim(), emoji: form.emoji || '🎁',
         imageUrl: form.imageUrl.trim() || undefined,
         lottieAsset: form.lottieAsset.trim() || undefined,
+        svgaUrl: form.svgaUrl.trim() || undefined,
         diamondCost, earningRate, category: form.category,
         sortOrder: parseInt(form.sortOrder) || 99, isActive: form.isActive,
       }
@@ -378,6 +398,25 @@ function GiftModal({
                         : form.lottieAsset
                       : 'or upload .json below'}
                   </p>
+                </div>
+              </div>
+
+              {/* B13: SVGA animation — preferred over Lottie in the app when both are set */}
+              <div>
+                <label className="block text-slate-400 text-xs mb-1.5 flex items-center gap-1"><Sparkles size={11} /> SVGA Animation — plays full screen when sent (preferred over Lottie)</label>
+                <div className="flex gap-2 items-center">
+                  <button onClick={() => svgaInputRef.current?.click()} disabled={svgaUploading || !form.name.trim()}
+                    title={!form.name.trim() ? 'Enter gift name first' : undefined}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-700 border border-dashed border-slate-500 text-slate-400 hover:border-blue-400 hover:text-blue-400 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-500 text-xs transition-colors flex-shrink-0">
+                    {svgaUploading ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}
+                    {svgaUploading ? `${svgaProgress}%` : 'Upload .svga'}
+                  </button>
+                  <input ref={svgaInputRef} type="file" accept=".svga" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) handleSvgaUpload(f) }} />
+                  <p className="text-slate-500 text-[10px] truncate flex-1">{form.svgaUrl ? '✓ SVGA uploaded' : 'Optional — max 5 MB'}</p>
+                  {form.svgaUrl && (
+                    <button onClick={() => set('svgaUrl', '')} className="text-slate-600 hover:text-red-400 flex-shrink-0" title="Remove the SVGA"><X size={12} /></button>
+                  )}
                 </div>
               </div>
             </div>

@@ -134,10 +134,19 @@ describe('activateHost — Phase 1A', () => {
   })
 
   test('an UNVERIFIED email on the Auth record does not count', async () => {
+    // QA #51 changed WHAT happens to this person, not whether the address
+    // counts: the verified phone used to be refused outright (that refusal was
+    // the "Details don't match the agency record" bug); it now claims the
+    // invitation and waits. The unverified address still proves nothing — it
+    // is reported as missing, and no Host role starts.
     const phoneOnly = { phone_number: PHONE, firebase: { sign_in_provider: 'phone' } }
     records.set('U1', { phoneNumber: PHONE, email: EMAIL, emailVerified: false })
-    const e = await refusal(call({ referralCode: 'ABC123' }, 'U1', phoneOnly))
-    expect(e && e.code).toBe('permission-denied')
+    const r = await call({ referralCode: 'ABC123' }, 'U1', phoneOnly)
+    expect(r.awaitingVerification).toBe(true)
+    expect(r.missing).toEqual(['email'])
+    expect(db.read('users/U1').isHost).toBe(undefined)
+    expect(db.read('hostApplications/HA1').isActivated).toBe(false)
+    expect(db.read('hostApplications/HA1').status).toBe('awaiting_verification')
   })
 
   test('AUTH-002: a guest is refused before any lookup', async () => {

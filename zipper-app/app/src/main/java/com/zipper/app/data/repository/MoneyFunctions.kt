@@ -483,6 +483,54 @@ class MoneyFunctions @Inject constructor(
             )
         }
 
+    /**
+     * QA #55 — what `quickLoginRestriction` said about the account this device
+     * holds a quick-login key for. [outcome] is `banned`, `suspended`,
+     * `device_banned`, `other_account` (the key is another account's — nothing
+     * else is said) or `not_restricted`.
+     */
+    data class RestrictionNotice(
+        val outcome: String,
+        val uid: String,
+        val reason: String,
+        val message: String,
+        val suspendedUntilMs: Long?,
+    )
+
+    /**
+     * QA #55: Firebase refused a sign-in because the login is disabled (a ban).
+     * Ask, with this handset's key, what happened to the account just tried —
+     * [phone] / [email] are what the person signed in with. No session, no
+     * token: an answer only when the key's account IS that sign-in.
+     */
+    suspend fun quickLoginRestriction(
+        token: String,
+        challengeId: String,
+        signature: String,
+        deviceId: String,
+        phone: String,
+        email: String,
+    ): Result<RestrictionNotice> =
+        call(
+            "quickLoginRestriction",
+            mapOf(
+                "token" to token,
+                "challengeId" to challengeId,
+                "signature" to signature,
+                "deviceId" to deviceId,
+                "phone" to phone,
+                "email" to email,
+            ),
+        ) { m ->
+            RestrictionNotice(
+                outcome = m["outcome"] as? String ?: "",
+                uid = m["uid"] as? String ?: "",
+                reason = m["reason"] as? String ?: "",
+                message = m["message"] as? String ?: "",
+                suspendedUntilMs = (m["suspendedUntilMs"] as? Number)?.toLong(),
+            )
+        }
+
     data class AppealSubmission(
         /** `submitted`, or `already_pending` when one is with a reviewer. */
         val status: String,
@@ -547,6 +595,31 @@ class MoneyFunctions @Inject constructor(
             },
         ) { m ->
             (m["revoked"] as? Number)?.toInt() ?: 0
+        }
+
+    /**
+     * B10 — "Remove this account from this device", on the server too.
+     *
+     * Needs no session, because the account being removed is usually not the one signed in: the proof is the one
+     * redemption takes — the secret plus a signature from this handset's key over a fresh challenge — and all it
+     * can do is delete that one credential. True when the server had it.
+     */
+    suspend fun forgetQuickLogin(
+        token: String,
+        challengeId: String,
+        signature: String,
+        deviceId: String,
+    ): Result<Boolean> =
+        call(
+            "forgetQuickLogin",
+            mapOf(
+                "token" to token,
+                "challengeId" to challengeId,
+                "signature" to signature,
+                "deviceId" to deviceId,
+            ),
+        ) { m ->
+            m["removed"] == true
         }
 
     data class GuestClaim(

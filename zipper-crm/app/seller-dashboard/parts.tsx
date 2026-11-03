@@ -16,6 +16,7 @@
 
 import { Check } from 'lucide-react'
 import type { CardStage } from '@/lib/apiPartners'
+import { SUPPORT_EMAIL } from '@/lib/contacts'  // QA #47
 
 /** The order a purchase actually travels in. `rejected`/`failed` leave it. */
 export const STAGE_TRACK: CardStage[] = [
@@ -50,9 +51,9 @@ export const STAGE_MEANING: Record<CardStage, string> = {
   executed:
     'Done. The coins are in your inventory and appear in your statement.',
   rejected:
-    'This was rejected. The reason is on the card. No money was taken from you by this card — if you have paid, contact us with the reference.',
+    `This was rejected. The reason is on the card. No money was taken from you by this card — if you have paid, write to ${SUPPORT_EMAIL} with the reference.`,
   failed:
-    'This card could not be executed. Nothing was credited. It needs a person — contact us with the reference.',
+    `This card could not be executed. Nothing was credited. It needs a person — write to ${SUPPORT_EMAIL} with the reference.`,
 }
 
 export const STAGE_TONE: Record<CardStage, string> = {

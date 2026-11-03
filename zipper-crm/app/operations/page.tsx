@@ -20,16 +20,13 @@ import {
   Clock,
   Scale,
 } from 'lucide-react'
+import { formatIstDate } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const OPS_ROLES: CrmRole[] = ['superadmin', 'ops_admin', 'ops_member']
 
 function formatDate(ts: { seconds: number } | null): string {
   if (!ts) return '—'
-  return new Date(ts.seconds * 1000).toLocaleDateString('en-IN', {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-  })
+  return formatIstDate(ts.seconds * 1000) || '—'
 }
 
 export default function OperationsDashboardPage() {

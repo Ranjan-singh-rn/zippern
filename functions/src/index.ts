@@ -27,10 +27,11 @@ import { type CrmUserDoc, syncClaim } from './storageClaims'
 import { assertActiveSession } from './mobileSession'
 import { activeHostRefusal, refusalDetails } from './hostEligibility'
 import { rosterRowIsCurrent } from './roster'
-import { type MailIdentity, SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail } from './mail'
+import { type MailIdentity, SENDGRID_KEY_ENV, escapeHtml, mailDomain, sendNotificationMail, supportContact } from './mail'
 import { activeOwnerEmails, sendOnce } from './mailLog'
 import { isoWeekLabelUtc } from './time'
 import { deriveAgoraUid } from './agoraUid'
+import { isEmulatorLoopback } from './emulatorLoopback'
 
 const asiaFirestore = functions.region('asia-south1').firestore
 // The Firestore triggers that send email: the same region, plus the SendGrid
@@ -414,7 +415,7 @@ function readServiceConfig(
 
   if (!base) {
     problems.push(`${API_BASE_ENV} is not set, so there is no backend to call`)
-  } else if (!/^https:\/\//i.test(base)) {
+  } else if (!/^https:\/\//i.test(base) && !isEmulatorLoopback(base)) {
     problems.push(
       `${API_BASE_ENV} is '${base}', which is not an https:// URL — a service ` +
       'key is never sent over plain http'
@@ -1822,7 +1823,7 @@ export const onAgencyApproved = asiaFirestoreMail
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
         Need help? Reach us at
-        <a href="mailto:314zipper@gmail.com" style="color:#ec4899;text-decoration:none;">314zipper@gmail.com</a>
+        <a href="mailto:${escapeHtml(supportContact())}" style="color:#ec4899;text-decoration:none;">${escapeHtml(supportContact())}</a>
       </p>
     </div>
 
@@ -2241,6 +2242,16 @@ export const generateAgoraToken = functions
       refuseUnlessCurrentHost()
       role = RtcRole.PUBLISHER
     } else {
+      // B12 (4 Nov 2026): somebody the host has BLOCKED does not watch the host's live — the same as a kick,
+      // and it lasts beyond this one room.
+      const hostUid = String(roomSnap.get('hostUid') ?? '')
+      if (hostUid) {
+        const blocked = await db.collection('users').doc(hostUid).collection('blocked').doc(callerUid).get()
+        if (blocked.exists) {
+          functions.logger.info('agora: refused a viewer the host blocked', { channelName, callerUid })
+          throw new functions.https.HttpsError('permission-denied', 'You can\'t watch this live.')
+        }
+      }
       role = RtcRole.SUBSCRIBER
     }
   } else if (channelName.startsWith('party_')) {
@@ -2475,7 +2486,7 @@ export const onAgencyRegistered = asiaFirestoreMail
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
         Questions? Reach us at
-        <a href="mailto:314zipper@gmail.com" style="color:#ec4899;text-decoration:none;">314zipper@gmail.com</a>
+        <a href="mailto:${escapeHtml(supportContact())}" style="color:#ec4899;text-decoration:none;">${escapeHtml(supportContact())}</a>
       </p>
     </div>
 
@@ -2571,7 +2582,7 @@ export const onSellerRegistered = asiaFirestoreMail
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
         Questions? Reach us at
-        <a href="mailto:314zipper@gmail.com" style="color:#f59e0b;text-decoration:none;">314zipper@gmail.com</a>
+        <a href="mailto:${escapeHtml(supportContact())}" style="color:#f59e0b;text-decoration:none;">${escapeHtml(supportContact())}</a>
       </p>
     </div>
 
@@ -2686,7 +2697,7 @@ export const onSellerApproved = asiaFirestoreMail
 
       <p style="color:#64748b;font-size:13px;margin:0;line-height:1.6;">
         Need help? Reach us at
-        <a href="mailto:314zipper@gmail.com" style="color:#f59e0b;text-decoration:none;">314zipper@gmail.com</a>
+        <a href="mailto:${escapeHtml(supportContact())}" style="color:#f59e0b;text-decoration:none;">${escapeHtml(supportContact())}</a>
       </p>
     </div>
 
@@ -4727,7 +4738,32 @@ export {
   invitePartySeat, respondPartySeatInvite,
   setPartySeatMute, setPartySeatLock, setPartyAdmin,
   endPartyRoom, sweepEmptyPartyRooms,
+  partyHeartbeat, setPartyMusic,
 } from './party'
+
+// ── Games (B3/B4, 3 Nov 2026) ─────────────────────────────────────────────────
+// Server-authoritative matches and rounds; every diamond through games/ledger.ts. Every game is OFF until it is
+// switched on in `appConfig/games` (CRM → Games).
+export {
+  gameCatalog, createGameMatch, joinGameMatch, quickGameMatch, ludoAction, claimGameTimeout,
+  leaveGameMatch, sweepGameMatches, rematchGameMatch, teenPattiAction, teenPattiMyCards, carromShot,
+  snakesRoll, fourRowDrop,
+} from './games/matches'
+export {
+  playPlinko, spinSlots, castFishing, chickenStart, chickenStep, chickenCashout,
+  crashStart, crashPoll, crashCashout, gameFairness, rotateGameSeed,
+  playDice, tossCoin, spinWheel, playKeno, playLimbo, spinRoulette, playDragonTiger, playAndarBahar,
+  hiloStart, hiloGuess, hiloCashout, minesStart, minesReveal, minesCashout,
+} from './games/instant'
+
+// ── Party Pro: the private-room subscription (B7, 3 Nov 2026) ───────────────
+export {
+  privateRoomSubscriptionStatus, subscribePrivateRooms, cancelPrivateRoomSubscription, renewPrivateRoomSubscriptions,
+} from './partySubscription'
+
+// ── Leaderboards (B8, 3 Nov 2026) ─────────────────────────────────────────────
+// Scores accrue inside the gift and call transactions; rewards settle once per closed IST period.
+export { settleLeaderboards } from './leaderboards'
 
 // ── Call billing ──────────────────────────────────────────────────────────────
 // Server-clocked. The caller's device no longer decides what it owes.
@@ -4756,9 +4792,14 @@ export { convertBeans, claimDailyReward, purchaseBagItem, equipBagItem, expireCo
 // file because it authenticates the same way redemption does — a signature from
 // the device's Keystore key over a server-issued challenge — and splitting the
 // two would mean two copies of that verification, one of which would rot.
+// B10: `forgetQuickLogin` — the account switcher's "Remove", proved like a redemption.
+// B12 (4 Nov 2026): live streaming — the viewer count recounted from presence rows, the sweep that closes rooms
+// nobody closed (and ends PKs past their time), and the PK battle callables (both rooms written by the server).
+export { liveViewerCount, sweepLiveRooms, pkMatch, pkRespond, pkEnd } from './live'
+
 export {
   quickLoginChallenge, mintQuickLoginToken, redeemQuickLogin, revokeQuickLogin,
-  submitAccountAppeal,
+  submitAccountAppeal, quickLoginRestriction, forgetQuickLogin,
 } from './quickLogin'
 
 export {

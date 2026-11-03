@@ -30,6 +30,13 @@ data class MessagesUiState(
     val tickets: List<SupportTicket> = emptyList(),
     val isLoading: Boolean = true,
     val totalUnread: Int = 0,
+    /**
+     * The personal notices have arrived at least once. The first tab waits for
+     * this as well as for the chats (E2E re-run, 3 Nov 2026: the chats came
+     * first, the tab was decided with no notice counted, and Messages opened
+     * on Chats beside "Official · 4").
+     */
+    val notificationsLoaded: Boolean = false,
 ) {
     /** Unread personal notices, for the Official tab's count. */
     val unreadOfficial: Int get() = notifications.count { !it.isRead }
@@ -61,7 +68,7 @@ class MessagesViewModel @Inject constructor(
         }
         viewModelScope.launch {
             chatRepo.myNotificationsFlow(myUid).collect { notifications ->
-                _state.update { it.copy(notifications = notifications) }
+                _state.update { it.copy(notifications = notifications, notificationsLoaded = true) }
             }
         }
         viewModelScope.launch {

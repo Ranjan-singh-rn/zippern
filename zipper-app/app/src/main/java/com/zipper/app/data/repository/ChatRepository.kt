@@ -211,6 +211,7 @@ class ChatRepository @Inject constructor(
                         imageUrl     = doc.getString("imageUrl") ?: "",
                         createdAt    = doc.millis("createdAt"),
                         targetGender = doc.getString("targetGender") ?: "all",
+                        senderName   = doc.getString("senderName")?.trim().orEmpty(),
                     )
                 } ?: emptyList()
                 trySend(list)
@@ -302,6 +303,7 @@ class ChatRepository @Inject constructor(
                             ?: (meta?.get("relatedId") ?: meta?.get("ticket_id") ?: meta?.get("partner_id")
                                 ?: meta?.get("recharge_id") ?: meta?.get("id"))?.toString()
                             ?: "",
+                        reason    = doc.getString("reason")?.trim().orEmpty(),
                     )
                 } ?: emptyList()
                 trySend(list)

@@ -218,6 +218,46 @@ def _object_name(url_or_path: str) -> str:
     return url_or_path
 
 
+def _emulator_view_url(object_name: str) -> str | None:
+    """LOCAL TEST COPY ONLY — a viewing link for an object in the Storage emulator.
+
+    The emulator has no signing key and no IAM, so `generate_signed_url` cannot
+    work there and every KYC document, host face and appeal attachment showed
+    "could not be signed" in the local copy. Outside production, and only while
+    the Storage emulator is in use, this returns the object's download-token
+    link as a same-origin path (`/v0/b/...`), which the local CRM proxies to
+    the emulator (zipper-crm/next.config.js, dev + emulator only). Production
+    returns None before anything else is looked at.
+    """
+    import os
+    import uuid
+    from urllib.parse import quote
+
+    from app.config import settings
+    from app.core import isolation
+
+    if isolation.is_production(settings):
+        return None
+    if not isolation.emulator_value(settings, "STORAGE_EMULATOR_HOST", "storage_emulator_host", os.environ):
+        return None
+
+    from firebase_admin import storage as fb_storage
+
+    bucket = fb_storage.bucket()
+    blob = bucket.get_blob(object_name)
+    if blob is None:
+        return None
+    meta = dict(blob.metadata or {})
+    token = str(meta.get("firebaseStorageDownloadTokens", "") or "").split(",")[0].strip()
+    if not token:
+        # Written by an Admin SDK, which sets no token: give it one (emulator only).
+        token = str(uuid.uuid4())
+        meta["firebaseStorageDownloadTokens"] = token
+        blob.metadata = meta
+        blob.patch()
+    return f"/v0/b/{bucket.name}/o/{quote(object_name, safe='')}?alt=media&token={quote(token, safe='')}"
+
+
 def _sign(url_or_path: str) -> tuple[str | None, str]:
     """Mint a short-lived signed URL for an object in the app's bucket.
 
@@ -231,6 +271,10 @@ def _sign(url_or_path: str) -> tuple[str | None, str]:
         return None, ""
 
     try:
+        local = _emulator_view_url(_object_name(url_or_path))
+        if local:
+            return local, ""
+
         from firebase_admin import storage as fb_storage
 
         blob = fb_storage.bucket().blob(_object_name(url_or_path))

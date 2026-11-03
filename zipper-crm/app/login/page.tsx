@@ -13,9 +13,11 @@ import {
   sendCrmEmailVerification,
   CrmUser,
 } from '@/lib/auth'
+import { resetEmailProblem, resetErrorText } from '@/lib/passwordReset'
 import { useAuth } from '@/components/AuthProvider'
 import api, { ApiError, firestoreBindingOf, getSessionToken, type FirestoreBinding, type OwnerMfaEnrolment } from '@/lib/api'
 import { OWNER_MFA_UNAVAILABLE_NOTICE, mfaUnavailable } from '@/lib/mfaAvailability'
+import { CrmDoorRefusal, doorRefusalText } from '@/lib/crmDoor'
 import TotpQrCode from '@/components/TotpQrCode'
 
 /** P1-A3: wait for AuthProvider's API session exchange rather than racing it. */
@@ -47,8 +49,9 @@ export default function LoginPage() {
 
   // Set when the failure looks like someone trying to sign in here with an
   // account that has no password. The observer is the case that matters:
-  // 314zipper@gmail.com used to be a superadmin with a password and is now the
-  // read-only observer, who signs in with a one-time code instead. Typing the
+  // the Observer's address (NEXT_PUBLIC_OBSERVER_EMAIL) used to be a superadmin
+  // with a password and is now the read-only observer, who signs in with a
+  // one-time code instead. Typing the
   // old password here gets "Invalid email or password", which is true and
   // completely unhelpful — the account exists, it just does not work this way.
   const [suggestObserver, setSuggestObserver] = useState(false)
@@ -84,14 +87,17 @@ export default function LoginPage() {
 
   async function handleForgotPassword() {
     const emailTrimmed = forgotEmail.trim()
-    if (!emailTrimmed) { setForgotError('Please enter your email address.'); return }
+    // QA #46: one address, checked before sending — the box used to send a
+    // doubled address and answer with a vague error.
+    const problem = resetEmailProblem(emailTrimmed)
+    if (problem) { setForgotError(problem); return }
     setForgotError('')
     setForgotSending(true)
     try {
       await sendCrmPasswordReset(emailTrimmed)
       setForgotSent(true)
-    } catch {
-      setForgotError('Could not send reset email. Check the address and try again.')
+    } catch (err) {
+      setForgotError(resetErrorText(err))
     } finally {
       setForgotSending(false)
     }
@@ -244,8 +250,8 @@ export default function LoginPage() {
         setError(outcome.message)
       }
       // A blank refusal message is a closed popup. Say nothing.
-    } catch {
-      setError('Google sign-in failed. Try again.')
+    } catch (err: unknown) {
+      setError(err instanceof CrmDoorRefusal ? doorRefusalText(err.message) : 'Google sign-in failed. Try again.')
     } finally {
       setGoogleBusy(false)
     }
@@ -273,7 +279,9 @@ export default function LoginPage() {
       afterSignedIn(user)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : ''
-      if (isEmailNotVerified(err)) {
+      if (err instanceof CrmDoorRefusal) {
+        setLinkError(doorRefusalText(err.message))
+      } else if (isEmailNotVerified(err)) {
         // The password was right — this is not a second attempt at it. The
         // address has not been proved, so linking is refused and the way
         // forward is the button below rather than the field above. Shown in
@@ -342,8 +350,10 @@ export default function LoginPage() {
       afterSignedIn(await crmSignIn(email.trim(), password))
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Login failed.'
-      if (msg.includes('deactivated')) {
-        setError('This account has been deactivated. Contact your administrator.')
+      if (err instanceof CrmDoorRefusal) {
+        // QA #49 / #44: the door's own sentence, as it is — a rejection with
+        // its reason and "you may apply again", a suspension, a deactivation.
+        setError(doorRefusalText(err.message))
       } else if (msg.includes('CRM account not found')) {
         // The Firebase password was right — there is simply no staff record
         // behind it. That is exactly the observer's shape, so point there
@@ -645,7 +655,10 @@ export default function LoginPage() {
                     autoFocus
                     type="email"
                     value={forgotEmail}
-                    onChange={(e) => setForgotEmail(e.target.value)}
+                    // QA #46: the address carried over from the sign-in form is
+                    // selected, so typing it again replaces it instead of doubling it.
+                    onFocus={(e) => e.currentTarget.select()}
+                    onChange={(e) => { setForgotEmail(e.target.value); if (forgotError) setForgotError('') }}
                     onKeyDown={(e) => e.key === 'Enter' && handleForgotPassword()}
                     placeholder="your.email@gmail.com"
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-4 py-2.5 text-white placeholder-slate-500 text-sm focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500 transition-colors"

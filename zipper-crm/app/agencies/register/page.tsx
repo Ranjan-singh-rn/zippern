@@ -62,6 +62,7 @@ import {
   createAgencyAccount, createPartnerLoginThen, generateCrmId, canAccess,
 } from '@/lib/auth'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
+import { kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
 import {
   Upload,
   CheckCircle,
@@ -96,6 +97,7 @@ import {
 } from '@/lib/partnerDuplicates'
 import PhoneInput from '@/components/PhoneInput'
 import { useRegisteredCheck } from '@/lib/useRegisteredCheck'
+import { SUPPORT_EMAIL, mailtoHref } from '@/lib/contacts'  // QA #47: the official support address
 
 /**
  * What happened to the agency's login, kept separate from "the agency was
@@ -194,6 +196,13 @@ export default function RegisterAgencyPage() {
     setUrl: (s: string) => void,
     setFile: (f: File) => void
   ) => {
+    // QA #29: a new attempt clears the last one's error — it used to stay on
+    // the step after the retry had uploaded, so nobody could tell it was in.
+    setError('')
+    // QA #32: the Storage rules' own limits, checked first so the refusal
+    // names the real cause instead of "does not have permission".
+    const problem = kycFileProblem(file)
+    if (problem) { setError(problem); return }
     setFile(file)
     setProgress(0)
     const storageRef = ref(storage, path)
@@ -207,12 +216,13 @@ export default function RegisterAgencyPage() {
         console.error('Upload error:', err)
         setProgress(0)
         setFile(null as unknown as File)
-        setError('Upload failed: ' + (err.message ?? 'Please try again.'))
+        setError(kycUploadErrorText(err))
       },
       async () => {
         try {
           const url = await getDownloadURL(uploadTask.snapshot.ref)
           setUrl(url)
+          setError('')
         } catch (err: unknown) {
           console.error('getDownloadURL error:', err)
           setProgress(0)
@@ -1411,8 +1421,8 @@ export default function RegisterAgencyPage() {
         {step !== 4 && (
           <p className="text-center text-slate-600 text-xs mt-6">
             All data is encrypted and stored securely. For support, contact{' '}
-            <a href="mailto:314zipper@gmail.com" className="text-pink-500 hover:underline">
-              314zipper@gmail.com
+            <a href={mailtoHref(SUPPORT_EMAIL)} className="text-pink-500 hover:underline">
+              {SUPPORT_EMAIL}
             </a>
           </p>
         )}

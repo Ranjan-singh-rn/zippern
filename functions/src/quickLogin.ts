@@ -55,7 +55,7 @@ function store(): admin.firestore.Firestore {
 }
 
 /**
- * F-8: the three UNAUTHENTICATED callables in this file share one builder —
+ * F-8: the UNAUTHENTICATED callables in this file (B10 added `forgetQuickLogin`) share one builder —
  * App Check enforcement follows `ENFORCE_APP_CHECK` (off today; see
  * rateLimit.ts for the order of operations before it can be turned on), and
  * each handler takes a token from its per-device / per-IP bucket before it
@@ -251,6 +251,9 @@ export const mintQuickLoginToken = functions
     // device holds exactly one key. Done AFTER the new one lands, so a failure
     // here leaves a usable credential rather than none.
     await retireOthers(uid, deviceId, hash(secret))
+    // B10: and at most MAX_ACCOUNTS_PER_DEVICE accounts per device KEY — the
+    // account switcher's limit, enforced where the client cannot skip it.
+    await retireBeyondDeviceLimit(publicKey, hash(secret))
 
     await recordEvent('QUICK_LOGIN_CREATED', {
       uid,
@@ -317,6 +320,51 @@ async function retireOthers(uid: string, deviceId: string, keepHash: string): Pr
       .filter((d) => d.id !== keepHash)
       .map((d) => d.ref.delete().catch(() => undefined)),
   )
+}
+
+/**
+ * B10 (4 Nov 2026) — how many accounts one handset may hold a quick-login
+ * credential for: the account switcher's limit (Android `QuickLoginStore.
+ * MAX_ACCOUNTS`). Counted by the device KEY, which unlike the device id is not
+ * the client's to choose — every credential this handset holds was registered
+ * with the same public key.
+ */
+export const MAX_ACCOUNTS_PER_DEVICE = 5
+
+/**
+ * Pure — which credentials on one device key go, so that at most [limit] stay:
+ * the newest (latest `expiresAt`, i.e. most recently minted or rotated) are
+ * kept, and [keepId] — the one just minted — always is.
+ */
+export function credentialsBeyondLimit(
+  docs: Array<{ id: string; expiresAtMs: number }>,
+  keepId: string,
+  limit: number = MAX_ACCOUNTS_PER_DEVICE,
+): string[] {
+  const others = docs.filter((d) => d.id !== keepId).sort((a, b) => b.expiresAtMs - a.expiresAtMs)
+  const room = Math.max(0, limit - 1)
+  return others.slice(room).map((d) => d.id)
+}
+
+async function retireBeyondDeviceLimit(publicKey: string, keepHash: string): Promise<void> {
+  if (!publicKey) return
+  try {
+    const all = await store().collection(CREDENTIALS).where('publicKey', '==', publicKey).limit(50).get()
+    const gone = credentialsBeyondLimit(
+      all.docs.map((d) => ({
+        id: d.id,
+        expiresAtMs: (d.get('expiresAt') as { toMillis?(): number } | null)?.toMillis?.() ?? 0,
+      })),
+      keepHash,
+    )
+    await Promise.all(gone.map((id) => store().collection(CREDENTIALS).doc(id).delete().catch(() => undefined)))
+    if (gone.length > 0) {
+      await recordEvent('QUICK_LOGIN_REVOKED', { reason: 'device_account_limit', count: gone.length })
+    }
+  } catch (err) {
+    // The new credential is already written; an over-full device is tidied on the next mint.
+    functions.logger.warn('quick login device limit not applied', { err: String(err) })
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -518,6 +566,120 @@ export const redeemQuickLogin = publicCallable
     }
   })
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════════
+ *  3b. QA #55 — what happened to the account this phone holds a key for
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ * A ban switches the Firebase login off (`set_user_disabled`). Somebody banned
+ * while signed OUT who then signs in by phone is refused by Firebase itself —
+ * "The user account has been disabled by an administrator." — before any of our
+ * code can say why, and with no session nothing of ours could be asked. The
+ * reason and the appeal are personal; they are not given to anybody who merely
+ * knows a phone number.
+ *
+ * The one proof that survives a ban is this handset's quick-login key (see
+ * `submitAccountAppeal`). So the app, refused by Firebase, asks HERE with that
+ * proof — a signature over a fresh challenge — plus the phone number or e-mail
+ * it just tried. Answered only when the key's account IS that sign-in
+ * (`sameSignInIdentity`) and is restricted; everything else gets an answer that
+ * says nothing about any account. Never a session, a custom token, a rotation
+ * or a deleted credential: a read of one account's restriction, for the device
+ * that holds its key. The login stays disabled — nothing here weakens the ban.
+ */
+
+/** Pure — is the account's Auth record the phone number or e-mail just tried? */
+export function sameSignInIdentity(
+  record: { phoneNumber?: string | null; email?: string | null } | null | undefined,
+  tried: { phone?: string; email?: string },
+): boolean {
+  if (!record) return false
+  const digits = (v: unknown) => String(v ?? '').replace(/\D/g, '')
+  const phone = digits(tried.phone)
+  const email = String(tried.email ?? '').trim().toLowerCase()
+  if (phone !== '' && phone === digits(record.phoneNumber)) return true
+  if (email !== '' && email === String(record.email ?? '').trim().toLowerCase()) return true
+  return false
+}
+
+export const quickLoginRestriction = publicCallable
+  .onCall(async (data: {
+    token?: string
+    challengeId?: string
+    signature?: string
+    deviceId?: string
+    phone?: string
+    email?: string
+  }, context) => {
+    const secret = String(data?.token ?? '')
+    const challengeId = String(data?.challengeId ?? '')
+    const signature = String(data?.signature ?? '')
+    const deviceId = String(data?.deviceId ?? '').slice(0, 128)
+    const tried = { phone: String(data?.phone ?? '').slice(0, 32), email: String(data?.email ?? '').slice(0, 320) }
+    const now = Date.now()
+
+    if (secret.length < MIN_SECRET_CHARS) throw refuse('refused')
+    // F-8: the same gate and budgets as the other public quick-login calls.
+    refuseWithoutAppCheck(context, 'quickLoginRestriction')
+    await enforceRateLimit('quickLoginRestriction', { deviceId, ip: clientIpOf(context.rawRequest) }, now)
+
+    const credSnap = await store().collection(CREDENTIALS).doc(hash(secret)).get()
+    const credential = credSnap.exists ? credSnap.data() : null
+    const challenge = await consumeChallenge(challengeId, now)
+    const signatureValid =
+      challenge !== null && verifySignature(String(credential?.publicKey ?? ''), challenge, signature)
+
+    const uid = String(credential?.uid ?? '')
+    const [accountSnap, deviceBanned] = await Promise.all([
+      uid && signatureValid ? store().collection('users').doc(uid).get() : Promise.resolve(null),
+      isDeviceBanned(deviceId),
+    ])
+    const outcome = redemptionOutcome({
+      rate: null,
+      credential,
+      account: accountSnap?.exists ? accountSnap.data() : null,
+      deviceBanned,
+      signatureValid,
+      nowMs: now,
+    })
+    // No proof of the device: the same neutral refusal redemption gives.
+    if (outcome === 'refused' || outcome === 'legacy' || outcome === 'rate_limited') throw refuse(outcome)
+    // A barred handset is about the handset, whoever is holding it.
+    if (outcome === 'device_banned') {
+      return { outcome, message: messageFor(outcome) }
+    }
+
+    let record: admin.auth.UserRecord | null = null
+    try {
+      record = await admin.auth().getUser(uid)
+    } catch {
+      record = null
+    }
+    if (!sameSignInIdentity(record, tried)) {
+      await recordEvent('QUICK_LOGIN_RESTRICTION_OTHER_ACCOUNT', {
+        uid, deviceFingerprint: fingerprint(deviceId),
+      })
+      return { outcome: 'other_account' }
+    }
+    if (!isReportableState(outcome)) return { outcome: 'not_restricted' }
+
+    await recordEvent('QUICK_LOGIN_RESTRICTION_SHOWN', {
+      uid, state: outcome, deviceFingerprint: fingerprint(deviceId),
+    })
+    const banReason = String(accountSnap?.get('banReason') ?? '')
+    const until = (accountSnap?.get('suspendedUntil') as { toMillis?(): number } | null)?.toMillis?.()
+    return {
+      outcome,
+      uid,
+      displayName: String(accountSnap?.get('name') ?? ''),
+      reason: banReason,
+      suspendedUntilMs: outcome === 'suspended' && typeof until === 'number' ? until : null,
+      message: messageFor(outcome, banReason),
+      canAppeal: permitsAppeal(outcome),
+      appeal: await appealStateFor(uid),
+    }
+  })
+
 /**
  * Read and consume a challenge. Returns its value, or null if unusable.
  *
@@ -711,6 +873,57 @@ export const revokeQuickLogin = functions
       return { revoked: 1 }
     }
     return { revoked: 0 }
+  })
+
+/**
+ * B10 (4 Nov 2026) — "Remove this account from this device".
+ *
+ * The account switcher removes accounts that are NOT signed in — that is most of
+ * what it removes — so `revokeQuickLogin`, which needs the account's own
+ * session, cannot do it. The proof here is the one redemption takes: the secret
+ * and a signature over a fresh challenge from the key registered at mint. Whoever
+ * can produce that could redeem the credential and sign in, so letting them
+ * delete it instead grants nothing new.
+ *
+ * It does exactly one thing: delete that credential. No session, no custom
+ * token, no account read, no other credential. Anything unprovable — a short or
+ * unknown secret, a spent or missing challenge, a bad signature, a legacy record
+ * with no key — gets the same `{ removed: false }`, and the device forgets its
+ * copy regardless. Gated and budgeted like the other unauthenticated callables
+ * (F-8).
+ */
+export const forgetQuickLogin = publicCallable
+  .onCall(async (data: {
+    token?: string
+    challengeId?: string
+    signature?: string
+    deviceId?: string
+  }, context) => {
+    const secret = String(data?.token ?? '')
+    const challengeId = String(data?.challengeId ?? '')
+    const signature = String(data?.signature ?? '')
+    const deviceId = String(data?.deviceId ?? '').slice(0, 128)
+    const now = Date.now()
+
+    if (secret.length < MIN_SECRET_CHARS) return { removed: false }
+    refuseWithoutAppCheck(context, 'forgetQuickLogin')
+    await enforceRateLimit('forgetQuickLogin', { deviceId, ip: clientIpOf(context.rawRequest) }, now)
+
+    const credRef = store().collection(CREDENTIALS).doc(hash(secret))
+    const credSnap = await credRef.get()
+    const challenge = await consumeChallenge(challengeId, now)
+    const credential = credSnap.exists ? credSnap.data() : null
+    const proved = credential !== null && credential !== undefined && challenge !== null &&
+      verifySignature(String(credential.publicKey ?? ''), challenge, signature)
+    if (!proved) return { removed: false }
+
+    await credRef.delete()
+    await recordEvent('QUICK_LOGIN_REVOKED', {
+      uid: String(credential?.uid ?? ''),
+      reason: 'removed_from_device',
+      deviceFingerprint: fingerprint(deviceId),
+    })
+    return { removed: true }
   })
 
 // ══════════════════════════════════════════════════════════════════════════════

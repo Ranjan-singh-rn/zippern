@@ -230,6 +230,36 @@ async def revenue(
     return await _deliver(report, fmt, user)
 
 
+@router.get("/games")
+async def games(
+    since: datetime | None = _SINCE,
+    until: datetime | None = _UNTIL,
+    fmt: str = _FORMAT,
+    user: dict = Depends(require_internal),
+):
+    """B6: games money — per game diamonds in/out, platform fee, sessions, players, and the zero-difference check."""
+    _require_business_financials(user)
+    report = await _produce(svc.games_summary(since, until))
+    return await _deliver(report, fmt, user)
+
+
+@router.get("/promotions")
+async def promotions(
+    since: datetime | None = _SINCE,
+    until: datetime | None = _UNTIL,
+    fmt: str = _FORMAT,
+    rates: Rates = Depends(request_rates),
+    user: dict = Depends(require_internal),
+):
+    """B2c: daily-reward diamonds and free call cards issued, cards used on calls, and their host cost.
+
+    Business financials — the same gate as revenue: who may see what Zipper earns may see what it gives away.
+    """
+    _require_business_financials(user)
+    report = await _produce(svc.promotions_summary(since, until, rates))
+    return await _deliver(report, fmt, user)
+
+
 @router.get("/payouts")
 async def payouts(
     since: datetime | None = _SINCE,

@@ -331,10 +331,17 @@ async def start_enrolment(user: dict) -> dict:
     }
 
 
+def _lock_time(until: datetime) -> str:
+    """The clock time a locked Owner may try again, in IST (QA #54): "3:45 pm IST"."""
+    from app.core import ist  # local: pure, and keeps this module's imports as they were
+
+    return ist.clock(until)
+
+
 async def _locked(rec: dict) -> None:
     until = _aware(rec.get("locked_until"))
     if until and until > _now():
-        raise MfaError(f"Too many wrong codes. Try again after {until.strftime('%H:%M UTC')}.", 429)
+        raise MfaError(f"Too many wrong codes. Try again after {_lock_time(until)}.", 429)
 
 
 async def _fail(user: dict, rec: dict, why: str) -> None:
@@ -549,8 +556,10 @@ async def _notify(uid: str, kind: str, key: str, title: str, body: str, *, email
                     email=str(email_to["email"]), name=str(email_to.get("name", "")),
                     role=str(email_to.get("role", "")), uid=uid),
                 subject=title,
+                # QA #27: a security notice carries no figure.
                 html=email_service.page(title=title, preheader=body,
-                                        body=f'<p style="line-height:1.6">{email_service.esc(body)}</p>'),
+                                        body=f'<p style="line-height:1.6">{email_service.esc(body)}</p>',
+                                        figures=False),
                 sensitivity=email_service.Sensitivity.OPERATIONAL,
                 dedupe_key=key,
                 meta={"kind": kind},

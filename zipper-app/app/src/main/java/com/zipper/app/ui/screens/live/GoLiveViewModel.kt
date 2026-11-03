@@ -134,6 +134,19 @@ data class GoLiveUiState(
     val myUid: String = "",
     val myName: String = "",
     val myPhotoUrl: String = "",
+    // ── B12 (4 Nov 2026) ─────────────────────────────────────────────────────
+    /** Paused: camera and mic off, viewers see "back soon"; the server ends a pause past 15 minutes. */
+    val isPaused: Boolean = false,
+    /** The camera is on (the host may talk with it off; viewers see the host's photo). */
+    val isCameraOn: Boolean = true,
+    /** The pinned announcement above the chat. */
+    val pinnedMessage: String = "",
+    /** Viewers muted in the chat. */
+    val mutedViewers: Set<String> = emptySet(),
+    /** The engine's connection — the host's own "Reconnecting…" chip. */
+    val link: AgoraManager.Link = AgoraManager.Link.Idle,
+    /** A one-off line for the snackbar that is not an error — the PK verdict. */
+    val notice: String? = null,
 )
 
 @HiltViewModel
@@ -275,6 +288,7 @@ class GoLiveViewModel @Inject constructor(
                 }
                 startDurationTimer()
                 collectRoomStreams(roomId)
+                startHeartbeat(roomId)
                 listenForPKInvites(user.uid)
                 sendAutoInvitesToLikedOnlineUsers(
                     myUid = user.uid,
@@ -335,6 +349,26 @@ class GoLiveViewModel @Inject constructor(
         }
     }
 
+    /**
+     * B12: "still broadcasting", every minute — the server's sweep closes a room whose host has been silent for
+     * three. The first beat goes at once, so the sweep never mistakes a new room for an old build's.
+     */
+    private var heartbeatJob: kotlinx.coroutines.Job? = null
+    private var lastPkSeenAt = 0L
+    private var liveStartedAtMs = 0L
+    fun clearNotice() { _state.update { it.copy(notice = null) } }
+    private fun startHeartbeat(roomId: String) {
+        liveStartedAtMs = System.currentTimeMillis()
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch {
+            while (true) {
+                try { repo.hostHeartbeat(roomId) } catch (_: Exception) {}
+                delay(com.zipper.app.data.repository.LiveRepository.LIVE_HEARTBEAT_MS)
+            }
+        }
+        viewModelScope.launch { AgoraManager.link.collect { l -> _state.update { it.copy(link = l) } } }
+    }
+
     private fun startDurationTimer() {
         durationJob = viewModelScope.launch {
             while (true) {
@@ -379,7 +413,12 @@ class GoLiveViewModel @Inject constructor(
                         it.copy(
                             mutedByStaff = room.hostMuted,
                             staffMuteMessage = if (room.hostMuted) LiveModeration.mutedMessage(room.hostMuteReason) else "",
+                            // B12: the server's count and peak (recounted from presence rows).
                             viewerCount = room.viewerCount,
+                            peakViewers = maxOf(it.peakViewers, room.peakViewers),
+                            isPaused = room.isPaused,
+                            pinnedMessage = room.pinnedMessage,
+                            mutedViewers = room.mutedViewers.toSet(),
                             totalGiftsReceived = room.totalGiftsReceived,
                             totalBeansSession = room.totalBeansEarned,
                             pkState = newPkState,
@@ -396,6 +435,16 @@ class GoLiveViewModel @Inject constructor(
                     // collector waits on a network call. See [pkChannel].
                     if (room.pkActive && room.pkChannelId.isNotBlank()) joinPKChannel(room.pkChannelId)
                     else if (!room.pkActive) leavePKChannel()
+                    // B12: the PK's verdict, as the server recorded it on this room — said once.
+                    if (room.lastPkEndedAt > lastPkSeenAt) {
+                        val first = lastPkSeenAt == 0L
+                        lastPkSeenAt = room.lastPkEndedAt
+                        if (!first || room.lastPkEndedAt > liveStartedAtMs) {
+                            _state.update {
+                                it.copy(notice = LiveRoomUi.pkVerdict(it.myName, it.myUid, room.lastPkWinnerUid, room.lastPkMyScore, room.lastPkPartnerScore))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -514,6 +563,7 @@ class GoLiveViewModel @Inject constructor(
         if (s.roomId.isBlank()) return
         durationJob?.cancel()
         faceCountdownJob?.cancel()
+        heartbeatJob?.cancel()
         _state.update { it.copy(isLive = false, pkState = PKState.IDLE) }
         // Drop any PK join still in flight before leaving. A token fetch that
         // lands after the leave would put the engine straight back into
@@ -551,7 +601,88 @@ class GoLiveViewModel @Inject constructor(
         }
         val new = !_state.value.isMicOn
         _state.update { it.copy(isMicOn = new) }
-        AgoraManager.muteLocalAudio(!new)
+        // B12: a paused live stays silent until it is resumed.
+        AgoraManager.muteLocalAudio(!new || _state.value.isPaused)
+    }
+
+    // ── B12: pause, camera, pinned message ───────────────────────────────────
+
+    /** Pause (camera and mic off, viewers see "back soon") or resume (back as they were). */
+    fun togglePause() {
+        val s = _state.value
+        if (s.roomId.isBlank()) return
+        val paused = !s.isPaused
+        AgoraManager.muteLocalVideo(paused || !s.isCameraOn)
+        AgoraManager.muteLocalAudio(paused || !s.isMicOn)
+        _state.update { it.copy(isPaused = paused) }
+        viewModelScope.launch {
+            try { repo.setPaused(s.roomId, paused) } catch (e: Exception) {
+                _state.update { it.copy(error = "Couldn't ${if (paused) "pause" else "resume"}. ${e.localizedMessage ?: ""}".trim()) }
+            }
+        }
+    }
+
+    /** Camera off (still live and talking) or back on. */
+    fun toggleCamera() {
+        val s = _state.value
+        if (s.roomId.isBlank()) return
+        val on = !s.isCameraOn
+        if (!s.isPaused) AgoraManager.muteLocalVideo(!on)
+        _state.update { it.copy(isCameraOn = on) }
+        viewModelScope.launch { try { repo.setCameraOff(s.roomId, !on) } catch (_: Exception) {} }
+    }
+
+    /** Pin an announcement above the chat (blank removes it). */
+    fun setPinnedMessage(text: String) {
+        val s = _state.value
+        if (s.roomId.isBlank()) return
+        val pinned = LiveRoomUi.pinned(text)
+        viewModelScope.launch {
+            try { repo.setPinnedMessage(s.roomId, pinned) } catch (e: Exception) {
+                _state.update { it.copy(error = "Couldn't pin that. ${e.localizedMessage ?: ""}".trim()) }
+            }
+        }
+    }
+
+    // ── B12: chat moderation ─────────────────────────────────────────────────
+
+    /** Mute a viewer in the chat (they keep watching), or unmute them. */
+    fun toggleMuteViewer(targetUid: String) {
+        val s = _state.value
+        if (s.roomId.isBlank() || targetUid.isBlank()) return
+        val mute = targetUid !in s.mutedViewers
+        viewModelScope.launch {
+            try { repo.setViewerMuted(s.roomId, targetUid, mute) } catch (e: Exception) {
+                _state.update { it.copy(error = "Couldn't ${if (mute) "mute" else "unmute"} them. ${e.localizedMessage ?: ""}".trim()) }
+            }
+        }
+    }
+
+    /**
+     * Block a viewer: the ordinary block (no calls, messages — or, B12, watching any of this host's lives: the
+     * server refuses them a token) and removed from this one now.
+     */
+    fun blockViewer(targetUid: String) {
+        val s = _state.value
+        if (s.roomId.isBlank() || targetUid.isBlank()) return
+        val v = s.viewers.firstOrNull { it.uid == targetUid }
+        viewModelScope.launch {
+            when (val r = profileRepo.blockUser(targetUid, v?.name.orEmpty(), v?.photoUrl.orEmpty())) {
+                is com.zipper.app.data.repository.ProfileResult.Error -> _state.update { it.copy(error = r.message) }
+                else -> kickViewer(targetUid)
+            }
+        }
+    }
+
+    /** The host removes a comment from their room. */
+    fun deleteComment(commentId: String) {
+        val s = _state.value
+        if (s.roomId.isBlank() || commentId.isBlank()) return
+        viewModelScope.launch {
+            try { repo.deleteComment(s.roomId, commentId) } catch (e: Exception) {
+                _state.update { it.copy(error = "Couldn't delete that comment. ${e.localizedMessage ?: ""}".trim()) }
+            }
+        }
     }
 
     // ── Call protection ───────────────────────────────────────────────────────
@@ -580,8 +711,7 @@ class GoLiveViewModel @Inject constructor(
     fun kickViewer(targetUid: String) {
         val roomId = _state.value.roomId
         if (roomId.isBlank() || targetUid.isBlank()) return
-        // A second tap while the first batch is in flight would kick twice, and
-        // kickViewer decrements viewerCount each time.
+        // A second tap while the first batch is in flight would kick twice.
         if (targetUid in _state.value.kickPending) return
         val name = _state.value.viewers.firstOrNull { it.uid == targetUid }
             ?.name?.takeIf { it.isNotBlank() } ?: "that viewer"

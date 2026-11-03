@@ -35,10 +35,12 @@
  * only possible outcome is a refusal teaches the operator nothing, and pressing
  * it looks like a broken screen rather than a rule.
  *
- * That is the ONE place this file hides a control, and it is the exception to
- * the rule below rather than a change of mind about it. Every other action is
- * always offered: if the API will not allow it, it says why and that answer is
- * shown, because a greyed-out control teaches nobody anything either.
+ * The other rule that hides a control is PERMISSION (QA #41, 3 Nov 2026): a
+ * control is drawn only for somebody whose permission list holds what its
+ * route asks for (`lib/moderationAccess`) — Support no longer sees Ban,
+ * Suspend or Adjust balance only to be refused after typing a reason. The
+ * server still checks the same permission on every call; hiding grants and
+ * removes nothing. Anything else the API refuses is shown with its reason.
  *
  * ── ROLE ACTIONS COME FROM THE ROLE RECORDS (UGP-B) ─────────────────────────
  *
@@ -56,7 +58,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useAuth } from '@/components/AuthProvider'
-import { hasPermission } from '@/lib/auth'
+import { hasPermission, type Permission } from '@/lib/auth'
 import { partnerOps, roleAppeals } from '@/lib/apiPartners'
 import {
   deductionProblem, deductionSummary, heldSummary, type UserRoles,
@@ -66,6 +68,7 @@ import {
   accountActions, roleRows, type AccountAction, type RoleKind, type RoleRowAction,
 } from '@/lib/roleStateActions'
 import { roleAppealIsOpen } from '@/lib/governanceRequests'
+import { mayOffer } from '@/lib/moderationAccess'
 import { TransferRecommendation } from '@/components/TransferRecommendation'
 import { BanDetailsFields } from '@/components/BanDetailsFields'
 import {
@@ -106,6 +109,7 @@ import {
   DEFAULT_SUSPENSION, SuspendDuration, suspensionDays, suspensionProblem,
   suspensionResult, type SuspensionTerm,
 } from '@/components/SuspendDuration'
+import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const MIN_REASON = 3
 /**
@@ -468,7 +472,7 @@ function hostRoleOutcome(res: HostRoleResult, resumed: boolean): Success {
   }
   const untilRaw = res.host?.suspendedUntil ?? ''
   const until = untilRaw ? new Date(untilRaw) : null
-  const when = until && !Number.isNaN(until.getTime()) ? ` until ${until.toLocaleString('en-IN')}` : ' with no end date'
+  const when = until && !Number.isNaN(until.getTime()) ? ` until ${formatIst(until)}` : ' with no end date'
   const told = [res.notified?.host ? 'the host' : '', res.notified?.agency ? 'their agency' : ''].filter(Boolean)
   const untold = [res.notified?.host ? '' : 'the host', res.notified?.agency ? '' : 'their agency'].filter(Boolean)
   const ended = res.live_rooms_ended ?? []
@@ -493,10 +497,16 @@ export function UserActions({
   actorUid, diamonds = 0, beansAvailable = 0, onDone,
 }: Props) {
   const { crmUser, apiUser } = useAuth()
+  // QA #41: what this reviewer may be OFFERED (the server checks again).
+  const can = (permission: string) => hasPermission(crmUser, permission as Permission)
   const canAdjustBalance = hasPermission(crmUser, 'can_adjust_balance')
+  const canBan = hasPermission(crmUser, 'can_ban_users')
   // Suspending, resuming and revoking a Host cost `can_approve_kyc` on the
   // server. Offered to whoever holds it; the server decides either way.
   const canApproveKyc = hasPermission(crmUser, 'can_approve_kyc')
+  // Suspending, resuming and revoking an Agency, Sub-agency or Coin Seller role
+  // cost either approval permission (`partner_ops._APPROVE_PARTNER`) — E2E round 2.
+  const canManagePartnerRole = canApproveKyc || hasPermission(crmUser, 'can_approve_seller')
   // GOV C2: restoring a REVOKED role is the Owner's decision (403 otherwise).
   const isOwner = apiUser?.role === 'owner'
   const [pending, setPending] = useState<ActionSpec | null>(null)
@@ -571,7 +581,9 @@ export function UserActions({
   }, [uid])
   useEffect(() => { void loadRoles() }, [loadRoles])
   // Spec §10: one row per role, each with its own state and its own actions.
-  const roleRowsList = roleRows(roles, { isOwner, openReinstatement, canManageHostRole: canApproveKyc })
+  const roleRowsList = roleRows(roles, {
+    isOwner, openReinstatement, canManageHostRole: canApproveKyc, canManagePartnerRole,
+  })
   const allowedDeduction = (roles?.deduction_currencies ?? []).filter(
     (c): c is UserCurrency => c === 'diamonds' || c === 'beans',
   )
@@ -617,13 +629,14 @@ export function UserActions({
   // governs the whole set, which is what the old `internal ? []` did and
   // what the list now does for self as well.
   const account = accountActions(subject, { actorUid, isOwner, openAppealId })
+    .filter((a) => mayOffer(a.kind, can))
   const accountByKey = new Map<string, AccountAction>(account.map((a) => [a.kind, a]))
   const visible = !isOrdinaryTarget(subject, actorUid)
     ? []
     : ACTIONS.filter((spec) => (
       POLICY_KEYS.has(spec.key)
         ? accountByKey.has(spec.key)
-        : !spec.states || spec.states.includes(restriction)
+        : (!spec.states || spec.states.includes(restriction)) && mayOffer(spec.key, can)
     ))
   const reviewAppeal = accountByKey.get('review_appeal')
 
@@ -996,6 +1009,7 @@ export function UserActions({
       {/* The one thing an operator most needs to know before choosing, and the
           one the old copy got wrong: these two restrictions differ in what they
           do to the HANDSET, not in how severe they sound. */}
+      {canBan && (
       <div className="flex items-start gap-2 bg-slate-950/60 border border-slate-800 rounded-lg px-4 py-3">
         <Smartphone size={15} className="text-slate-400 mt-0.5 shrink-0" />
         <p className="text-slate-300 text-sm">
@@ -1006,6 +1020,7 @@ export function UserActions({
           the difference between the two, and it is what the choice is about.
         </p>
       </div>
+      )}
 
       {deleting && (
         <div className="flex items-start gap-2 bg-slate-950/60 border border-slate-800 rounded-lg px-4 py-3">
@@ -1030,7 +1045,9 @@ export function UserActions({
       )}
 
       {/* Money is never a direct write, and the person pressing the button
-          should know that before they press it, not after. */}
+          should know that before they press it, not after. Only shown to
+          somebody who is offered the button (QA #41). */}
+      {canAdjustBalance && (
       <div className="flex items-start gap-2 bg-blue-500/5 border border-blue-500/25 rounded-lg px-4 py-3">
         <Coins size={15} className="text-blue-300 mt-0.5 shrink-0" />
         <p className="text-blue-100/90 text-sm">
@@ -1042,6 +1059,7 @@ export function UserActions({
           .
         </p>
       </div>
+      )}
 
       {internal && (
         <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 mb-3">
@@ -1132,7 +1150,7 @@ export function UserActions({
                         {r.row.role === 'host' && r.state === 'suspended' && (
                           <p className="text-yellow-200/80 text-xs mt-1">
                             {r.row.suspended_until
-                              ? `Until ${new Date(r.row.suspended_until).toLocaleString('en-IN')} — lifts itself`
+                              ? `Until ${formatIst(r.row.suspended_until)} — lifts itself`
                               : 'Until somebody resumes it'}
                             {r.row.suspension_reason ? ` · ${r.row.suspension_reason}` : ''}
                           </p>

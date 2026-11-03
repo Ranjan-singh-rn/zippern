@@ -64,7 +64,7 @@ def report(settings=None, mail=None) -> list[str]:
     for env_name, attr, mailbox in SWITCHES:
         on = bool(getattr(settings, attr, False))
         add(f"  {env_name:<34} = {'true ' if on else 'false'}"
-            f"  → {mailbox} {'leaves as itself' if on else 'falls back to no-reply@ (default; Q8 open)'}")
+            f"  → {mailbox} {'leaves as itself — NOT allowed by the owner decision of 3 Nov 2026' if on else 'falls back to no-reply@ (required: automated mail never leaves from info@/support@)'}")
     add(f"  {'SendGrid API key':<34} = {'set' if str(getattr(settings, 'sendgrid_api_key', '') or '').strip() else 'NOT set'}")
     add(f"  {'EMAIL_PROVIDER':<34} = {str(getattr(settings, 'email_provider', '') or 'sendgrid')}")
     add("")
@@ -90,6 +90,17 @@ def report(settings=None, mail=None) -> list[str]:
         if domain and domain not in mail.PUBLIC_MAILBOX_DOMAINS:
             domains.setdefault(domain, address)
         add(f"  once switched on, {label} would leave as: {_shown(mail, address)}")
+    add("")
+
+    # QA #47 (owner decision, 3 Nov 2026): the two CONTACT addresses people are
+    # told to write to. They never send automated mail.
+    from app.core import contacts
+
+    add("── Contacts shown to people (QA #47 — never senders of automated mail) ──")
+    add(f"  {'CONTACT_SUPPORT_EMAIL':<34} = {contacts.support_email()}")
+    add(f"  {'CONTACT_INFO_EMAIL':<34} = {contacts.info_email()}")
+    add(f"  {'List-Unsubscribe mailto':<34} = {mail.unsubscribe_mailbox()}")
+    add(f"  These must RECEIVE mail: check  dig +short MX {contacts.official_domain()}  (empty = they bounce).")
     add("")
 
     add("── Templates (Reply-To is never set; auth/security are never tracked) ──")
@@ -121,15 +132,15 @@ def report(settings=None, mail=None) -> list[str]:
         add(f"         TXT    mail.{domain}  \"v=spf1 include:sendgrid.net ~all\"")
         add(f"       check: dig +short TXT mail.{domain}   (and dig +short TXT {domain})")
         add("    4. DMARC — start at p=none with reports; tighten only after clean reports:")
-        add(f"         TXT    _dmarc.{domain}  \"v=DMARC1; p=none; rua=mailto:dmarc@{domain}; fo=1; adkim=r; aspf=r\"")
-        add(f"       check: dig +short TXT _dmarc.{domain}   (dmarc@{domain} must be a mailbox someone reads)")
+        add(f"         TXT    _dmarc.{domain}  \"v=DMARC1; p=none; rua=mailto:<a mailbox you read>; fo=1; adkim=r; aspf=r\"")
+        add(f"       check: dig +short TXT _dmarc.{domain}   (report to an existing mailbox — do not invent one)")
         add("    5. Then click Verify in SendGrid and send one test message to a mailbox you own;")
         add("       its headers must show spf=pass, dkim=pass (d=" + domain + ") and dmarc=pass.")
     add("")
-    add("── Before switching info@ / support@ on (owner question Q8) ──")
-    add("  * Confirm the mailbox exists (mailbox, alias or forwarder) and that someone reads it.")
-    add("  * Set the switch on the backend (Cloud Run env) AND the Functions env, together.")
-    add("  * No Reply-To is ever added: replies go to the From, so only switch on a mailbox that is read.")
+    add("── info@ / support@ as senders: keep both switches OFF (owner decision, 3 Nov 2026) ──")
+    add("  * Automated mail must not appear to come from info@ or support@ — it leaves from no-reply@.")
+    add("  * info@ and support@ are contacts: make sure both mailboxes exist and someone reads them.")
+    add("  * No Reply-To is ever added; emails tell people to WRITE to support@ instead of replying.")
     return out
 
 

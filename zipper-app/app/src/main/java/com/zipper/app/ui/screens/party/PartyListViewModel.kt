@@ -6,6 +6,7 @@ import com.zipper.app.data.model.PartyRoom
 import com.zipper.app.data.model.User
 import com.zipper.app.data.repository.PartyRepository
 import com.zipper.app.data.repository.ProfileRepository
+import com.zipper.app.util.PartyHeartbeatPolicy
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -55,7 +56,13 @@ data class PartyListUiState(
     /** Set once when a room has been opened, so the screen can navigate into it. */
     val createdRoomId: String? = null,
     val error: String? = null,
+    /** B7: Party Pro — what a private room needs (level 7 and an unexpired subscription), as the server says. */
+    val pro: PartyRepository.ProStatus? = null,
+    val subscribing: Boolean = false,
 ) {
+    /** Whether the create sheet may open a private room now (the server checks again; this only decides the UI). */
+    val privateAllowed: Boolean get() = pro == null || !pro.enabled || !pro.required || pro.active
+
     /**
      * The rooms to draw.
      *
@@ -63,8 +70,12 @@ data class PartyListUiState(
      * every active room and filter here because no composite index existed, which
      * also meant the list could not exclude private rooms and had no usable sort.
      * Both are the server's job now.
+     *
+     * B2a: except a room nobody is in (no one seated, no one in the lobby) — the server closes it on its next
+     * sweep, within a minute, and opening it in the meantime would land on an empty room about to shut.
      */
-    val visibleRooms: List<PartyRoom> get() = rooms
+    val visibleRooms: List<PartyRoom>
+        get() = rooms.filterNot { PartyHeartbeatPolicy.isClosing(it.occupantCount, it.listenerCount) }
 
     /**
      * Whether to offer the "Start a room" button at all.
@@ -104,6 +115,7 @@ class PartyListViewModel @Inject constructor(
     private var roomsJob: Job? = null
 
     init {
+        refreshPro()
         subscribeRooms(_state.value.mode)
         viewModelScope.launch {
             profileRepo.currentUserFlow().collect { user ->
@@ -209,8 +221,46 @@ class PartyListViewModel @Inject constructor(
             )) {
                 is PartyRepository.Result.Ok ->
                     _state.update { it.copy(creating = false, createdRoomId = res.value.roomId) }
-                is PartyRepository.Result.Failed ->
+                is PartyRepository.Result.Failed -> {
                     _state.update { it.copy(creating = false, error = res.userMessage) }
+                    // The server's own answer on Party Pro wins over what the sheet last knew.
+                    if (res.detail == "PRIVATE_ROOM_SUBSCRIPTION_REQUIRED") refreshPro()
+                }
+            }
+        }
+    }
+
+    // ── Party Pro (B7) ───────────────────────────────────────────────────────
+
+    private var proKey: String? = null
+
+    fun refreshPro() {
+        viewModelScope.launch {
+            (repo.proStatus() as? PartyRepository.Result.Ok)?.let { r -> _state.update { it.copy(pro = r.value) } }
+        }
+    }
+
+    /** The server takes the diamonds and extends Party Pro; one key per tap, kept for that tap's retries. */
+    fun subscribePro() {
+        if (_state.value.subscribing) return
+        val key = proKey ?: java.util.UUID.randomUUID().toString().also { proKey = it }
+        _state.update { it.copy(subscribing = true, error = null) }
+        viewModelScope.launch {
+            when (val r = repo.subscribePro(key)) {
+                is PartyRepository.Result.Ok -> { proKey = null; _state.update { it.copy(subscribing = false) }; refreshPro() }
+                is PartyRepository.Result.Failed -> {
+                    if (r.code != "unavailable") proKey = null
+                    _state.update { it.copy(subscribing = false, error = r.userMessage) }
+                }
+            }
+        }
+    }
+
+    fun cancelProRenewal() {
+        viewModelScope.launch {
+            when (val r = repo.cancelPro()) {
+                is PartyRepository.Result.Ok -> refreshPro()
+                is PartyRepository.Result.Failed -> _state.update { it.copy(error = r.userMessage) }
             }
         }
     }

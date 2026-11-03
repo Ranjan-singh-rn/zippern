@@ -28,6 +28,14 @@ data class ActivationRequirement(
     val emailUnproved: Boolean,
     /** The server's sentence, when it sent one. */
     val message: String = "",
+    /**
+     * E2E round 2 (3 Nov 2026, QA #51): both contacts ARE verified, and the
+     * server's check still did not start a waiting role — it sent its reason
+     * (`started[].refusal`, e.g. "Your agency invited you with another email
+     * address (q•••@example.com). Verify that address…"). The line said "Your
+     * role is starting." for ever instead. "" when nothing was refused.
+     */
+    val notStarted: String = "",
 ) {
     /** The note shown before applying, or "" when nothing is missing. */
     val beforeApplying: String
@@ -38,6 +46,7 @@ data class ActivationRequirement(
     /** The line under a role that is approved and waiting. */
     val waitingLine: String
         get() = when {
+            complete && notStarted.isNotBlank() -> notStarted
             complete -> "Both contacts are verified. Your role is starting."
             missing.isEmpty() ->
                 "Approved — it starts once both your phone number and your email address are verified."

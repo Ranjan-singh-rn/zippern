@@ -37,6 +37,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -104,6 +106,9 @@ fun GoLiveScreen(
     var showEnd by remember { mutableStateOf(false) }
     var showViewers by remember { mutableStateOf(false) }
     var showShare by remember { mutableStateOf(false) }
+    // B12: the pin editor and a comment the host is about to delete.
+    var showPin by remember { mutableStateOf(false) }
+    var commentToDelete by remember { mutableStateOf<LiveComment?>(null) }
 
     // ── PIP ────────────────────────────────────────────────────────────────
     var isInPip by remember { mutableStateOf(false) }
@@ -155,6 +160,8 @@ fun GoLiveScreen(
         }
     }
     LaunchedEffect(state.error) { state.error?.takeIf { it.isNotBlank() }?.let { snackbar.showSnackbar(it); viewModel.clearError() } }
+    // B12: the PK verdict and other one-off lines.
+    LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); viewModel.clearNotice() } }
     /*
      * Put the camera down on the way out.
      *
@@ -230,9 +237,29 @@ fun GoLiveScreen(
                 Row(Modifier.padding(horizontal = Space.md), horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
                     // The presence list, not room.viewerCount — the badge and
                     // the sheet it opens must not disagree.
-                    Box(Modifier.clickableNoRipple { showViewers = true }) { GlassChip(Icons.Default.People, "${compactCount(state.viewers.size.toLong())} watching") }
+                    Box(Modifier.clickableNoRipple { showViewers = true }) { GlassChip(Icons.Default.People, "${compactCount(maxOf(state.viewers.size, state.viewerCount).toLong())} watching") }
                     GlassChip(Icons.Default.CardGiftcard, compactCount(state.totalGiftsReceived))
                     if (state.callProtectionEnabled) Chip("Calls off", tint = c.tintGoldSubtle, contentColor = c.brandVip)
+                    // B12: what the viewers see right now.
+                    if (state.isPaused) Chip("Paused", tint = c.tintDangerSubtle, contentColor = c.statusWarning)
+                    if (!state.isCameraOn && !state.isPaused) Chip("Camera off", tint = c.tintDangerSubtle, contentColor = c.statusWarning)
+                }
+                // B12: the host's own connection, from the engine.
+                when (state.link) {
+                    AgoraManager.Link.Reconnecting -> Chip(LiveRoomUi.RECONNECTING, tint = c.tintBrandMedium, contentColor = c.textPrimary, modifier = Modifier.padding(horizontal = Space.md))
+                    AgoraManager.Link.Failed -> Chip(LiveRoomUi.CONNECTION_LOST, tint = c.tintDangerSubtle, contentColor = c.statusDanger, modifier = Modifier.padding(horizontal = Space.md))
+                    else -> Unit
+                }
+                if (state.pinnedMessage.isNotBlank()) {
+                    Row(
+                        Modifier.padding(horizontal = Space.md).fillMaxWidth(0.8f)
+                            .background(c.scrimMedium, RoundedCornerShape(Radius.md)).border(1.dp, c.glassMid, RoundedCornerShape(Radius.md))
+                            .clickableNoRipple { showPin = true }.padding(horizontal = Space.md, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm),
+                    ) {
+                        Icon(Icons.Default.PushPin, null, tint = c.brandVip, modifier = Modifier.size(14.dp))
+                        Text(state.pinnedMessage, style = ZipperTheme.type.bodyS, color = c.textPrimary, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    }
                 }
             }
 
@@ -254,6 +281,10 @@ fun GoLiveScreen(
                 Rail(Icons.Default.Share, "Share") { showShare = true }
                 Rail(if (state.isMicOn) Icons.Default.Mic else Icons.Default.MicOff, if (state.isMicOn) "Mute" else "Unmute", tint = if (state.isMicOn) c.textPrimary else c.statusWarning, onClick = viewModel::toggleMic)
                 Rail(Icons.Default.FlipCameraAndroid, "Flip") { AgoraManager.switchCamera() }
+                // B12: camera off / on, pause / resume, and the pinned message.
+                Rail(if (state.isCameraOn) Icons.Default.Videocam else Icons.Default.VideocamOff, if (state.isCameraOn) "Camera" else "Cam off", tint = if (state.isCameraOn) c.textPrimary else c.statusWarning, onClick = viewModel::toggleCamera)
+                Rail(if (state.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause, if (state.isPaused) "Resume" else "Pause", tint = if (state.isPaused) c.statusWarning else c.textPrimary, onClick = viewModel::togglePause)
+                Rail(Icons.Default.PushPin, "Pin") { showPin = true }
                 Rail(if (state.callProtectionEnabled) Icons.Default.PhoneDisabled else Icons.Default.Phone, if (state.callProtectionEnabled) "Calls off" else "Calls on", tint = if (state.callProtectionEnabled) c.brandVip else c.textPrimary, onClick = viewModel::toggleCallProtection)
                 Rail(Icons.Default.PictureInPicture, "PIP") {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity?.enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(9, 16)).build())
@@ -267,7 +298,12 @@ fun GoLiveScreen(
             ) {
                 state.recentGifts.firstOrNull()?.let { g -> GiftEventPill(g.senderName, g.giftName, g.quantity, null) }
                 LazyColumn(state = listState, modifier = Modifier.fillMaxWidth(0.78f).heightIn(max = 150.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    items(state.comments, key = { it.id }) { HostCommentPill(it) }
+                    // B12: a long press on a comment offers to delete it.
+                    items(state.comments, key = { it.id }) { cm ->
+                        Box(Modifier.pointerInput(cm.id) { detectTapGestures(onLongPress = { if (!cm.isJoin) commentToDelete = cm }) }) {
+                            HostCommentPill(cm)
+                        }
+                    }
                 }
                 Row(
                     Modifier.fillMaxWidth().height(44.dp).background(c.scrimMedium, CircleShape).border(1.dp, c.glassMid, CircleShape).padding(start = 16.dp, end = 12.dp),
@@ -314,10 +350,45 @@ fun GoLiveScreen(
     }
     if (state.pkState == PKState.WAITING) PKSearchingDialog(onCancel = viewModel::cancelPKSearch)
     if (state.pkState == PKState.INVITED) state.pkInvite?.let { PKMatchFoundDialog(invite = it, myUid = state.myUid, onAccept = viewModel::acceptPKInvite, onReject = viewModel::rejectPKInvite) }
+    // B12: the pinned message editor.
+    if (showPin) {
+        var draft by remember { mutableStateOf(state.pinnedMessage) }
+        AlertDialog(
+            onDismissRequest = { showPin = false }, containerColor = c.bgElevated,
+            title = { Text("Pinned message", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(Space.xs)) {
+                    OutlinedTextField(
+                        value = draft, onValueChange = { draft = it.take(LiveRoomUi.PINNED_MAX) },
+                        placeholder = { Text("e.g. PK at 9 pm — top gifter gets a shout-out!") },
+                        maxLines = 4,
+                    )
+                    Text("${draft.length}/${LiveRoomUi.PINNED_MAX}", style = ZipperTheme.type.caption, color = c.textMuted)
+                }
+            },
+            confirmButton = { TextButton({ showPin = false; viewModel.setPinnedMessage(draft) }) { Text("Pin", color = c.textBrand) } },
+            dismissButton = {
+                TextButton({ showPin = false; viewModel.setPinnedMessage("") }) { Text(if (state.pinnedMessage.isBlank()) "Cancel" else "Remove pin", color = c.textSecondary) }
+            },
+        )
+    }
+    // B12: delete a viewer's comment (asked first).
+    commentToDelete?.let { cm ->
+        AlertDialog(
+            onDismissRequest = { commentToDelete = null }, containerColor = c.bgElevated,
+            title = { Text("Delete this comment?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text("${cm.name}: ${cm.message}", style = ZipperTheme.type.bodyM, color = c.textSecondary, maxLines = 4) },
+            confirmButton = { TextButton({ commentToDelete = null; viewModel.deleteComment(cm.id) }) { Text("Delete", color = c.statusDanger) } },
+            dismissButton = { TextButton({ commentToDelete = null }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
     if (showViewers) ViewerManagementSheet(
         viewers = state.viewers,
         leaderboard = state.giftLeaderboard,
         kickPending = state.kickPending,
+        mutedViewers = state.mutedViewers,
+        onToggleMute = viewModel::toggleMuteViewer,
+        onBlock = viewModel::blockViewer,
         onKick = viewModel::kickViewer,
         onOpenProfile = { uid -> showViewers = false; onOpenProfile(uid) },
         onDismiss = { showViewers = false },
@@ -418,6 +489,10 @@ private fun ViewerManagementSheet(
     viewers: List<ViewerPresence>,
     leaderboard: List<GiftLeaderboardEntry>,
     kickPending: Set<String>,
+    /** B12: viewers muted in the chat, and the mute / block actions. */
+    mutedViewers: Set<String> = emptySet(),
+    onToggleMute: (String) -> Unit = {},
+    onBlock: (String) -> Unit = {},
     onKick: (String) -> Unit,
     onOpenProfile: (String) -> Unit = {},
     onDismiss: () -> Unit,
@@ -433,6 +508,7 @@ private fun ViewerManagementSheet(
      * with no dialog and nothing to undo it.
      */
     var confirmKick by remember { mutableStateOf<ViewerPresence?>(null) }
+    var confirmBlock by remember { mutableStateOf<ViewerPresence?>(null) }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = c.bgElevated, dragHandle = null, shape = RoundedCornerShape(topStart = Radius.xl, topEnd = Radius.xl)) {
         Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(bottom = Space.md)) {
             Box(Modifier.padding(top = 6.dp).size(36.dp, 4.dp).background(c.borderDefault, CircleShape).align(Alignment.CenterHorizontally))
@@ -454,6 +530,19 @@ private fun ViewerManagementSheet(
                             Avatar(v.photoUrl, size = AvatarSize.MD, initial = v.name)
                             Text(v.name, style = ZipperTheme.type.labelM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (v.level > 0) LevelChip(v.level)
+                            // B12: mute in chat (they keep watching) — a tap toggles it.
+                            val muted = v.uid in mutedViewers
+                            Icon(
+                                if (muted) Icons.Default.CommentsDisabled else Icons.Default.Comment,
+                                if (muted) "Unmute ${v.name} in chat" else "Mute ${v.name} in chat",
+                                tint = if (muted) c.statusWarning else c.textSecondary,
+                                modifier = Modifier.size(22.dp).clickableNoRipple { onToggleMute(v.uid) },
+                            )
+                            // B12: block — confirmed in the dialog below, like Remove.
+                            Icon(
+                                Icons.Default.Block, "Block ${v.name}", tint = c.statusDanger,
+                                modifier = Modifier.size(22.dp).clickableNoRipple { confirmBlock = v },
+                            )
                             // Spinner while the batch is in flight: the row only
                             // disappears once the viewers snapshot comes back, and
                             // until it does a failed kick and a slow one looked
@@ -498,6 +587,23 @@ private fun ViewerManagementSheet(
             },
             confirmButton = { TextButton({ onKick(target.uid); confirmKick = null }) { Text("Remove", color = c.statusDanger) } },
             dismissButton = { TextButton({ confirmKick = null }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
+    // B12: block — removed now, and kept out of every future live (the server refuses them a token), calls and
+    // messages too. Undone from Settings → Blocked users.
+    confirmBlock?.let { target ->
+        val name = target.name.ifBlank { "this viewer" }
+        AlertDialog(
+            onDismissRequest = { confirmBlock = null }, containerColor = c.bgElevated,
+            title = { Text("Block $name?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = {
+                Text(
+                    "They'll be removed now and can't watch your lives, call or message you. Unblock any time in Settings → Blocked users.",
+                    style = ZipperTheme.type.bodyM, color = c.textSecondary,
+                )
+            },
+            confirmButton = { TextButton({ onBlock(target.uid); confirmBlock = null }) { Text("Block", color = c.statusDanger) } },
+            dismissButton = { TextButton({ confirmBlock = null }) { Text("Cancel", color = c.textSecondary) } },
         )
     }
 }

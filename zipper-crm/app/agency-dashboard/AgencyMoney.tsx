@@ -393,7 +393,7 @@ export function AgencyMoney({
           loading={false}
           failure={rosterFailure}
           value={rosterFailure ? undefined : roster.length.toLocaleString('en-IN')}
-          hint="Hosts who have redeemed their code and are linked to you. Invitations not yet redeemed are in the Hosts table above."
+          hint="Hosts who have redeemed their code and are linked to you. Invitations not yet redeemed are in the Hosts table below."
           tone="text-slate-200"
         />
       </div>

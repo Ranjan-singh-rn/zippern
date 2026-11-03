@@ -37,6 +37,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.zipper.app.data.model.PartyRoom
 import com.zipper.app.ui.components.*
+import com.zipper.app.data.repository.PartyRepository
 // The glass chip lives with Live Browse, which is where it was drawn. Importing
 // it beats a second copy that drifts from the first.
 import com.zipper.app.ui.screens.live.GlassChip
@@ -76,11 +77,47 @@ import kotlinx.coroutines.launch
  * describes.
  */
 
+/**
+ * The standalone "Party Rooms" screen (route `party_list`).
+ *
+ * Since 3 Nov 2026 the everyday way in is the **Party** tab of the Live tab
+ * (LiveBrowseScreen), which hosts [PartyRoomsPane] directly. This route stays
+ * so an old link or notification that opens it still lands somewhere useful.
+ */
 @Composable
 fun PartyListScreen(
     onBack: () -> Unit = {},
     onOpenRoom: (String) -> Unit = {},
     viewModel: PartyListViewModel = hiltViewModel(),
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    ZipperScreen(
+        topBar = {
+            TopBar(
+                title = "Party Rooms",
+                onBack = onBack,
+                actions = {
+                    // What THIS tab can see, not a global figure: the query is
+                    // one mode, capped at 60, and private rooms are not in it.
+                    GlassChip(Icons.Outlined.People, "${compactCount(state.visibleRooms.size.toLong())} open")
+                },
+            )
+        },
+    ) { _ ->
+        PartyRoomsPane(onOpenRoom = onOpenRoom, viewModel = viewModel)
+    }
+}
+
+/**
+ * Party rooms: the Audio / Video switch, the room list, "Start Party" and the
+ * private-room lookup — everything except a top bar, so the Live tab's
+ * **Party** page and the standalone [PartyListScreen] draw the same thing.
+ */
+@Composable
+fun PartyRoomsPane(
+    onOpenRoom: (String) -> Unit,
+    viewModel: PartyListViewModel,
+    modifier: Modifier = Modifier,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val c = ZipperTheme.colors
@@ -120,56 +157,47 @@ fun PartyListScreen(
     }
 
     val rooms = state.visibleRooms
-    val onStartRoom: (() -> Unit)? = if (state.canCreateRoom) ({ showCreate = true }) else null
 
-    ZipperScreen(
-        topBar = {
-            Column {
-                TopBar(
-                    title = "Party Rooms",
-                    onBack = onBack,
-                    actions = {
-                        // What THIS tab can see, not a global figure: the query is
-                        // one mode, capped at 60, and private rooms are not in it.
-                        GlassChip(Icons.Outlined.People, "${compactCount(rooms.size.toLong())} open")
-                        IconButtonCircle(
-                            Icons.Outlined.Lock,
-                            "Open a private room",
-                            { showOpenById = true },
-                            background = Color.Transparent,
-                        )
-                    },
-                )
-                Row(
-                    Modifier.fillMaxWidth().padding(start = Space.md, end = Space.md, bottom = Space.sm),
-                    horizontalArrangement = Arrangement.spacedBy(Space.sm),
-                ) {
-                    ModePill("Audio", Icons.Default.Mic, state.mode == PartyRoom.MODE_AUDIO) {
-                        viewModel.selectMode(PartyRoom.MODE_AUDIO)
-                    }
-                    ModePill("Video", Icons.Default.Videocam, state.mode == PartyRoom.MODE_VIDEO) {
-                        viewModel.selectMode(PartyRoom.MODE_VIDEO)
-                    }
-                }
-                HairlineDivider()
+    Column(modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = Space.md, end = Space.sm, top = Space.sm, bottom = Space.sm),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Space.sm),
+        ) {
+            ModePill("Audio", Icons.Default.Mic, state.mode == PartyRoom.MODE_AUDIO) {
+                viewModel.selectMode(PartyRoom.MODE_AUDIO)
             }
-        },
-    ) { _ ->
+            ModePill("Video", Icons.Default.Videocam, state.mode == PartyRoom.MODE_VIDEO) {
+                viewModel.selectMode(PartyRoom.MODE_VIDEO)
+            }
+            Spacer(Modifier.weight(1f))
+            IconButtonCircle(
+                Icons.Outlined.Lock,
+                "Open a private room",
+                { showOpenById = true },
+                background = Color.Transparent,
+            )
+        }
+        HairlineDivider()
+
         Box(Modifier.fillMaxSize()) {
             when {
                 state.isLoading -> LoadingState()
                 rooms.isEmpty() -> EmptyState(
                     icon = Icons.Outlined.Groups,
-                    title = if (state.mode == PartyRoom.MODE_AUDIO) "No audio rooms open" else "No video rooms open",
+                    title = if (state.mode == PartyRoom.MODE_AUDIO) "No audio parties right now" else "No video parties right now",
                     body = if (state.canCreateRoom) {
-                        "Open one and people will find you here — a room with one person in it fills up fast. " +
-                            "Private rooms are never listed: if somebody sent you a room's id, use the lock above."
+                        "Start one and people will find you here — a party with one person in it fills up fast. " +
+                            "Private parties are never listed: if somebody sent you a room's id, use the lock above."
                     } else {
-                        "Check the other tab, or look again in a few minutes. Rooms open all day. " +
-                            "Private rooms are never listed — for one of those you need its id."
+                        "Check the other tab, or look again in a few minutes. Parties start all day. " +
+                            "Private parties are never listed — for one of those you need its id."
                     },
-                    actionLabel = if (state.canCreateRoom) "Start a room" else null,
-                    onAction = onStartRoom,
+                    // No button here: whoever may start a party already has the
+                    // floating "Start Party" below, and two identical buttons on
+                    // one empty screen only compete with each other.
+                    actionLabel = null,
+                    onAction = null,
                 )
                 else -> LazyColumn(
                     Modifier.fillMaxSize(),
@@ -202,7 +230,7 @@ fun PartyListScreen(
                     horizontalArrangement = Arrangement.spacedBy(Space.sm),
                 ) {
                     Icon(Icons.Outlined.Groups, null, tint = Color.White, modifier = Modifier.size(Size.Icon.md))
-                    Text("Start a room", style = ZipperTheme.type.labelL, color = Color.White)
+                    Text("Start Party", style = ZipperTheme.type.labelL, color = Color.White)
                 }
             }
 
@@ -482,6 +510,12 @@ private fun CreateRoomSheet(
                     error = false,
                     onCode = viewModel::setDraftPassword,
                 ) { }
+                PartyProCard(
+                    pro = state.pro,
+                    subscribing = state.subscribing,
+                    onSubscribe = viewModel::subscribePro,
+                    onCancelRenewal = viewModel::cancelProRenewal,
+                )
             } else {
                 FormHint(
                     "Anybody browsing the ${if (draft.mode == PartyRoom.MODE_AUDIO) "audio" else "video"} tab " +
@@ -797,4 +831,52 @@ private fun FormField(
 private fun defaultRoomTitle(name: String?): String {
     val first = name?.trim()?.split(' ', '\t', '\n')?.firstOrNull { it.isNotBlank() }.orEmpty()
     return if (first.isEmpty()) "Your room" else "${first}'s room"
+}
+
+
+/**
+ * B7: Party Pro, in the create sheet when "Private" is chosen. A private room is a paid feature — level 7 and an
+ * unexpired subscription, paid in diamonds and taken by the server (functions/src/partySubscription.ts). This card
+ * only says where the player stands; the server decides.
+ */
+@Composable
+private fun PartyProCard(
+    pro: PartyRepository.ProStatus?,
+    subscribing: Boolean,
+    onSubscribe: () -> Unit,
+    onCancelRenewal: () -> Unit,
+) {
+    val c = ZipperTheme.colors
+    if (pro == null || !pro.enabled || !pro.required) return
+    val until = if (pro.expiresAtMs > 0) java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.ENGLISH).format(java.util.Date(pro.expiresAtMs)) else ""
+    Column(
+        Modifier.fillMaxWidth().background(c.tintGoldSubtle, RoundedCornerShape(Radius.md)).padding(Space.md),
+        verticalArrangement = Arrangement.spacedBy(Space.xs),
+    ) {
+        Text("Party Pro", style = ZipperTheme.type.labelL, color = c.textPrimary)
+        when {
+            pro.active -> {
+                Text(
+                    if (pro.autoRenew) "Active until $until · renews from your diamonds" else "Active until $until · renewal off",
+                    style = ZipperTheme.type.bodyS, color = c.textSecondary,
+                )
+                if (pro.autoRenew) ZipperButton("Turn off renewal", onCancelRenewal, size = ButtonSize.Small, style = ButtonStyle.Ghost)
+            }
+            !pro.eligible -> Text(
+                "Private rooms unlock at level ${pro.minLevel}. You are level ${pro.level}.",
+                style = ZipperTheme.type.bodyS, color = c.textSecondary,
+            )
+            else -> {
+                Text(
+                    "Private rooms with a PIN, for ${pro.days} days: ◆ ${pro.priceDiamonds} (₹${pro.priceInr.toLong()}).",
+                    style = ZipperTheme.type.bodyS, color = c.textSecondary,
+                )
+                ZipperButton(
+                    if (pro.diamonds >= pro.priceDiamonds) "Subscribe" else "Not enough diamonds",
+                    onSubscribe, size = ButtonSize.Medium, gradient = true, loading = subscribing,
+                    enabled = !subscribing && pro.diamonds >= pro.priceDiamonds,
+                )
+            }
+        }
+    }
 }

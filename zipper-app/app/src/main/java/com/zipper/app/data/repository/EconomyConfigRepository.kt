@@ -1,12 +1,16 @@
 package com.zipper.app.data.repository
 
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import com.zipper.app.util.EconomyEngine
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -47,6 +51,7 @@ import javax.inject.Singleton
 @Singleton
 class EconomyConfigRepository @Inject constructor(
     private val firestore: FirebaseFirestore,
+    private val auth: FirebaseAuth,
 ) {
 
     data class GiftRates(
@@ -309,7 +314,28 @@ class EconomyConfigRepository @Inject constructor(
      * The listener is detached when the collector stops, so it costs nothing
      * while no price is on screen.
      */
-    fun observe(): Flow<EconomyConfig> = callbackFlow {
+    /*
+     * Only while somebody is signed in. `appConfig/economy` is readable by
+     * signed-in users only, and MainActivity's activity-scoped ProfileViewModel
+     * starts collecting this before anyone has signed in: the listener was
+     * refused (PERMISSION_DENIED in every cold start's log) and a Firestore
+     * listener that has failed never fires again, so that collector sat on the
+     * fallback values for the rest of the process. The listener is now attached
+     * when a user is signed in, and re-attached after every sign-in.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun observe(): Flow<EconomyConfig> = signedIn().flatMapLatest { signedIn ->
+        if (signedIn) snapshots() else flowOf(cached ?: fallback())
+    }.distinctUntilChanged()
+
+    private fun signedIn(): Flow<Boolean> = callbackFlow {
+        // An AuthStateListener is called once on registration with the current state.
+        val listener = FirebaseAuth.AuthStateListener { trySend(it.currentUser != null) }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }.distinctUntilChanged()
+
+    private fun snapshots(): Flow<EconomyConfig> = callbackFlow {
         // Emit immediately from cache or fallback so the UI never renders empty
         // while the first snapshot is in flight.
         trySend(cached ?: fallback())
@@ -326,7 +352,7 @@ class EconomyConfigRepository @Inject constructor(
                 trySend(parsed)
             }
         awaitClose { reg.remove() }
-    }.distinctUntilChanged()
+    }
 
     private suspend fun fetch(): EconomyConfig = try {
         val doc = firestore.collection("appConfig").document("economy").get().await()

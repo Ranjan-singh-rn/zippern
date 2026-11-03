@@ -221,10 +221,41 @@ class SessionViewModel @Inject constructor(
     /** A-9: the cut-off sign-out, once per signed-in stretch — the snapshot keeps firing while we tear down. */
     private var cutoffHandled = false
 
+    /**
+     * QA #31: whoever Firebase last said was signed in, so the listener below
+     * can see a session END rather than merely be told there is none.
+     */
+    private var lastAuthUid: String? = FirebaseAuth.getInstance().currentUser?.uid
+
+    /**
+     * QA #31 — FIREBASE ENDED THE SESSION ON ITS OWN.
+     *
+     * The account was disabled or deleted, its refresh tokens were revoked, or
+     * a major account change expired them: the SDK sets `currentUser` to null
+     * and calls this. Nothing used to listen, so the person stayed in the main
+     * shell with every read refused — 0 diamonds, empty lists, no message.
+     *
+     * Only while a signed-in screen is being watched (`watchingUid`), and only
+     * when the app did not just sign out itself (`AuthLoss`): then the same
+     * path as every other forced sign-out — teardown, then Login, which says
+     * "Your session has expired. Please sign in again." A banned account that
+     * signs in again from there gets the Banned screen (QA #55).
+     */
+    private val authListener = FirebaseAuth.AuthStateListener { fa ->
+        val now = fa.currentUser?.uid
+        val was = lastAuthUid
+        lastAuthUid = now
+        if (watchingUid != null && com.zipper.app.util.AuthLoss.isUnexpected(was, now)) {
+            stopWatching()
+            viewModelScope.launch { _events.emit(SessionEvent.SignedOut(ForcedSignOut.SESSION_EXPIRED)) }
+        }
+    }
+
     init {
         viewModelScope.launch {
             ServerRefusals.events.collect { kind -> onServerRefusal(kind) }
         }
+        FirebaseAuth.getInstance().addAuthStateListener(authListener)
     }
 
     /**
@@ -498,6 +529,7 @@ class SessionViewModel @Inject constructor(
              */
             if (FirebaseAuth.getInstance().currentUser?.uid == startedUid) {
                 try { sessionManager.clear() } catch (_: Exception) {}
+                com.zipper.app.util.AuthLoss.expect()   // QA #31: the app's own sign-out
                 FirebaseAuth.getInstance().signOut()
             }
         }
@@ -527,6 +559,7 @@ class SessionViewModel @Inject constructor(
 
     override fun onCleared() {
         stopWatching()
+        FirebaseAuth.getInstance().removeAuthStateListener(authListener)
         super.onCleared()
     }
 }

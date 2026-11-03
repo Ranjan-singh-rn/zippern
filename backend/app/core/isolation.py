@@ -119,6 +119,39 @@ def host_of(value: str) -> str:
     return v  # bare host, or a bare IPv6 literal
 
 
+#: The Android emulator's name for the machine it runs on (its host's 127.0.0.1).
+ANDROID_EMULATOR_HOST_ALIAS = "10.0.2.2"
+
+
+def is_local_emulator_media_url(settings: Any, url: str, environ: Mapping[str, str] | None = None) -> bool:
+    """True for a Storage EMULATOR download link — never in production.
+
+    In production an uploaded file's link is `https://firebasestorage…`. Under
+    the local test copy the Firebase SDK returns the emulator's own
+    `http://<host>:9199/v0/b/<bucket>/o/<object>`, which the https-only checks
+    on submitted documents refused ("Upload all three identity documents.").
+    Accepted only when ALL hold: not production; the Storage emulator is
+    configured; scheme http; host this machine or the Android emulator's alias
+    for it; a Firebase Storage object path.
+    """
+    if is_production(settings):
+        return False
+    env = os.environ if environ is None else environ
+    if not emulator_value(settings, "STORAGE_EMULATOR_HOST", "storage_emulator_host", env):
+        return False
+    try:
+        parts = urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and (is_loopback_host(host) or host == ANDROID_EMULATOR_HOST_ALIAS)
+        and parts.path.startswith("/v0/b/")
+        and "/o/" in parts.path
+    )
+
+
 def mongo_hosts(uri: str) -> tuple[str, list[str]]:
     """(scheme, hosts) of a MongoDB connection string.
 

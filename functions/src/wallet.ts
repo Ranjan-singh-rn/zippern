@@ -344,14 +344,40 @@ export const claimDailyReward = functions
       tx.update(userRef, updates)
 
       tx.set(claimRef, { day: streak, diamonds, videoCards, claimedAt: now })
-      tx.set(userRef.collection('diamondTransactions').doc(), {
+      // B2c: a deterministic id — one claim per IST day is already enforced by `dailyClaims/{today}` — so the
+      // promotion record below and this history row name each other and a reconciliation can pair them.
+      const historyId = `daily_${today}`
+      tx.set(userRef.collection('diamondTransactions').doc(historyId), {
         type: 'credit',
         amount: diamonds,
         balanceAfter: Number(userSnap.get('diamonds') ?? 0) + diamonds,
         reason: 'daily_reward',
         reasonLabel: `Daily reward — day ${streak}`,
         context: 'reward',
+        // Promotional, not purchased: never revenue, always a liability until spent.
+        funding: 'promotional',
+        ...(videoCards > 0 ? { videoCards } : {}),
         timestamp: now,
+      })
+      /*
+       * B2c (3 Nov 2026): the CRM-visible record of what this claim gave away.
+       *
+       * Daily rewards used to land only in this user's own wallet and history, and nothing the CRM reports read
+       * ever saw them — so the free diamonds and free-call cards Zipper hands out every day were missing from
+       * every finance figure ("daily rewards are not updating CRM numbers"). `promoCredits` is a top-level,
+       * server-only collection the reports scan by `createdAt` (backend `reports.promotions_summary`), one
+       * document per grant with a deterministic id, written in the same transaction as the credit.
+       */
+      tx.set(db.collection('promoCredits').doc(`daily_${uid}_${today}`), {
+        kind: 'daily_reward',
+        uid,
+        dateKey: today,
+        day: streak,
+        diamonds,
+        videoCards,
+        historyRow: `users/${uid}/diamondTransactions/${historyId}`,
+        source: 'claimDailyReward',
+        createdAt: now,
       })
 
       return { day: streak, diamonds, videoCards }

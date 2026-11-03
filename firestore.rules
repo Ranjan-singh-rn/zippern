@@ -117,6 +117,43 @@ rules_version = '2';
 //      LUCKY_GIFTS_DISABLED + the CRM page's Owner-only toggle (Tech saves
 //      merge without `enabled`).
 //
+// ── E. Track B (3 Nov 2026) ──────────────────────────────────────────────────
+//   E1 gameMatches/{matchId}: read by any signed-in account (lobby, spectators);
+//      write `if false` (functions/src/games, Admin SDK). gameMatches/{id}/
+//      private/{doc} (seed, invite code): deny-all.             needs: none.
+//   E2 users/{uid}/gameHistory/{matchId}: the owner, Finance and admins read;
+//      write `if false`.                                         needs: none.
+//   E3 gameLedger, gameIdempotency, promoCredits: deny-all, stated (the CRM
+//      reads through the API).                                   needs: none.
+//   E4 appConfig/games (every game's switch, entries, fee): Owner-only write,
+//      the whole document. Read as every other appConfig document.
+//                                    needs: the CRM Games page (Owner).
+//   E5 partyRooms/{roomId}/admitted/{uid} (who a private room let in): no rule
+//      — the catch-all denies; written by joinPartyRoom (Admin SDK). needs: none.
+//   E7 partyRooms/{roomId}/accessLog: the room's owner and staff read; no
+//      writes. pinMisses: deny-all. partySubscriptions/{uid}: the holder and
+//      staff read; no writes. subscriptionPayments, subscriptionIdempotency:
+//      deny-all. appConfig/partySubscription: Owner-only write.
+//                                    needs: Functions joinPartyRoom (B7),
+//                                    subscribePrivateRooms & co.
+//   E6 leaderboards/{board_period_key} and its entries/{uid}: read by any
+//      signed-in account; written only by settleGift / call billing (Admin
+//      SDK). leaderboardSettlements: Owner and Finance read; no writes.
+//      appConfig/leaderboards (reward tiers): Owner-only write.
+//                                    needs: Functions settleLeaderboards.
+//   E8 (B12, 4 Nov 2026) liveRooms: created live, empty and unpaid; the host
+//      may change only `hostLiveFields()` (no totals, peak, server marks or PK
+//      fields but `pkWaiting`; heartbeat/pause marks = request.time; pinned
+//      ≤ 140; an ended room stays ended); viewers move `viewerCount` by ±1 and
+//      `likeCount` by +1 only. comments: the writer's own uid, 1–300 chars,
+//      not muted (`mutedViewers`) or blocked by the host; the host may delete.
+//      viewers/{uid}: not blocked by the host. pkInvites: no client writes.
+//                                    needs: Functions liveViewerCount,
+//                                    sweepLiveRooms, pkMatch/pkRespond/pkEnd,
+//                                    settleGift (B12) + the B12 app (heart-
+//                                    beat, PK via callables, no client PK
+//                                    score, no client viewerCount increments).
+//
 // ── Indexes (firestore.indexes.json, additive; never accept a deletion) ─────
 //   staffRoster(role, isActive) — needed by C1. The Owner work hub (APK ≥ 20)
 //   needs salaryRequests / hostApplications / supportTickets / techTickets
@@ -2545,6 +2582,11 @@ service cloud.firestore {
         allow read:   if isOwner(uid) || isStaff();
         allow create, update, delete: if isStaff();
       }
+      // B4 (3 Nov 2026): the player's own game results. Written by the game functions at settlement.
+      match /gameHistory/{matchId} {
+        allow read:  if isOwner(uid) || isFinance() || isAdmin();
+        allow write: if false;
+      }
       match /diamondTransactions/{txId} {
         // This is the dispute record — the row a payment gateway is shown when
         // a user claims they never spent a recharge. It was client-creatable
@@ -3375,10 +3417,13 @@ service cloud.firestore {
     // ══════════════════════════════════════════════════════════════════════════
     // PK INVITES / LIVE ROOMS
     // ══════════════════════════════════════════════════════════════════════════
+    // B12 (4 Nov 2026): PK invites are created, accepted, declined and ended by Cloud Functions only
+    // (`pkMatch` / `pkRespond` / `pkEnd` / the live sweep in functions/src/live.ts), because each step also
+    // writes BOTH hosts' rooms — which no phone may do. A participant reads them; nobody writes them directly.
     match /pkInvites/{inviteId} {
       allow read:   if request.auth != null;
-      allow create: if isAppUser() && request.auth.uid in request.resource.data.participants;
-      allow update: if (isAppUser() && request.auth.uid in resource.data.participants) || isAdmin();
+      allow create: if false;
+      allow update: if isAdmin();
       allow delete: if isAdmin();
     }
 
@@ -3422,7 +3467,41 @@ service cloud.firestore {
       }
 
       allow read:   if request.auth != null;
-      allow create: if mayGoLive() && request.resource.data.hostUid == request.auth.uid;
+      // B12: a room is born live, empty and unpaid — the server owns every count and total from there.
+      allow create: if mayGoLive() && request.resource.data.hostUid == request.auth.uid
+                    && request.resource.data.isActive == true
+                    && request.resource.data.get('viewerCount', 0) == 0
+                    && request.resource.data.get('totalBeansEarned', 0) == 0
+                    && request.resource.data.get('totalGiftsReceived', 0) == 0
+                    && request.resource.data.get('pkActive', false) == false;
+
+      /*
+       * B12 (4 Nov 2026): what the HOST may change on their own room — and nothing the server owns. Money
+       * totals (`totalGiftsReceived`, `totalBeansEarned`), the peak, the server's start mark and duration, the
+       * end reason and every PK field but `pkWaiting` are written by Cloud Functions only (live.ts, gifts.ts,
+       * profiles.ts). `isLiveHost()` used to allow any field, so a host's app could rewrite its own totals, its
+       * PK score, or its `hostUid`. `viewerCount` moves only by one (the kick of an older build decrements it;
+       * the server recounts from the presence rows anyway). The heartbeat and the pause mark are the server's
+       * clock, so the sweep cannot be cheated by a date in the future.
+       */
+      function hostLiveFields() {
+        return ['isActive', 'endedAt', 'durationSeconds', 'title', 'category', 'welcomeMessage',
+                'pinnedMessage', 'isPaused', 'pausedAt', 'isCameraOff', 'mutedViewers', 'kickedViewers',
+                'pkWaiting', 'hostHeartbeatAt', 'viewerCount'];
+      }
+      function liveCounterStep(field) {
+        return (request.resource.data.get(field, 0) - resource.data.get(field, 0)) in [1, -1];
+      }
+      function hostLiveWriteOk() {
+        return liveChanged().hasOnly(hostLiveFields())
+            && !(resource.data.get('isActive', false) == false && request.resource.data.get('isActive', false) == true)
+            && (!('pinnedMessage' in liveChanged())
+                || (request.resource.data.pinnedMessage is string
+                    && request.resource.data.pinnedMessage.size() <= 140))
+            && (!('viewerCount' in liveChanged()) || liveCounterStep('viewerCount'))
+            && (!('hostHeartbeatAt' in liveChanged()) || request.resource.data.hostHeartbeatAt == request.time)
+            && (!('pausedAt' in liveChanged()) || request.resource.data.pausedAt == request.time);
+      }
 
       // Who may CHANGE a live room.
       //
@@ -3434,8 +3513,13 @@ service cloud.firestore {
       // A viewer legitimately writes exactly two counters, and nothing else.
       // Everything that decides money, identity or moderation belongs to the
       // host or to the server.
-      allow update: if isLiveHost()
-                    || (isAppUser() && liveChanged().hasOnly(['viewerCount', 'likeCount']))
+      //
+      // B12: and a viewer's "two counters" move by one each — a like adds one, a join or leave of an older build
+      // moves the count by one (the server recounts it from the presence rows; see functions/src/live.ts).
+      allow update: if (isLiveHost() && hostLiveWriteOk())
+                    || (isAppUser() && liveChanged().hasOnly(['viewerCount']) && liveCounterStep('viewerCount'))
+                    || (isAppUser() && liveChanged().hasOnly(['likeCount'])
+                        && request.resource.data.likeCount == resource.data.get('likeCount', 0) + 1)
                     || isOps();
       allow delete: if isLiveHost() || isOps();
 
@@ -3453,10 +3537,28 @@ service cloud.firestore {
                    .data.get('kickedViewers', []));
       }
 
+      // B12 (4 Nov 2026): a comment is the writer's own (the `uid` on it is theirs — it was anybody's, so one
+      // account could post as another), says something, and not too much; a viewer the host MUTED or BLOCKED
+      // does not post; and the host may delete any comment in their own room.
+      function liveRoomDoc() {
+        return get(/databases/$(database)/documents/liveRooms/$(roomId)).data;
+      }
+      function notMutedInLive() {
+        return !(request.auth.uid in liveRoomDoc().get('mutedViewers', []));
+      }
+      function notBlockedByLiveHost() {
+        return !exists(/databases/$(database)/documents/users/$(liveRoomDoc().hostUid)/blocked/$(request.auth.uid));
+      }
       match /comments/{commentId} {
         allow read:           if request.auth != null;
-        allow create:         if isActiveAppUser() && notKickedFromLive();
-        allow update, delete: if isOps() || isAdmin();
+        allow create:         if isActiveAppUser() && notKickedFromLive() && notMutedInLive() && notBlockedByLiveHost()
+                              && request.resource.data.uid == request.auth.uid
+                              && request.resource.data.message is string
+                              && request.resource.data.message.size() > 0
+                              && request.resource.data.message.size() <= 300;
+        allow update:         if isOps() || isAdmin();
+        allow delete:         if isOps() || isAdmin()
+                              || (isAppUser() && liveRoomDoc().hostUid == request.auth.uid);
       }
       match /gifts/{giftId} {
         allow read:           if request.auth != null;
@@ -3469,9 +3571,11 @@ service cloud.firestore {
       }
       match /viewers/{uid} {
         allow read:           if request.auth != null;
+        // B12: and not somebody the host blocked (no token either — generateAgoraToken).
         allow create, update: if isActiveAppUser()
                               && request.auth.uid == uid
-                              && notKickedFromLive();
+                              && notKickedFromLive()
+                              && notBlockedByLiveHost();
         allow delete: if (isAppUser()
                           && (request.auth.uid == uid
                               || request.auth.uid == get(
@@ -3675,6 +3779,16 @@ service cloud.firestore {
       // Deny-all is already the catch-all's answer; this block only states it
       // where a reader of the room rules will look.
       match /private/{docId} {
+        allow read, write: if false;
+      }
+      // B7 (3 Nov 2026): who came in, who was turned away, who was locked out, and every official entry — for the
+      // room's owner and Zipper staff. Written only by joinPartyRoom (Admin SDK).
+      match /accessLog/{logId} {
+        allow read: if isRoomHost() || isStaff();
+        allow write: if false;
+      }
+      // A guesser's misses for this room (the lockout). Server-only.
+      match /pinMisses/{uid} {
         allow read, write: if false;
       }
     }
@@ -4064,10 +4178,21 @@ service cloud.firestore {
       // removed), a create may not carry it, and a delete — which would drop a
       // switch that is on — is the Owner's. Split by method for that alone;
       // every other appConfig document is allowed exactly as before.
+      //
+      // Track B (3 Nov 2026): `games` — every game's on/off switch, entry amounts and platform fee — is the
+      // Owner's alone, like the lucky-gift switch: the whole document, because its switches are nested per game.
+      // B8: `leaderboards` — the reward tiers paid out when a ranking period closes — is money, so the Owner's too.
+      // B8 / B7: `leaderboards` (ranking rewards) and `partySubscription` (Party Pro's price, level and period) are
+      // money too — the Owner's alone, like `games`. Listed once, here, and kept apart from the bank account's arm
+      // so that arm reads exactly as it always has.
+      function ownerOnlyConfig() {
+        return docId in ['games', 'leaderboards', 'partySubscription'];
+      }
       function appConfigWriter() {
         return docId != 'androidUpdate'
             && ((docId == 'paymentCredentials' && isSuperAdmin())
-                || (docId != 'paymentCredentials' && (isTech() || isSuperAdmin())));
+                || (ownerOnlyConfig() && isSuperAdmin())
+                || (docId != 'paymentCredentials' && !ownerOnlyConfig() && (isTech() || isSuperAdmin())));
       }
       allow create: if appConfigWriter()
                     && (docId != 'luckyGifts' || isSuperAdmin()
@@ -4549,6 +4674,80 @@ service cloud.firestore {
     // Replay guard for settleGift. Server-only, and never read by a client.
     match /giftIdempotency/{claimId} {
       allow read, write: if false;
+    }
+
+    // ── Games (B3/B4, 3 Nov 2026) ─────────────────────────────────────────────
+    //
+    // A match is public to signed-in accounts — the lobby lists open ones and anyone may watch a game — and holds
+    // nothing secret: the seed and a private match's invite code live in `private/meta`, which no client reads.
+    // Every write is a game function (Admin SDK); a client never moves a token, a die or a diamond itself.
+    match /gameMatches/{matchId} {
+      allow read:  if request.auth != null;
+      allow write: if false;
+      match /private/{docId} {
+        allow read, write: if false;
+      }
+    }
+    // The business ledger of every game movement and the replay guard: server-only (the CRM reads through the API).
+    match /gameLedger/{rowId} {
+      allow read, write: if false;
+    }
+    match /gameIdempotency/{claimId} {
+      allow read, write: if false;
+    }
+    // B2c: promotions given away (daily rewards, free call cards used). Server-only; the CRM reads through the API.
+    match /promoCredits/{rowId} {
+      allow read, write: if false;
+    }
+
+    // ── Leaderboards (B8, 3 Nov 2026) ─────────────────────────────────────────
+    // A ranking is public to signed-in accounts and written only by the functions that move money (gifts, calls):
+    // a client that could write a score could buy the top spot for nothing. Settlements (who was paid what) are for
+    // the Owner and Finance.
+    match /leaderboards/{boardId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+      match /entries/{uid} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
+    }
+    match /leaderboardSettlements/{settlementId} {
+      allow read: if isSuperAdmin() || isFinance();
+      allow write: if false;
+    }
+
+    // ── Room music (B7, 3 Nov 2026) ───────────────────────────────────────────
+    // Zipper's licensed catalogue: read by signed-in accounts (only enabled tracks), kept by Tech and the Owner.
+    // setPartyMusic accepts only a track from here — never an arbitrary URL.
+    match /musicTracks/{trackId} {
+      allow read: if request.auth != null && (resource.data.get('enabled', true) == true || isTech() || isSuperAdmin());
+      allow write: if isTech() || isSuperAdmin();
+    }
+
+    // ── Party Pro (B7, 3 Nov 2026) ────────────────────────────────────────────
+    // A subscription is read by its holder and by staff; it is written only by the functions that take the
+    // diamonds for it (functions/src/partySubscription.ts) — never because the app says a payment went through.
+    match /partySubscriptions/{uid} {
+      allow read: if (request.auth != null && request.auth.uid == uid) || isStaff();
+      allow write: if false;
+    }
+    match /subscriptionPayments/{paymentId} {
+      allow read, write: if false;
+    }
+    match /subscriptionIdempotency/{claimId} {
+      allow read, write: if false;
+    }
+
+    // ── Seller-to-seller trades (B9, 3 Nov 2026) ─────────────────────────────
+    // The mirror of a trade (Mongo `seller_trades` is authoritative): readable by staff and by the two sellers in it
+    // (their CRM login names the seller record); written only by the backend.
+    match /sellerTrades/{tradeId} {
+      allow read: if isStaff()
+                  || (request.auth != null
+                      && (resource.data.buyerSellerId == get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('sellerId', '-')
+                          || resource.data.sellerSellerId == get(/databases/$(database)/documents/crmUsers/$(request.auth.uid)).data.get('sellerId', '-')));
+      allow write: if false;
     }
 
   }

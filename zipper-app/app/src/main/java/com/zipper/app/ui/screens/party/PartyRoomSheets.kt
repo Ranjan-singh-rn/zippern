@@ -4,8 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -218,7 +220,18 @@ private fun SettingField(
     }
 }
 
-/** Four digits, drawn as boxes over a zero-size field. Same shape as the OTP screen. */
+/**
+ * Four digits, drawn as boxes, typed into a field laid over the boxes — the shape of the OTP boxes
+ * (`OtpCodeBoxes`).
+ *
+ * A3 (3 Nov 2026): the field used to be ZERO-SIZE, beside the boxes. A single-line text field scrolls its own
+ * text, so it is itself a scrolling container, and one measured 0×0 cannot answer the "bring me into view" a
+ * focused field sends up to its parents. Inside the create-room form and the room settings sheet — both scroll —
+ * tapping the boxes crashed the app with "Expected BringIntoViewRequester to not be used before parents are
+ * placed" (emulator drop box, 3 Nov 2026 13:32:15 and 13:32:51 IST). Laid over the boxes, the field has their
+ * size; its text and cursor are transparent, so the boxes are still what is seen, and a tap anywhere on them
+ * lands in the field.
+ */
 @Composable
 internal fun PartyDigitsField(
     code: String,
@@ -236,26 +249,10 @@ internal fun PartyDigitsField(
 ) {
     val c = ZipperTheme.colors
     val focus = remember { FocusRequester() }
-    // `runCatching` because requesting focus on a node that is not attached yet
-    // throws, and the one frame where that can happen is not worth a crash.
-    LaunchedEffect(autoFocus) { if (autoFocus) runCatching { focus.requestFocus() } }
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        // A zero-size field behind the boxes, which is how the OTP screen does it:
-        // the boxes are drawn, the IME talks to this.
-        BasicTextField(
-            value = code,
-            onValueChange = { v -> onCode(v.filter { ch -> ch.isDigit() }.take(4)) },
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done,
-            ),
-            keyboardActions = KeyboardActions(onDone = { onDone() }),
-            cursorBrush = SolidColor(c.brandPrimary),
-            modifier = Modifier.size(0.dp).focusRequester(focus),
-        )
-        Row(
-            Modifier.clickableNoRipple { runCatching { focus.requestFocus() } },
-            horizontalArrangement = Arrangement.spacedBy(Space.sm),
-        ) {
+    // After the first layout, never from the composition that made the field — see requestFocusAfterLayout.
+    LaunchedEffect(autoFocus) { if (autoFocus) focus.requestFocusAfterLayout() }
+    Box {
+        Row(horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
             repeat(4) { i ->
                 val ch = code.getOrNull(i)
                 val shape = RoundedCornerShape(Radius.md)
@@ -284,6 +281,19 @@ internal fun PartyDigitsField(
                 }
             }
         }
+        // Over the boxes, at their size: the boxes are what is seen, the IME talks to this.
+        BasicTextField(
+            value = code,
+            onValueChange = { v -> onCode(v.filter { ch -> ch.isDigit() }.take(4)) },
+            singleLine = true,
+            textStyle = ZipperTheme.type.bodyL.copy(color = Color.Transparent),
+            cursorBrush = SolidColor(Color.Transparent),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.NumberPassword, imeAction = ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = { onDone() }),
+            modifier = Modifier.matchParentSize().focusRequester(focus),
+        )
     }
 }
 
@@ -307,6 +317,16 @@ internal fun PartyRoomMenuSheet(
 ) {
     val c = ZipperTheme.colors
     var confirmEnd by remember { mutableStateOf(false) }
+    var showAccessLog by remember { mutableStateOf(false) }
+    var showMusic by remember { mutableStateOf(false) }
+    if (showAccessLog) {
+        PartyAccessLogSheet(viewModel, onDismiss = { showAccessLog = false })
+        return
+    }
+    if (showMusic) {
+        PartyMusicSheet(state, viewModel, onDismiss = { showMusic = false })
+        return
+    }
 
     PartySheetFrame("Room · ${compactCount(state.memberList.size.toLong())} here", onDismiss) {
         if (state.amSeated) {
@@ -324,6 +344,12 @@ internal fun PartyRoomMenuSheet(
         PartySheetRow(Icons.Outlined.People, "People in the room", c.textPrimary) {
             onDismiss(); onMembers()
         }
+        // B7: room music — the owner and admins pick from Zipper's licensed catalogue.
+        if (state.canModerate) {
+            PartySheetRow(Icons.Outlined.Settings, state.room?.music?.let { "Music · ${it.title}" } ?: "Music", c.textPrimary) {
+                showMusic = true
+            }
+        }
         if (state.canModerate && state.seatRequests.isNotEmpty()) {
             PartySheetRow(
                 Icons.Outlined.Groups,
@@ -334,6 +360,10 @@ internal fun PartyRoomMenuSheet(
         if (state.isOwner) {
             PartySheetRow(Icons.Outlined.Settings, "Room settings", c.textPrimary) {
                 onDismiss(); onSettings()
+            }
+            // B7: who came into a private room, who was turned away or locked out, and every official entry.
+            if (state.room?.isPrivate == true) {
+                PartySheetRow(Icons.Outlined.People, "Access log", c.textPrimary) { showAccessLog = true }
             }
             PartySheetRow(Icons.Default.Block, "End this room", c.statusDanger) { confirmEnd = true }
         }
@@ -570,6 +600,9 @@ internal fun PartyMembersSheet(
     viewModel: PartyRoomViewModel,
     onOpenProfile: (String) -> Unit,
     onDismiss: () -> Unit,
+    /** B7: the member card's Message and Send-a-gift. */
+    onOpenChat: (String) -> Unit = {},
+    onGift: () -> Unit = {},
 ) {
     val c = ZipperTheme.colors
     val room = state.room
@@ -675,6 +708,9 @@ internal fun PartyMembersSheet(
             onRemoveFromRoom = { actionFor = null; confirmRemove = m },
             onOpenProfile = { actionFor = null; onDismiss(); onOpenProfile(m.uid) },
             onDismiss = { actionFor = null },
+            viewModel = viewModel,
+            onMessage = { actionFor = null; onDismiss(); onOpenChat(m.uid) },
+            onGift = { actionFor = null; onDismiss(); onGift() },
         )
     }
 
@@ -719,10 +755,18 @@ private fun PartyMemberActionsDialog(
     onRemoveFromRoom: () -> Unit,
     onOpenProfile: () -> Unit,
     onDismiss: () -> Unit,
+    viewModel: PartyRoomViewModel? = null,
+    onMessage: () -> Unit = {},
+    onGift: () -> Unit = {},
 ) {
     val c = ZipperTheme.colors
     val room = state.room
     val isMe = member.uid == state.myUid
+    // B7: the card's social actions. Follow state is asked once when the card opens.
+    var following by remember(member.uid) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(member.uid) { if (!isMe && viewModel != null) following = viewModel.isFollowing(member.uid) }
+    var confirmBlock by remember { mutableStateOf(false) }
+    var reporting by remember { mutableStateOf(false) }
     val targetIsOwner = room?.isOwner(member.uid) == true
     val targetIsAdmin = room?.isAdmin(member.uid) == true
     val freeSeat = lowestFreeSeat(state)
@@ -732,14 +776,44 @@ private fun PartyMemberActionsDialog(
         onDismissRequest = onDismiss,
         containerColor = c.bgElevated,
         title = {
-            Text(
-                member.name.ifBlank { "Guest" }, style = ZipperTheme.type.headingS,
-                color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis,
-            )
+            // B7: a profile card — photo, name, level and where they are in the room; tap it for the full profile.
+            Row(
+                Modifier.fillMaxWidth().clickableNoRipple(onOpenProfile),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Space.md),
+            ) {
+                Avatar(member.photoUrl, size = AvatarSize.LG, initial = member.name)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        member.name.ifBlank { "Guest" }, style = ZipperTheme.type.headingS,
+                        color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOfNotNull(
+                            if (member.level > 0) "Lv ${member.level}" else null,
+                            if (targetIsOwner) "Host" else if (targetIsAdmin) "Admin" else null,
+                            if (member.seatIndex > 0) "Seat ${member.seatIndex}" else "Listening",
+                        ).joinToString(" · "),
+                        style = ZipperTheme.type.caption, color = c.textSecondary,
+                    )
+                }
+            }
         },
         text = {
             Column(Modifier.fillMaxWidth()) {
                 PartySheetRow(Icons.Outlined.Person, "View profile", c.textPrimary, onClick = onOpenProfile)
+                if (!isMe && viewModel != null) {
+                    val f = following
+                    PartySheetRow(
+                        Icons.Default.Star,
+                        when (f) { true -> "Following — tap to unfollow"; false -> "Follow"; null -> "Follow" },
+                        c.textPrimary, enabled = f != null,
+                    ) { viewModel.follow(member.uid, f != true); following = f != true }
+                    PartySheetRow(Icons.Outlined.Person, "Message", c.textPrimary, onClick = onMessage)
+                    if (member.seatIndex > 0) PartySheetRow(Icons.Default.Add, "Send a gift", c.textPrimary, onClick = onGift)
+                    PartySheetRow(Icons.Default.Block, "Report", c.textPrimary) { reporting = true }
+                    PartySheetRow(Icons.Default.Block, "Block", c.statusDanger) { confirmBlock = true }
+                }
 
                 if (state.canModerate && !isMe && member.seatIndex == 0) {
                     // The lowest free unlocked seat, picked here rather than asked
@@ -780,6 +854,34 @@ private fun PartyMemberActionsDialog(
         },
         confirmButton = { TextButton(onDismiss) { Text("Close", color = c.textSecondary) } },
     )
+
+    // B7: block and report ask once, in words, before anything is sent.
+    if (confirmBlock && viewModel != null) {
+        AlertDialog(
+            onDismissRequest = { confirmBlock = false },
+            containerColor = c.bgElevated,
+            title = { Text("Block ${member.name.ifBlank { "this person" }}?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text("They can no longer call or message you. You can unblock them from Settings.", style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+            confirmButton = { TextButton({ confirmBlock = false; viewModel.block(member); onDismiss() }) { Text("Block", color = c.statusDanger) } },
+            dismissButton = { TextButton({ confirmBlock = false }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
+    if (reporting && viewModel != null) {
+        val reasons = listOf("Harassment or bullying", "Sexual content", "Hate or violence", "Spam or scam", "Underage user", "Something else")
+        AlertDialog(
+            onDismissRequest = { reporting = false },
+            containerColor = c.bgElevated,
+            title = { Text("Why are you reporting them?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = {
+                Column {
+                    reasons.forEach { r ->
+                        PartySheetRow(Icons.Default.Block, r, c.textPrimary) { reporting = false; viewModel.report(member.uid, r); onDismiss() }
+                    }
+                }
+            },
+            confirmButton = { TextButton({ reporting = false }) { Text("Cancel", color = c.textSecondary) } },
+        )
+    }
 }
 
 /**
@@ -843,6 +945,40 @@ internal fun PartyRoomSettingsSheet(
                 .padding(horizontal = Space.lg, vertical = Space.md),
             verticalArrangement = Arrangement.spacedBy(Space.lg),
         ) {
+            // ── Theme (B7) ───────────────────────────────────────────────────
+            SettingLabel("Background")
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+                ROOM_THEMES.forEach { (id, name) ->
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box(
+                            Modifier.size(54.dp, 72.dp)
+                                .background(roomThemeBrush(id), RoundedCornerShape(Radius.md))
+                                .border(if (room.theme == id) 2.dp else 1.dp, if (room.theme == id) c.brandPrimary else c.borderSubtle, RoundedCornerShape(Radius.md))
+                                .then(if (!saving) Modifier.clickableNoRipple { viewModel.saveSettings(theme = id) } else Modifier),
+                        )
+                        Text(name, style = ZipperTheme.type.caption, color = c.textSecondary)
+                    }
+                }
+            }
+
+            // ── Calls while hosting (B7) ─────────────────────────────────────
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    SettingLabel("No calls while I'm in this room")
+                    Text(
+                        "People who ring you are told you're hosting a party room.",
+                        style = ZipperTheme.type.caption, color = c.textMuted,
+                    )
+                }
+                androidx.compose.material3.Switch(
+                    checked = room.ownerBlocksCalls,
+                    onCheckedChange = { viewModel.saveSettings(blockCalls = it) },
+                    enabled = !saving,
+                )
+            }
+
+            HairlineDivider()
+
             // ── Name ─────────────────────────────────────────────────────────
             SettingLabel("Room name")
             SettingField(
@@ -1193,7 +1329,17 @@ internal fun PartyEntranceOverlay(
     }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        if (listener.hasEntrance) {
+        if (listener.entranceSvgaUrl.isNotBlank()) {
+            // B13: the SVGA entrance greets the arrival by photo and name (dynamic keys `avatar`, `name`).
+            com.zipper.app.ui.components.Svga(
+                source = listener.entranceSvgaUrl,
+                modifier = Modifier.fillMaxSize(),
+                loops = 1,
+                dynamicImages = mapOf("avatar" to listener.photoUrl),
+                dynamicTexts = mapOf("name" to listener.name),
+                onFinished = onFinished,
+            )
+        } else if (listener.hasEntrance) {
             EntranceVideo(
                 videoUrl = listener.entranceVideoUrl,
                 posterUrl = listener.entrancePosterUrl,
@@ -1231,6 +1377,90 @@ internal fun PartyEntranceOverlay(
                 modifier = Modifier.widthIn(max = 220.dp),
             )
             if (listener.level > 0) LevelChip(listener.level)
+        }
+    }
+}
+
+
+/** B7: the private room's access log, newest first — the owner's to read (rules: the room's host and staff). */
+@Composable
+internal fun PartyAccessLogSheet(viewModel: PartyRoomViewModel, onDismiss: () -> Unit) {
+    val c = ZipperTheme.colors
+    val entries by remember { viewModel.accessLogFlow() }.collectAsStateWithLifecycle(emptyList())
+    val fmt = remember { java.text.SimpleDateFormat("d MMM, h:mm a", java.util.Locale.ENGLISH) }
+    PartySheetFrame("Access log", onDismiss) {
+        if (entries.isEmpty()) {
+            Text("Nobody has tried to come in yet.", style = ZipperTheme.type.bodyS, color = c.textMuted, modifier = Modifier.padding(Space.lg))
+        }
+        LazyColumn(Modifier.heightIn(max = 440.dp)) {
+            items(entries.size) { i ->
+                val e = entries[i]
+                Row(Modifier.fillMaxWidth().padding(horizontal = Space.lg, vertical = Space.sm), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(e.name.ifBlank { e.uid }, style = ZipperTheme.type.labelM, color = c.textPrimary, maxLines = 1)
+                        Text(fmt.format(java.util.Date(e.atMs)), style = ZipperTheme.type.caption, color = c.textMuted)
+                    }
+                    Text(
+                        when (e.result) {
+                            "admitted" -> "Came in with the PIN"
+                            "wrong_pin" -> "Wrong PIN"
+                            "locked" -> "Locked out"
+                            "official" -> "Zipper official (${e.role})"
+                            else -> e.result
+                        },
+                        style = ZipperTheme.type.caption,
+                        color = when (e.result) { "admitted" -> c.statusSuccess; "official" -> c.statusWarning; else -> c.statusDanger },
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * B7: room music. The owner or an admin picks a track from Zipper's licensed catalogue; their phone plays it into the
+ * room (mixed into the audio it publishes — so they need to be on a seat to be heard), with pause, volume and stop.
+ * An empty catalogue says so: tracks are the Owner's to add, licensed, in the CRM.
+ */
+@Composable
+internal fun PartyMusicSheet(state: PartyRoomUiState, viewModel: PartyRoomViewModel, onDismiss: () -> Unit) {
+    val c = ZipperTheme.colors
+    val tracks by remember { viewModel.musicTracksFlow() }.collectAsStateWithLifecycle(emptyList())
+    val now = state.room?.music
+    val mine = now?.by == state.myUid
+    var paused by remember { mutableStateOf(false) }
+    var volume by remember { mutableFloatStateOf(60f) }
+    PartySheetFrame("Music", onDismiss) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = Space.lg, vertical = Space.sm), verticalArrangement = Arrangement.spacedBy(Space.sm)) {
+            if (now != null) {
+                Text("Now playing: ${now.title}${if (now.artist.isNotBlank()) " — ${now.artist}" else ""}", style = ZipperTheme.type.labelM, color = c.textPrimary)
+                if (mine) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
+                        ZipperButton(if (paused) "Resume" else "Pause", { paused = !paused; viewModel.pauseMusic(paused) }, size = ButtonSize.Small, style = ButtonStyle.Secondary)
+                        ZipperButton("Stop", { viewModel.stopMusic() }, size = ButtonSize.Small, style = ButtonStyle.Secondary)
+                    }
+                    Text("Volume", style = ZipperTheme.type.caption, color = c.textMuted)
+                    androidx.compose.material3.Slider(value = volume, onValueChange = { volume = it; viewModel.musicVolume(it.toInt()) }, valueRange = 0f..100f)
+                } else {
+                    Text("Played from another moderator's phone.", style = ZipperTheme.type.caption, color = c.textMuted)
+                }
+            }
+            if (!state.amSeated) {
+                Text("Take a seat to play music — it goes out with your microphone.", style = ZipperTheme.type.caption, color = c.statusWarning)
+            }
+            if (tracks.isEmpty()) {
+                Text("No tracks yet. Zipper adds licensed music in the CRM.", style = ZipperTheme.type.bodyS, color = c.textMuted)
+            }
+        }
+        LazyColumn(Modifier.heightIn(max = 360.dp)) {
+            items(tracks.size) { i ->
+                val t = tracks[i]
+                PartySheetRow(Icons.Outlined.Settings, if (t.artist.isNotBlank()) "${t.title} — ${t.artist}" else t.title, c.textPrimary, enabled = state.amSeated) {
+                    paused = false
+                    viewModel.playMusic(t)
+                }
+            }
         }
     }
 }

@@ -90,9 +90,23 @@ function isIncrement(v) {
 function applyIncrements(prior, data) {
   const out = {}
   for (const [k, v] of Object.entries(data)) {
-    out[k] = isIncrement(v) ? Number((prior && prior[k]) ?? 0) + Number(v.operand) : v
+    if (isIncrement(v)) out[k] = Number((prior && prior[k]) ?? 0) + Number(v.operand)
+    else if (isArrayTransform(v, 'ArrayUnionTransform')) {
+      // B7 (3 Nov 2026): arrayUnion / arrayRemove applied as the server applies them (before this the transform
+      // object itself was stored). Elements compared by value, as Firestore compares them.
+      const before = Array.isArray(prior && prior[k]) ? prior[k] : []
+      const seen = new Set(before.map((x) => JSON.stringify(x)))
+      out[k] = [...before, ...v.elements.filter((e) => !seen.has(JSON.stringify(e)) && seen.add(JSON.stringify(e)))]
+    } else if (isArrayTransform(v, 'ArrayRemoveTransform')) {
+      const drop = new Set(v.elements.map((x) => JSON.stringify(x)))
+      out[k] = (Array.isArray(prior && prior[k]) ? prior[k] : []).filter((x) => !drop.has(JSON.stringify(x)))
+    } else out[k] = v
   }
   return out
+}
+
+function isArrayTransform(v, name) {
+  return v != null && typeof v === 'object' && v.constructor && v.constructor.name === name && Array.isArray(v.elements)
 }
 
 /** Replace sentinels with what the server would have written. */
@@ -104,6 +118,31 @@ function materialise(data) {
   const out = {}
   for (const [k, v] of Object.entries(data)) out[k] = materialise(v)
   return out
+}
+
+/**
+ * What the Admin SDK refuses before anything is sent — added deliberately (3 Nov 2026) after game code wrote nested
+ * arrays that this fake silently stored and the real SDK rejects: an array directly inside an array, and `undefined`
+ * anywhere (the project does not set `ignoreUndefinedProperties`). Validated when a write is MADE (as the SDK does,
+ * at `set`/`update` time, not at commit), and again when it is applied.
+ */
+function assertWritable(data, path) {
+  const fail = (what, where) => {
+    throw new Error(`Value for argument "data" is not a valid Firestore document. ${what} (found in field "${where}") — ${path}`)
+  }
+  const walk = (v, where, inArray) => {
+    if (v === undefined) fail('Cannot use "undefined" as a Firestore value', where)
+    if (Array.isArray(v)) {
+      if (inArray) fail('Cannot have nested arrays', where)
+      v.forEach((x, i) => walk(x, `${where}.${i}`, true))
+      return
+    }
+    if (v && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype) {
+      for (const [k, x] of Object.entries(v)) walk(x, `${where}.${k}`, false)
+    }
+  }
+  if (data == null || typeof data !== 'object') throw new Error(`Value for argument "data" is not a valid Firestore document — ${path}`)
+  for (const [k, v] of Object.entries(data)) walk(v, k, false)
 }
 
 let autoId = 0
@@ -135,6 +174,7 @@ class DocRef {
   collection(name) { return new CollectionRef(this._store, `${this.path}/${name}`) }
   async get() { return new Snapshot(this.id, this._store._docs.get(this.path), this) }
   async set(data, opts) {
+    assertWritable(data, this.path)
     const merge = !!(opts && opts.merge)
     if (!merge && Object.values(data).some(isDelete)) {
       // What the SDK says: delete() is for update() and set(..., {merge}).
@@ -163,6 +203,7 @@ class DocRef {
     await this.set(data)
   }
   async update(data) {
+    assertWritable(data, this.path)
     const prior = this._store._docs.get(this.path)
     if (!prior) throw new Error(`update on missing document ${this.path}`)
     this._store._docs.set(
@@ -221,6 +262,14 @@ class Query {
   }
   limit(n) {
     return new Query(this._store, this._collection, this._filters, this._order, n, this._startAfter)
+  }
+  /**
+   * The aggregate count, as the Admin SDK has it (`query.count().get()` → `.data().count`). Added deliberately
+   * for B12: the live room's viewer count is recounted from the presence rows instead of trusted from clients.
+   */
+  count() {
+    const q = this
+    return { get: async () => { const snap = await q.get(); return { data: () => ({ count: snap.size }) } } }
   }
   /**
    * Cursor by document snapshot (the only form the handlers use). Added
@@ -351,8 +400,8 @@ class FakeFirestore {
     if (this.transactionMode === 'optimistic') return this._runOptimistic(fn)
     const run = this._txChain.then(() => fn({
       get: (ref) => ref.get(),
-      set: (ref, data, opts) => { void ref.set(data, opts) },
-      update: (ref, data) => { void ref.update(data) },
+      set: (ref, data, opts) => { assertWritable(data, ref.path); void ref.set(data, opts) },
+      update: (ref, data) => { assertWritable(data, ref.path); void ref.update(data) },
       delete: (ref) => { void ref.delete() },
     }))
     this._txChain = run.catch(() => undefined)
@@ -370,14 +419,24 @@ class FakeFirestore {
           if (ops.length) {
             throw new Error('Firestore transactions require all reads to be executed before all writes.')
           }
+          // A QUERY inside a transaction (B2a: the party seat paths read `seats where uid == x`). Added
+          // deliberately: every document it returns is recorded as read, so a concurrent change to any of them
+          // aborts this attempt as Firestore would. (A document inserted into the result set by another commit is
+          // not detected — the fake does not model phantom reads.)
+          if (!(ref instanceof DocRef)) {
+            const result = await ref.get()
+            for (const d of result.docs) reads.set(d.ref.path, this._version(d.ref.path))
+            await yieldTurn()
+            return result
+          }
           reads.set(ref.path, this._version(ref.path))
           const data = this._docs.get(ref.path)
           const snap = new Snapshot(ref.id, data === undefined ? undefined : { ...data }, ref)
           await yieldTurn()                // let the competing transactions read too
           return snap
         },
-        set: (ref, data, opts) => { ops.push({ path: ref.path, run: () => ref.set(data, opts) }) },
-        update: (ref, data) => { ops.push({ path: ref.path, check: true, run: () => ref.update(data) }) },
+        set: (ref, data, opts) => { assertWritable(data, ref.path); ops.push({ path: ref.path, run: () => ref.set(data, opts) }) },
+        update: (ref, data) => { assertWritable(data, ref.path); ops.push({ path: ref.path, check: true, run: () => ref.update(data) }) },
         delete: (ref) => { ops.push({ path: ref.path, run: () => ref.delete() }) },
       }
       const value = await fn(tx)          // a throw from the callback fails the transaction, as in the SDK
@@ -411,8 +470,9 @@ class FakeFirestore {
   batch() {
     const ops = []
     return {
-      set: (ref, data, opts) => { ops.push(() => ref.set(data, opts)) },
+      set: (ref, data, opts) => { assertWritable(data, ref.path); ops.push(() => ref.set(data, opts)) },
       update: (ref, data) => {
+        assertWritable(data, ref.path)
         ops.push({ check: ref, run: () => ref.update(data) })
       },
       delete: (ref) => { ops.push(() => ref.delete()) },

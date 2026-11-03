@@ -34,7 +34,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
@@ -65,7 +64,7 @@ import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
 import com.zipper.app.util.ALL_COUNTRIES
 import com.zipper.app.util.CountryCode
-import com.zipper.app.util.QuickLoginStore
+import com.zipper.app.data.repository.SavedAccount
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -162,8 +161,9 @@ fun LoginScreen(
      *
      * The counter is what stops the button becoming a trap. When the server
      * refuses the saved token — expired, revoked, or the account is gone —
-     * `signInWithQuickLogin` calls `quickLogin.clear()` and returns an error, so
-     * the secret is already gone from the device by the time the error reaches
+     * `signInWithQuickLogin` forgets that account's secret (B10: that account's
+     * only) and returns an error, so the secret is already gone from the device
+     * by the time the error reaches
      * this screen. Keyed on `Unit`, the effect would never re-run: the button
      * would stay on screen, showing a name and a photo for an account that no
      * longer exists, and fail with the same snackbar every single time it was
@@ -176,8 +176,10 @@ fun LoginScreen(
      * login form and adding the button once there is something real to put in it.
      */
     var quickLoginProbe by remember { mutableIntStateOf(0) }
-    var quickLogin by remember { mutableStateOf<QuickLoginStore.Saved?>(null) }
-    LaunchedEffect(quickLoginProbe) { quickLogin = viewModel.savedQuickLogin() }
+    // B10: every account this device remembers (most recent first), not just one — names, photos and IDs only.
+    var savedAccounts by remember { mutableStateOf<List<SavedAccount>>(emptyList()) }
+    LaunchedEffect(quickLoginProbe) { savedAccounts = viewModel.savedAccounts() }
+    var confirmRemove by remember { mutableStateOf<SavedAccount?>(null) }
 
     /*
      * FX-21 (minimal): this device's guest account, if one was signed out of
@@ -301,6 +303,14 @@ fun LoginScreen(
             // what makes the stale button disappear in the same frame as the
             // failure rather than at the next cold start.
             quickLoginProbe++
+            // QA #37: a refused saved sign-in is explained where the older
+            // "signed out" banner was, and stays until dismissed — the button
+            // it replaces is already gone, and a snackbar was the only trace.
+            if (com.zipper.app.util.QuickLoginNotice.belongsInBanner(it)) {
+                forcedSignOutReason = it
+                viewModel.clearError()
+                return@LaunchedEffect
+            }
             /*
              * A long message needs longer than four seconds.
              *
@@ -344,8 +354,9 @@ fun LoginScreen(
                     onGetOtp = { afterGuestWarning(::sendOtp) },
                     onGoogle = { afterGuestWarning(::launchGoogleSignIn) },
                     onGuest = { viewModel.signInAsGuest(deviceId) },
-                    quickLogin = quickLogin,
-                    onQuickLogin = { viewModel.quickLogin(deviceId) },
+                    savedAccounts = savedAccounts,
+                    onQuickLogin = { a -> viewModel.quickLogin(deviceId, a.uid) },
+                    onRemoveSaved = { a -> confirmRemove = a },
                     forcedSignOutReason = forcedSignOutReason,
                     onDismissForcedSignOut = { forcedSignOutReason = null },
                 )
@@ -368,6 +379,31 @@ fun LoginScreen(
 
     if (showCountryPicker) {
         CountryPickerSheet(selectedCountry, onSelect = { selectedCountry = it; showCountryPicker = false }) { showCountryPicker = false }
+    }
+
+    // B10: "Remove" — this device forgets one account (and the server its saved sign-in). Asked first.
+    confirmRemove?.let { a ->
+        AlertDialog(
+            onDismissRequest = { confirmRemove = null }, containerColor = c.bgElevated,
+            title = { Text("Remove ${a.title} from this device?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = {
+                Text(
+                    "Its saved sign-in is deleted. The account itself is not touched — sign in to it again any time " +
+                        "with your phone number or Google.",
+                    style = ZipperTheme.type.bodyM, color = c.textSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton({
+                    confirmRemove = null
+                    scope.launch {
+                        viewModel.forgetSavedAccount(deviceId, a.uid)
+                        quickLoginProbe++
+                    }
+                }) { Text("Remove", color = c.statusDanger) }
+            },
+            dismissButton = { TextButton({ confirmRemove = null }) { Text("Cancel", color = c.textSecondary) } },
+        )
     }
 
     // FX-21: the warning, before a phone or Google sign-in starts.
@@ -401,9 +437,10 @@ private fun PhoneStage(
     country: CountryCode, onPickCountry: () -> Unit,
     termsAccepted: Boolean, onTerms: (Boolean) -> Unit, onOpenTerms: () -> Unit,
     loading: Boolean, onGetOtp: () -> Unit, onGoogle: () -> Unit, onGuest: () -> Unit,
-    /** What this device remembers, or null when it remembers nothing. */
-    quickLogin: QuickLoginStore.Saved?,
-    onQuickLogin: () -> Unit,
+    /** B10: the accounts this device remembers, most recent first; empty when it remembers none. */
+    savedAccounts: List<SavedAccount>,
+    onQuickLogin: (SavedAccount) -> Unit,
+    onRemoveSaved: (SavedAccount) -> Unit,
     /** Why they were signed out, when they did not ask to be. */
     forcedSignOutReason: String?,
     onDismissForcedSignOut: () -> Unit,
@@ -498,8 +535,13 @@ private fun PhoneStage(
          * greyed out at 40% alpha, which is precisely the dead-control problem
          * the comment below describes, reintroduced at the top of the screen.
          */
-        if (quickLogin != null) {
-            QuickLoginBlock(saved = quickLogin, loading = loading, onClick = onQuickLogin)
+        if (savedAccounts.isNotEmpty()) {
+            QuickLoginBlock(
+                saved = savedAccounts.first(), loading = loading,
+                onClick = { onQuickLogin(savedAccounts.first()) },
+                onRemove = { onRemoveSaved(savedAccounts.first()) },
+                others = savedAccounts.drop(1), onOther = onQuickLogin, onRemoveOther = onRemoveSaved,
+            )
         }
 
         /*
@@ -667,7 +709,7 @@ fun OtpCodeBoxes(
 ) {
     val c = ZipperTheme.colors
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focus.requestFocus() }
+    LaunchedEffect(Unit) { focus.requestFocusAfterLayout() }
 
     Box(modifier) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
@@ -714,9 +756,15 @@ fun OtpCodeBoxes(
  */
 @Composable
 private fun QuickLoginBlock(
-    saved: QuickLoginStore.Saved,
+    saved: SavedAccount,
     loading: Boolean,
     onClick: () -> Unit,
+    /** B10: forget this account on this device (asks first). */
+    onRemove: () -> Unit,
+    /** B10: the other accounts this device remembers, under the main card. */
+    others: List<SavedAccount> = emptyList(),
+    onOther: (SavedAccount) -> Unit = {},
+    onRemoveOther: (SavedAccount) -> Unit = {},
 ) {
     val c = ZipperTheme.colors
 
@@ -757,7 +805,7 @@ private fun QuickLoginBlock(
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(label, style = ZipperTheme.type.labelL, color = c.textOnBrand, maxLines = 1)
                 Text(
-                    "Signed in on this device before",
+                    listOf(saved.idLabel, "Signed in on this device before").filter { it.isNotBlank() }.joinToString("  ·  "),
                     style = ZipperTheme.type.caption,
                     color = c.textOnBrand.copy(0.80f),
                     maxLines = 1,
@@ -771,6 +819,40 @@ private fun QuickLoginBlock(
                 )
             } else {
                 Icon(Icons.Default.ChevronRight, null, tint = c.textOnBrand, modifier = Modifier.size(24.dp))
+                Icon(
+                    Icons.Default.Close, "Remove ${saved.title} from this device", tint = c.textOnBrand.copy(0.80f),
+                    modifier = Modifier.size(20.dp).clickableNoRipple(onRemove),
+                )
+            }
+        }
+
+        /*
+         * B10: the other accounts this device remembers — one tap each, like the main card, and each removable.
+         * Smaller, because the main card is the one most people want; the order is most recently used first.
+         */
+        others.forEach { other ->
+            Row(
+                Modifier.fillMaxWidth()
+                    .background(c.bgRaised, RoundedCornerShape(Radius.lg))
+                    .then(if (loading) Modifier else Modifier.clickableNoRipple { onOther(other) })
+                    .padding(horizontal = Space.lg, vertical = Space.sm),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Space.md),
+            ) {
+                Avatar(photoUrl = other.photoUrl, size = AvatarSize.MD, initial = other.title)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        if (other.displayName.isBlank()) "Continue as guest" else "Continue as ${other.title}",
+                        style = ZipperTheme.type.labelM, color = c.textPrimary, maxLines = 1,
+                    )
+                    if (other.idLabel.isNotBlank()) {
+                        Text(other.idLabel, style = ZipperTheme.type.caption, color = c.textMuted, maxLines = 1)
+                    }
+                }
+                Icon(
+                    Icons.Default.Close, "Remove ${other.title} from this device", tint = c.textMuted,
+                    modifier = Modifier.size(20.dp).then(if (loading) Modifier else Modifier.clickableNoRipple { onRemoveOther(other) }),
+                )
             }
         }
 
@@ -842,14 +924,43 @@ private fun ForcedSignOutNotice(reason: String, onDismiss: () -> Unit) {
  * Rose.r500 and Violet.v500 — the two ends of the brand gradient. They now read
  * from the tokens, so retuning the brand retunes all seven screens from one
  * place instead of leaving them on last season's pink.
+ *
+ * Drawn as radial gradients, not blurred discs. `Modifier.blur` defaults to
+ * `BlurredEdgeTreatment.Rectangle`, which clips the blurred layer to the box it
+ * sits in: on Android 12+ every orb came out as a hard-edged pink or violet
+ * rectangle (the QA emulator run of 2 Nov 2026 showed three blocks behind the
+ * Login logo), and below Android 12 `blur` does nothing, so the same orbs were
+ * flat discs with hard rims. A gradient that fades to transparent looks like the
+ * blur was meant to, costs no RenderEffect, and is identical on every version.
+ *
+ * Same three orbs as before: the centre of each disc stays where the disc was
+ * (80,100 dp from the top-left; 60 dp in from the right at 180 dp; 90 dp in from
+ * the left, 70 dp up from the bottom) and the fade reaches as far as the old
+ * blur radius did (disc radius + blur radius).
  */
 @Composable
 fun AmbientGlows() {
     val c = ZipperTheme.colors
-    Box(Modifier.fillMaxSize()) {
-        Box(Modifier.size(320.dp).offset((-80).dp, (-60).dp).blur(120.dp).background(c.brandGradientFrom.copy(0.28f), CircleShape))
-        Box(Modifier.size(280.dp).align(Alignment.TopEnd).offset(80.dp, 40.dp).blur(100.dp).background(c.brandGradientTo.copy(0.24f), CircleShape))
-        Box(Modifier.size(300.dp).align(Alignment.BottomStart).offset((-60).dp, 80.dp).blur(120.dp).background(c.brandGradientFrom.copy(0.18f), CircleShape))
+    val from = c.brandGradientFrom
+    val to = c.brandGradientTo
+    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+        fun orb(color: Color, alpha: Float, center: androidx.compose.ui.geometry.Offset, radius: Float) {
+            drawCircle(
+                brush = Brush.radialGradient(
+                    0f to color.copy(alpha = alpha * 0.85f),
+                    0.4f to color.copy(alpha = alpha * 0.6f),
+                    0.75f to color.copy(alpha = alpha * 0.18f),
+                    1f to Color.Transparent,
+                    center = center,
+                    radius = radius,
+                ),
+                radius = radius,
+                center = center,
+            )
+        }
+        orb(from, 0.28f, androidx.compose.ui.geometry.Offset(80.dp.toPx(), 100.dp.toPx()), 280.dp.toPx())
+        orb(to, 0.24f, androidx.compose.ui.geometry.Offset(size.width - 60.dp.toPx(), 180.dp.toPx()), 240.dp.toPx())
+        orb(from, 0.18f, androidx.compose.ui.geometry.Offset(90.dp.toPx(), size.height - 70.dp.toPx()), 270.dp.toPx())
     }
 }
 

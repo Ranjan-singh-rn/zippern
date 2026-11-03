@@ -57,8 +57,18 @@ fun Avatar(
      * pays real diamonds for one, so it must render everywhere the avatar does.
      */
     frameUrl: String? = null,
+    /**
+     * B13: the equipped frame's catalogue ID (`users/{uid}.equippedFrame`). Resolved to its artwork here — the
+     * pointer holds the id, and handing that to [frameUrl] drew nothing. An SVGA frame plays (looping) only when
+     * [animatedFrame] is true: one avatar on a profile, never a list of them.
+     */
+    frameItemId: String? = null,
+    animatedFrame: Boolean = false,
 ) {
     val c = ZipperTheme.colors
+    val frameItem = rememberCosmetic(frameItemId)
+    val resolvedFrameUrl = frameUrl ?: frameItem?.stillUrl?.takeIf { it.isNotBlank() }
+    val frameSvga = frameItem?.svgaUrl?.takeIf { animatedFrame && it.isNotBlank() }
     val ringColor = when (ring) {
         AvatarRing.None -> null
         AvatarRing.Online -> c.statusOnline
@@ -97,11 +107,14 @@ fun Avatar(
                 )
             }
         }
-        if (!frameUrl.isNullOrBlank()) {
+        if (frameSvga != null) {
+            // B13: an animated frame, looping, at the same 1.3× as the still ones.
+            Svga(source = frameSvga, modifier = Modifier.size(size.dp * 1.3f), loops = 0)
+        } else if (!resolvedFrameUrl.isNullOrBlank()) {
             // Frames are authored at ~1.3× the avatar diameter so the artwork
             // clears the photo edge. Not clipped — frames have wings and crowns.
             AsyncImage(
-                model = frameUrl,
+                model = resolvedFrameUrl,
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.size(size.dp * 1.3f),

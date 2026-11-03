@@ -22,9 +22,6 @@ import com.zipper.app.ui.components.ButtonStyle
 import com.zipper.app.ui.components.ZipperButton
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /** One day in millis, for the "how much longer" arithmetic below. */
 private const val DAY_MS = 86_400_000L
@@ -78,7 +75,7 @@ fun SuspendedScreen(
      * Sign out and go back to Login, so another account can be used on this
      * phone. The graph hands in the app's one sign-out path rather than this
      * screen rolling its own — see `signOutAndGoToLogin` in ZipperNavGraph,
-     * which is the same call "Switch account" in Settings makes.
+     * which is the same call Log out (and the switcher's "Add account") makes.
      */
     onBackToLogin: () -> Unit,
     viewModel: BannedViewModel = hiltViewModel(),
@@ -96,7 +93,8 @@ fun SuspendedScreen(
 
     val endsOn = remember(untilMillis) {
         if (untilMillis <= 0L) null
-        else SimpleDateFormat("d MMMM yyyy", Locale.getDefault()).format(Date(untilMillis))
+        // QA #54: the end of a suspension is a moment — date AND time, in IST.
+        else com.zipper.app.util.IstTime.format(untilMillis)
     }
     /*
      * ROUNDED UP, NOT DOWN.

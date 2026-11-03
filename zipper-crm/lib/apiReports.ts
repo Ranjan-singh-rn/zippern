@@ -497,6 +497,15 @@ export const reports = {
   /** Point in time; takes no date range. */
   liabilities: () => getReport<LiabilityReport>('/liabilities'),
 
+  /**
+   * B2c: daily-reward diamonds and free call cards issued, cards used on calls and the host beans paid for them.
+   * Promotional diamonds are never revenue; this is where they are counted.
+   */
+  promotions: (p: RangeParams = {}) => getReport<AnyReport>('/promotions', { ...p }),
+
+  /** B6: games money — per game diamonds in/out, Zipper's fee, and the zero-difference check on every match. */
+  games: (p: RangeParams = {}) => getReport<AnyReport>('/games', { ...p }),
+
   /** Omit `team` for every team — only owners and the Observer may. */
   teamThroughput: (p: RangeParams & { team?: string } = {}) =>
     getReport<ThroughputReport>('/team-throughput', { ...p }),
@@ -513,6 +522,7 @@ export const reports = {
     margin: (p: RangeParams) => downloadReportCsv('/margin', { ...p }, 'margin'),
     channels: (p: RangeParams) => downloadReportCsv('/channels', { ...p }, 'channels'),
     liabilities: () => downloadReportCsv('/liabilities', {}, 'liabilities'),
+    promotions: (p: RangeParams) => downloadReportCsv('/promotions', { ...p }, 'promotions'),
     teamThroughput: (p: RangeParams & { team?: string }) =>
       downloadReportCsv('/team-throughput', { ...p }, 'team-throughput'),
   },

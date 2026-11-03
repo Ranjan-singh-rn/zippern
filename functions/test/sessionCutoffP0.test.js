@@ -160,7 +160,11 @@ describe('every call site hands its token to the gate', () => {
   // 30 since Decision 15 (RC): `checkPartnerActivation`, which can start an
   // Owner-approved role once both contacts are verified, is a protected
   // operation like the application it follows.
-  test('there are exactly 30 gated call sites', () => expect(sites.length).toBe(30))
+  // 31 since B7 (3 Nov 2026): `subscribePrivateRooms` takes diamonds for Party Pro — a protected operation.
+  // 34 since B12 (4 Nov 2026): `pkMatch`, `pkRespond` and `pkEnd` (live.ts) write both hosts' rooms for a PK
+  // battle — protected operations like every other room action.
+  // (The game callables live in src/games/ and gate the same way; this count covers src/*.ts only.)
+  test('there are exactly 34 gated call sites', () => expect(sites.length).toBe(34))
   for (const [file, args] of sites) {
     test(`${file}: assertActiveSession(${args.split(',')[2]?.trim() ?? ''}, …) passes the auth token`, () => {
       expect(/context\.auth\?\.token\s*$/.test(args.trim())).toBe(true)

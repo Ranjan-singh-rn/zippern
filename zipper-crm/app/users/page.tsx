@@ -35,10 +35,11 @@ import {
 import { db } from '@/lib/firebase'
 import { searchUsers, type UserRecord } from '@/lib/firestore'
 import { accountActions } from '@/lib/roleStateActions'
+import { mayOffer } from '@/lib/moderationAccess'
 import { downloadCsv } from '@/components/ui/DataTable'
 import { Denied, Empty, ErrorState, Loading, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
-import { canAccess, type CrmRole } from '@/lib/auth'
+import { canAccess, hasPermission, type CrmRole, type Permission } from '@/lib/auth'
 import api, { ApiError } from '@/lib/api'
 import {
   DEFAULT_SUSPENSION, SuspendDuration, suspensionDays, suspensionProblem,
@@ -49,6 +50,7 @@ import { BanDetailsFields } from '@/components/BanDetailsFields'
 import {
   DEFAULT_BAN_DETAILS, banDetailsBody, banDetailsProblem, banDetailsSummary, type BanDetailsInput,
 } from '@/lib/banDetails'
+import { formatIstDate } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
 
 const VIEW_ROLES: CrmRole[] = [
   'superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member',
@@ -198,7 +200,7 @@ function mapUser(d: QueryDocumentSnapshot<DocumentData>): UserRecord {
 
 function formatJoined(ts: Timestamp | null): string {
   if (!ts) return '—'
-  try { return new Date(ts.toMillis()).toLocaleDateString('en-IN') } catch { return '—' }
+  try { return formatIstDate(ts.toMillis()) || '—' } catch { return '—' }
 }
 
 function messageOf(err: unknown, fallback: string): string {
@@ -403,8 +405,10 @@ export default function UsersPage() {
     (u: UserRecord): Array<ActionSpec & { disabled: boolean; hint: string }> =>
       accountActions(u, { actorUid: crmUser?.uid, isOwner })
         .filter((a) => a.via === 'api')
+        // QA #41: only what this reviewer's permissions reach (the API checks again).
+        .filter((a) => mayOffer(a.kind, (p) => hasPermission(crmUser, p as Permission)))
         .map((a) => ({ ...ACTIONS[a.kind as ActionKey], disabled: a.disabled, hint: a.hint })),
-    [crmUser?.uid, isOwner],
+    [crmUser, isOwner],
   )
 
   const sortNote = useMemo(() => SORTS[sort], [sort])

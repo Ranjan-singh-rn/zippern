@@ -957,6 +957,8 @@ def render(subject: str, body: str) -> str:
             "like this one, use the unsubscribe link your mail client shows for "
             "this message and we will stop."
         ),
+        # QA #27: an announcement is words, not figures.
+        figures=False,
     )
 
 

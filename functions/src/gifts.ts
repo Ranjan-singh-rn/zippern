@@ -28,6 +28,13 @@ const MIN_INSTANCES = Number(process.env.WARM_INSTANCES ?? 0) || 0
 
 const HOT = { region: 'asia-south1' as const, minInstances: MIN_INSTANCES }
 import { accrueWeeklyEarning } from './payouts'
+import { accrueBoards } from './leaderboards'
+import { liveGiftRefusal, pkScoring } from './live'
+
+/** The name a leaderboard shows for a user document. */
+function displayNameOf(d: Record<string, unknown>): string {
+  return String(d.displayName ?? d.name ?? '').trim() || 'Zipper user'
+}
 import { accrueHostStats, applyHostLevel, getHostLadder } from './hostStats'
 import { assertActiveSession } from './mobileSession'
 import {
@@ -252,6 +259,30 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       if (!receiverSnap.exists) throw new HttpsError('not-found', 'Recipient not found.')
       if (!giftSnap.exists)     throw new HttpsError('not-found', 'That gift no longer exists.')
 
+      /*
+       * B12 (4 Nov 2026): a LIVE gift must be for this live — still on air, to its host (or, during a PK, the
+       * host it is battling), and not from somebody the host removed or blocked. A kick already cut the video
+       * (`generateAgoraToken`) and the chat (rules); the wallet was the way left in. Read here, before the first
+       * write, and refused with nothing moved. During a PK the battling room is read too, for its score below.
+       */
+      let pkPartnerSnap: admin.firestore.DocumentSnapshot | null = null
+      const liveRoomData = giftContext === 'live' && roomSnap?.exists
+        ? (roomSnap.data() as Record<string, unknown>)
+        : null
+      if (liveRoomData) {
+        const liveHostUid = String(liveRoomData.hostUid ?? '')
+        const blockedSnap = liveHostUid
+          ? await tx.get(db.collection('users').doc(liveHostUid).collection('blocked').doc(senderUid))
+          : null
+        const refusal = liveGiftRefusal({
+          room: liveRoomData, senderUid, receiverUid, senderBlockedByHost: blockedSnap?.exists === true,
+        })
+        if (refusal) throw new HttpsError('failed-precondition', refusal)
+        if (pkScoring(liveRoomData, Date.now()) && String(liveRoomData.pkPartnerId ?? '')) {
+          pkPartnerSnap = await tx.get(db.collection('liveRooms').doc(String(liveRoomData.pkPartnerId)))
+        }
+      }
+
       const gift = giftSnap.data() as Record<string, any>
 
       // ── Field names come from the CRM, not from what reads nicely ──────────
@@ -401,6 +432,15 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       // Bank the earning against this IST week, for the one-week-in-arrears
       // release. Same transaction as the credit — they must not diverge.
       accrueWeeklyEarning(tx, receiverRef, beansCredited, 'gift')
+
+      // B8: the rankings — what the sender spent and what a host earned, counted in the transaction that moved it.
+      accrueBoards(tx, [
+        { board: 'supporters', uid: senderUid, score: totalCost, name: displayNameOf(senderData), photoUrl: String(senderData.photoUrl ?? '') },
+        ...(receiverSnap.get('isHost') === true
+          ? [{ board: 'hosts' as const, uid: receiverUid, score: beansCredited, name: displayNameOf(receiverSnap.data() ?? {}), photoUrl: String(receiverSnap.get('photoUrl') ?? '') }]
+          : []),
+        ...(luckyOutcome ? [{ board: 'lucky' as const, uid: senderUid, score: totalCost, name: displayNameOf(senderData), photoUrl: String(senderData.photoUrl ?? '') }] : []),
+      ])
 
       // Host Home's "today", and the level ladder. Same transaction as the
       // credit — a daily total that disagreed with the wallet would be
@@ -594,6 +634,8 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         beansEarned: beansCredited,
         imageUrl:   gift.imageUrl ?? gift.iconUrl ?? '',
         lottieAsset: gift.lottieAsset ?? '',
+        // B13: the SVGA animation (tools/decor), played by every screen that shows this gift land.
+        svgaUrl:    gift.svgaUrl ?? '',
         roomId:     roomId ?? '',
         timestamp:  now,
         // The win, for the room to celebrate. No roll internals here: this
@@ -611,12 +653,17 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
       if (roomRef && roomSnap?.exists) {
         tx.set(roomRef.collection('gifts').doc(), {
           uid:         senderUid,
+          // B7 (3 Nov 2026): the receiver and the settlement it belongs to, so the room can fly the gift from the
+          // sender's seat to the receiver's — an animation tied to the gift that was actually paid for.
+          receiverUid,
+          transactionId: txRef.id,
           senderName:  senderData.displayName ?? senderData.name ?? '',
           senderPhotoUrl: senderData.photoUrl ?? '',
           giftName:    gift.name ?? gift.displayName ?? giftId,
           giftId,
           emoji:       gift.emoji ?? '',
           imageUrl:    gift.imageUrl ?? gift.iconUrl ?? '',
+          svgaUrl:     gift.svgaUrl ?? '',
           quantity,
           diamondCost: totalCost,
           // Millis, not serverTimestamp: liveGiftsFlow orders on this field and
@@ -624,10 +671,28 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
           timestamp:   Date.now(),
         })
 
+        /*
+         * B12: the PK score, from diamonds that actually moved, in the gift's own transaction — it used to be a
+         * second write from the viewer's phone into BOTH rooms, which the rules refuse for the room that is not
+         * the phone's. A gift to this room's host scores for this room; one to the battling host scores for theirs.
+         */
+        const pkLive = liveRoomData !== null && pkScoring(liveRoomData, Date.now())
+        const toPartner = pkLive && receiverUid !== String(liveRoomData?.hostUid ?? '')
+        const partnerPaired = pkPartnerSnap?.exists === true && pkPartnerSnap.get('pkPartnerId') === roomRef.id
         tx.update(roomRef, {
           totalGiftsReceived: admin.firestore.FieldValue.increment(quantity),
           totalBeansEarned:   admin.firestore.FieldValue.increment(beansCredited),
+          ...(pkLive
+            ? toPartner
+              ? { pkPartnerScore: admin.firestore.FieldValue.increment(totalCost) }
+              : { pkScore: admin.firestore.FieldValue.increment(totalCost) }
+            : {}),
         })
+        if (pkLive && partnerPaired && pkPartnerSnap) {
+          tx.update(pkPartnerSnap.ref, toPartner
+            ? { pkScore: admin.firestore.FieldValue.increment(totalCost) }
+            : { pkPartnerScore: admin.firestore.FieldValue.increment(totalCost) })
+        }
 
         /*
          * The seat's own total, for the in-room leaderboard.

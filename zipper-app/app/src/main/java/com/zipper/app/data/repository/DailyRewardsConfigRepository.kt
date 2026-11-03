@@ -80,8 +80,22 @@ class DailyRewardsConfigRepository @Inject constructor(
     fun observe(): Flow<DailyRewardsConfig> = callbackFlow {
         val reg = firestore.collection("appConfig").document("dailyRewards")
             .addSnapshotListener { snap, err ->
-                if (err != null || snap == null || !snap.exists()) {
+                if (err != null || snap == null) {
                     trySend(FALLBACK)
+                    return@addSnapshotListener
+                }
+                if (!snap.exists()) {
+                    /*
+                     * The SERVER says there is no document: nobody has saved a
+                     * schedule in the CRM yet. That is not a failure to read —
+                     * `claimDailyReward` then pays its own FALLBACK_SCHEDULE,
+                     * which is DAILY_REWARDS_OFFLINE_FALLBACK row for row, so
+                     * the compiled-in list IS the live schedule and saying
+                     * "amounts are indicative" would be wrong (QA, 3 Nov 2026:
+                     * every user of a fresh project saw that warning). Only a
+                     * miss answered from the local cache is a real unknown.
+                     */
+                    trySend(if (snap.metadata.isFromCache) FALLBACK else DEFAULT_SCHEDULE)
                     return@addSnapshotListener
                 }
                 trySend(parse(snap))
@@ -148,6 +162,11 @@ class DailyRewardsConfigRepository @Inject constructor(
         val FALLBACK = DailyRewardsConfig(
             schedule   = DAILY_REWARDS_OFFLINE_FALLBACK,
             isFallback = true,
+        )
+        /** No schedule saved yet: the server pays exactly this list (wallet.ts FALLBACK_SCHEDULE). */
+        val DEFAULT_SCHEDULE = DailyRewardsConfig(
+            schedule   = DAILY_REWARDS_OFFLINE_FALLBACK,
+            isFallback = false,
         )
     }
 }

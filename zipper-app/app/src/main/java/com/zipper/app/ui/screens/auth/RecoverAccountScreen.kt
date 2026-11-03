@@ -22,9 +22,6 @@ import com.zipper.app.ui.components.ZipperButton
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
 import com.zipper.app.util.DeletionWindow
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * "You asked us to delete this account. Do you still want that?"
@@ -145,7 +142,8 @@ fun RecoverAccountScreen(
 
     val dueText = remember(state.dueAtMillis) {
         if (state.dueAtMillis <= 0L) null
-        else SimpleDateFormat("d MMMM yyyy", Locale.getDefault()).format(Date(state.dueAtMillis))
+        // QA #54: the calendar day in IST, whatever the handset's zone.
+        else com.zipper.app.util.IstTime.longDate(state.dueAtMillis)
     }
     val daysLeft = remember(state.dueAtMillis) {
         if (state.dueAtMillis <= 0L) null

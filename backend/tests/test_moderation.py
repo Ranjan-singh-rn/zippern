@@ -371,6 +371,18 @@ for bad_days in (0, -3, 366, 4000):
     ok(f"…and says what the range is for {bad_days}", "1 to 365" in message)
 check("…and the account is untouched", stored("u-bounds")["accountState"], "active")
 
+# QA #52: the service itself refuses a day count that is not a whole number —
+# a bool (True == 1 in Python) or a float — whatever reaches it.
+for odd_days in (True, 2.5):
+    try:
+        run(svc.suspend_user("u-bounds", "Spam in chat, repeated.", OPS, days=odd_days))
+        refused = ""
+    except svc.UserError as exc:
+        refused = str(exc)
+    ok(f"QA #52: a suspension of {odd_days!r} days is refused by the service, with the range",
+       "1 to 365" in refused)
+check("QA #52: …and the account is untouched", stored("u-bounds")["accountState"], "active")
+
 for bad_reason in ("", "  ", "no"):
     rejects(
         f"suspending with the reason {bad_reason!r}",

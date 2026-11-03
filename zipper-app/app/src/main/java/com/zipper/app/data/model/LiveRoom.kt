@@ -38,6 +38,25 @@ data class LiveRoom(
     val pkPartnerScore: Long = 0L,
     val pkEndTime: Long = 0L,           // epoch ms when PK timer ends
     val pkChannelId: String = "",       // shared Agora channel used during PK
+
+    // ── B12 (4 Nov 2026) ─────────────────────────────────────────────────────
+    /** The host paused the live: viewers see "back soon", the host's camera and mic are off. */
+    val isPaused: Boolean = false,
+    /** The host turned the camera off (still live, still talking): viewers see the host's photo. */
+    val isCameraOff: Boolean = false,
+    /** The host's pinned announcement, shown above the chat (≤ 140 characters). */
+    val pinnedMessage: String = "",
+    /** Viewers the host muted in the chat (they still watch). */
+    val mutedViewers: List<String> = emptyList(),
+    /** The most people watching at once — counted by the server from presence rows. */
+    val peakViewers: Int = 0,
+    /** Streamed seconds measured by the server at the close (0 until then). */
+    val serverDurationSeconds: Long = 0L,
+    /** The last PK's verdict, written by the server on both rooms. */
+    val lastPkWinnerUid: String = "",
+    val lastPkMyScore: Long = 0L,
+    val lastPkPartnerScore: Long = 0L,
+    val lastPkEndedAt: Long = 0L,
 ) {
     companion object {
         /**
@@ -53,6 +72,8 @@ data class LiveRoom(
             if (!doc.exists()) return null
             @Suppress("UNCHECKED_CAST")
             val kicked = (doc.get("kickedViewers") as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
+            val muted = (doc.get("mutedViewers") as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
+            val lastPk = doc.get("lastPk") as? Map<*, *>
             return LiveRoom(
                 roomId             = doc.id,
                 hostUid            = doc.getString("hostUid") ?: "",
@@ -85,6 +106,16 @@ data class LiveRoom(
                 pkPartnerScore     = doc.getLong("pkPartnerScore") ?: 0L,
                 pkEndTime          = doc.millis("pkEndTime"),
                 pkChannelId        = doc.getString("pkChannelId") ?: "",
+                isPaused           = doc.getBoolean("isPaused") ?: false,
+                isCameraOff        = doc.getBoolean("isCameraOff") ?: false,
+                pinnedMessage      = doc.getString("pinnedMessage") ?: "",
+                mutedViewers       = muted,
+                peakViewers        = (doc.getLong("peakViewers") ?: 0L).toInt(),
+                serverDurationSeconds = doc.getLong("serverDurationSeconds") ?: 0L,
+                lastPkWinnerUid    = lastPk?.get("winnerUid") as? String ?: "",
+                lastPkMyScore      = (lastPk?.get("myScore") as? Number)?.toLong() ?: 0L,
+                lastPkPartnerScore = (lastPk?.get("partnerScore") as? Number)?.toLong() ?: 0L,
+                lastPkEndedAt      = (lastPk?.get("endedAtMs") as? Number)?.toLong() ?: 0L,
             )
         }
     }
@@ -107,7 +138,7 @@ data class PkInvite(
     val participants: List<String> = emptyList(), // [hostAUid, hostBUid] for array-contains query
     val hostAAccepted: Boolean = false,
     val hostBAccepted: Boolean = false,
-    val status: String = "pending",     // pending | started | rejected | expired
+    val status: String = "pending",     // pending | started | rejected | cancelled | ended (B12: server-written)
     val createdAt: Long = 0L,
 )
 
@@ -153,6 +184,8 @@ data class LiveGiftEvent(
     val imageUrl: String = "",
     val quantity: Int = 1,
     val timestamp: Long = 0L,
+    /** B13: the gift's SVGA animation (tools/decor), written by settleGift on the room's gift row. */
+    val svgaUrl: String = "",
 ) {
     companion object {
         fun from(doc: com.google.firebase.firestore.DocumentSnapshot): LiveGiftEvent? {
@@ -167,6 +200,7 @@ data class LiveGiftEvent(
                 imageUrl       = doc.getString("imageUrl") ?: "",
                 quantity       = (doc.getLong("quantity") ?: 1L).toInt(),
                 timestamp      = doc.millis("timestamp"),
+                svgaUrl        = doc.getString("svgaUrl") ?: "",
             )
         }
     }

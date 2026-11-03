@@ -204,6 +204,20 @@ class Settings(BaseSettings):
     #: between recording and the provider answering; it is retried like a failure.
     email_stale_queued_minutes: int = 30
 
+    # ── QA #47 (3 Nov 2026): one domain, three addresses ─────────────────────
+    #
+    # Owner decision, final: the email domain is zipperlive.org, with exactly
+    # three identities — no-reply@ (the SENDER of every automated message:
+    # `mail_from` above), info@ (general business information) and support@
+    # (customer support). The two below are what a PERSON is told to write to;
+    # nothing automated is ever sent FROM them — the identity switches above
+    # stay off. Override per environment with CONTACT_SUPPORT_EMAIL /
+    # CONTACT_INFO_EMAIL; `app.core.contacts` refuses an override that is not
+    # on the official domain, and is the one place they are read.
+    official_email_domain: str = "zipperlive.org"
+    contact_support_email: str = "support@zipperlive.org"
+    contact_info_email: str = "info@zipperlive.org"
+
     # Where partner-facing mail points people. Used in links only; no figure is
     # ever derived from it.
     portal_url: str = "https://zipper.web.app"
@@ -237,9 +251,10 @@ class Settings(BaseSettings):
     #: Empty falls back to `support_email`, then to `mail_from`.
     mail_from_support: str = ""
 
-    #: Where a `List-Unsubscribe` mailto: points. Empty is derived as
-    #: `unsubscribe@<the mail_from domain>`, which must be a real mailbox or an
-    #: alias that reaches one — Gmail checks that it does not hard-bounce.
+    #: Where a `List-Unsubscribe` mailto: points. Empty is the support address
+    #: (`app.core.contacts.support_email`) — QA #47: the derived
+    #: `unsubscribe@<domain>` was an address nobody created, and Gmail checks
+    #: that the mailbox does not hard-bounce.
     unsubscribe_email: str = ""
     #: The RFC 8058 one-click endpoint. `List-Unsubscribe-Post` is only ever
     #: emitted when this is set, because a one-click header pointing at nothing
@@ -267,6 +282,10 @@ class Settings(BaseSettings):
     # than "sendgrid" — a deliberate "disabled" included — sends nothing and
     # records the delivery as not_configured, exactly like a missing key.
     email_provider: str = "sendgrid"
+    #: LOCAL TEST COPY ONLY (LOCAL_MAILBOX_DIR). Outside production, a message is
+    #: written to this directory as JSON instead of being sent — see
+    #: `email._local_mailbox_dir`. Ignored in production; empty means off.
+    local_mailbox_dir: str = ""
     #: One send asks SendGrid at most this many times (capped at 5), and asks
     #: again only after an attempt SendGrid provably did not take — see
     #: `email._attempt_class`. Bulk mail always makes exactly one attempt.

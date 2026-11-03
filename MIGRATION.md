@@ -580,7 +580,8 @@ the part that goes wrong.
       sessions worth preserving and no reason to carry a secret out of a project
       you are leaving.
 - [ ] `SENDGRID_API_KEY` — **unchanged**. SendGrid is a separate account.
-      `MAIL_FROM` stays `314zipper@gmail.com`, the address verified there.
+      `MAIL_FROM` is `no-reply@zipperlive.org` (QA #47, owner decision 3 Nov 2026),
+      on the domain authenticated there.
       Sending from an unverified address is a silent 403.
 - [ ] `SERVICE_KEY_WEEKLY_ACCRUAL` — **mint a new one**, § 8.1.
 - [ ] `SERVICE_KEY_REPORTING` — **mint a new one**, § 9.2. A **different value**

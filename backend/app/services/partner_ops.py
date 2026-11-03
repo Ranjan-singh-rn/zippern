@@ -5139,6 +5139,11 @@ async def apply_pending_changes(partner_id: str, reason: str, actor: dict) -> di
         },
     )
 
+    # QA #50: the partner is told — the change appeared without a word before.
+    notified = await _notify_details_decided(
+        partner_id, collection, doc, applied=True, fields=sorted(allowed), reason="", decision_id=audit_id,
+    )
+
     return {
         "partner_id": partner_id,
         "collection": collection,
@@ -5147,6 +5152,7 @@ async def apply_pending_changes(partner_id: str, reason: str, actor: dict) -> di
         "before": before,
         "after": allowed,
         "audit_id": audit_id,
+        "notified": notified,
         "note": (
             ""
             if not refused
@@ -5218,18 +5224,54 @@ async def reject_pending_changes(partner_id: str, reason: str, actor: dict) -> d
         },
     )
 
+    # QA #50: the partner is told, with the reason — not only on a dashboard.
+    notified = await _notify_details_decided(
+        partner_id, collection, doc, applied=False, fields=proposed, reason=reason, decision_id=audit_id,
+    )
+
     return {
         "partner_id": partner_id,
         "collection": collection,
         "refused": proposed,
         "kyc_status": previous,
         "audit_id": audit_id,
+        "notified": notified,
         "note": (
-            "Nothing on the record changed. The reason is stored on it and "
-            "shown on the partner's own dashboard, so they are told why rather "
-            "than resubmitting the same change."
+            "Nothing on the record changed. The reason is stored on it, shown on "
+            "the partner's own dashboard and sent to them as an Official message "
+            "and email, so they are told why rather than resubmitting the same change."
         ),
     }
+
+
+async def _notify_details_decided(
+    partner_id: str, collection: str, doc: Mapping, *, applied: bool, fields: list[str],
+    reason: str, decision_id: object,
+) -> bool:
+    """QA #50: tell the human behind the partner document. Never raises — the
+    decision is written and audited by the time this runs.
+
+    The human is the document's own `crmUid` back-link, falling back to the
+    business record's `owner_crm_uid` (a proposal can predate that record, so
+    neither is required). Nobody to tell is False, not an error.
+    """
+    from app.services import notices  # local: notices imports email, which imports settings
+
+    try:
+        kind = str(_derive_kind(collection, dict(doc)))
+        uid = _crm_login_of(dict(doc))
+        if not uid:
+            record = await get_db()[C.PARTNERS].find_one({"_id": partner_id})
+            uid = str((record or {}).get("owner_crm_uid") or "").strip()
+        if not uid:
+            return False
+        return bool(await notices.partner_details_decided(
+            uid, kind, partner_id, applied=applied, fields=fields, reason=reason,
+            decision_id=str(decision_id or ""),
+        ))
+    except Exception:  # noqa: BLE001
+        log.exception("partner %s: the detail-change notice was not delivered", partner_id)
+        return False
 
 
 async def list_partners(
@@ -5347,7 +5389,7 @@ def _explains_amount(reason: str) -> bool:
     return len(text) >= 12 and any(word in text for word in _AMOUNT_WORDS)
 
 
-async def _expected_purchase_minor(coins: int) -> int | None:
+async def _expected_purchase_minor(coins: int, partner: dict | None = None) -> int | None:
     """What `coins` cost in paise at the published wholesale rate, or None.
 
     None means the rate could not be read — and in that case nothing is
@@ -5374,6 +5416,12 @@ async def _expected_purchase_minor(coins: int) -> int | None:
     # `seller_wholesale_price_inr_per_lakh` falls back to retail when no
     # discount is configured, so an unconfigured business behaves as before.
     per_lakh = float(getattr(rates, "seller_wholesale_price_inr_per_lakh", 0) or 0)
+    # B9 (3 Nov 2026): a seller on a priced tier buys at that tier's price (seller_business.tier_price_per_lakh).
+    from app.services.seller_business import tier_price_per_lakh
+
+    tier_price = tier_price_per_lakh(rates, partner)
+    if tier_price:
+        per_lakh = tier_price
     if per_lakh <= 0:
         return None
     if getattr(rates, "provisional", False):
@@ -5419,7 +5467,8 @@ async def request_coin_purchase(
     # person filing says in the reason why it differs. A genuine discrepancy —
     # a bank fee, a part payment, an agreed rate for one deal — is a sentence
     # somebody has to write down, and it lands in the audit log with their name.
-    expected_minor = await _expected_purchase_minor(coins)
+    seller_doc = await _partner(seller_id, PartnerKind.SELLER)
+    expected_minor = await _expected_purchase_minor(coins, seller_doc)
     if expected_minor is not None and amount_paid_minor != expected_minor:
         difference = amount_paid_minor - expected_minor
         # A rupee either way is rounding, not a discrepancy worth a sentence.
@@ -5550,10 +5599,19 @@ async def request_lending(
     if due_at is None:
         raise PartnerOpsError("A due date is required — credit without one is a gift.")
 
-    await _partner(seller_id, PartnerKind.SELLER)
+    partner = await _partner(seller_id, PartnerKind.SELLER)
     allowed, why = await partner_svc.can_take_inventory(seller_id)
     if not allowed:
         raise PartnerOpsError(why)
+    # B9 (3 Nov 2026): with a credit limit set, nobody lends past it — the limit is raised first, on the record.
+    credit = partner.get("credit") or {}
+    limit = int(credit.get("limit") or 0)
+    outstanding = int(credit.get("outstanding") or 0)
+    if limit > 0 and outstanding + coins > limit:
+        raise PartnerOpsError(
+            f"This would take the seller's debt to {outstanding + coins:,} coins, over their credit limit of "
+            f"{limit:,}. Raise the limit first if Zipper agrees to lend more."
+        )
 
     return await _raise(
         NewCard(
@@ -5611,11 +5669,19 @@ async def execute_lending(card_id: str, actor: dict) -> dict:
 
     def _compute(partner: dict) -> tuple[dict, dict]:
         before = int((partner.get("credit") or {}).get("outstanding", 0))
+        # B9 (3 Nov 2026): one due date governs the debt, and a new loan never pushes back money already owed —
+        # while something is outstanding, the EARLIER of the two dates stands.
+        prior_due = (partner.get("credit") or {}).get("due_at")
+        effective_due = due_at
+        if before > 0 and isinstance(prior_due, datetime) and isinstance(due_at, datetime):
+            p = prior_due if prior_due.tzinfo else prior_due.replace(tzinfo=timezone.utc)
+            d = due_at if due_at.tzinfo else due_at.replace(tzinfo=timezone.utc)
+            effective_due = min(p, d)
         return (
             {
                 "$inc": {"credit.outstanding": coins, "credit.total_lent": coins},
                 "$set": {
-                    "credit.due_at": due_at,
+                    "credit.due_at": effective_due,
                     "credit.terms": payload.get("terms", ""),
                     "credit.last_issued_at": now,
                     "updated_at": now,
