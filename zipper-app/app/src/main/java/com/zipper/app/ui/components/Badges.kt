@@ -13,6 +13,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.zipper.app.ui.theme.ZipperTheme
@@ -43,15 +44,6 @@ fun LiveBadge(kind: LiveBadgeKind, modifier: Modifier = Modifier, viewers: Long 
         LiveBadgeKind.Party -> "PARTY"
     }
 
-    // The live dot breathes. A static red dot reads as an icon; a pulsing one
-    // reads as "happening now", which is the whole message of the badge.
-    val pulse = rememberInfiniteTransition(label = "live")
-    val dotAlpha by pulse.animateFloat(
-        initialValue = 1f, targetValue = 0.35f,
-        animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "dot",
-    )
-
     Row(
         modifier = modifier
             .height(20.dp)
@@ -60,14 +52,33 @@ fun LiveBadge(kind: LiveBadgeKind, modifier: Modifier = Modifier, viewers: Long 
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier
-                .size(6.dp)
-                .alpha(if (kind == LiveBadgeKind.Live) dotAlpha else 1f)
-                .background(Color.White, CircleShape)
-        )
+        if (kind == LiveBadgeKind.Live) LiveDot() else Box(Modifier.size(6.dp).background(Color.White, CircleShape))
         Text(label, style = ZipperTheme.type.overline, color = Color.White, maxLines = 1)
     }
+}
+
+/**
+ * The live dot breathes. A static red dot reads as an icon; a pulsing one reads as "happening now", which is the
+ * whole message of the badge.
+ *
+ * O10 (5 Nov 2026), speed: the pulse used to be created in EVERY badge (viewer counts and party badges too) and read
+ * during composition, so each card on the Home grid and the Live tab recomposed on every animation frame. It is now
+ * created only for a LIVE badge and read in the draw phase (`graphicsLayer`), which repaints the dot and nothing else.
+ */
+@Composable
+private fun LiveDot() {
+    val pulse = rememberInfiniteTransition(label = "live")
+    val dotAlpha = pulse.animateFloat(
+        initialValue = 1f, targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "dot",
+    )
+    Box(
+        Modifier
+            .size(6.dp)
+            .graphicsLayer { alpha = dotAlpha.value }
+            .background(Color.White, CircleShape)
+    )
 }
 
 /*

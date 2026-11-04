@@ -14,7 +14,12 @@ import com.zipper.app.util.UserLanguage
  *
  * Maintained by the `syncPublicProfile` Cloud Function. Nothing writes it from
  * the app.
+ *
+ * O10 (5 Nov 2026), speed: `@Immutable` — every field is a `val` and the lists are never mutated after parsing, so
+ * Compose may compare two profiles by value. Without it the List fields made the class unstable: each feed snapshot
+ * builds new instances, and every card on the Home grid recomposed even when its person had not changed.
  */
+@androidx.compose.runtime.Immutable
 data class PublicProfile(
     val uid: String = "",
     val name: String = "",

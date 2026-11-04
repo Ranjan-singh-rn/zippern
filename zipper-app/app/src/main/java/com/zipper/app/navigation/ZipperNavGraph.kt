@@ -131,6 +131,12 @@ fun ZipperNavGraph(
     NavHost(
         navController = navController,
         startDestination = Screen.Splash.route,
+        // O10 (5 Nov 2026), speed: navigation-compose's default is a 700 ms cross-fade, during which BOTH screens are
+        // composed and drawn — every tap on a card, a chat or a room felt slow. A short fade keeps it smooth.
+        enterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(150)) },
+        exitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(150)) },
+        popEnterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(150)) },
+        popExitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(150)) },
     ) {
         composable(Screen.Splash.route) {
             SplashScreen(

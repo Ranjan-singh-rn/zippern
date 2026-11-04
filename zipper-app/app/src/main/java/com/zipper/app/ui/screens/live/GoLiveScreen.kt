@@ -152,7 +152,8 @@ fun GoLiveScreen(
         while (true) {
             delay(3000)
             try {
-                val bmp = Bitmap.createBitmap(localSurface.width.coerceAtLeast(64), localSurface.height.coerceAtLeast(64), Bitmap.Config.ARGB_8888)
+                // O10: a quarter-size frame is plenty to find a face, and a sixteenth of the memory every 3 s.
+                val bmp = Bitmap.createBitmap((localSurface.width / 4).coerceAtLeast(64), (localSurface.height / 4).coerceAtLeast(64), Bitmap.Config.ARGB_8888)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     PixelCopy.request(localSurface, bmp, { r -> if (r == PixelCopy.SUCCESS) FaceDetectionManager.analyzeFrame(bmp) }, Handler(Looper.getMainLooper()))
                 } else viewModel.reportFaceDetected(true)
@@ -224,7 +225,7 @@ fun GoLiveScreen(
                             Text(state.myName.ifBlank { "You" }, style = ZipperTheme.type.labelS, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 110.dp))
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 LiveBadge(LiveBadgeKind.Live)
-                                Text(formatClock(state.liveDurationSeconds), style = ZipperTheme.type.caption, color = c.textSecondary)
+                                LiveClock(viewModel.duration)
                             }
                         }
                     }
@@ -611,4 +612,12 @@ private fun ViewerManagementSheet(
 private fun formatClock(secs: Long): String {
     val h = secs / 3600; val m = (secs % 3600) / 60; val s = secs % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+
+/** O10: the on-air clock, reading its own flow so its tick redraws this label and nothing else. */
+@Composable
+private fun LiveClock(duration: kotlinx.coroutines.flow.StateFlow<Long>) {
+    val seconds by duration.collectAsStateWithLifecycle()
+    Text(formatClock(seconds), style = ZipperTheme.type.caption, color = ZipperTheme.colors.textSecondary)
 }

@@ -916,7 +916,23 @@ private fun AudioSeatGrid(
         ) {
             row.forEach { index ->
                 Box(Modifier.weight(1f)) {
-                    AudioSeat(index, state, onSeatTap, onToggleLock)
+                    // O10 (5 Nov 2026), speed: each seat gets ONLY its own values. It used to be handed the whole room
+                    // state, which changes with every 400 ms speaking report, so every seat recomposed several times a
+                    // second; now a seat recomposes when something about THAT seat changes.
+                    val room = state.room
+                    if (room != null) {
+                        val seat = state.seatByIndex[index]
+                        AudioSeat(
+                            index = index, room = room, seat = seat,
+                            locked = room.lockedSeats.contains(index),
+                            mine = seat != null && seat.uid == state.myUid,
+                            waiting = state.myRequestedSeat == index,
+                            speaking = isSpeaking(seat, state),
+                            busy = state.busySeat == index,
+                            canModerate = state.canModerate,
+                            onSeatTap = onSeatTap, onToggleLock = onToggleLock,
+                        )
+                    }
                 }
             }
             // Keep a short last row's columns the same width as the others.
@@ -928,17 +944,17 @@ private fun AudioSeatGrid(
 @Composable
 private fun AudioSeat(
     index: Int,
-    state: PartyRoomUiState,
+    room: PartyRoom,
+    seat: PartySeat?,
+    locked: Boolean,
+    mine: Boolean,
+    waiting: Boolean,
+    speaking: Boolean,
+    busy: Boolean,
+    canModerate: Boolean,
     onSeatTap: (Int) -> Unit,
     onToggleLock: (Int) -> Unit,
 ) {
-    val room = state.room ?: return
-    val seat = state.seatByIndex[index]
-    val locked = room.lockedSeats.contains(index)
-    val mine = seat != null && seat.uid == state.myUid
-    val waiting = state.myRequestedSeat == index
-    val speaking = isSpeaking(seat, state)
-
     Column(
         Modifier.fillMaxWidth()
             .recordSeatCentre(PartySeatCentres.centres, index)
@@ -970,10 +986,10 @@ private fun AudioSeat(
                 EmptySeatDisc(
                     diameter = Size.Avatar.md,
                     locked = locked,
-                    busy = state.busySeat == index,
+                    busy = busy,
                     waiting = waiting,
                 )
-                if (state.canModerate) {
+                if (canModerate) {
                     // 22dp in the 56dp box's corner: clear of the seat's centre by
                     // 6dp — but only if Compose does not quietly grow its touch
                     // area to the 48dp minimum, which reaches back over the middle
@@ -1015,9 +1031,19 @@ private fun VideoSeatGrid(
     (1..state.seatCount).chunked(columns).forEach { row ->
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
             row.forEach { index ->
+                val room = state.room ?: return@forEach
+                val seat = state.seatByIndex[index]
+                // O10: each tile gets only its own values (see AudioSeatGrid).
                 VideoTile(
                     index = index,
-                    state = state,
+                    room = room,
+                    seat = seat,
+                    locked = room.lockedSeats.contains(index),
+                    mine = seat != null && seat.uid == state.myUid,
+                    speaking = isSpeaking(seat, state),
+                    busy = state.busySeat == index,
+                    waiting = state.myRequestedSeat == index,
+                    canModerate = state.canModerate,
                     // A factory, not an instance: the surface is only allocated
                     // for a tile that will really show video, and the map keys it
                     // by seat so the same tile always gets the same one back.
@@ -1035,18 +1061,20 @@ private fun VideoSeatGrid(
 @Composable
 private fun VideoTile(
     index: Int,
-    state: PartyRoomUiState,
+    room: PartyRoom,
+    seat: PartySeat?,
+    locked: Boolean,
+    mine: Boolean,
+    speaking: Boolean,
+    busy: Boolean,
+    waiting: Boolean,
+    canModerate: Boolean,
     surfaceFor: () -> SurfaceView,
     onSeatTap: (Int) -> Unit,
     onToggleLock: (Int) -> Unit,
     modifier: Modifier,
 ) {
     val c = ZipperTheme.colors
-    val room = state.room ?: return
-    val seat = state.seatByIndex[index]
-    val locked = room.lockedSeats.contains(index)
-    val mine = seat != null && seat.uid == state.myUid
-    val speaking = isSpeaking(seat, state)
     val showVideo = seat != null && !seat.cameraOff
     val surface = if (showVideo) surfaceFor() else null
 
@@ -1111,10 +1139,10 @@ private fun VideoTile(
             EmptySeatDisc(
                 diameter = Size.Avatar.md,
                 locked = locked,
-                busy = state.busySeat == index,
-                waiting = state.myRequestedSeat == index,
+                busy = busy,
+                waiting = waiting,
             )
-            if (state.canModerate) {
+            if (canModerate) {
                 SeatLockToggle(locked, Modifier.align(Alignment.TopEnd).padding(Space.xxs)) {
                     onToggleLock(index)
                 }

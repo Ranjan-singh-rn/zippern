@@ -420,11 +420,21 @@ class ProfileRepository @Inject constructor(
 
     // ── Wallet transaction flows ──────────────────────────────────────────────
 
+    private companion object {
+        /** O10: how many wallet rows the history screens stream (newest first). */
+        const val TRANSACTIONS_SHOWN = 50L
+    }
+
+
     /** Real-time stream of diamond transactions for [uid], newest first. */
     fun diamondTransactionsFlow(uid: String): Flow<List<DiamondTransaction>> = callbackFlow {
         val listener = firestore.collection("users").document(uid)
             .collection("diamondTransactions")
-            // No orderBy — sort client-side to avoid needing a Firestore index
+            // O10 (5 Nov 2026), speed: the newest 50, not the whole history. Every writer stamps `timestamp`
+            // (Functions and backend), and a single-field order needs no composite index. The listener used to
+            // download every row since the account was made — on every launch, in up to two ViewModels at once.
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(TRANSACTIONS_SHOWN)
             .addSnapshotListener { snap, err ->
                 if (err != null || snap == null) { trySend(emptyList()); return@addSnapshotListener }
                 val list = snap.documents.mapNotNull { doc ->
@@ -447,7 +457,11 @@ class ProfileRepository @Inject constructor(
     fun beanTransactionsFlow(uid: String): Flow<List<BeanTransaction>> = callbackFlow {
         val listener = firestore.collection("users").document(uid)
             .collection("beanTransactions")
-            // No orderBy — sort client-side to avoid needing a Firestore index
+            // O10 (5 Nov 2026), speed: the newest 50, not the whole history. Every writer stamps `timestamp`
+            // (Functions and backend), and a single-field order needs no composite index. The listener used to
+            // download every row since the account was made — on every launch, in up to two ViewModels at once.
+            .orderBy("timestamp", com.google.firebase.firestore.Query.Direction.DESCENDING)
+            .limit(TRANSACTIONS_SHOWN)
             .addSnapshotListener { snap, err ->
                 if (err != null || snap == null) { trySend(emptyList()); return@addSnapshotListener }
                 val list = snap.documents.mapNotNull { doc ->
@@ -488,12 +502,16 @@ class ProfileRepository @Inject constructor(
 
     // ── Follow counts ─────────────────────────────────────────────────────────
 
+    // O10 (5 Nov 2026), speed: an aggregate count — one small answer from the server — instead of downloading every
+    // follower document to count them.
     suspend fun getFollowerCount(targetUid: String): Int = try {
-        firestore.collection("users").document(targetUid).collection("followers").get().await().size()
+        firestore.collection("users").document(targetUid).collection("followers")
+            .count().get(com.google.firebase.firestore.AggregateSource.SERVER).await().count.toInt()
     } catch (_: Exception) { 0 }
 
     suspend fun getFollowingCount(targetUid: String): Int = try {
-        firestore.collection("users").document(targetUid).collection("following").get().await().size()
+        firestore.collection("users").document(targetUid).collection("following")
+            .count().get(com.google.firebase.firestore.AggregateSource.SERVER).await().count.toInt()
     } catch (_: Exception) { 0 }
 
     // ── Follow / Unfollow ─────────────────────────────────────────────────────

@@ -45,6 +45,7 @@ import com.zipper.app.ui.components.AvatarSize
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
@@ -111,12 +112,16 @@ fun GiftAnimationOverlay(
         Column(
             Modifier
                 .fillMaxWidth()
+                // O10 (5 Nov 2026), speed: every animated value is read in the draw phase, so the gift moves without
+                // recomposing the overlay on each frame (`.scale(scale.value)` / `.alpha(fade.value)` read them in
+                // composition).
                 .graphicsLayer {
                     translationX = travel.value * dxDp.dp.toPx()
                     translationY = travel.value * dyDp.dp.toPx()
-                }
-                .scale(scale.value)
-                .alpha(fade.value),
+                    scaleX = scale.value
+                    scaleY = scale.value
+                    alpha = fade.value
+                },
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(Space.md),
         ) {
@@ -245,16 +250,20 @@ private fun LottieGiftOverlay(giftEvent: LiveGiftEvent, onDismiss: () -> Unit, m
     }
     val spec = remember(giftEvent.lottieAsset) { lottieSpecOf(giftEvent.lottieAsset) }
     val composition by com.airbnb.lottie.compose.rememberLottieComposition(spec)
-    val progress by com.airbnb.lottie.compose.animateLottieCompositionAsState(composition, iterations = 1)
+    val progress = com.airbnb.lottie.compose.animateLottieCompositionAsState(composition, iterations = 1)
     LaunchedEffect(giftEvent.id) {
         delay(SVGA_GIFT_WATCHDOG_MS)
         finish()
     }
-    LaunchedEffect(composition, progress) {
-        if (composition != null && progress >= 1f) finish()
+    // O10: watched as a flow, not as an effect key — keyed on the progress, this effect was cancelled and restarted
+    // on every animation frame, and the whole overlay recomposed with it.
+    LaunchedEffect(composition) {
+        if (composition == null) return@LaunchedEffect
+        androidx.compose.runtime.snapshotFlow { progress.value }.first { it >= 1f }
+        finish()
     }
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        com.airbnb.lottie.compose.LottieAnimation(composition, { progress }, modifier = Modifier.fillMaxSize())
+        com.airbnb.lottie.compose.LottieAnimation(composition, { progress.value }, modifier = Modifier.fillMaxSize())
         Row(
             Modifier
                 .align(Alignment.BottomCenter)

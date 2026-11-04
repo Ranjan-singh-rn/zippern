@@ -7,7 +7,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatDelegate
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.*
 import androidx.core.os.LocaleListCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -22,7 +21,6 @@ import com.zipper.app.navigation.ZipperNavGraph
 import com.zipper.app.ui.screens.auth.ForcedSignOut
 import com.zipper.app.ui.screens.auth.SessionEvent
 import com.zipper.app.ui.screens.auth.SessionViewModel
-import com.zipper.app.ui.screens.profile.ProfileViewModel
 import com.zipper.app.ui.screens.update.AppUpdateGate
 import com.zipper.app.ui.theme.ZipperTheme
 import dagger.hilt.android.AndroidEntryPoint
@@ -37,7 +35,6 @@ import javax.inject.Inject
 class MainActivity : ComponentActivity() {
 
     private val sessionViewModel: SessionViewModel by viewModels()
-    private val profileViewModel: ProfileViewModel by viewModels()
 
     /**
      * The OTA updater.
@@ -158,15 +155,10 @@ class MainActivity : ComponentActivity() {
         consumeIntent(intent)
 
         setContent {
-            val profileState by profileViewModel.state.collectAsStateWithLifecycle()
-            val systemDark = isSystemInDarkTheme()
-            val darkTheme = when (profileState.user?.theme) {
-                "dark"  -> true
-                "light" -> false
-                else    -> systemDark   // "system" or null (before user doc loads)
-            }
-
-            ZipperTheme(darkTheme = darkTheme) {
+            // O10 (5 Nov 2026), speed: this used to collect the whole ProfileViewModel here — creating it at launch
+            // with its six Firestore listeners — only to pick a light/dark theme that ZipperTheme ignores (the app
+            // is dark-only). Every profile change then recomposed the root and rebuilt the navigation graph.
+            ZipperTheme {
                 val navController = rememberNavController()
 
                 // React to mid-session kicks and bans in real-time

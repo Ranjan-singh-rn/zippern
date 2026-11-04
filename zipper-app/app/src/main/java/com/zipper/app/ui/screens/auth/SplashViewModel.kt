@@ -10,6 +10,7 @@ import com.zipper.app.util.DeletionWindow
 import com.zipper.app.util.SessionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
@@ -180,6 +181,19 @@ class SplashViewModel @Inject constructor(
     suspend fun refreshRoles() {
         withTimeoutOrNull(4_000) {
             try { authRepository.syncRoles() } catch (_: Exception) { }
+        }
+    }
+
+    /**
+     * O10 (5 Nov 2026), speed: the same refresh, not awaited. Splash used to hold every cold start for up to 4 s on
+     * it. It runs in a scope of its own because this ViewModel is cleared the moment Splash navigates away, which
+     * would cancel it half-way.
+     */
+    fun refreshRolesInBackground() {
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+            withTimeoutOrNull(15_000) {
+                try { authRepository.syncRoles() } catch (_: Exception) { }
+            }
         }
     }
 }

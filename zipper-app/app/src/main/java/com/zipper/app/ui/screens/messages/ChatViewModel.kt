@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
@@ -31,7 +32,8 @@ import javax.inject.Inject
 
 data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
-    val messageInput: String = "",
+    /** O10: more messages exist above the newest page ("Show earlier messages"). */
+    val hasEarlier: Boolean = false,
     val otherUserName: String = "",
     val otherUserPhotoUrl: String = "",
     val otherUserOnline: Boolean = false,
@@ -65,6 +67,16 @@ class ChatViewModel @Inject constructor(
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
+
+    /**
+     * O10 (5 Nov 2026), speed: what is typed lives in its own flow. It used to be a field of [state], so every
+     * keystroke produced a new screen state and recomposed the whole thread; only the composer reads it now.
+     */
+    private val _input = MutableStateFlow("")
+    val input: StateFlow<String> = _input.asStateFlow()
+
+    /** How many of the newest messages the thread streams; raised by [showEarlier]. */
+    private val shown = MutableStateFlow(ChatRepository.MESSAGES_PAGE)
 
     private val recorder = VoiceRecorder(appContext)
     private val player = VoicePlayer()
@@ -107,14 +119,19 @@ class ChatViewModel @Inject constructor(
      * The thread, minus what this viewer deleted (O5: "delete chat" keeps only what came after). A read failure is
      * said on screen — it used to look like an empty chat.
      */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private fun observeMessages() {
         viewModelScope.launch {
-            combine(chatRepo.messagesFlow(convoId), chatRepo.clearedAtFlow(convoId, myUid)) { update, clearedAt ->
-                update to clearedAt
-            }.collect { (update, clearedAt) ->
+            shown.flatMapLatest { limit ->
+                combine(chatRepo.messagesFlow(convoId, limit), chatRepo.clearedAtFlow(convoId, myUid)) { update, clearedAt ->
+                    Triple(update, clearedAt, limit)
+                }
+            }.collect { (update, clearedAt, limit) ->
                 _state.update {
                     it.copy(
                         messages = ChatParse.after(update.messages, clearedAt),
+                        // A full page came back, so there may be more above it.
+                        hasEarlier = update.messages.size >= limit,
                         isLoading = false,
                         loadFailed = update.failed,
                     )
@@ -123,7 +140,10 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    fun onInput(v: String) { _state.update { it.copy(messageInput = v) } }
+    /** O10: one more page of older messages above the ones shown. */
+    fun showEarlier() { shown.update { it + ChatRepository.MESSAGES_PAGE } }
+
+    fun onInput(v: String) { _input.value = v }
 
     fun consumeNotice() { _state.update { it.copy(notice = null) } }
 
@@ -151,12 +171,12 @@ class ChatViewModel @Inject constructor(
     }
 
     fun sendMessage() {
-        val text = _state.value.messageInput.trim()
+        val text = _input.value.trim()
         if (text.isBlank()) return
-        _state.update { it.copy(messageInput = "") }
+        _input.value = ""
         viewModelScope.launch {
             // Put the text back when it did not go, so nothing typed is lost.
-            if (!deliver("text", text = text)) _state.update { if (it.messageInput.isEmpty()) it.copy(messageInput = text) else it }
+            if (!deliver("text", text = text)) _input.update { if (it.isEmpty()) text else it }
         }
     }
 

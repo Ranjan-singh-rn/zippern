@@ -29,7 +29,13 @@ class ChatRepository @Inject constructor(
     private val storage: FirebaseStorage,
 ) {
 
-    private companion object { const val TAG = "Chat" }
+    companion object {
+        private const val TAG = "Chat"
+        /** O10: how many chats the Messages list streams, newest first. */
+        const val CONVERSATIONS_SHOWN = 100L
+        /** O10: a thread opens on its newest messages; "Show earlier messages" adds this many at a time. */
+        const val MESSAGES_PAGE = 100L
+    }
 
     private val convoCol get() = firestore.collection("conversations")
     private val broadcastCol get() = firestore.collection("broadcasts")
@@ -56,6 +62,8 @@ class ChatRepository @Inject constructor(
         val primary = convoCol
             .whereArrayContains("participants", myUid)
             .orderBy("lastMessageAt", Query.Direction.DESCENDING)
+            // O10 (5 Nov 2026), speed: the latest 100 chats, not every conversation the account ever had.
+            .limit(CONVERSATIONS_SHOWN)
             .addSnapshotListener { snap, err ->
                 if (err != null) {
                     android.util.Log.w(TAG, "conversations listener failed; reading them unordered", err)
@@ -63,6 +71,7 @@ class ChatRepository @Inject constructor(
                     // ChatParse.visible sorts the rows here. Started once.
                     if (fallback == null) {
                         fallback = convoCol.whereArrayContains("participants", myUid)
+                            .limit(CONVERSATIONS_SHOWN)
                             .addSnapshotListener { s2, e2 ->
                                 if (e2 != null) {
                                     android.util.Log.w(TAG, "conversations fallback failed", e2)
@@ -119,9 +128,14 @@ class ChatRepository @Inject constructor(
 
     data class MessagesUpdate(val messages: List<ChatMessage>, val failed: Boolean = false)
 
-    fun messagesFlow(convoId: String): Flow<MessagesUpdate> = callbackFlow {
+    /**
+     * The newest [limit] messages, oldest first. O10 (5 Nov 2026), speed: the thread used to stream its WHOLE history
+     * and re-parse all of it on every new message; "Show earlier messages" raises [limit] a page at a time.
+     */
+    fun messagesFlow(convoId: String, limit: Long = MESSAGES_PAGE): Flow<MessagesUpdate> = callbackFlow {
         val listener = convoCol.document(convoId).collection("messages")
             .orderBy("timestamp", Query.Direction.ASCENDING)
+            .limitToLast(limit)
             .addSnapshotListener { snap, err ->
                 if (err != null) {
                     android.util.Log.w(TAG, "messages listener failed for $convoId", err)

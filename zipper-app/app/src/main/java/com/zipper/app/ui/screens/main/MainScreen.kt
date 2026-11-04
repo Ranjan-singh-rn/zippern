@@ -156,6 +156,11 @@ fun MainScreen(
             navController = tabNavController,
             startDestination = "tab_home",
             modifier = Modifier.padding(padding),
+            // O10: switching tabs is instant (the default was a 700 ms cross-fade of both tabs).
+            enterTransition = { androidx.compose.animation.EnterTransition.None },
+            exitTransition = { androidx.compose.animation.ExitTransition.None },
+            popEnterTransition = { androidx.compose.animation.EnterTransition.None },
+            popExitTransition = { androidx.compose.animation.ExitTransition.None },
         ) {
             composable("tab_home") {
                 HomeScreen(

@@ -131,7 +131,11 @@ fun ChatScreen(
     // used to keep counting messages the person had already seen here.
     val newestFromThem = state.messages.lastOrNull { it.senderUid != myUid }?.id
     LaunchedEffect(newestFromThem) { viewModel.markRead() }
-    LaunchedEffect(state.messages.size) { if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1) }
+    // O10: follow the NEWEST message (a page of older ones loaded above must not jump the view to the bottom).
+    val newestId = state.messages.lastOrNull()?.id
+    LaunchedEffect(newestId) {
+        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1 + (if (state.hasEarlier) 1 else 0))
+    }
     LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); viewModel.consumeNotice() } }
     LaunchedEffect(peerState.toastMessage) { peerState.toastMessage?.let { snackbar.showSnackbar(it); peer.clearToast() } }
     // O5b: the server rang them (`startCall` priced it and checked blocks, the host's calls switch and the balance).
@@ -210,6 +214,11 @@ fun ChatScreen(
                         state = listState, modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(Space.md), verticalArrangement = Arrangement.spacedBy(Space.sm),
                     ) {
+                        if (state.hasEarlier) item(key = "earlier") {
+                            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                TextButton(viewModel::showEarlier) { Text("Show earlier messages", color = c.textBrand) }
+                            }
+                        }
                         items(state.messages, key = { it.id }) { msg ->
                             MessageRow(
                                 msg, msg.senderUid == myUid, onJoinLive,
@@ -263,29 +272,10 @@ fun ChatScreen(
                         background = Color.Transparent, tint = c.textSecondary, enabled = !busy)
                     IconButtonCircle(Icons.Default.CardGiftcard, "Send a gift", { showGifts = true },
                         background = Color.Transparent, tint = c.currencyDiamond)
-                    Row(
-                        Modifier.weight(1f).heightIn(min = 48.dp).background(c.bgBase, RoundedCornerShape(24.dp)).border(1.dp, c.borderDefault, RoundedCornerShape(24.dp)).padding(start = Space.lg, end = Space.md, top = 12.dp, bottom = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        BasicTextField(
-                            value = state.messageInput, onValueChange = viewModel::onInput, maxLines = 4,
-                            textStyle = ZipperTheme.type.bodyM.copy(color = c.textPrimary), cursorBrush = SolidColor(c.brandPrimary),
-                            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Send),
-                            keyboardActions = KeyboardActions(onSend = { viewModel.sendMessage() }),
-                            modifier = Modifier.weight(1f),
-                            decorationBox = { inner -> if (state.messageInput.isEmpty()) Text("Type a message…", style = ZipperTheme.type.bodyS, color = c.textMuted); inner() },
-                        )
-                    }
-                    val canSend = state.messageInput.isNotBlank()
-                    Box(
-                        Modifier.size(48.dp)
-                            .background(Brush.linearGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), CircleShape)
-                            .clickableNoRipple { if (canSend) viewModel.sendMessage() else if (!busy) startVoice() },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (canSend) Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = Color.White, modifier = Modifier.size(22.dp))
-                        else Icon(Icons.Default.Mic, "Record a voice message", tint = Color.White, modifier = Modifier.size(22.dp))
-                    }
+                    TextComposer(
+                        input = viewModel.input, onInput = viewModel::onInput, onSend = viewModel::sendMessage,
+                        onVoice = { if (!busy) startVoice() }, modifier = Modifier.weight(1f),
+                    )
                 }
             }
         }
@@ -439,3 +429,45 @@ private fun MessageRow(
 // QA #54: message times in IST, whatever the handset's zone.
 private val timeFmt = SimpleDateFormat("h:mm a", Locale.getDefault()).apply { timeZone = com.zipper.app.util.IstTime.ZONE }
 private fun timeOf(ms: Long): String = if (ms <= 0) "" else timeFmt.format(Date(ms))
+
+
+/**
+ * The text field and the send / voice button. O10 (5 Nov 2026), speed: its own composable reading its own flow, so a
+ * keystroke recomposes this row and nothing else — the thread above it used to recompose on every letter typed.
+ */
+@Composable
+private fun TextComposer(
+    input: kotlinx.coroutines.flow.StateFlow<String>,
+    onInput: (String) -> Unit,
+    onSend: () -> Unit,
+    onVoice: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val c = ZipperTheme.colors
+    val text by input.collectAsStateWithLifecycle()
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
+        Row(
+            Modifier.weight(1f).heightIn(min = 48.dp).background(c.bgBase, RoundedCornerShape(24.dp)).border(1.dp, c.borderDefault, RoundedCornerShape(24.dp)).padding(start = Space.lg, end = Space.md, top = 12.dp, bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BasicTextField(
+                value = text, onValueChange = onInput, maxLines = 4,
+                textStyle = ZipperTheme.type.bodyM.copy(color = c.textPrimary), cursorBrush = SolidColor(c.brandPrimary),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                modifier = Modifier.weight(1f),
+                decorationBox = { inner -> if (text.isEmpty()) Text("Type a message…", style = ZipperTheme.type.bodyS, color = c.textMuted); inner() },
+            )
+        }
+        val canSend = text.isNotBlank()
+        Box(
+            Modifier.size(48.dp)
+                .background(Brush.linearGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), CircleShape)
+                .clickableNoRipple { if (canSend) onSend() else onVoice() },
+            contentAlignment = Alignment.Center,
+        ) {
+            if (canSend) Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = Color.White, modifier = Modifier.size(22.dp))
+            else Icon(Icons.Default.Mic, "Record a voice message", tint = Color.White, modifier = Modifier.size(22.dp))
+        }
+    }
+}

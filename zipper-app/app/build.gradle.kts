@@ -442,6 +442,13 @@ android {
     }
 }
 
+// O10 (5 Nov 2026), speed: strong skipping — a composable whose parameters did not change is skipped even when a
+// parameter's type is not provably stable (List fields, lambdas). On by default from Kotlin 2.0.20; this build is on
+// 2.0.0, where it is opt-in. Without it the navigation graph and every card in a list recomposed on any change above.
+composeCompiler {
+    enableStrongSkippingMode = true
+}
+
 dependencies {
     // Core
     implementation(libs.androidx.core.ktx)

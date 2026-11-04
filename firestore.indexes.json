@@ -1121,6 +1121,20 @@
           "order": "ASCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "liveRooms",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "isActive",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "viewerCount",
+          "order": "DESCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": [

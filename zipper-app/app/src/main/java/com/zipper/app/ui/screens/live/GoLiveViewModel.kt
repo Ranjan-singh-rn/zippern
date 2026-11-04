@@ -164,6 +164,13 @@ class GoLiveViewModel @Inject constructor(
     private val _state = MutableStateFlow(GoLiveUiState())
     val state: StateFlow<GoLiveUiState> = _state.asStateFlow()
 
+    /**
+     * O10 (5 Nov 2026), speed: the on-air clock ticks in its own flow. It used to be a field of [state], so the whole
+     * Go Live screen — camera surface, chat, gifts — recomposed once a second for one small "12:34" label.
+     */
+    private val _duration = MutableStateFlow(0L)
+    val duration: StateFlow<Long> = _duration.asStateFlow()
+
     private var durationJob: Job? = null
     private var faceCountdownJob: Job? = null
 
@@ -379,7 +386,7 @@ class GoLiveViewModel @Inject constructor(
         durationJob = viewModelScope.launch {
             while (true) {
                 delay(1000)
-                _state.update { it.copy(liveDurationSeconds = it.liveDurationSeconds + 1) }
+                _duration.update { it + 1 }
             }
         }
     }
@@ -550,7 +557,7 @@ class GoLiveViewModel @Inject constructor(
     fun sessionSummary(): LiveSessionSummary = with(_state.value) {
         LiveSessionSummary(
             roomId = roomId,
-            durationSeconds = liveDurationSeconds,
+            durationSeconds = _duration.value,
             totalBeans = totalBeansSession,
             peakViewers = peakViewers,
             gifterCount = gifterCount,
@@ -568,6 +575,7 @@ class GoLiveViewModel @Inject constructor(
         val s = _state.value
         if (s.roomId.isBlank()) return
         durationJob?.cancel()
+        val durationAtEnd = _duration.value
         faceCountdownJob?.cancel()
         heartbeatJob?.cancel()
         _state.update { it.copy(isLive = false, pkState = PKState.IDLE) }
@@ -588,7 +596,7 @@ class GoLiveViewModel @Inject constructor(
                 if (s.pkState == PKState.WAITING) pkRepo.cancelPKQueue(s.roomId)
             } catch (_: Exception) {}
             if (!roomAlreadyClosed) {
-                try { repo.endLive(s.roomId, s.liveDurationSeconds) } catch (_: Exception) {}
+                try { repo.endLive(s.roomId, durationAtEnd) } catch (_: Exception) {}
             }
         }
     }

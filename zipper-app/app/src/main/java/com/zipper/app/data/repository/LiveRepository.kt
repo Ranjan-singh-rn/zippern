@@ -2,6 +2,7 @@ package com.zipper.app.data.repository
 
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
 import com.zipper.app.data.model.GiftLeaderboardEntry
@@ -42,22 +43,34 @@ class LiveRepository @Inject constructor(
 
     // ── Live room listing ─────────────────────────────────────────────────────
 
+    /**
+     * The live rooms, most watched first. O10 (5 Nov 2026), speed: at most [LIVE_ROOMS_SHOWN], ordered by the server
+     * (index `liveRooms(isActive, viewerCount desc)`), parsed off the main thread. It used to stream EVERY active
+     * room and sort them on the main thread on each change — and every host's heartbeat is a change. Until the index
+     * is deployed the ordered query is refused; the same limit is then read unordered and sorted here.
+     */
     fun liveRoomsFlow(): Flow<List<LiveRoom>> = callbackFlow {
-        val listener = liveRoomsCol
+        var fallback: ListenerRegistration? = null
+        fun send(snap: com.google.firebase.firestore.QuerySnapshot) {
+            trySend(snap.documents.mapNotNull { doc -> LiveRoom.from(doc) }.sortedByDescending { it.viewerCount })
+        }
+        val primary = liveRoomsCol
             .whereEqualTo("isActive", true)
-            .addSnapshotListener { snap, err ->
-                if (err != null || snap == null) {
-                    trySend(emptyList())
+            .orderBy("viewerCount", Query.Direction.DESCENDING)
+            .limit(LIVE_ROOMS_SHOWN)
+            .addSnapshotListener(BackgroundListeners.executor) { snap, err ->
+                if (err != null) {
+                    if (fallback == null) {
+                        fallback = liveRoomsCol.whereEqualTo("isActive", true).limit(LIVE_ROOMS_SHOWN)
+                            .addSnapshotListener(BackgroundListeners.executor) { s2, e2 ->
+                                if (e2 != null || s2 == null) trySend(emptyList()) else send(s2)
+                            }
+                    }
                     return@addSnapshotListener
                 }
-                val rooms = snap.documents
-                    .mapNotNull { doc ->
-                        LiveRoom.from(doc)
-                    }
-                    .sortedByDescending { it.viewerCount }
-                trySend(rooms)
+                if (snap == null) trySend(emptyList()) else send(snap)
             }
-        awaitClose { listener.remove() }
+        awaitClose { primary.remove(); fallback?.remove() }
     }
 
     fun roomFlow(roomId: String): Flow<LiveRoom?> = callbackFlow {
@@ -355,11 +368,26 @@ class LiveRepository @Inject constructor(
     // ── Viewer presence ───────────────────────────────────────────────────────
 
     /** Real-time list of viewers in a room. */
+    /**
+     * O10 (5 Nov 2026), speed: the first [VIEWERS_SHOWN] viewers, read field by field (no reflection) and off the
+     * main thread. Every viewer's heartbeat rewrites their row, so in a busy room this listener fires constantly; it
+     * used to re-parse the whole audience on the main thread each time. The audience SIZE is the server's
+     * `viewerCount` on the room, not this list's length.
+     */
     fun viewersFlow(roomId: String): Flow<List<ViewerPresence>> = callbackFlow {
         val listener = liveRoomsCol.document(roomId).collection("viewers")
             .orderBy("joinedAt", Query.Direction.ASCENDING)
-            .addSnapshotListener { snap, _ ->
-                val list = snap?.documents?.mapNotNull { it.toObject(ViewerPresence::class.java) } ?: emptyList()
+            .limit(VIEWERS_SHOWN)
+            .addSnapshotListener(BackgroundListeners.executor) { snap, _ ->
+                val list = snap?.documents?.mapNotNull { d ->
+                    ViewerPresence(
+                        uid = d.getString("uid") ?: d.id,
+                        name = d.getString("name").orEmpty(),
+                        photoUrl = d.getString("photoUrl").orEmpty(),
+                        level = (d.getLong("level") ?: 0L).toInt(),
+                        joinedAt = d.getLong("joinedAt") ?: 0L,
+                    )
+                } ?: emptyList()
                 trySend(list)
             }
         awaitClose { listener.remove() }
@@ -395,7 +423,8 @@ class LiveRepository @Inject constructor(
     fun giftLeaderboardFlow(roomId: String): Flow<RoomGifters> = callbackFlow {
         val listener = liveRoomsCol.document(roomId).collection("gifts")
             .orderBy("timestamp", Query.Direction.ASCENDING)
-            .addSnapshotListener { snap, _ ->
+            // O10: summed off the main thread — it re-adds every gift of the session on each new gift.
+            .addSnapshotListener(BackgroundListeners.executor) { snap, _ ->
                 if (snap == null) { trySend(RoomGifters()); return@addSnapshotListener }
                 // Group by sender uid, sum diamond costs
                 val totals = mutableMapOf<String, Triple<String, String, Long>>() // uid → (name, photo, total)
@@ -552,6 +581,10 @@ class LiveRepository @Inject constructor(
         const val LIVE_HEARTBEAT_MS = 60_000L
         /** B12: the longest pinned message (the rules allow 140). */
         const val PINNED_MAX = 140
+        /** O10: the live rooms the Live tab streams, most watched first. */
+        const val LIVE_ROOMS_SHOWN = 60L
+        /** O10: viewer rows a room streams for its avatar strip (the count is the server's `viewerCount`). */
+        const val VIEWERS_SHOWN = 100L
         /** B12: the longest comment (the rules allow 300). */
         const val COMMENT_MAX = 300
     }

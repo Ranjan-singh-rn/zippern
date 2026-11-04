@@ -78,7 +78,8 @@ class DiscoverRepository @Inject constructor(
             .orderBy("lastSeen", Query.Direction.DESCENDING)
             .limit(limit)
 
-        val reg = q.addSnapshotListener { snap, err ->
+        // O10: parsed off the main thread — every listed person's presence change re-sends the page.
+        val reg = q.addSnapshotListener(BackgroundListeners.executor) { snap, err ->
             if (err != null || snap == null) {
                 // A missing composite index surfaces here. The message carries a
                 // console link to create it — worth reading rather than

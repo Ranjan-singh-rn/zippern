@@ -30,6 +30,7 @@ import com.zipper.app.data.repository.RestrictionKind
 import com.zipper.app.util.DeviceBan
 import com.zipper.app.util.SessionManager
 import com.zipper.app.util.millis
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
@@ -89,18 +90,27 @@ fun SplashScreen(
     LaunchedEffect(attempt) {
         gateError = null
         if (attempt == 0) {
-            scale.animateTo(1f, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy))
-            delay(800)
+            // O10 (5 Nov 2026), speed: the logo used to spring in and THEN wait 800 ms before any check started —
+            // over a second of nothing on every cold start. The mark now springs in while the checks run.
+            launch { scale.animateTo(1f, animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)) }
         }
 
         // Device-level ban check — blocks reinstalled accounts too
         val deviceId = Settings.Secure.getString(
             context.contentResolver, Settings.Secure.ANDROID_ID
         ) ?: ""
-        if (deviceId.isNotBlank()) {
+        // O10: the device read is started at once and the credential reload below runs while it is in flight; the
+        // ban is still decided FIRST, before anything else is looked at.
+        val deviceBanRead = if (deviceId.isNotBlank()) async {
+            runCatching {
+                FirebaseFirestore.getInstance().collection("bannedDevices").document(deviceId).get().await()
+            }
+        } else null
+        val signedIn = FirebaseAuth.getInstance().currentUser
+        val reloadRun = signedIn?.let { user -> async { runCatching { user.reload().await() } } }
+        if (deviceBanRead != null) {
             try {
-                val deviceBanSnap = FirebaseFirestore.getInstance()
-                    .collection("bannedDevices").document(deviceId).get().await()
+                val deviceBanSnap = deviceBanRead.await().getOrThrow()
                 // B44: a LIFTED bar is kept with `isActive: false` and bars
                 // nothing — the server's own reading. See DeviceBan.
                 if (DeviceBan.applies(deviceBanSnap.exists(), deviceBanSnap.getBoolean("isActive"))) {
@@ -148,14 +158,14 @@ fun SplashScreen(
          * have already decided not to act on would cost a Play Services round
          * trip on every launch and change the outcome not at all.
          */
-        val user = FirebaseAuth.getInstance().currentUser
-        if (user == null) {
+        val user = signedIn
+        if (user == null || reloadRun == null) {
             onNavigateToLogin()
             return@LaunchedEffect
         }
 
         try {
-            user.reload().await()
+            reloadRun.await().getOrThrow()
         } catch (e: Exception) {
             /*
              * ── B03: ONLY A REFUSED CREDENTIAL ENDS THE SESSION ──────────────
@@ -422,7 +432,9 @@ fun SplashScreen(
             // restored session too — see SplashViewModel.refreshRoles. Done
             // BEFORE the profile gate and independent of it: an approved
             // Agency is an Agency whether or not their app profile is complete.
-            splashViewModel.refreshRoles()
+            // O10: refreshed in the background — the app opens without waiting up to 4 s for it; the role flags
+            // land on the account document and every screen that reads them updates when they do.
+            splashViewModel.refreshRolesInBackground()
 
             val profileComplete = snap.getBoolean("isProfileComplete") ?: false
             if (!profileComplete) onNavigateToProfileSetup() else onNavigateToMain()
