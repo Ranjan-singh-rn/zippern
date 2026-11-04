@@ -310,3 +310,41 @@ describe('streamed time — measured by the server', () => {
     expect(db.read('users/H1').streamedTimeSeconds).toBe(secs)
   })
 })
+
+describe('O1 (5 Nov 2026) — the live host switches incoming calls off', () => {
+  const calls = require('../lib/calls')
+  const start = (key, caller = 'CALLER') => calls.startCall.run({ data: { peerUid: 'LH', idempotencyKey: key }, auth: { uid: caller, token } })
+  async function refusalOf(p) { try { await p } catch (e) { return e } return null }
+  beforeEach(() => {
+    db.seed('users/LH', { name: 'Live Host', accountState: 'active', isHost: true, isVerifiedHost: true, callRateBeans: 500,
+      gender: 'female', isLive: true, liveRoomId: 'LIVE1' })
+    db.seed('users/CALLER', { name: 'Caller', accountState: 'active', diamonds: 5000, gender: 'male' })
+    db.seed('liveRooms/LIVE1', { hostUid: 'LH', isActive: true, hostBlocksCalls: true })
+  })
+
+  test('calls off: the caller is told the host is live and not taking calls, and nothing is charged', async () => {
+    const e = await refusalOf(start('k-live-1'))
+    expect(e && e.details && e.details.code).toBe('PEER_IN_LIVE')
+    expect(e.message).toContain('is live and not taking calls')
+    expect(db.read('users/CALLER').diamonds).toBe(5000)
+    expect(db.all('calls').length).toBe(0)
+  })
+
+  test('calls back on: the call rings', async () => {
+    db.seed('liveRooms/LIVE1', { hostUid: 'LH', isActive: true, hostBlocksCalls: false })
+    const ok = await start('k-live-2')
+    expect(db.read(`calls/${ok.callId}`).status).toBe('ringing')
+  })
+
+  test('an ended live does not keep the switch on', async () => {
+    db.seed('liveRooms/LIVE1', { hostUid: 'LH', isActive: false, hostBlocksCalls: true })
+    const ok = await start('k-live-3')
+    expect(db.read(`calls/${ok.callId}`).status).toBe('ringing')
+  })
+
+  test('the switch counts only on the host\'s OWN room (a stale liveRoomId pointing elsewhere does not block)', async () => {
+    db.seed('liveRooms/LIVE1', { hostUid: 'SOMEONE_ELSE', isActive: true, hostBlocksCalls: true })
+    const ok = await start('k-live-4')
+    expect(db.read(`calls/${ok.callId}`).status).toBe('ringing')
+  })
+})

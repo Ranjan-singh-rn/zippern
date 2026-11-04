@@ -89,7 +89,11 @@ fun ProfileScreen(
     val clipboard = LocalClipboardManager.current
     var showLanguageSheet by remember { mutableStateOf(false) }
 
-    Column(Modifier.fillMaxSize().background(c.bgBase).verticalScroll(rememberScrollState())) {
+    // QA #16: Back and Edit stay on screen (they used to scroll away with the hero), and the status bar gets a scrim
+    // that fades in as the page scrolls, so content no longer runs under the clock.
+    val profileScroll = rememberScrollState()
+    Box(Modifier.fillMaxSize().background(c.bgBase)) {
+    Column(Modifier.fillMaxSize().verticalScroll(profileScroll)) {
         // ── Hero ──────────────────────────────────────────────────────────
         Box(Modifier.fillMaxWidth().height(262.dp)) {
             Box(Modifier.fillMaxWidth().height(210.dp).background(placeholderBrush(user.uid))) {
@@ -101,13 +105,6 @@ fun ProfileScreen(
                 }
                 Box(Modifier.fillMaxWidth().height(110.dp).background(Brush.verticalGradient(listOf(Color(0xC7070812), Color(0x4D070812), Color.Transparent))))
                 Box(Modifier.fillMaxWidth().height(120.dp).align(Alignment.BottomCenter).background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x59070812), Color(0xE5070812)))))
-            }
-            Row(
-                Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = Space.xs, vertical = Space.xs),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                IconButtonCircle(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack, size = 36.dp, background = c.scrimMedium)
-                IconButtonCircle(Icons.Outlined.Edit, "Edit profile", onEditProfile, size = 36.dp, background = c.scrimMedium)
             }
             Avatar(
                 user.photoUrl, size = AvatarSize.XL,
@@ -196,9 +193,12 @@ fun ProfileScreen(
                 KeyValueRow("Email", user.email.ifBlank { "—" })
                 KeyValueRow("Phone", user.phoneNumber.ifBlank { "—" })
                 KeyValueRow("Referral Code", user.referralCode.ifBlank { "—" })
-                val h = user.streamedTimeSeconds / 3600
-                val m = (user.streamedTimeSeconds % 3600) / 60
-                KeyValueRow("Streamed Time", "${h}h ${m}m")
+                // QA #17: streamed time is a host's figure — a viewer's "0h 0m" said nothing and read like a fault.
+                if (user.isHost) {
+                    val h = user.streamedTimeSeconds / 3600
+                    val m = (user.streamedTimeSeconds % 3600) / 60
+                    KeyValueRow("Streamed Time", "${h}h ${m}m")
+                }
                 if (user.languages.isNotEmpty()) {
                     Text("Languages", style = ZipperTheme.type.bodyS, color = c.textMuted)
                     LanguageChipRow(selected = user.languages, onTapOverflow = { showLanguageSheet = true }, visibleCount = 4)
@@ -261,9 +261,26 @@ fun ProfileScreen(
             }
 
             GiftStrip("Gifts Sent", giftsSent, "No gifts sent yet. Send one from any host's profile.", onViewAllGiftsSent)
-            GiftStrip("Gifts Received", giftsReceived, "No gifts received yet. Go live to receive some.", onViewAllGiftsReceived)
+            // QA #17: "go live" is advice only a host can take; anyone can receive a gift in a party room or a chat.
+            GiftStrip(
+                "Gifts Received", giftsReceived,
+                if (user.isHost) "No gifts received yet. Go live to receive some." else "No gifts received yet.",
+                onViewAllGiftsReceived,
+            )
         }
         Spacer(Modifier.navigationBarsPadding().height(Space.xl))
+    }
+    // The pinned bar over the page (QA #16).
+    val barScrim = (profileScroll.value / 360f).coerceIn(0f, 1f)
+    Box(Modifier.fillMaxWidth().background(c.bgBase.copy(alpha = barScrim)).statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = Space.xs, vertical = Space.xs),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            IconButtonCircle(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack, size = 36.dp, background = c.scrimMedium)
+            IconButtonCircle(Icons.Outlined.Edit, "Edit profile", onEditProfile, size = 36.dp, background = c.scrimMedium)
+        }
+    }
     }
 
     // Full language sheet

@@ -49,6 +49,10 @@ fun ZipperScreen(
 /**
  * Top bar — 56dp (size/bar/top). Title centred when there is a back action,
  * left-aligned on root tabs. Actions on the right.
+ *
+ * O5b (5 Nov 2026): a LEFT-aligned title is laid out in a row — back, title, actions — so it can never sit under
+ * the back arrow or run under the actions. It used to be placed in the same box as the arrow with only a small
+ * start padding, and on the Diamond Shop (back + left title + balance pill) the arrow was drawn over the "D".
  */
 @Composable
 fun TopBar(
@@ -59,6 +63,34 @@ fun TopBar(
     actions: @Composable RowScope.() -> Unit = {},
 ) {
     val c = ZipperTheme.colors
+    if (!centered) {
+        Row(
+            modifier
+                .fillMaxWidth()
+                .height(Size.Bar.top)
+                .padding(horizontal = Space.sm),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Space.xs),
+        ) {
+            if (onBack != null) {
+                IconButtonCircle(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack, background = Color.Transparent)
+            }
+            Text(
+                title,
+                style = ZipperTheme.type.headingM,
+                color = c.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f).padding(start = if (onBack == null) Space.sm else 0.dp),
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(Space.xs),
+                verticalAlignment = Alignment.CenterVertically,
+                content = actions,
+            )
+        }
+        return
+    }
     Box(
         modifier
             .fillMaxWidth()
@@ -74,13 +106,13 @@ fun TopBar(
         }
         Text(
             title,
-            style = if (centered) ZipperTheme.type.headingS else ZipperTheme.type.headingM,
+            style = ZipperTheme.type.headingS,
             color = c.textPrimary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
-                .align(if (centered) Alignment.Center else Alignment.CenterStart)
-                .then(if (centered) Modifier.padding(horizontal = Size.Control.md + Space.sm) else Modifier.padding(start = Space.sm)),
+                .align(Alignment.Center)
+                .padding(horizontal = Size.Control.md + Space.sm),
         )
         Row(
             Modifier.align(Alignment.CenterEnd),

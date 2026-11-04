@@ -100,7 +100,8 @@ data class PartyRoom(
         const val VISIBILITY_PUBLIC = "public"
         const val VISIBILITY_PRIVATE = "private"
 
-        const val DEFAULT_WELCOME = "welcome to my room have fun"
+        /** QA #21: the same sentence the server writes (functions/src/party.ts DEFAULT_WELCOME). */
+        const val DEFAULT_WELCOME = "Welcome to my room. Have fun!"
         const val WELCOME_MAX_CHARS = 250
 
         /**

@@ -110,6 +110,7 @@ import {
   suspensionResult, type SuspensionTerm,
 } from '@/components/SuspendDuration'
 import { formatIst } from '@/lib/istTime'  // QA #54: shown in IST, stored in UTC
+import { raisedOutcome } from '@/lib/ownerFastPath'
 
 const MIN_REASON = 3
 /**
@@ -383,8 +384,8 @@ const ACTIONS: ActionSpec[] = [
     title: 'Request a balance change',
     effect: (
       <>
-        This creates a request. An owner signs before any balance changes. Nothing moves when you
-        press confirm — the card goes to the money board and waits.
+        This raises a card on the money board. One Owner approves it — that approval is final, and the
+        balance changes the moment they do. Raised by an Owner, it is done when you confirm.
       </>
     ),
     confirmLabel: 'Raise the request',
@@ -949,7 +950,8 @@ export function UserActions({
                   {success.deductionCard.amount.toLocaleString('en-IN')} {success.deductionCard.currency}
                 </strong>{' '}
                 was requested. <strong>No money has moved.</strong> The card waits on the money board
-                for an owner to sign it, and is then taken from the live balance — whole, or not at all.
+                for one Owner to approve it, and is taken from the live balance the moment they do — whole,
+                or not at all.
               </p>
               <p className="mt-1 text-blue-100/70 text-xs">
                 Card {success.deductionCard.id} · {success.deductionCard.stage.replace(/_/g, ' ')}
@@ -973,8 +975,8 @@ export function UserActions({
             <div className="text-blue-50 text-sm">
               <p className="font-semibold">{success.text}</p>
               <p className="mt-1 text-blue-100/90">
-                <strong>No money has moved.</strong> The request is a card on the money board and an
-                owner has to sign it before the balance changes. If nobody signs it, nothing happens.
+                {/* O6: what happened, from the server's answer — "done" only when the card came back executed. */}
+                <strong>{raisedOutcome(success.card).headline}</strong> {raisedOutcome(success.card).detail}
               </p>
               <p className="mt-1 text-blue-100/70 text-xs">
                 Card {success.card.id} · {success.card.stage.replace(/_/g, ' ')}

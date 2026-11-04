@@ -971,6 +971,10 @@ fun ZipperNavGraph(
                 onBack      = { navController.popBackStack() },
                 onJoinLive  = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
                 onOpenProfile = { u -> navController.navigate(Screen.UserProfile.createRoute(u)) },
+                // O5: the gift drawer's "Recharge" when the balance is short.
+                onRecharge  = { navController.navigate(Screen.DiamondShop.route) },
+                // O5b: the call button in the chat header — the same outgoing call the profile starts.
+                onStartCall = { callId -> navController.navigate(Screen.VideoCall.createRoute(callId, isOutgoing = true)) },
                 prefilledMessage = prefilledMsg,
             )
         }

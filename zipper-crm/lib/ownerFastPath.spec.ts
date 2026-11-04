@@ -15,8 +15,9 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import {
-  EXECUTABLE_TYPES, PAYMENT_REF_TYPES, SELF_SUBJECT_REFUSAL, VERIFICATION_NOTE_REQUIRED,
-  fastPathOutcome, fastPathPlan, fastPathProblem, ownerNoticeLine, ownerNoticeTally, ownerSignBlock,
+  AUTO_EXECUTE_TYPES, EXECUTABLE_TYPES, OWNER_APPROVAL_NOTE, PAYMENT_REF_TYPES, SELF_SUBJECT_REFUSAL,
+  VERIFICATION_NOTE_REQUIRED, fastPathOutcome, fastPathPlan, fastPathProblem, ownerApproveBody, ownerApprovePlan,
+  ownerNoticeLine, ownerNoticeTally, ownerSignBlock, raisedOutcome,
 } from './ownerFastPath'
 
 let checks = 0
@@ -182,6 +183,57 @@ eq('nothing signed → nothing to say', ownerNoticeTally([]), '')
   ok('lib/api.ts posts to owner-fast-path', api.includes('/owner-fast-path`'))
 }
 
+// ── 9. O6 (Owner decision, 5 Nov 2026): one Owner's approval is final ──────
+{
+  eq('O6: the signature executes coin and diamond cards only',
+    Array.from(AUTO_EXECUTE_TYPES).sort(),
+    ['bad_debt_write_off', 'balance_credit', 'balance_debit', 'lending_issue', 'lending_recover', 'lending_repay',
+      'seller_coin_purchase'])
+  for (const t of ['commission_payout', 'host_withdrawal', 'subagency_payout', 'operating_expense', 'owner_drawings']) {
+    ok(`O6: a ${t} is never executed by a signature`, !AUTO_EXECUTE_TYPES.has(t))
+  }
+  ok('O6: every type the signature executes has an executor', Array.from(AUTO_EXECUTE_TYPES).every((t) => EXECUTABLE_TYPES.has(t)))
+  eq('O6: Approve on a requested coin card runs every stage and the execution',
+    stages(ownerApprovePlan(card('requested'), ME)), ['under_review', 'awaiting_signoff', 'approved', 'executed'])
+  eq('O6: Approve on a requested payout stops at the signature',
+    stages(ownerApprovePlan(card('requested', 'commission_payout'), ME)), ['under_review', 'awaiting_signoff', 'approved'])
+  eq('O6: Approve on the card that pays the Owner is refused first',
+    ownerApprovePlan(card('requested', 'balance_credit', ME), ME).refusal, SELF_SUBJECT_REFUSAL)
+  eq('O6: an empty note sends the default verification note', ownerApproveBody(card('requested'), '  ').verification_note,
+    OWNER_APPROVAL_NOTE)
+  eq('O6: a written note is sent as both notes',
+    [ownerApproveBody(card('requested'), 'UTR matched').verification_note,
+      ownerApproveBody(card('requested'), 'UTR matched').signature_note], ['UTR matched', 'UTR matched'])
+  eq('O6: execute is asked for a coin card', ownerApproveBody(card('requested'), '').execute, true)
+  eq('O6: …and not for a payout', ownerApproveBody(card('requested', 'host_withdrawal'), '').execute, false)
+  eq('O6: executed → done', raisedOutcome({ stage: 'executed', type: 'lending_issue' }).done, true)
+  const refused = raisedOutcome({ stage: 'approved', auto_executed: false, auto_execute_error: 'Frozen.' })
+  eq('O6: a refused execution is an error, never "done"', [refused.tone, refused.done], ['error', false])
+  ok('O6: …saying why', refused.detail.includes('Frozen.'))
+  eq('O6: the card that pays an Owner needs another', raisedOutcome({ stage: 'awaiting_signoff',
+    owner_complete_error: SELF_SUBJECT_REFUSAL }).headline, 'Raised — it needs another Owner.')
+  eq('O6: a raised card says nothing moved', raisedOutcome({ stage: 'requested' }).headline, 'Raised — no money has moved yet.')
+  eq('O6: an approved payout says it is not paid', raisedOutcome({ stage: 'approved', type: 'commission_payout' }).headline,
+    'Approved — not paid yet.')
+  eq('O6: nothing at all is never "done"', raisedOutcome(undefined).done, false)
+
+  // The server's list, when the backend sits beside this repo.
+  const cardsPy = path.join(__dirname, '..', '..', 'backend', 'app', 'services', 'cards.py')
+  if (fs.existsSync(cardsPy)) {
+    const src = fs.readFileSync(cardsPy, 'utf8')
+    const m = src.match(/AUTO_EXECUTE_TYPES: frozenset\[str\] = frozenset\(\{([\s\S]*?)\}\)/)
+    const server = m ? (m[1].match(/CardType\.[A-Z_]+/g) ?? []).map((x) => x.slice('CardType.'.length).toLowerCase()).sort() : []
+    eq('O6 server: the same types execute on the signature', server, Array.from(AUTO_EXECUTE_TYPES).sort())
+    ok('O6 server: the decision is on', /^AUTO_EXECUTE_ON_OWNER_SIGN = True$/m.test(src))
+    ok('O6 server: an Owner completes the cards they raise', /^OWNER_COMPLETES_OWN_CARDS = True$/m.test(src))
+  }
+
+  // The board offers one Approve to an Owner, and says what it did.
+  const board = fs.readFileSync(path.join(__dirname, '..', 'app', 'board', 'page.tsx'), 'utf8')
+  ok('O6 board: one Approve for an Owner', board.includes('ownerApproveBody(card, note)'))
+  ok('O6 board: …that says what happened', board.includes('raisedOutcome('))
+}
+
 if (failures.length) {
   console.error(`\n${failures.length} of ${checks} owner fast-path checks FAILED:\n`)
   for (const f of failures) console.error(`  ✗ ${f}`)
@@ -191,3 +243,4 @@ console.log(`All ${checks} owner fast-path checks passed.`)
 console.log('  · the confirmation lists every stage the server will run, from where the card is, and the amount')
 console.log('  · execution only for a type with an executor; a payout needs its bank reference')
 console.log('  · the card that pays the Owner is refused first; the other Owners\' notice is reported, never assumed')
+

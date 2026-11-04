@@ -297,3 +297,126 @@ export function fastPathOutcome(result: unknown): FastPathOutcome {
     : r.owner_notice
   return { ran, executed, notice: notice === undefined ? null : ownerNoticeLine(notice) }
 }
+
+// ── O6 (Owner decision, 5 Nov 2026): one Owner's approval is final ───────────
+//
+//   "one owner, if it is doing something, let it be done; the other owners just get to know … if owner signs
+//    something, that will be a final decision … coins will be directly automatically added — no extra clicking."
+//
+// Mirrored from `backend/app/services/cards.py`:
+//   * `AUTO_EXECUTE_ON_OWNER_SIGN` — an Owner's signature on one of `AUTO_EXECUTE_TYPES` runs its execution in the
+//     same request (the answer carries `auto_executed`, and `auto_execute_error` when the execution was refused);
+//   * `OWNER_COMPLETES_OWN_CARDS` — a coin / balance card an Owner raises from a staff screen is reviewed, verified,
+//     signed and executed in the same request (`fast_path` on the answer; `owner_complete_error` when it stopped —
+//     the card that pays them still needs another Owner);
+//   * payouts are never executed by a signature: their execution records a bank transfer a person makes first.
+
+/** The card types an Owner's signature executes (`cards.AUTO_EXECUTE_TYPES`): coins and diamonds inside Zipper. */
+export const AUTO_EXECUTE_TYPES: ReadonlySet<string> = new Set([
+  'seller_coin_purchase',
+  'lending_issue',
+  'lending_repay',
+  'lending_recover',
+  'bad_debt_write_off',
+  'balance_credit',
+  'balance_debit',
+])
+
+/** The note an Owner's one-click approval sends when they wrote none (the server asks for ≥ 3 characters). */
+export const OWNER_APPROVAL_NOTE = 'Approved by the Owner'
+
+/**
+ * What the Owner's one "Approve" does on this card: every remaining stage, and the execution when the type is one
+ * the signature executes. A payout stops at Approved (its bank transfer is recorded on its own screen).
+ */
+export function ownerApprovePlan(
+  card: { stage?: unknown; type?: unknown; subject?: { id?: unknown } | null },
+  myUid: string,
+): FastPathPlan {
+  return fastPathPlan(card, { execute: AUTO_EXECUTE_TYPES.has(text(card.type)), myUid })
+}
+
+/** The body the one-click approval sends to `POST /cards/{id}/owner-fast-path`. */
+export function ownerApproveBody(card: { type?: unknown }, note: string): {
+  verification_note: string
+  signature_note: string
+  execute: boolean
+  payment_ref: string
+} {
+  const n = text(note)
+  return {
+    verification_note: n.length >= MIN_VERIFICATION_NOTE ? n : OWNER_APPROVAL_NOTE,
+    signature_note: n,
+    execute: AUTO_EXECUTE_TYPES.has(text(card.type)),
+    payment_ref: '',
+  }
+}
+
+export interface RaisedOutcome {
+  /** The money moved in this request. */
+  done: boolean
+  tone: 'ok' | 'warn' | 'error' | 'info'
+  headline: string
+  detail: string
+}
+
+/**
+ * One honest sentence for what raising, signing or approving a card did — from the server's answer, never assumed.
+ * "Done" only when the card came back executed.
+ */
+export function raisedOutcome(result: unknown): RaisedOutcome {
+  const r = result && typeof result === 'object' ? (result as Record<string, unknown>) : {}
+  const stage = text(r.stage)
+  const type = text(r.type)
+  const autoError = text(r.auto_execute_error)
+  const completeError = text(r.owner_complete_error)
+  if (stage === 'executed') {
+    return {
+      done: true,
+      tone: 'ok',
+      headline: 'Done — the money moved.',
+      detail: 'An Owner approved it, so it was carried out at once. Every stage is in the audit log, and the other ' +
+        'Owners were told.',
+    }
+  }
+  if (r.auto_executed === false || autoError) {
+    return {
+      done: false,
+      tone: 'error',
+      headline: 'Approved, but the money did not move.',
+      detail: `${autoError || 'The execution was refused.'} The approval stands; open the card on the money board.`,
+    }
+  }
+  if (completeError) {
+    return { done: false, tone: 'warn', headline: 'Raised — it needs another Owner.', detail: completeError }
+  }
+  if (stage === 'approved') {
+    return {
+      done: false,
+      tone: 'warn',
+      headline: 'Approved — not paid yet.',
+      detail: PAYMENT_REF_TYPES.has(type)
+        ? 'A payout is finished when the bank transfer is recorded on it, with its reference.'
+        : 'Open the card on the money board to carry it out.',
+    }
+  }
+  if (stage === 'failed') {
+    return { done: false, tone: 'error', headline: 'The money did not move.', detail: 'Open the card on the money board for why.' }
+  }
+  if (stage === 'rejected') {
+    return { done: false, tone: 'warn', headline: 'Rejected — nothing moved.', detail: text(r.rejection_reason) }
+  }
+  return {
+    done: false,
+    tone: 'info',
+    headline: 'Raised — no money has moved yet.',
+    detail: 'It is a card on the money board. One Owner approves it — that approval is final, and the money moves ' +
+      'the moment they do. The other Owners are told.',
+  }
+}
+
+/** "Lending card for Coins R Us: Done — the money moved. …" — one line for a screen that raised a card. */
+export function raisedSentence(what: string, result: unknown): string {
+  const o = raisedOutcome(result)
+  return `${what}: ${o.headline}${o.detail ? ` ${o.detail}` : ''}`
+}

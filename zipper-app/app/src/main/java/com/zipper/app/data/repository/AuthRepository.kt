@@ -32,6 +32,15 @@ import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * QA #9: the sign-in itself worked but this device's session could not be claimed, so the account was signed out
+ * again — and the one-time code that got it there is spent. The login screen recognises this sentence, goes back to
+ * the number (kept) and lets the person ask for a new code at once, instead of leaving them on a spent code with a
+ * resend timer.
+ */
+const val SESSION_NOT_STARTED_MESSAGE =
+    "We couldn't finish signing you in on this device. Check your connection, then tap Get OTP for a new code."
+
 sealed class AuthResult {
     object Success : AuthResult()
     data class Error(val message: String) : AuthResult()
@@ -432,10 +441,8 @@ class AuthRepository @Inject constructor(
                     // the next sign-in or cold start shows the proper screen.)
                     AuthResult.Error(res.userMessage)
                 } else {
-                    AuthResult.Error(
-                        "Could not start your session on this device. " +
-                        "Check your connection and try again."
-                    )
+                    // QA #9: the code that got us here is used up — the screen goes back to the number and says so.
+                    AuthResult.Error(SESSION_NOT_STARTED_MESSAGE)
                 }
             }
         }

@@ -991,6 +991,24 @@ service firebase.storage {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // CHAT PHOTOS AND VOICE NOTES (O5, 5 Nov 2026)
+    // /chatMedia/{convoId}/{uid}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    // {convoId} is the sorted uid pair (`a_b`), the same id as the Firestore
+    // conversation. A writer must be one of the pair and writes only under
+    // their own uid; the two of them read. A photo is compressed by the app
+    // (1080 px JPEG) and capped at 10 MB here; a voice note is AAC
+    // (`audio/mp4`), at most a minute, capped at 5 MB. Nobody else reads the
+    // folder. The chat renders the stored download URL.
+    match /chatMedia/{convoId}/{uid}/{fileName} {
+      allow read:   if request.auth != null && request.auth.uid in convoId.split('_');
+      allow write:  if isOwner(uid) && request.auth.uid in convoId.split('_')
+                   && ((isImage() && maxSize(10))
+                       || (request.resource != null && request.resource.contentType.matches('audio/.*') && maxSize(5)));
+      allow delete: if isOwner(uid);
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // DENY EVERYTHING ELSE
     // ══════════════════════════════════════════════════════════════
     match /{allPaths=**} {

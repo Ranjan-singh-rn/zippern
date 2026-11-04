@@ -1286,8 +1286,26 @@ export interface OwnerNotice {
   error?: string
 }
 
+/**
+ * O6 (Owner decision, 5 Nov 2026) — what an Owner's signature or approval did beyond the signature. Read through
+ * `approvalOutcome` in `lib/ownerFastPath.ts`.
+ */
+export interface OwnerOutcomeFields {
+  /** The signature ran the execution (true) or tried and was refused (false). Absent: a type the signature does not execute. */
+  auto_executed?: boolean
+  /** Why the execution the signature ran was refused (a frozen account, a short balance). */
+  auto_execute_error?: string
+  /** A card an Owner raised that stopped before the end — the card that pays them needs another Owner. */
+  owner_complete_error?: string
+  /** Present when an Owner's raise or approval ran the stages in one step. */
+  fast_path?: {
+    steps: { stage: string; action: string }[]
+    executed: (Record<string, unknown> & { owner_notice?: OwnerNotice }) | null
+  }
+}
+
 /** A card as a signature or an execution answers it: plus who was told. */
-export type CardWithNotice = Card & { owner_notice?: OwnerNotice }
+export type CardWithNotice = Card & { owner_notice?: OwnerNotice } & OwnerOutcomeFields
 
 /** What `POST /cards/{id}/owner-fast-path` sends. */
 export interface OwnerFastPathBody {
@@ -1305,7 +1323,7 @@ export interface OwnerFastPathBody {
  * `executed` is the type executor's own answer (null when not asked or not
  * reached); an execution carries its `owner_notice` there when it has one.
  */
-export type OwnerFastPathResult = Card & {
+export type OwnerFastPathResult = Card & OwnerOutcomeFields & {
   fast_path: {
     steps: { stage: string; action: string }[]
     executed: (Record<string, unknown> & { owner_notice?: OwnerNotice }) | null
@@ -1633,7 +1651,7 @@ export const users = {
     currency: UserCurrency,
     amount: number,
     reason: string,
-  ) => post<Card>(`/users/${uid}/balance-request`, { currency, amount, reason }),
+  ) => post<CardWithNotice>(`/users/${uid}/balance-request`, { currency, amount, reason }),
 
   /**
    * Move the money for a signed balance card. **Owners only.**
@@ -2239,30 +2257,30 @@ export const partnerOps = {
       evidence_url?: string
       reason: string
     },
-  ) => post<Card>(`/partner-ops/sellers/${sellerId}/coin-purchases`, body),
+  ) => post<CardWithNotice>(`/partner-ops/sellers/${sellerId}/coin-purchases`, body),
   executeCoinPurchase: (cardId: string) =>
     post(`/partner-ops/coin-purchases/${cardId}/execute`),
 
   requestLending: (
     sellerId: string,
     body: { coins: number; due_at: string; terms?: string; reason: string },
-  ) => post<Card>(`/partner-ops/sellers/${sellerId}/lending`, body),
+  ) => post<CardWithNotice>(`/partner-ops/sellers/${sellerId}/lending`, body),
   executeLending: (cardId: string) => post(`/partner-ops/lending/${cardId}/execute`),
 
   requestRepayment: (
     sellerId: string,
     body: { coins: number; payment_ref?: string; reason: string },
-  ) => post<Card>(`/partner-ops/sellers/${sellerId}/repayments`, body),
+  ) => post<CardWithNotice>(`/partner-ops/sellers/${sellerId}/repayments`, body),
   executeRepayment: (cardId: string) => post(`/partner-ops/repayments/${cardId}/execute`),
 
   requestRecovery: (
     sellerId: string,
     body: { coins: number; penalty_coins?: number; reason: string },
-  ) => post<Card>(`/partner-ops/sellers/${sellerId}/recoveries`, body),
+  ) => post<CardWithNotice>(`/partner-ops/sellers/${sellerId}/recoveries`, body),
   executeRecovery: (cardId: string) => post(`/partner-ops/recoveries/${cardId}/execute`),
 
   requestWriteOff: (partnerId: string, body: { coins: number; reason: string }) =>
-    post<Card>(`/partner-ops/partners/${partnerId}/write-off`, body),
+    post<CardWithNotice>(`/partner-ops/partners/${partnerId}/write-off`, body),
   executeWriteOff: (cardId: string) => post(`/partner-ops/write-offs/${cardId}/execute`),
 
   /**

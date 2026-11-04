@@ -64,6 +64,17 @@ OWNER_ALONE = True
 #: self-subject cards too; nothing else reads this flag.
 SELF_SUBJECT_NEEDS_ANOTHER_OWNER = True
 
+#: Owner decision, 5 Nov 2026: "if owner signs something, that will be a final decision … if owner signs, coins will
+#: be directly automatically added — no extra clicking." An Owner's signature on a card whose execution only moves
+#: coins or diamonds inside Zipper runs that execution in the same request. Payouts are NOT in this set: their
+#: execution records a bank transfer a person makes first (with its reference), so that step stays theirs.
+AUTO_EXECUTE_ON_OWNER_SIGN = True
+
+#: Owner decision, 5 Nov 2026: "one owner, if it is doing something, let it be done; the other owners just get to
+#: know." A card an Owner raises from a staff screen is reviewed, verified and signed by them in the same step
+#: (`complete_if_owner` → `owner_fast_path`: every stage still writes its own audit entry, the other Owners are told).
+OWNER_COMPLETES_OWN_CARDS = True
+
 
 class Stage(StrEnum):
     REQUESTED = "requested"
@@ -511,7 +522,45 @@ async def sign(card_id: str, actor: dict, note: str = "") -> dict:
     )
     signed = await _get(card_id, as_dict=True)
     signed["owner_notice"] = await _notify_owners(signed, actor, "card_signed")
+    auto = await _auto_execute_after_owner_sign(signed, actor)
+    if auto is not None:
+        notice = signed.get("owner_notice")
+        signed = auto
+        signed.setdefault("owner_notice", notice)
     return signed
+
+
+async def _auto_execute_after_owner_sign(card: dict, actor: dict) -> dict | None:
+    """Owner decision (5 Nov 2026): an Owner's signature on a coin / diamond card moves it at once.
+
+    Runs the type's own registered executor — the same code, checks, idempotency keys, claim and audit as the
+    separate execute step it replaces — so nothing about HOW the money moves changes, only that nobody has to click
+    a second time. Returns the card as it is afterwards, or None when this card is not one that executes on
+    signature. An execution that fails (a frozen account, a short balance) leaves the card exactly where the
+    executor leaves it (approved, or failed with its reason) and says so; the signature itself stands.
+    """
+    if not (AUTO_EXECUTE_ON_OWNER_SIGN and R.is_owner_value(actor.get("role"))):
+        return None
+    card_type = str(card.get("type") or "")
+    if card_type not in AUTO_EXECUTE_TYPES or str(card.get("stage")) != str(Stage.APPROVED):
+        return None
+    executor = EXECUTORS.get(card_type)
+    if executor is None:
+        return None
+    card_id = str(card.get("id") or card.get("_id") or "")
+    try:
+        result = await executor(card_id, actor, payment_ref="")
+        out = await _get(card_id, as_dict=True)
+        out["auto_executed"] = True
+        if isinstance(result, dict) and result.get("owner_notice") is not None:
+            out["execution_notice"] = result["owner_notice"]
+        return out
+    except Exception as exc:  # noqa: BLE001 — the signature is committed; say what the execution did
+        log.warning("Auto-execution after the Owner's signature failed for card %s: %s", card_id, exc)
+        out = await _get(card_id, as_dict=True)
+        out["auto_executed"] = False
+        out["auto_execute_error"] = str(exc)
+        return out
 
 
 async def reject(card_id: str, actor: dict, reason: str) -> dict:
@@ -655,6 +704,20 @@ async def mark_executed(
     return done
 
 
+#: The card types an Owner's signature executes at once (`AUTO_EXECUTE_ON_OWNER_SIGN`): coin and diamond
+#: movements inside Zipper — a seller's purchased inventory, a loan and its repayment, recovery and write-off, and a
+#: user's balance credit or debit. Never a payout (commission, host withdrawal, sub-agency, expense, capital).
+AUTO_EXECUTE_TYPES: frozenset[str] = frozenset({
+    str(CardType.SELLER_COIN_PURCHASE),
+    str(CardType.LENDING_ISSUE),
+    str(CardType.LENDING_REPAY),
+    str(CardType.LENDING_RECOVER),
+    str(CardType.BAD_DEBT_WRITE_OFF),
+    str(CardType.BALANCE_CREDIT),
+    str(CardType.BALANCE_DEBIT),
+})
+
+
 # ── Execution registry, for the owner fast path ───────────────────────────────
 #
 # Execution is type-specific (`partner_ops.execute_coin_purchase`,
@@ -717,12 +780,26 @@ async def owner_fast_path(
         await verify(card_id, actor, verification_note)
         steps.append({"stage": str(Stage.AWAITING_SIGNOFF), "action": audit.Action.CARD_VERIFIED})
         card = await _get(card_id)
+    auto_error: str | None = None
+    sign_notice: dict | None = None
     if card["stage"] == Stage.AWAITING_SIGNOFF:
-        await sign(card_id, actor, signature_note)
+        signed = await sign(card_id, actor, signature_note)
         steps.append({"stage": str(Stage.APPROVED), "action": audit.Action.CARD_SIGNED})
+        sign_notice = signed.get("owner_notice")
+        if signed.get("auto_executed") is False:
+            auto_error = str(signed.get("auto_execute_error") or "The execution after the signature did not go through.")
         card = await _get(card_id)
 
     executed: dict | None = None
+    if card["stage"] == Stage.EXECUTED:
+        # The Owner's signature already executed it (`AUTO_EXECUTE_ON_OWNER_SIGN`).
+        steps.append({"stage": str(Stage.EXECUTED), "action": audit.Action.CARD_EXECUTED})
+        executed = {"by_signature": True}
+        execute = False
+    elif auto_error is not None:
+        # The signature already ran the execution and it was refused (a frozen account, a short balance). Running
+        # it a second time a moment later would be refused for the same reason; the reason is reported instead.
+        execute = False
     if execute:
         executor = EXECUTORS.get(str(card.get("type")))
         if executor is None:
@@ -747,7 +824,50 @@ async def owner_fast_path(
     )
     out = await _get(card_id, as_dict=True)
     out["fast_path"] = {"steps": steps, "executed": executed}
+    if sign_notice is not None:
+        # Whether the other Owners were told of the signature — the board says so after a one-click approval.
+        out["owner_notice"] = sign_notice
+    if executed is not None:
+        out["auto_executed"] = True
+    if auto_error is not None:
+        out["auto_executed"] = False
+        out["auto_execute_error"] = auto_error
     return out
+
+
+async def complete_if_owner(card: dict, actor: dict, note: str = "") -> dict:
+    """Owner decision (5 Nov 2026): a card an Owner raises is done in the same step.
+
+    Runs `owner_fast_path` for an Owner actor (every stage, each with its own audit entry; the other Owners told),
+    executing it too when its type executes on signature. Anyone else's card is returned untouched and waits for an
+    Owner as before. A refusal on the way (the self-dealing rule: an Owner does not sign a card that pays them) leaves
+    the card at the stage it reached, on the board, and says why.
+    """
+    if not (OWNER_COMPLETES_OWN_CARDS and OWNER_ALONE and R.is_owner_value(actor.get("role"))):
+        return card
+    card_id = str(card.get("id") or card.get("_id") or "")
+    if not card_id:
+        return card
+    if str(card.get("stage") or "") in (str(Stage.EXECUTED), str(Stage.REJECTED), str(Stage.FAILED)):
+        # A replayed request answered with a card that is already finished: nothing left to do.
+        return card
+    note = (note or "").strip()
+    try:
+        done = await owner_fast_path(
+            card_id, actor,
+            verification_note=note if len(note) >= 3 else "Raised by an Owner and approved by them in the same step",
+            signature_note=note,
+            execute=str(card.get("type") or "") in AUTO_EXECUTE_TYPES,
+        )
+    except Exception as exc:  # noqa: BLE001 — the card was raised; say where it stopped and why
+        if not isinstance(exc, CardError):
+            log.warning("Owner completion of card %s stopped: %s", card_id, exc)
+        done = await _get(card_id, as_dict=True)
+        done["owner_complete_error"] = str(exc)
+    # What the raising call added to its answer (a duplicate-reference warning, the outstanding debt) stays on it.
+    for k, v in card.items():
+        done.setdefault(k, v)
+    return done
 
 
 # ── Telling the other Owners ──────────────────────────────────────────────────

@@ -43,6 +43,7 @@ import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
 import { db } from '@/lib/firebase'
 import api, { ApiError, type Card, type UserCurrency } from '@/lib/api'
+import { raisedOutcome } from '@/lib/ownerFastPath'
 import { getSellerLendingLedger, type DiamondLendingRecord } from '@/lib/economyConfig'
 import {
   getUserBeanTransactions, getUserDiamondTransactions, type Transaction,
@@ -97,7 +98,7 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     tone: 'blue',
     title: 'Request a balance change',
     effect:
-      'This creates a request. Nothing moves when you press confirm — the card goes to the money board, a second person verifies it, and an owner signs before the balance changes.',
+      'This raises a card on the money board. One Owner approves it — that approval is final, and the balance changes the moment they do. Raised by an Owner, it is done when you confirm.',
     confirmLabel: 'Raise the request',
     reasonHint: 'Why the balance should change, and what it is correcting.',
   },
@@ -108,7 +109,7 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     tone: 'purple',
     title: 'Lend coins to this seller',
     effect:
-      'Lending is credit — company money going out on trust — so it raises a card and no coins move until an owner signs. A due date is required: without one nothing can ever be reported as overdue.',
+      'Lending is credit — company money going out on trust — so it raises a card: one Owner approves it, and the coins move the moment they do (raised by an Owner, it is done when you confirm). A due date is required: without one nothing can ever be reported as overdue.',
     confirmLabel: 'Raise the lending card',
     reasonHint: 'Why this seller is being extended credit, and against what agreement.',
   },
@@ -119,7 +120,7 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     tone: 'green',
     title: 'Record a repayment',
     effect:
-      'For coins the seller has actually paid back. This raises a card — it does not clear the debt by itself. The outstanding balance changes only after verification and signature.',
+      'For coins the seller has actually paid back. This raises a card; the outstanding debt goes down when one Owner approves it (raised by an Owner, it is done when you confirm).',
     confirmLabel: 'Raise the repayment card',
     reasonHint: 'What was repaid and how it arrived. Put the bank reference in the field above too.',
   },
@@ -130,7 +131,7 @@ const ACTIONS: Record<ActionKey, ActionSpec> = {
     tone: 'amber',
     title: 'Recover coins from this seller',
     effect:
-      'Pulling coins back off a seller — for overdue credit, or inventory taken back. A recovery is a card like anything else: it is verified and signed before anything moves.',
+      'Pulling coins back off a seller — for overdue credit, or inventory taken back. A recovery is a card like anything else: nothing moves until one Owner approves it (raised by an Owner, it is done when you confirm).',
     confirmLabel: 'Raise the recovery card',
     reasonHint: 'Why coins are being recovered, and what the seller has been told.',
   },
@@ -381,8 +382,8 @@ export default function CurrencyPage() {
       <div className="flex items-start gap-2 bg-blue-500/5 border border-blue-500/25 rounded-xl px-4 py-3">
         <Coins size={15} className="text-blue-300 mt-0.5 shrink-0" />
         <p className="text-blue-100/90 text-sm">
-          Nothing here is a direct write. <strong>Every action raises a card. A second person
-          verifies it and an owner signs it before any balance changes.</strong> You can follow
+          Nothing here is a direct write. <strong>Every action raises a card. One Owner approves it —
+          that approval is final, and the balance changes the moment they do.</strong> You can follow
           anything you raise on the{' '}
           <Link href="/board" className="text-blue-300 underline underline-offset-2 hover:text-white">
             money board
@@ -410,9 +411,9 @@ export default function CurrencyPage() {
         ))}
       </div>
 
-      {/* A raised card is deliberately not dressed up as a success: nothing has
-          happened to the balance yet, and saying otherwise is the failure mode
-          this whole flow exists to prevent. */}
+      {/* A raised card is not dressed up as a success: what it says comes from the server's answer
+          (`raisedOutcome`). "Done" only when the card came back executed — O6: an Owner's own request is
+          approved and carried out in the same step; anyone else's waits for one Owner's approval. */}
       {raised && (
         <div className="flex items-start justify-between gap-3 bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3">
           <div className="flex items-start gap-2">
@@ -420,9 +421,7 @@ export default function CurrencyPage() {
             <div className="text-blue-50 text-sm">
               <p className="font-semibold">{raised.text}</p>
               <p className="mt-1 text-blue-100/90">
-                <strong>No money has moved.</strong> The request is a card on the money board. It
-                needs a second person to verify it and an owner to sign it before anything changes.
-                If nobody does, nothing happens.
+                <strong>{raisedOutcome(raised.card).headline}</strong> {raisedOutcome(raised.card).detail}
               </p>
               <p className="mt-1 text-blue-100/70 text-xs">
                 Card {raised.card.id} · {raised.card.stage.replace(/_/g, ' ')}

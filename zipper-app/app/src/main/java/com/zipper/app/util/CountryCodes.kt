@@ -124,3 +124,42 @@ val ALL_COUNTRIES = listOf(
     CountryCode("Yemen",                "🇾🇪", "+967", 9),
     CountryCode("Zimbabwe",             "🇿🇼", "+263", 9),
 ).sortedBy { it.name }
+
+/**
+ * QA #7: the picker's list — India pinned first (nearly every Zipper user dials +91), the rest in the list's order.
+ * A search keeps the same rule: India first when it matches.
+ */
+fun countriesForPicker(query: String = "", all: List<CountryCode> = ALL_COUNTRIES): List<CountryCode> {
+    val q = query.trim()
+    val matched = if (q.isEmpty()) all else all.filter { it.name.contains(q, ignoreCase = true) || it.dialCode.contains(q) }
+    val india = matched.filter { it.dialCode == "+91" }
+    return india + matched.filterNot { it.dialCode == "+91" }
+}
+
+/**
+ * QA #8: what is wrong with a phone number as typed, in words a person can act on — or null when it can be sent.
+ *
+ * [digits] is the local part only (the field already strips anything but digits and caps it at [CountryCode.maxDigits]).
+ * India is checked exactly (10 digits, starting 6–9: every Indian mobile number); elsewhere only the length, since
+ * numbering plans differ and the SMS provider is the real judge.
+ */
+fun phoneNumberProblem(digits: String, country: CountryCode): String? {
+    if (digits.isEmpty()) return "Enter your mobile number."
+    if (country.dialCode == "+91") {
+        if (digits.first() !in '6'..'9') return "Indian mobile numbers start with 6, 7, 8 or 9."
+        if (digits.length != 10) return "Indian mobile numbers have 10 digits."
+        return null
+    }
+    if (digits.length < 5) return "That number looks too short."
+    return null
+}
+
+/**
+ * Whether to SHOW [phoneNumberProblem] yet: not while somebody is still typing a number that could become right —
+ * a wrong first digit shows at once, a short number only once the field is full or the person tries to send it.
+ */
+fun showPhoneProblemNow(digits: String, country: CountryCode, submitted: Boolean): Boolean {
+    if (digits.isEmpty()) return submitted
+    if (country.dialCode == "+91" && digits.first() !in '6'..'9') return true
+    return submitted || digits.length >= country.maxDigits
+}

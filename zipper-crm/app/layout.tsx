@@ -3,7 +3,7 @@
 import './globals.css'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import { AuthProvider, useAuth } from '@/components/AuthProvider'
 import { PartnerRoleSwitcher } from '@/components/PartnerRoleSwitcher'
 import {
@@ -75,7 +75,7 @@ import {
   ArrowRightLeft,
   Lock,
   MonitorSmartphone,
-  ShieldCheck, Gamepad2, Trophy, Music, Crown,
+  ShieldCheck, Gamepad2, Trophy, Music, Crown, Menu as MenuIcon,
 } from 'lucide-react'
 
 // Every screen below reads an endpoint behind `_require_oversight` or
@@ -87,6 +87,42 @@ const OVERSIGHT_ROLES: CrmRole[] = [
   'finance_admin', 'app_admin', 'ops_admin',
   'tech_admin', 'support_admin', 'marketing_admin',
 ]
+
+// ── Phones: the sidebar becomes a drawer ─────────────────────────────────────
+//
+// 5 Nov 2026: partners and staff open the CRM from the app's Work tab, on a phone. The fixed 256 px column left a
+// phone ~120 px for the page. Below `md` the column is a drawer behind a menu button (the page gets the full width);
+// from `md` up it is the fixed column it always was. Layout only — no route, role or data changes.
+const DrawerContext = createContext<{ open: boolean; setOpen: (open: boolean) => void }>({ open: false, setOpen: () => {} })
+
+const ASIDE_BASE = 'w-64 h-screen bg-slate-900 border-r border-slate-800 fixed top-0 left-0 flex flex-col z-40 transition-transform duration-200 md:translate-x-0'
+/** A tap on any link inside the drawer closes it, even a link to the page already open. */
+function closeOnLink(setOpen: (open: boolean) => void) {
+  return (e: React.MouseEvent) => { if ((e.target as HTMLElement).closest('a')) setOpen(false) }
+}
+function asideClass(open: boolean, extra = ''): string {
+  return `${ASIDE_BASE} ${open ? 'translate-x-0' : '-translate-x-full'}${extra ? ` ${extra}` : ''}`
+}
+
+/** The phone-width top bar: the menu button that opens the drawer. Hidden from `md` up. */
+function MobileTopBar() {
+  const { setOpen } = useContext(DrawerContext)
+  return (
+    <div className="md:hidden sticky top-0 z-30 flex items-center gap-3 px-4 py-3 bg-slate-900 border-b border-slate-800">
+      <button type="button" onClick={() => setOpen(true)} aria-label="Open menu" className="text-slate-300 hover:text-white">
+        <MenuIcon size={22} />
+      </button>
+      <span className="text-lg font-black tracking-tight"><span className="text-pink-500">Zipper</span><span className="text-white"> CRM</span></span>
+    </div>
+  )
+}
+
+/** Dims the page behind an open drawer; a tap closes it. Phones only. */
+function DrawerScrim() {
+  const { open, setOpen } = useContext(DrawerContext)
+  if (!open) return null
+  return <div className="md:hidden fixed inset-0 z-30 bg-black/60" onClick={() => setOpen(false)} aria-hidden="true" />
+}
 
 // ── Nav link definitions ─────────────────────────────────────────────────────
 
@@ -419,6 +455,7 @@ function NavSkeleton() {
 function Sidebar() {
   const pathname = usePathname()
   const { crmUser, canAccess, loading } = useAuth()
+  const { open: drawerOpen, setOpen: setDrawerOpen } = useContext(DrawerContext)
   const [pendingCount, setPendingCount] = useState(0)
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
   const [hydrated, setHydrated] = useState(false)
@@ -487,7 +524,7 @@ function Sidebar() {
   const initial = crmUser?.name ? crmUser.name[0].toUpperCase() : '?'
 
   return (
-    <aside className="w-64 h-screen bg-slate-900 border-r border-slate-800 fixed top-0 left-0 flex flex-col z-40 overflow-hidden">
+    <aside className={asideClass(drawerOpen, 'overflow-hidden')} onClick={closeOnLink(setDrawerOpen)}>
       {/* Logo */}
       <div className="px-6 py-5 border-b border-slate-800 flex-shrink-0">
         <span className="text-2xl font-black text-pink-500 tracking-tight">Zipper</span>
@@ -719,10 +756,13 @@ const OBSERVER_ROUTES = [
 
 function ObserverShell({ children, pathname }: { children: React.ReactNode; pathname: string }) {
   const allowed = OBSERVER_ROUTES.some((r) => pathname.startsWith(r))
+  const { open: drawerOpen, setOpen: setDrawerOpen } = useContext(DrawerContext)
 
   return (
     <>
-      <aside className="w-64 h-screen bg-slate-900 border-r border-slate-800 fixed top-0 left-0 flex flex-col z-40">
+      <MobileTopBar />
+      <DrawerScrim />
+      <aside className={asideClass(drawerOpen)} onClick={closeOnLink(setDrawerOpen)}>
         <div className="px-6 py-5 border-b border-slate-800">
           <span className="text-2xl font-black text-pink-500 tracking-tight">Zipper</span>
           <span className="text-2xl font-black text-white tracking-tight"> CRM</span>
@@ -762,7 +802,7 @@ function ObserverShell({ children, pathname }: { children: React.ReactNode; path
           </div>
         </div>
       </aside>
-      <main className="ml-64 min-h-screen p-8">
+      <main className="md:ml-64 min-h-screen p-4 md:p-8 min-w-0">
         {allowed ? children : (
           <div className="max-w-lg mx-auto text-center py-24">
             <Eye size={32} className="text-slate-700 mx-auto mb-4" />
@@ -782,6 +822,10 @@ function AppShell({ children }: { children: React.ReactNode }) {
   const { crmUser, loading, apiUser, crmProfileUnread } = useAuth()
   const pathname = usePathname()
   const router = useRouter()
+  // The phone drawer (see DrawerContext): closed again on every navigation.
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  useEffect(() => { setDrawerOpen(false) }, [pathname])
+  const drawer = { open: drawerOpen, setOpen: setDrawerOpen }
 
   // Public pages — rendered standalone, no sidebar, no auth gate.
   // /observer is here deliberately: the observer signs in with a one-time code
@@ -823,7 +867,11 @@ function AppShell({ children }: { children: React.ReactNode }) {
   // signed-out check below, which would otherwise bounce them to /login even
   // though they are properly authenticated.
   if (!loading && !crmUser && apiUser?.role === 'observer') {
-    return <ObserverShell pathname={pathname}>{children}</ObserverShell>
+    return (
+      <DrawerContext.Provider value={drawer}>
+        <ObserverShell pathname={pathname}>{children}</ObserverShell>
+      </DrawerContext.Provider>
+    )
   }
 
   // Not logged in — redirect to /login in progress, render nothing.
@@ -840,12 +888,14 @@ function AppShell({ children }: { children: React.ReactNode }) {
   const contentReady = !loading && !!crmUser && !redirectTo
 
   return (
-    <>
+    <DrawerContext.Provider value={drawer}>
+      <MobileTopBar />
+      <DrawerScrim />
       <Sidebar />
-      <main className="ml-64 min-h-screen p-8">
+      <main className="md:ml-64 min-h-screen p-4 md:p-8 min-w-0">
         {contentReady ? children : <ContentSkeleton />}
       </main>
-    </>
+    </DrawerContext.Provider>
   )
 }
 

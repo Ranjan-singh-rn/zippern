@@ -1699,4 +1699,5 @@ private fun PartyGiftEvent.asLiveGiftEvent(): LiveGiftEvent = LiveGiftEvent(
     quantity = quantity,
     timestamp = timestamp,
     svgaUrl = svgaUrl,
+    lottieAsset = lottieAsset,
 )

@@ -107,16 +107,91 @@ fun CurrencyPill(
     }
 }
 
-/** The currency's coloured disc, used inside pills and beside prices. */
+/**
+ * The currency's token, used inside pills and beside prices.
+ *
+ * O5b (5 Nov 2026), "the diamonds UI is not proper": this used to be a plain coloured dot for every currency, so a
+ * diamond balance, a gift price and a call rate all showed an aqua circle and nothing that read as a diamond. Each
+ * currency now has its own glyph, drawn (no image to load, sharp at any size): a cut gem for diamonds, a bean on a
+ * mint token for beans, a minted gold coin for coins. Same size and colour family as before, so every layout that
+ * held the dot holds the token.
+ */
 @Composable
 fun CurrencyDisc(currency: Currency, size: androidx.compose.ui.unit.Dp) {
-    val c = ZipperTheme.colors
-    val disc = when (currency) {
-        Currency.Diamond -> c.currencyDiamond
-        Currency.Bean -> c.currencyBean
-        Currency.Coin -> c.currencyCoin
+    when (currency) {
+        Currency.Diamond -> DiamondGem(Modifier.size(size))
+        Currency.Bean -> Box(
+            Modifier.size(size).background(
+                androidx.compose.ui.graphics.Brush.linearGradient(listOf(com.zipper.app.ui.theme.Mint.m300, com.zipper.app.ui.theme.Mint.m600)),
+                CircleShape,
+            ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                androidx.compose.ui.res.painterResource(com.zipper.app.R.drawable.ic_bean), null,
+                tint = Color.White.copy(alpha = 0.92f), modifier = Modifier.size(size * 0.62f),
+            )
+        }
+        Currency.Coin -> GoldCoin(Modifier.size(size))
     }
-    Box(Modifier.size(size).background(disc, CircleShape))
+}
+
+/** A brilliant-cut gem: crown, girdle and pavilion, with light facets on top. */
+@Composable
+private fun DiamondGem(modifier: Modifier) {
+    androidx.compose.foundation.Canvas(modifier) {
+        val u = this.size.minDimension / 24f
+        val ox = (this.size.width - 24f * u) / 2f
+        val oy = (this.size.height - 24f * u) / 2f
+        fun p(x: Float, y: Float) = androidx.compose.ui.geometry.Offset(ox + x * u, oy + y * u)
+        val outline = androidx.compose.ui.graphics.Path().apply {
+            moveTo(p(6f, 3.5f).x, p(6f, 3.5f).y); lineTo(p(18f, 3.5f).x, p(18f, 3.5f).y)
+            lineTo(p(22.5f, 9f).x, p(22.5f, 9f).y); lineTo(p(12f, 21.5f).x, p(12f, 21.5f).y)
+            lineTo(p(1.5f, 9f).x, p(1.5f, 9f).y); close()
+        }
+        drawPath(
+            outline,
+            androidx.compose.ui.graphics.Brush.verticalGradient(
+                listOf(com.zipper.app.ui.theme.Aqua.a300, com.zipper.app.ui.theme.Aqua.a400, com.zipper.app.ui.theme.Aqua.a600),
+                startY = p(0f, 3.5f).y, endY = p(0f, 21.5f).y,
+            ),
+        )
+        // The light catching the top-left facets.
+        val shine = androidx.compose.ui.graphics.Path().apply {
+            moveTo(p(6f, 3.5f).x, p(6f, 3.5f).y); lineTo(p(12f, 3.5f).x, p(12f, 3.5f).y)
+            lineTo(p(9f, 9f).x, p(9f, 9f).y); lineTo(p(1.5f, 9f).x, p(1.5f, 9f).y); close()
+        }
+        drawPath(shine, Color.White.copy(alpha = 0.35f))
+        val facet = Color.White.copy(alpha = 0.55f)
+        val w = (1.1f * u).coerceAtLeast(1f)
+        drawLine(facet, p(1.5f, 9f), p(22.5f, 9f), w)                       // girdle
+        drawLine(facet, p(6f, 3.5f), p(9f, 9f), w); drawLine(facet, p(12f, 3.5f), p(9f, 9f), w)
+        drawLine(facet, p(12f, 3.5f), p(15f, 9f), w); drawLine(facet, p(18f, 3.5f), p(15f, 9f), w)
+        drawLine(facet, p(9f, 9f), p(12f, 21.5f), w); drawLine(facet, p(15f, 9f), p(12f, 21.5f), w)
+        drawPath(outline, Color.White.copy(alpha = 0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = w))
+    }
+}
+
+/** A minted gold coin: rim, inner ring and a shine. */
+@Composable
+private fun GoldCoin(modifier: Modifier) {
+    androidx.compose.foundation.Canvas(modifier) {
+        val r = this.size.minDimension / 2f
+        val centre = androidx.compose.ui.geometry.Offset(this.size.width / 2f, this.size.height / 2f)
+        drawCircle(
+            androidx.compose.ui.graphics.Brush.linearGradient(
+                listOf(com.zipper.app.ui.theme.Gold.g300, com.zipper.app.ui.theme.Gold.g500, com.zipper.app.ui.theme.Gold.g700),
+                start = androidx.compose.ui.geometry.Offset(centre.x - r, centre.y - r),
+                end = androidx.compose.ui.geometry.Offset(centre.x + r, centre.y + r),
+            ),
+            radius = r, center = centre,
+        )
+        drawCircle(
+            com.zipper.app.ui.theme.Gold.g200.copy(alpha = 0.85f), radius = r * 0.66f, center = centre,
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = (r * 0.14f).coerceAtLeast(1f)),
+        )
+        drawCircle(Color.White.copy(alpha = 0.35f), radius = r * 0.22f, center = androidx.compose.ui.geometry.Offset(centre.x - r * 0.32f, centre.y - r * 0.32f))
+    }
 }
 
 /** Small "price" row: disc + amount, for gift tiles and shop items. */

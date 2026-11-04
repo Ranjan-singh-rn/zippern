@@ -83,6 +83,25 @@ class ProfileViewModel @Inject constructor(
     private val _state = MutableStateFlow(ProfileUiState(isLoading = true))
     val state: StateFlow<ProfileUiState> = _state.asStateFlow()
 
+    /*
+     * The call-rate ceiling comes from getHostHome rather than a table in this file (it was hardcoded in
+     * EditProfileScreen as 700/2000/5000/12000 — a fourth copy of a number that also lives in the CRM config, the level
+     * ladder and the functions' fallback). QA #24: asked ONCE, and only for a host — it used to be called from init
+     * for everybody, so every Me-tab visit by a non-host made 4–5 calls the server could only refuse.
+     */
+    private var hostCeilingRequested = false
+    private fun loadHostCeilingOnce() {
+        if (hostCeilingRequested) return
+        hostCeilingRequested = true
+        viewModelScope.launch {
+            when (val res = hostStats.hostHome()) {
+                is HostStatsRepository.Result.Ok ->
+                    _state.update { it.copy(maxCallRateBeans = res.home.level.maxCallRateBeans) }
+                is HostStatsRepository.Result.Failed -> Unit  // e.g. a suspended host role: no ceiling to show
+            }
+        }
+    }
+
     init {
         viewModelScope.launch {
             economyConfig.observe().collect { cfg ->
@@ -119,19 +138,9 @@ class ProfileViewModel @Inject constructor(
                 }
             }
         }
-        // The ceiling comes from getHostHome rather than a table in this file.
-        // It was hardcoded in EditProfileScreen as 700/2000/5000/12000 — a
-        // fourth copy of a number that also lives in the CRM config, the level
-        // ladder and the functions' fallback, and the only one a host could see.
-        viewModelScope.launch {
-            when (val res = hostStats.hostHome()) {
-                is HostStatsRepository.Result.Ok ->
-                    _state.update { it.copy(maxCallRateBeans = res.home.level.maxCallRateBeans) }
-                is HostStatsRepository.Result.Failed -> Unit  // not a host
-            }
-        }
         viewModelScope.launch {
             repo.currentUserFlow().collect { user ->
+                if (user?.isHost == true) loadHostCeilingOnce()
                 _state.update { s ->
                     s.copy(
                         user = user,

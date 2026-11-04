@@ -268,6 +268,22 @@ describe('a gift in a party room flies from the sender to the receiver', () => {
     const [mirror] = db.all(`partyRooms/${r.roomId}/gifts`)
     expect(mirror).toMatchObject({ uid: 'GUEST', receiverUid: 'OWNER', transactionId: res.transactionId, diamondCost: 10 })
   })
+
+  test('O2: the room mirror carries the CRM\'s Lottie and SVGA, so the room can play the animation', async () => {
+    const gifts = require('../lib/gifts')
+    const r = await call(PARTY.createPartyRoom, { mode: 'audio' }, 'OWNER')
+    await call(PARTY.joinPartyRoom, { roomId: r.roomId }, 'OWNER')
+    await call(PARTY.takePartySeat, { roomId: r.roomId, seatIndex: 1 }, 'OWNER')
+    db.seed('gifts/castle', { name: 'Castle', category: 'normal', diamondCost: 10, earningRate: 50, isActive: true,
+      lottieAsset: 'gifts/g10_castle.json', svgaUrl: '' })
+    db.seed('users/GUEST', { ...user('GUEST'), diamonds: 100 })
+    await gifts.settleGift.run({
+      data: { giftId: 'castle', receiverUid: 'OWNER', context: 'party', roomId: r.roomId, quantity: 1, idempotencyKey: 'gift-k-lottie' },
+      auth: { uid: 'GUEST', token: { auth_time: 2000, firebase: { sign_in_provider: 'phone' } } },
+    })
+    const [mirror] = db.all(`partyRooms/${r.roomId}/gifts`)
+    expect(mirror).toMatchObject({ giftId: 'castle', lottieAsset: 'gifts/g10_castle.json', svgaUrl: '' })
+  })
 })
 
 describe('room music: only Zipper\'s own catalogue, only the owner or an admin', () => {

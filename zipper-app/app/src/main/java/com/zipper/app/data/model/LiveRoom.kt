@@ -186,6 +186,8 @@ data class LiveGiftEvent(
     val timestamp: Long = 0L,
     /** B13: the gift's SVGA animation (tools/decor), written by settleGift on the room's gift row. */
     val svgaUrl: String = "",
+    /** O2: the CRM's Lottie for the gift — a bundled `gifts/….json` or a URL — played when there is no SVGA. */
+    val lottieAsset: String = "",
 ) {
     companion object {
         fun from(doc: com.google.firebase.firestore.DocumentSnapshot): LiveGiftEvent? {
@@ -201,6 +203,7 @@ data class LiveGiftEvent(
                 quantity       = (doc.getLong("quantity") ?: 1L).toInt(),
                 timestamp      = doc.millis("timestamp"),
                 svgaUrl        = doc.getString("svgaUrl") ?: "",
+                lottieAsset    = doc.getString("lottieAsset") ?: "",
             )
         }
     }

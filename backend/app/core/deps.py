@@ -243,6 +243,10 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/partner-ops/seller-trades/{trade_id}/dispute"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/self-use"),
         ("GET", "/api/partner-ops/sellers/{seller_id}/profit"),
+        # O7 (Owner, 5 Nov 2026): a seller pays back borrowed coins — a payment to Zipper with its reference, or
+        # unsold coins handed back. Scoped by `own_partner_id_or_403(…, kind="seller")`; a request that moves
+        # nothing until one Owner approves it.
+        ("POST", "/api/partner-ops/sellers/{seller_id}/repayment-requests"),
         # 4.3.8 — "Seller sells diamonds to users and files a record of each
         # sale." Filing leaves the sale at `pending`; approval is owner-only and
         # debits the seller's inventory first (4.3.9).

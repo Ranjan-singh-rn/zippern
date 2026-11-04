@@ -3485,9 +3485,10 @@ service cloud.firestore {
        * clock, so the sweep cannot be cheated by a date in the future.
        */
       function hostLiveFields() {
+        // O1 (5 Nov 2026): `hostBlocksCalls` — the host's own switch for incoming calls while live (startCall reads it).
         return ['isActive', 'endedAt', 'durationSeconds', 'title', 'category', 'welcomeMessage',
                 'pinnedMessage', 'isPaused', 'pausedAt', 'isCameraOff', 'mutedViewers', 'kickedViewers',
-                'pkWaiting', 'hostHeartbeatAt', 'viewerCount'];
+                'pkWaiting', 'hostHeartbeatAt', 'viewerCount', 'hostBlocksCalls'];
       }
       function liveCounterStep(field) {
         return (request.resource.data.get(field, 0) - resource.data.get(field, 0)) in [1, -1];
@@ -4000,8 +4001,31 @@ service cloud.firestore {
         allow read:   if inThisConversation() || isOps();
         // Phase 1A (SESSION-001/003): `sessionCurrent()` added — a displaced
         // device could still send chat with its old token.
-        allow write:  if (inThisConversation() && notBanned() && sessionCurrent()
-                          && notBlockedByPeer())
+        //
+        // O5 (5 Nov 2026): a NEW message names its writer as the sender and is
+        // one of the kinds a phone sends — text, a photo, a voice note, a live
+        // invite. A `gift` message is written only by settleGift (Admin SDK),
+        // in the transaction that moved the money, so a chat can never show a
+        // gift nobody paid for.
+        allow create: if (inThisConversation() && notBanned() && sessionCurrent()
+                          && notBlockedByPeer()
+                          && request.resource.data.get('senderUid', '') == request.auth.uid
+                          && request.resource.data.get('type', 'text') in ['text', 'image', 'voice', 'invite'])
+                      || isOps();
+        // Changing or removing a message is its own sender's — never a gift,
+        // and never turning one kind into another. (Nothing in the app edits a
+        // message today; "delete chat" hides a conversation for one person with
+        // `clearedAt` on the conversation, the other person's copy untouched.)
+        allow update: if (inThisConversation() && notBanned() && sessionCurrent()
+                          && notBlockedByPeer()
+                          && resource.data.get('senderUid', '') == request.auth.uid
+                          && resource.data.get('type', 'text') != 'gift'
+                          && request.resource.data.get('senderUid', '') == request.auth.uid
+                          && request.resource.data.get('type', 'text') == resource.data.get('type', 'text'))
+                      || isOps();
+        allow delete: if (inThisConversation()
+                          && resource.data.get('senderUid', '') == request.auth.uid
+                          && resource.data.get('type', 'text') != 'gift')
                       || isOps();
       }
     }

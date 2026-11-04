@@ -228,7 +228,7 @@ export default function InboxPage() {
       <SectionHead
         icon={<PenLine size={15} className="text-green-400" />}
         title="Money"
-        blurb="Cards to check and sign. Nothing moves until an owner signs."
+        blurb="Cards to check and approve. One Owner's approval is final — coins move the moment they approve."
         href="/board"
         linkLabel="Open board"
       />

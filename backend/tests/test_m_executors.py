@@ -76,6 +76,12 @@ fs = FakeFirestore()
 firebase_mod.firestore_client = lambda: fs  # type: ignore[assignment]
 
 from app.services import cards as cards_svc  # noqa: E402
+
+# O6 (Owner decision, 5 Nov 2026): an Owner's signature now executes a coin / diamond card in the same request
+# (`cards.AUTO_EXECUTE_ON_OWNER_SIGN`). This file pins the two-step board — sign, then the type's own execute route —
+# which is what the flag restores when switched off and what a card signed before the decision still takes. Nothing
+# asserted below changed; the decision's own behaviour is pinned in tests/test_o6_owner_sign_final.py.
+cards_svc.AUTO_EXECUTE_ON_OWNER_SIGN = False
 from app.services import commission as commission_svc  # noqa: E402
 from app.services import owner_mail  # noqa: E402
 from app.services import partner_ops as ops  # noqa: E402

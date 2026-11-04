@@ -116,6 +116,8 @@ data class PartyGiftEvent(
     val transactionId: String = "",
     /** B13: the gift's SVGA animation, written by settleGift. */
     val svgaUrl: String = "",
+    /** O2: the CRM's Lottie for the gift (bundled asset or URL), written by settleGift. */
+    val lottieAsset: String = "",
 ) {
     companion object {
         fun from(doc: com.google.firebase.firestore.DocumentSnapshot): PartyGiftEvent? {
@@ -135,6 +137,7 @@ data class PartyGiftEvent(
                 receiverUid    = doc.getString("receiverUid") ?: "",
                 transactionId  = doc.getString("transactionId") ?: "",
                 svgaUrl        = doc.getString("svgaUrl") ?: "",
+                lottieAsset    = doc.getString("lottieAsset") ?: "",
             )
         }
     }
@@ -464,6 +467,8 @@ class PartyRepository @Inject constructor(
         val mode: String,
         val seatMode: String,
         val welcomeMessage: String,
+        /** QA #22: the server already had me in this room (a restored screen, a reconnect) — no new "joined" line. */
+        val rejoined: Boolean = false,
     )
     data class TookSeat(val seatIndex: Int, val alreadySeated: Boolean)
     data class LeftSeat(val left: Boolean, val kicked: Boolean, val roomEmpty: Boolean)
@@ -550,6 +555,7 @@ class PartyRepository @Inject constructor(
                 mode           = m["mode"] as? String ?: PartyRoom.MODE_AUDIO,
                 seatMode       = m["seatMode"] as? String ?: PartyRoom.SEAT_MODE_FREE,
                 welcomeMessage = m["welcomeMessage"] as? String ?: PartyRoom.DEFAULT_WELCOME,
+                rejoined = m["rejoined"] as? Boolean ?: false,
             )
         }
 
@@ -772,6 +778,7 @@ class PartyRepository @Inject constructor(
                 mode           = m["mode"] as? String ?: PartyRoom.MODE_AUDIO,
                 seatMode       = m["seatMode"] as? String ?: PartyRoom.SEAT_MODE_FREE,
                 welcomeMessage = m["welcomeMessage"] as? String ?: PartyRoom.DEFAULT_WELCOME,
+                rejoined = m["rejoined"] as? Boolean ?: false,
             )
         }
 

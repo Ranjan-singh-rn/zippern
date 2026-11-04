@@ -291,6 +291,8 @@ android {
             buildConfigField("boolean", "OTA_ENABLED", "true")
             buildConfigField("String", "OTA_CHANNEL", "\"release\"")
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
+            // The CRM, opened from the Work tab ("Open the full CRM"): the Hosting site that also serves /api.
+            buildConfigField("String", "CRM_WEB_URL", "\"$zipperApiBaseRelease\"")
             buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
             buildConfigField("String", "EMULATOR_HOST", "\"\"")
             buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
@@ -301,6 +303,7 @@ android {
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             // Opt-in only — see `zipperApiBase` above.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBase\"")
+            buildConfigField("String", "CRM_WEB_URL", "\"$zipperApiBase\"")
             buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
             buildConfigField("String", "EMULATOR_HOST", "\"\"")
             buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
@@ -352,6 +355,8 @@ android {
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             // Production host by default; `zipper.apiBase` still overrides.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
+            // The CRM, opened from the Work tab ("Open the full CRM"): the Hosting site that also serves /api.
+            buildConfigField("String", "CRM_WEB_URL", "\"$zipperApiBaseRelease\"")
             buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "false")
             buildConfigField("String", "EMULATOR_HOST", "\"\"")
             buildConfigField("String", "EMULATOR_PROJECT_ID", "\"\"")
@@ -381,6 +386,9 @@ android {
             buildConfigField("boolean", "OTA_ENABLED", "false")
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
             buildConfigField("String", "ZIPPER_API_BASE", "\"http://10.0.2.2:8000\"")
+            // The local CRM (local-stack.command: next dev on the Mac's 127.0.0.1:3001, which serves the emulators and the
+            // API under its own origin), as the emulator reaches the Mac.
+            buildConfigField("String", "CRM_WEB_URL", "\"http://10.0.2.2:3001\"")
             buildConfigField("boolean", "USE_FIREBASE_EMULATORS", "true")
             buildConfigField("String", "EMULATOR_HOST", "\"10.0.2.2\"")
             buildConfigField("String", "EMULATOR_PROJECT_ID", "\"demo-zipper\"")

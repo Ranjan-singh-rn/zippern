@@ -406,7 +406,8 @@ class PartyRoomViewModel @Inject constructor(
                 is PartyRepository.Result.Ok -> {
                     admitted = true
                     _state.update { it.copy(joining = false, gate = PartyGate.None) }
-                    announceArrival()
+                    // QA #22: one "joined" line per arrival — not one per screen restore or reconnect.
+                    if (!res.value.rejoined) announceArrival()
                     connectAgora(context)
                     startHeartbeat()
                 }
@@ -464,7 +465,8 @@ class PartyRoomViewModel @Inject constructor(
                 is PartyRepository.Result.Ok -> {
                     admitted = true
                     _state.update { it.copy(joining = false, gate = PartyGate.None) }
-                    announceArrival()
+                    // QA #22: one "joined" line per arrival — not one per screen restore or reconnect.
+                    if (!res.value.rejoined) announceArrival()
                     connectAgora(context)
                     startHeartbeat()
                 }

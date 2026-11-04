@@ -14,6 +14,9 @@ private val partnerViewer: (Caps) -> Boolean = { c ->
         c.hasAny(Perm.APPROVE_KYC, Perm.APPROVE_SELLER) || c.has(Perm.COIN_OPERATIONS))
 }
 
+/** The CRM's /seller-trades page: the Owner and Finance (`can_coin_operations`); the Observer reads. */
+private val tradeDesk: (Caps) -> Boolean = { c -> c.isInternal && (c.readsAll || c.has(Perm.COIN_OPERATIONS)) }
+
 private val partnerSubtitle = listOf(Field("Kind", "kind"), Field("Created", "created_at", FieldKind.Date))
 
 private val partnerLinks = listOf(
@@ -27,6 +30,11 @@ private val partnerLinks = listOf(
         showFor = { i, _ -> stat(i, "kind") == "seller" }, target = Link("seller.statement", "{item:id}")),
     WorkAction("partner.sellerHistory", "Seller history", kind = ActionKind.Navigate, gate = { true },
         showFor = { i, _ -> stat(i, "kind") == "seller" }, target = Link("seller.history", "{item:id}")),
+    // B9: margin, credit, tier and limit (the CRM's business panel on /sellers/[id]) and this seller's trades.
+    WorkAction("partner.sellerBusiness", "Coin business", kind = ActionKind.Navigate, gate = { true },
+        showFor = { i, _ -> stat(i, "kind") == "seller" }, target = Link("seller.business", "{item:id}")),
+    WorkAction("partner.sellerTrades", "Trades with other sellers", kind = ActionKind.Navigate, gate = tradeDesk,
+        showFor = { i, _ -> stat(i, "kind") == "seller" }, target = Link("sellerTrades", "{item:id}")),
     WorkAction("partner.owner", "Owner's account", kind = ActionKind.Navigate, gate = { c -> c.isInternal },
         showFor = { i, _ -> stat(i, "owner_crm_uid").isNotBlank() }, target = Link("users.record", "{item:owner_crm_uid}")),
 )
@@ -143,6 +151,36 @@ internal val partnersModules: List<WorkModule> = listOf(
                 reason(),
             ),
             confirm = "File this sale for an Owner's approval? Nothing moves until it is approved.")),
+    ),
+    WorkModule(
+        id = "sellerTrades", title = "Seller-to-seller trades", group = Group.Money,
+        summary = "Coins one seller bought from another: check the payment reference, then an Owner approves and the coins move once.",
+        crm = "/seller-trades",
+        gate = tradeDesk,
+        source = Source.Api("/api/partner-ops/seller-trades", limitParam = null),
+        params = listOf(Input("seller_id", "Seller ID (optional)", required = false, maxLen = 64, asQuery = true,
+            help = "Blank lists every seller's trades.")),
+        filters = listOf(Filter("status", "Status", listOf("pending" to "Pending", "approved" to "Approved", "rejected" to "Rejected", "" to "All"))),
+        titlePaths = listOf("trade_line", "id"), statusPath = "trade_state",
+        subtitle = listOf(Field("Coins", "coins", FieldKind.Count), Field("Paid", "amount_paid_minor", FieldKind.Money),
+            Field("Reference", "payment_ref"), Field("Filed", "created_at", FieldKind.Date)),
+        detail = sellerTradeDetail + listOf(Field("History", "history", FieldKind.Json)),
+        hide = setOf("client_request_id"),
+        rowTransform = ::sellerTradeRow,
+        searchPaths = listOf("buyer_name", "seller_name", "payment_ref", "buyer_id", "seller_id"),
+        note = "Check the reference against the bank or UPI statement first. A trade the selling seller reported as not paid " +
+            "cannot be approved — reject it and the buyer can file again with proof.",
+        actions = listOf(
+            WorkAction("trade.approve", "Approve — move the coins", "/api/partner-ops/seller-trades/{item:id}/approve", danger = true,
+                gate = { c -> c.isOwner && c.has(Perm.COIN_OPERATIONS) },
+                showFor = { i, _ -> stat(i) == "pending" && i["disputed"] != true },
+                inputs = listOf(reason(label = "How the payment was verified")),
+                confirm = "Payment verified? The selling seller's coins move to the buyer, once."),
+            WorkAction("trade.reject", "Reject", "/api/partner-ops/seller-trades/{item:id}/reject", danger = true,
+                gate = { c -> c.has(Perm.COIN_OPERATIONS) }, showFor = statusIn("pending"),
+                inputs = listOf(reason()),
+                confirm = "Reject this trade? Nothing has moved, so nothing moves back; the buyer can file again with proof."),
+        ),
     ),
     WorkModule(
         id = "credit.overdue", title = "Seller credit", group = Group.Money,

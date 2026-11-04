@@ -50,6 +50,25 @@ const val MAX_VIDEO_DURATION_MS  = 60_000L        // 60 seconds
 const val MAX_VIDEO_SIZE_BYTES   = 80L * 1024 * 1024   // 80 MB — covers most 60s 1080p clips
 const val MAX_IMAGE_SIZE_BYTES   = 20L * 1024 * 1024   // 20 MB — raw HEIC/RAW from cameras
 
+/*
+ * QA #14: what storage.rules accepts under profileMedia/ — images 15 MB, videos 50 MB. The pick-time limits above are
+ * higher on purpose (a 20 MB camera photo compresses to well under 1 MB), but when compression FAILS the original is
+ * sent as it is, and Storage refused anything over these with an error that read like a permissions fault. Checked
+ * before that raw upload instead, with a sentence a person can act on.
+ */
+const val STORAGE_IMAGE_MAX_BYTES = 15L * 1024 * 1024
+const val STORAGE_VIDEO_MAX_BYTES = 50L * 1024 * 1024
+
+/** Why an UNcompressed file cannot be uploaded, or null when it fits ([sizeBytes] < 0 = unknown: let Storage decide). */
+fun rawUploadProblem(sizeBytes: Long, isVideo: Boolean): String? {
+    if (sizeBytes < 0) return null
+    val cap = if (isVideo) STORAGE_VIDEO_MAX_BYTES else STORAGE_IMAGE_MAX_BYTES
+    if (sizeBytes <= cap) return null
+    val mb = (sizeBytes + 1024 * 1024 - 1) / (1024 * 1024)
+    return if (isVideo) "This video ($mb MB) could not be made smaller on this phone, and videos must be under 50 MB. Trim it and try again."
+    else "This photo ($mb MB) could not be made smaller on this phone, and photos must be under 15 MB. Choose a smaller one."
+}
+
 /** Storage rules check contentType; putBytes without metadata uploads as octet-stream and is refused. */
 private val JPEG_META = com.google.firebase.storage.StorageMetadata.Builder().setContentType("image/jpeg").build()
 private val MP4_META  = com.google.firebase.storage.StorageMetadata.Builder().setContentType("video/mp4").build()
@@ -182,14 +201,20 @@ class ProfileRepository @Inject constructor(
                 val bytes = MediaUtils.compressImage(context, photoUri)
                 val ref = storage.reference.child("profileMedia/$id/avatar.jpg")
                 if (bytes != null) ref.putBytes(bytes, JPEG_META).await()
-                else ref.putFile(photoUri, JPEG_META).await()          // fallback if compress fails
+                else {                                                  // fallback if compress fails
+                    rawUploadProblem(getFileSizeBytes(photoUri), isVideo = false)?.let { throw IllegalStateException(it) }
+                    ref.putFile(photoUri, JPEG_META).await()
+                }
                 photoUrl = ref.downloadUrl.await().toString()
             }
             if (coverUri != null) {
                 val bytes = MediaUtils.compressImage(context, coverUri)
                 val ref = storage.reference.child("profileMedia/$id/cover.jpg")
                 if (bytes != null) ref.putBytes(bytes, JPEG_META).await()
-                else ref.putFile(coverUri, JPEG_META).await()
+                else {
+                    rawUploadProblem(getFileSizeBytes(coverUri), isVideo = false)?.let { throw IllegalStateException(it) }
+                    ref.putFile(coverUri, JPEG_META).await()
+                }
                 coverUrl = ref.downloadUrl.await().toString()
             }
 
@@ -219,13 +244,19 @@ class ProfileRepository @Inject constructor(
                                 outputName  = "zipper_${ts}_$idx",
                             )
                             val uploadUri = compressedUri ?: uri  // fallback to original if compress fails
+                            if (compressedUri == null) {
+                                rawUploadProblem(getFileSizeBytes(uri), isVideo = true)?.let { throw IllegalStateException(it) }
+                            }
                             mediaRef.putFile(uploadUri, if (isVideo) MP4_META else JPEG_META).await()
                             // Clean up temp file immediately after upload
                             compressedUri?.path?.let { java.io.File(it).delete() }
                         } else {
                             val bytes = MediaUtils.compressImage(context, uri)
                             if (bytes != null) mediaRef.putBytes(bytes, JPEG_META).await()
-                            else mediaRef.putFile(uri, if (isVideo) MP4_META else JPEG_META).await()
+                            else {
+                                rawUploadProblem(getFileSizeBytes(uri), isVideo = false)?.let { throw IllegalStateException(it) }
+                                mediaRef.putFile(uri, if (isVideo) MP4_META else JPEG_META).await()
+                            }
                         }
 
                         val mediaUrl = mediaRef.downloadUrl.await().toString()

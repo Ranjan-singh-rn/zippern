@@ -21,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -29,7 +28,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.firestore.FirebaseFirestore
-import com.zipper.app.R
 import com.zipper.app.data.repository.DiscoverRepository
 import com.zipper.app.ui.components.*
 import com.zipper.app.ui.theme.Radius
@@ -151,9 +149,12 @@ fun DiamondShopScreen(
     ) { _ ->
         when {
             state.isLoadingPackages -> LoadingState()
+            // O5b: no packs published is not "you cannot recharge" — a verified reseller can still take payment and
+            // add diamonds. The way to them is offered rather than a dead end.
             state.packages.isEmpty() -> EmptyState(
-                Icons.Outlined.Storefront, "Packs aren't available right now",
-                "Recharge packs are set by Zipper and load from the server. Try again in a moment.",
+                Icons.Outlined.Storefront, "Packs are being set up",
+                "You can still recharge: message a verified reseller, pay them directly, and they add the diamonds to your account.",
+                actionLabel = "Buy from a reseller", onAction = onViewResellers,
             )
             else -> LazyColumn(contentPadding = PaddingValues(horizontal = Space.lg, vertical = Space.sm), verticalArrangement = Arrangement.spacedBy(Space.md)) {
                 item {
@@ -256,7 +257,7 @@ private fun PackCard(p: RechargePackage, localPrice: String?, modifier: Modifier
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            Icon(painterResource(R.drawable.ic_diamond), null, tint = c.currencyDiamond, modifier = Modifier.size(20.dp))
+            CurrencyDisc(Currency.Diamond, 20.dp)   // O5b: the same cut gem as every balance and price
             Text(indianGrouping(p.totalDiamonds), style = ZipperTheme.type.numericM, color = c.currencyDiamond)
         }
         Text(

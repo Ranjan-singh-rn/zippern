@@ -110,6 +110,18 @@ def _fail(exc: PartnerOpsError) -> HTTPException:
 _own_id_or_403 = own_partner_id_or_403
 
 
+async def _owner_completes(card: dict, user: dict, note: str = "") -> dict:
+    """Owner decision (5 Nov 2026): "one owner, if it is doing something, let it be done; the other owners just get
+    to know." A coin card an Owner raises from a staff screen is reviewed, verified, signed and — for coins —
+    executed in the same request (`cards.complete_if_owner` → `owner_fast_path`: every stage still writes its own
+    audit entry, and the other Owners are told). Anyone else's card waits for an Owner as before; a partner's card
+    is never touched here.
+    """
+    if not R.is_internal(user.get("role")):
+        return card
+    return await cards_svc.complete_if_owner(card, user, note)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # The three capabilities this router turns on
 # ══════════════════════════════════════════════════════════════════════════════
@@ -817,7 +829,7 @@ async def request_coin_purchase(
         return cards_svc.partner_view(
             card, partner_ids_of(user), user.get("uid", "")
         )
-    return card
+    return await _owner_completes(card, user, body.reason or "")
 
 
 @router.get("/payment-references/{payment_ref}")
@@ -856,13 +868,17 @@ async def execute_coin_purchase(card_id: str, user: dict = Depends(require_owner
 async def request_lending(
     seller_id: str, body: Lending, user: dict = Depends(require_write)
 ):
-    """Raise a lending card. A due date is required — credit without one is a gift."""
+    """Raise a lending card. A due date is required — credit without one is a gift.
+
+    Raised by an Owner, it is approved and the coins lent in the same step (`_owner_completes`).
+    """
     try:
-        return await svc.request_lending(
+        card = await svc.request_lending(
             seller_id, body.coins, body.due_at, body.terms, body.reason, user
         )
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
+    return await _owner_completes(card, user, body.reason)
 
 
 @router.post("/lending/{card_id}/execute", dependencies=[_COIN_OPS])
@@ -945,7 +961,7 @@ async def request_borrow(seller_id: str, body: BorrowRequest, user: dict = Depen
         raise _fail(exc) from exc
     if R.is_external(user["role"]):
         return cards_svc.partner_view(card, partner_ids_of(user), user.get("uid", ""))
-    return card
+    return await _owner_completes(card, user, body.reason)
 
 
 @router.post("/seller-trades", status_code=status.HTTP_201_CREATED)
@@ -1037,13 +1053,46 @@ async def seller_profit(seller_id: str, user: dict = Depends(current_user)):
 async def request_repayment(
     seller_id: str, body: Repayment, user: dict = Depends(require_write)
 ):
-    """Raise a repayment card. Spec 4.3.10."""
+    """Raise a repayment card. Spec 4.3.10. Raised by an Owner, the debt is reduced in the same step."""
     try:
-        return await svc.request_repayment(
+        card = await svc.request_repayment(
             seller_id, body.coins, body.payment_ref, body.reason, user
         )
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
+    return await _owner_completes(card, user, body.reason)
+
+
+class SellerRepayment(BaseModel):
+    coins: int = Field(gt=0)
+    #: "payment" — paid Zipper for the borrowed coins; "return_coins" — hands unsold borrowed coins back.
+    method: str = Field(default="payment", max_length=16)
+    amount_paid_minor: int = Field(default=0, ge=0)
+    payment_ref: str = Field(default="", max_length=200)
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+@router.post("/sellers/{seller_id}/repayment-requests", status_code=status.HTTP_201_CREATED)
+async def request_seller_repayment(
+    seller_id: str, body: SellerRepayment, user: dict = Depends(require_write_or_partner)
+):
+    """O7 (Owner, 5 Nov 2026): a seller pays back borrowed coins — from the app's Work tab or the CRM seller portal.
+
+    A payment to Zipper (with its reference and amount) or unsold coins handed back from their inventory. Either
+    way a card that moves nothing until one Owner approves it. Scoped to the caller's own seller record
+    (`_own_id_or_403`); answered through `cards.partner_view` for a partner. Filed by an Owner on a seller's behalf,
+    it is approved and carried out in the same step (`_owner_completes`).
+    """
+    seller_id = _own_id_or_403(user, seller_id, kind="seller")
+    try:
+        card = await svc.request_seller_repayment(
+            seller_id, body.coins, body.method, body.amount_paid_minor, body.payment_ref, body.reason, user
+        )
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+    if R.is_external(user["role"]):
+        return cards_svc.partner_view(card, partner_ids_of(user), user.get("uid", ""))
+    return await _owner_completes(card, user, body.reason)
 
 
 @router.post("/repayments/{card_id}/execute", dependencies=[_COIN_OPS])
@@ -1064,13 +1113,15 @@ async def request_recovery(
     seller_id: str, body: Recovery, user: dict = Depends(require_write)
 ):
     """Raise a recovery card. The penalty is legitimate and may take the total
-    above the original debt (4.3.14); the split is shown before signing."""
+    above the original debt (4.3.14); the split is shown before signing. Raised by an Owner, it is recovered in the
+    same step."""
     try:
-        return await svc.request_recovery(
+        card = await svc.request_recovery(
             seller_id, body.coins, body.penalty_coins, body.reason, user
         )
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
+    return await _owner_completes(card, user, body.reason)
 
 
 @router.post("/recoveries/{card_id}/execute", dependencies=[_COIN_OPS])
@@ -1091,11 +1142,13 @@ async def execute_recovery(card_id: str, user: dict = Depends(require_owner)):
 async def write_off_debt(
     partner_id: str, body: WriteOff, user: dict = Depends(require_write)
 ):
-    """Raise a bad-debt write-off. Owner signature required. Spec 4.3.17."""
+    """Raise a bad-debt write-off. Owner signature required. Spec 4.3.17. Raised by an Owner, it is booked in the
+    same step."""
     try:
-        return await svc.write_off_debt(partner_id, body.coins, body.reason, user)
+        card = await svc.write_off_debt(partner_id, body.coins, body.reason, user)
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
+    return await _owner_completes(card, user, body.reason)
 
 
 @router.post("/write-offs/{card_id}/execute", dependencies=[_COIN_OPS])

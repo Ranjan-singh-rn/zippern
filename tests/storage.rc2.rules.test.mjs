@@ -231,6 +231,35 @@ await no('R-7 (as documented): …not twice',
 await no('R-7 (as documented): nor is that prefix listable',
   listAll(S(stranger, 'sellerDocs/signup')))
 
+// ════════════════════════════════════════════════════════════════════════════
+console.log('O5 — chat photos and voice notes: the two people in the chat, nobody else')
+// ════════════════════════════════════════════════════════════════════════════
+const m4a = { contentType: 'audio/mp4' }
+await ok('O5: alice sends a photo into her chat with mallory',
+  uploadBytes(S(appUser, 'chatMedia/alice_mallory/alice/p1.jpg'), jpegOf(2 * MiB), img))
+await ok('O5: …and a voice note',
+  uploadBytes(S(appUser, 'chatMedia/alice_mallory/alice/v1.m4a'), jpegOf(1 * MiB), m4a))
+await ok('O5: mallory, the other person, sees the photo',
+  getBytes(S(otherUser, 'chatMedia/alice_mallory/alice/p1.jpg')))
+await no('O5: mallory cannot write under alice\'s name',
+  uploadBytes(S(otherUser, 'chatMedia/alice_mallory/alice/p2.jpg'), jpegOf(1 * MiB), img))
+await no('O5: alice cannot write into a chat she is not in',
+  uploadBytes(S(appUser, 'chatMedia/bob_mallory/alice/p3.jpg'), jpegOf(1 * MiB), img))
+await no('O5: a stranger to the chat cannot see the photo',
+  getBytes(S(guest, 'chatMedia/alice_mallory/alice/p1.jpg')))
+await no('O5: …nor list the chat\'s folder',
+  listAll(S(guest, 'chatMedia/alice_mallory/alice')))
+await no('O5: a photo over 10 MB is refused',
+  uploadBytes(S(appUser, 'chatMedia/alice_mallory/alice/p4.jpg'), jpegOf(10 * MiB + 1), img))
+await no('O5: a voice note over 5 MB is refused',
+  uploadBytes(S(appUser, 'chatMedia/alice_mallory/alice/v2.m4a'), jpegOf(5 * MiB + 1), m4a))
+await no('O5: a video is not a chat attachment',
+  uploadBytes(S(appUser, 'chatMedia/alice_mallory/alice/x.mp4'), jpegOf(1 * MiB), vid))
+await no('O5: mallory cannot delete alice\'s photo',
+  deleteObject(S(otherUser, 'chatMedia/alice_mallory/alice/p1.jpg')))
+await ok('O5: alice deletes her own',
+  deleteObject(S(appUser, 'chatMedia/alice_mallory/alice/p1.jpg')))
+
 // ── Result ──────────────────────────────────────────────────────────────────
 await testEnv.cleanup()
 

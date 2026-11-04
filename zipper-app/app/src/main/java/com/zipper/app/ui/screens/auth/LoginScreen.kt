@@ -261,6 +261,10 @@ fun LoginScreen(
         if (uiState.navigateToOtp) { viewModel.onNavigatedToOtp(); otpStage = true; otp = ""; resendIn = 45 }
     }
     LaunchedEffect(resendIn) { if (resendIn > 0) { delay(1000); resendIn-- } }
+    // QA #9: a spent code cannot be retried — back to the number (kept), no resend wait; the message says what to do.
+    LaunchedEffect(uiState.otpNeedsNewCode) {
+        if (uiState.otpNeedsNewCode) { otpStage = false; otp = ""; resendIn = 0; viewModel.consumeOtpNeedsNewCode() }
+    }
     /*
      * `deviceId`, on the auto-filled path too.
      *
@@ -446,7 +450,10 @@ private fun PhoneStage(
     onDismissForcedSignOut: () -> Unit,
 ) {
     val c = ZipperTheme.colors
-    val canSubmit = phone.length >= 5 && termsAccepted && !loading
+    // QA #8: the number is checked here (India: 10 digits starting 6–9), and the reason is shown under the field.
+    val phoneProblem = com.zipper.app.util.phoneNumberProblem(phone, country)
+    var triedToSend by remember { mutableStateOf(false) }
+    val canSubmit = phoneProblem == null && termsAccepted && !loading
 
     Column(
         Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding().verticalScroll(rememberScrollState())
@@ -590,8 +597,11 @@ private fun PhoneStage(
             PhoneNumberField(
                 phone = phone, onPhone = onPhone,
                 country = country, onPickCountry = onPickCountry,
-                onDone = { if (canSubmit) onGetOtp() },
+                onDone = { triedToSend = true; if (canSubmit) onGetOtp() },
             )
+            if (phoneProblem != null && com.zipper.app.util.showPhoneProblemNow(phone, country, triedToSend)) {
+                Text(phoneProblem, style = ZipperTheme.type.caption, color = c.statusDanger)
+            }
             ZipperButton("Get OTP", onGetOtp, gradient = true, fullWidth = true, enabled = canSubmit, loading = loading)
         }
 
@@ -969,9 +979,8 @@ fun AmbientGlows() {
 fun CountryPickerSheet(selected: CountryCode, onSelect: (CountryCode) -> Unit, onDismiss: () -> Unit) {
     val c = ZipperTheme.colors
     var query by remember { mutableStateOf("") }
-    val list = remember(query) {
-        if (query.isBlank()) ALL_COUNTRIES else ALL_COUNTRIES.filter { it.name.contains(query, true) || it.dialCode.contains(query) }
-    }
+    // QA #7: India pinned at the top (nearly every Zipper user dials +91), with or without a search.
+    val list = remember(query) { com.zipper.app.util.countriesForPicker(query) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = c.bgElevated, dragHandle = null, shape = RoundedCornerShape(topStart = Radius.xl, topEnd = Radius.xl)) {
         Column(Modifier.fillMaxWidth().fillMaxHeight(0.85f).navigationBarsPadding()) {
             Box(Modifier.padding(top = 6.dp).size(36.dp, 4.dp).background(c.borderDefault, CircleShape).align(Alignment.CenterHorizontally))

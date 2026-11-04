@@ -56,6 +56,7 @@ import {
 } from '@/lib/coinPurchases'
 import { getRates, type Rates } from '@/lib/rates'
 import api, { ApiError } from '@/lib/api'
+import { raisedSentence } from '@/lib/ownerFastPath'
 import {
   board, inventory, partnerOps,
   coins as coinText, duplicatesOf, inr, num, proofUrl, str, when,
@@ -341,7 +342,7 @@ export default function CoinPurchases() {
             Sellers paying for inventory. This is the only point where money
             genuinely enters the business — every request is a card, and{' '}
             <span className="text-white font-medium">
-              an owner signs before anything moves
+              one Owner&apos;s approval is final — the coins are credited the moment they approve
             </span>
             .
           </p>
@@ -823,9 +824,8 @@ function ConvertDialog({
       })
       onRaised(
         (card.warning ? `${card.warning} ` : '')
-        + 'Card raised from the seller’s request. Nothing has moved — it still has '
-        + 'to be verified and signed before any coins exist. The seller’s original '
-        + 'request has been left untouched in Firestore.',
+        + raisedSentence('Card raised from the seller’s request', card)
+        + ' The seller’s original request has been left untouched in Firestore.',
       )
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'The request was not accepted.')
@@ -1479,8 +1479,8 @@ function PurchaseCard({
           ) : card.stage === 'requested' || card.stage === 'under_review' ? (
             <div className="space-y-3">
               <p className="text-slate-500 text-xs">
-                Verifying confirms the facts — it is not approval. An owner signs
-                on the money board, and only then is inventory credited.
+                Verifying confirms the facts — it is not approval. One Owner approves
+                on the money board, and the inventory is credited the moment they do.
               </p>
 
               {rejecting ? (
@@ -1537,7 +1537,7 @@ function PurchaseCard({
                       run(
                         'verify',
                         () => board.verify(card.id, note.trim()),
-                        'Verified. It is now waiting on an owner signature.',
+                        'Verified. It is now waiting for one Owner to approve it.',
                       )
                     }
                     disabled={note.trim().length < MIN_REASON || !!busy}
@@ -1642,11 +1642,7 @@ function RaiseDialog({
         evidence_url: evidenceUrl.trim(),
         reason: reason.trim(),
       })
-      onRaised(
-        card.warning
-          ? `${card.warning} The card is raised and flagged — nothing has moved.`
-          : 'Card raised. Nothing has moved: an owner signs before inventory is credited.',
-      )
+      onRaised((card.warning ? `${card.warning} ` : '') + raisedSentence('Coin purchase', card))
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'The request was not accepted.')
     } finally {
@@ -1661,7 +1657,7 @@ function RaiseDialog({
           <div>
             <h2 className="text-white font-semibold">Record a seller payment</h2>
             <p className="text-slate-500 text-xs mt-0.5">
-              This raises a card. No coins are credited until an owner signs.
+              This raises a card. The coins are credited when one Owner approves it — at once, if you are an Owner.
             </p>
           </div>
           <button onClick={onClose} className="text-slate-500 hover:text-white">

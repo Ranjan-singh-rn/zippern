@@ -181,6 +181,15 @@ class LiveRepository @Inject constructor(
         else ref.update("isPaused", false).await()
     }
 
+    /**
+     * O1 (5 Nov 2026): the host's "Calls off" switch while live. Written on the room (`hostBlocksCalls`, a host field in
+     * the rules) and ENFORCED by `startCall`, which refuses a caller with "… is live and not taking calls right now".
+     * The switch used to change only this phone's screen — every call still rang.
+     */
+    suspend fun setCallsBlocked(roomId: String, blocked: Boolean) {
+        liveRoomsCol.document(roomId).update("hostBlocksCalls", blocked).await()
+    }
+
     /** Camera off (still live and talking — viewers see the host's photo) or back on. */
     suspend fun setCameraOff(roomId: String, off: Boolean) {
         liveRoomsCol.document(roomId).update("isCameraOff", off).await()

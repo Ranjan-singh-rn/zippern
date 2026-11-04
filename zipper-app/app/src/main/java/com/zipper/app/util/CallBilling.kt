@@ -172,6 +172,13 @@ object CallBilling {
         return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%02d:%02d".format(m, sec)
     }
 
+    /**
+     * O5b (5 Nov 2026): the caller cannot pay for the first minute — the server's `startCall` would refuse — so the
+     * confirmation offers Recharge instead of Call. A free call (rate 0) is never short.
+     */
+    fun isShort(balanceDiamonds: Long, perMinRateDiamonds: Long): Boolean =
+        perMinRateDiamonds > 0L && balanceDiamonds < perMinRateDiamonds
+
     /** The pre-call sentence: what the first minute costs and when it is taken. */
     fun confirmText(perMinRateDiamonds: Long): String =
         "This call costs $perMinRateDiamonds diamonds per minute. The first minute is charged " +

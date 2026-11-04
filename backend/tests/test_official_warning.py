@@ -380,8 +380,9 @@ screen = (
     REPO / "zipper-app" / "app" / "src" / "main" / "java" / "com" / "zipper"
     / "app" / "ui" / "screens" / "messages" / "MessagesScreen.kt"
 ).read_text()
+# O5 (5 Nov 2026) added a third argument (what is new since the tab was last opened); both lists are still passed.
 ok("the Official tab renders them beside the broadcasts",
-   "OfficialTab(state.broadcasts, state.notifications)" in screen)
+   "OfficialTab(state.broadcasts, state.notifications" in screen)
 ok("a warning is drawn differently from an announcement",
    "PersonalNoticeCard" in screen and "isWarning" in screen,
    "a moderation decision read as news is a decision missed")

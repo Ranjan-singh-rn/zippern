@@ -467,6 +467,21 @@ export const startCall = onCall(HOT, async (req: CallableRequest<StartCallReques
         }
       }
 
+      // O1 (5 Nov 2026): and a host who is LIVE may switch incoming calls off for the broadcast. `isLive` and
+      // `liveRoomId` on the user document are the server's (syncLivePresence), and the switch is on the room.
+      const peerLiveId = String(peer.liveRoomId ?? '')
+      if (peer.isLive === true && peerLiveId) {
+        const liveSnap = await tx.get(db.collection('liveRooms').doc(peerLiveId))
+        if (liveSnap.exists && liveSnap.get('isActive') !== false && liveSnap.get('hostUid') === peerUid
+          && liveSnap.get('hostBlocksCalls') === true) {
+          throw new HttpsError(
+            'failed-precondition',
+            `${peer.displayName ?? peer.name ?? 'They'} is live and not taking calls right now.`,
+            { code: 'PEER_IN_LIVE' },
+          )
+        }
+      }
+
       const { perMin, pct, earner, payer } = rateFor(cfg, caller, peer)
 
       /*

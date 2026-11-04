@@ -116,6 +116,12 @@ class CallBillingTest {
         assertTrue(text.contains("60-second mark"))
     }
 
+    @Test fun `short of the first minute the confirmation offers recharge, a free call never is`() {
+        assertTrue(CallBilling.isShort(balanceDiamonds = 749, perMinRateDiamonds = 750))
+        assertFalse(CallBilling.isShort(balanceDiamonds = 750, perMinRateDiamonds = 750))
+        assertFalse("a host ringing a user pays nothing", CallBilling.isShort(balanceDiamonds = 0, perMinRateDiamonds = 0))
+    }
+
     @Test fun `duration formats as mm-ss and h-mm-ss`() {
         assertEquals("00:00", CallBilling.formatDuration(0))
         assertEquals("01:05", CallBilling.formatDuration(65))

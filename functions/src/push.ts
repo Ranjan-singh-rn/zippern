@@ -186,6 +186,9 @@ export const pushChatMessage = asia
     const preview =
       type === 'text' ? String(msg.text ?? '').slice(0, 120)
       : type === 'image' ? 'Sent a photo'
+      : type === 'voice' ? 'Sent a voice message'
+      // O5: written by settleGift only (firestore.rules refuses a client-written gift message).
+      : type === 'gift' ? `Sent you a gift: ${String(msg.giftName ?? 'a gift').slice(0, 60)}`
       : type === 'invite' ? 'Invited you to a live'
       : 'Sent a message'
 

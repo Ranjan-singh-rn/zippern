@@ -180,32 +180,13 @@ fun OtherUserProfileScreen(
     }
 
     if (showCallConfirm && user != null) {
-        AlertDialog(
-            onDismissRequest = { showCallConfirm = false },
-            containerColor = c.bgElevated,
-            title = { Text("Call ${user.name}?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(Space.sm)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.xs)) {
-                        CurrencyDisc(Currency.Diamond, 14.dp)
-                        Text("${indianGrouping(state.callCostDiamonds)} per minute", style = ZipperTheme.type.labelM, color = c.textPrimary)
-                    }
-                    Text(
-                        com.zipper.app.util.CallBilling.confirmText(state.callCostDiamonds),
-                        style = ZipperTheme.type.bodyM, color = c.textSecondary,
-                    )
-                    Text(
-                        "Your balance: ${indianGrouping(state.currentUserDiamonds)} diamonds",
-                        style = ZipperTheme.type.caption, color = c.textMuted,
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton({ showCallConfirm = false; viewModel.initiateCall() }) {
-                    Text("Call — first minute charged on connect", color = c.textBrand)
-                }
-            },
-            dismissButton = { TextButton({ showCallConfirm = false }) { Text("Cancel", color = c.textSecondary) } },
+        CallConfirmDialog(
+            name = user.name,
+            perMinuteDiamonds = state.callCostDiamonds,
+            balanceDiamonds = state.currentUserDiamonds,
+            onCall = { showCallConfirm = false; viewModel.initiateCall() },
+            onRecharge = { showCallConfirm = false; onRecharge() },
+            onDismiss = { showCallConfirm = false },
         )
     }
 

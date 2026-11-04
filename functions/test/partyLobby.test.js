@@ -223,3 +223,27 @@ describe('a private room remembers who it let in', () => {
     expect(listener(id, 'GUEST')).toBe(undefined)
   })
 })
+
+describe('QA #22 — one "joined" line per arrival', () => {
+  test('the first join is an arrival; joining again while still in the room is a rejoin', async () => {
+    const made = await call(PARTY.createPartyRoom, { title: 'Join lines', mode: 'audio', seatCount: 10, seatMode: 'free', visibility: 'public' }, 'OWNER')
+    const first = await call(PARTY.joinPartyRoom, { roomId: made.roomId }, 'GUEST')
+    expect(first.rejoined).toBe(false)
+    const again = await call(PARTY.joinPartyRoom, { roomId: made.roomId }, 'GUEST')   // a restored screen, a reconnect
+    expect(again.rejoined).toBe(true)
+    expect(room(made.roomId).listenerCount).toBe(1)   // …and it is still one person in the lobby
+  })
+
+  test('after leaving, coming back is a new arrival again', async () => {
+    const made = await call(PARTY.createPartyRoom, { title: 'Join lines 2', mode: 'audio', seatCount: 10, seatMode: 'free', visibility: 'public' }, 'OWNER')
+    await call(PARTY.joinPartyRoom, { roomId: made.roomId }, 'OWNER')
+    await call(PARTY.joinPartyRoom, { roomId: made.roomId }, 'GUEST')
+    await call(PARTY.leavePartyRoom, { roomId: made.roomId }, 'GUEST')
+    const back = await call(PARTY.joinPartyRoom, { roomId: made.roomId }, 'GUEST')
+    expect(back.rejoined).toBe(false)
+  })
+
+  test('QA #21: the default welcome is a sentence', () => {
+    expect(PARTY.DEFAULT_WELCOME).toBe('Welcome to my room. Have fun!')
+  })
+})

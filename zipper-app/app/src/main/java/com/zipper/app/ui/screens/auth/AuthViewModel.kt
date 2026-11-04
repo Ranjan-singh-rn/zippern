@@ -22,6 +22,8 @@ import javax.inject.Inject
 data class AuthUiState(
     val isLoading: Boolean = false,
     val error: String? = null,
+    /** QA #9: the OTP was spent on a sign-in whose session could not start — back to the number for a new code. */
+    val otpNeedsNewCode: Boolean = false,
     val verificationId: String? = null,
     val navigateToOtp: Boolean = false,
     val navigateToProfileSetup: Boolean = false,
@@ -243,7 +245,12 @@ class AuthViewModel @Inject constructor(
              * simply sat there with a spinner and no explanation.
              */
             when (val result = repo.verifyOtp(verificationId, code, deviceId, otpPhone)) {
-                is AuthResult.Error -> handleAuthError(result.message)
+                is AuthResult.Error -> {
+                    handleAuthError(result.message)
+                    if (result.message == com.zipper.app.data.repository.SESSION_NOT_STARTED_MESSAGE) {
+                        _uiState.update { it.copy(otpNeedsNewCode = true, verificationId = null) }
+                    }
+                }
                 else -> handleAuthResult(result)
             }
         }
@@ -255,6 +262,9 @@ class AuthViewModel @Inject constructor(
      * dark-mode or language change) — a second sign-in for the same code.
      */
     fun consumeAutoFilledOtp() = _uiState.update { it.copy(otpAutoFilled = null) }
+
+    /** QA #9: the login screen has gone back to the number. */
+    fun consumeOtpNeedsNewCode() = _uiState.update { it.copy(otpNeedsNewCode = false) }
 
     // ── Google Sign-In ────────────────────────────────────────────────────────
 

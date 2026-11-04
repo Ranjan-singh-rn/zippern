@@ -270,6 +270,7 @@ STORAGE_UNDECIDED: dict[str, str] = {
     "roomThumbs": "room thumbnails",
     "hostPhotos": "host photos per agency",
     "crmProfilePhotos": "CRM profile photos (flat; the Owners' own pictures live here)",
+    "chatMedia": "chat photos and voice notes between two people (O5, 5 Nov 2026: chatMedia/{convoId}/{uid}/…)",
     # Prefixes an earlier planner listed as owned-by-user; none seen in 2026-10.
     "users": "legacy per-user files", "profiles": "legacy per-user files",
     "avatars": "legacy per-user files", "agencies": "legacy per-partner files",

@@ -1,7 +1,10 @@
 package com.zipper.app.ui.screens.messages
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,8 +14,19 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.SupportAgent
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,7 +77,8 @@ fun MessagesScreen(
      * the person's own choice from then on — it never flips under them while
      * they read.
      */
-    var tab by remember { mutableIntStateOf(-1) }
+    // O5: saveable — coming back from a chat lands on the tab the person was on, not on Official again.
+    var tab by rememberSaveable { mutableIntStateOf(-1) }
     // Both lists, not just the chats: they arrive separately, and a tab decided
     // before the notices had come counted none of them.
     LaunchedEffect(state.isLoading, state.notificationsLoaded) {
@@ -72,10 +87,33 @@ fun MessagesScreen(
         }
     }
     val shown = if (tab >= 0) tab else com.zipper.app.util.MessagesTabs.initialTab(initialTab, state.unreadOfficial, state.totalUnread)
+    // O5: opening Official marks what is in it as seen (the server never marks a notice read).
+    LaunchedEffect(shown, state.notificationsLoaded, state.notifications.size) {
+        if (shown == com.zipper.app.util.MessagesTabs.OFFICIAL && state.notificationsLoaded) viewModel.officialOpened()
+    }
     val tabs = listOf("Official", "Feedback", "Chats")
 
-    Column(Modifier.fillMaxSize().background(c.bgBase).statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = Space.lg, vertical = Space.sm).height(30.dp), verticalAlignment = Alignment.CenterVertically) {
+    val snackbar = remember { SnackbarHostState() }
+    var confirmDelete by remember { mutableStateOf(false) }
+    LaunchedEffect(state.notice) { state.notice?.let { snackbar.showSnackbar(it); viewModel.consumeNotice() } }
+    val selecting = state.selected.isNotEmpty()
+    // Back leaves selection first, as every phone's own lists do.
+    androidx.activity.compose.BackHandler(enabled = selecting) { viewModel.clearSelection() }
+
+    Box(Modifier.fillMaxSize().background(c.bgBase)) {
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        if (selecting) {
+            // O5: "delete chat" — the selection bar replaces the title while chats are ticked.
+            Row(Modifier.fillMaxWidth().padding(horizontal = Space.sm, vertical = Space.xs).height(38.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButtonCircle(Icons.Default.Close, "Cancel selection", viewModel::clearSelection, background = Color.Transparent)
+                Text("${state.selected.size} selected", style = ZipperTheme.type.labelL, color = c.textPrimary, modifier = Modifier.weight(1f))
+                if (state.selected.size < state.conversations.size) {
+                    TextButton(viewModel::selectAll) { Text("Select all", color = c.textBrand) }
+                }
+                IconButtonCircle(Icons.Default.Delete, "Delete selected chats", { confirmDelete = true },
+                    background = Color.Transparent, tint = c.statusDanger, enabled = !state.deleting)
+            }
+        } else Row(Modifier.fillMaxWidth().padding(horizontal = Space.lg, vertical = Space.sm).height(30.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Messages", style = ZipperTheme.type.headingL, color = c.textPrimary)
             Spacer(Modifier.weight(1f))
             if (state.totalUnread > 0) {
@@ -97,7 +135,7 @@ fun MessagesScreen(
                 Box(
                     Modifier.weight(1f).fillMaxHeight()
                         .then(if (on) Modifier.background(Brush.horizontalGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), CircleShape) else Modifier)
-                        .clickableNoRipple { tab = i },
+                        .clickableNoRipple { tab = i; viewModel.clearSelection() },
                     contentAlignment = Alignment.Center,
                 ) { Text(label, style = ZipperTheme.type.labelM, color = if (on) Color.White else c.textMuted) }
             }
@@ -105,28 +143,94 @@ fun MessagesScreen(
 
         when {
             state.isLoading -> LoadingState()
-            shown == 0 -> OfficialTab(state.broadcasts, state.notifications)
+            shown == 0 -> OfficialTab(state.broadcasts, state.notifications, state.officialNewSince)
             shown == 1 -> TicketsTab(state.tickets, onNavigateToFeedback)
-            else -> ConversationsTab(state.conversations, viewModel.myUid()) { convo -> onNavigateToChat(convo.otherUserUid, convo.id) }
+            state.chatsFailed && state.conversations.isEmpty() -> EmptyState(
+                Icons.Outlined.CloudOff, "Chats could not be loaded",
+                "Check your connection. Your messages are safe — they show again once the app reaches the server.",
+            )
+            else -> ConversationsTab(
+                convos = state.conversations, myUid = viewModel.myUid(), selected = state.selected,
+                onOpen = { convo -> onNavigateToChat(convo.otherUserUid, convo.id) },
+                onToggle = viewModel::toggleSelected,
+            )
         }
+    }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = Space.lg)) { data ->
+            Snackbar(snackbarData = data, containerColor = c.bgElevated, contentColor = c.textPrimary)
+        }
+    }
+
+    if (confirmDelete) {
+        val chosen = state.conversations.filter { it.id in state.selected }
+        val one = chosen.singleOrNull()
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            containerColor = c.bgElevated,
+            title = {
+                Text(if (one != null) "Delete this chat?" else "Delete ${chosen.size} chats?", style = ZipperTheme.type.headingS, color = c.textPrimary)
+            },
+            text = {
+                Text(
+                    (if (one != null) "Your chat with ${one.otherUserName.ifBlank { "this person" }} is removed from your Messages. "
+                    else "These chats are removed from your Messages. ") +
+                        "The other person keeps their copy. A new message starts the chat again.",
+                    style = ZipperTheme.type.bodyM, color = c.textSecondary,
+                )
+            },
+            confirmButton = { TextButton({ confirmDelete = false; viewModel.deleteSelected() }) { Text("Delete", color = c.statusDanger) } },
+            dismissButton = { TextButton({ confirmDelete = false }) { Text("Cancel", color = c.textSecondary) } },
+        )
     }
 }
 
+/**
+ * The chat list. O5: a long press starts selecting; while anything is selected a tap ticks
+ * or unticks a chat instead of opening it, and the bar at the top deletes the ticked ones.
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ConversationsTab(convos: List<Conversation>, myUid: String, onOpen: (Conversation) -> Unit) {
+private fun ConversationsTab(
+    convos: List<Conversation>,
+    myUid: String,
+    selected: Set<String>,
+    onOpen: (Conversation) -> Unit,
+    onToggle: (String) -> Unit,
+) {
     val c = ZipperTheme.colors
     if (convos.isEmpty()) {
         EmptyState(Icons.Outlined.ChatBubbleOutline, "No chats yet", "Open someone's profile and tap Message, or reply to a reseller from the Diamond Shop.")
         return
     }
+    val selecting = selected.isNotEmpty()
     LazyColumn(contentPadding = PaddingValues(bottom = Space.xl)) {
+        if (!selecting) item(key = "select-hint") {
+            Text(
+                "Long-press a chat to select it — then delete one or several.",
+                style = ZipperTheme.type.caption, color = c.textMuted,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = Space.lg, vertical = Space.xs),
+            )
+        }
         items(convos, key = { it.id }) { convo ->
             val unread = convo.unreadCount[myUid] ?: 0L
             val fromThem = convo.lastMessageSenderUid != myUid
+            val ticked = convo.id in selected
             Row(
-                Modifier.fillMaxWidth().clickableNoRipple { onOpen(convo) }.padding(horizontal = Space.lg, vertical = Space.md),
+                Modifier.fillMaxWidth()
+                    .then(if (ticked) Modifier.background(c.tintBrandSubtle) else Modifier)
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() }, indication = null,
+                        onClick = { if (selecting) onToggle(convo.id) else onOpen(convo) },
+                        onLongClick = { onToggle(convo.id) },
+                    )
+                    .padding(horizontal = Space.lg, vertical = Space.md),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md),
             ) {
+                if (selecting) {
+                    Box(Modifier.size(22.dp).then(if (ticked) Modifier else Modifier.border(2.dp, c.borderDefault, CircleShape)), contentAlignment = Alignment.Center) {
+                        if (ticked) Icon(Icons.Default.CheckCircle, "Selected", tint = c.brandPrimary, modifier = Modifier.size(22.dp))
+                    }
+                }
                 Avatar(convo.otherUserPhotoUrl, size = AvatarSize.MD, initial = convo.otherUserName)
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(convo.otherUserName.ifBlank { "User" }, style = ZipperTheme.type.labelL, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -177,7 +281,7 @@ private sealed interface OfficialItem {
 }
 
 @Composable
-private fun OfficialTab(broadcasts: List<BroadcastMessage>, notifications: List<UserNotification>) {
+private fun OfficialTab(broadcasts: List<BroadcastMessage>, notifications: List<UserNotification>, newSince: Long = 0L) {
     val items: List<OfficialItem> = remember(broadcasts, notifications) {
         (broadcasts.map { OfficialItem.Announcement(it) } +
             notifications.map { OfficialItem.Personal(it) })
@@ -190,7 +294,7 @@ private fun OfficialTab(broadcasts: List<BroadcastMessage>, notifications: List<
         items(items, key = { it.key }) { item ->
             when (item) {
                 is OfficialItem.Announcement -> AnnouncementCard(item.b)
-                is OfficialItem.Personal -> PersonalNoticeCard(item.n)
+                is OfficialItem.Personal -> PersonalNoticeCard(item.n, isNew = !item.n.isRead && item.n.createdAt > newSince)
             }
         }
         item { Spacer(Modifier.height(Space.sm)) }
@@ -227,7 +331,7 @@ private fun AnnouncementCard(b: BroadcastMessage) {
  * reason the reviewer wrote.
  */
 @Composable
-private fun PersonalNoticeCard(n: UserNotification) {
+private fun PersonalNoticeCard(n: UserNotification, isNew: Boolean = !n.isRead) {
     val c = ZipperTheme.colors
     val tint = if (n.isWarning) c.statusWarning else c.currencyDiamond
     val label = if (n.isWarning) "WARNING" else "OFFICIAL"
@@ -243,7 +347,7 @@ private fun PersonalNoticeCard(n: UserNotification) {
             Chip(label, tint = tint.copy(alpha = 0.14f), contentColor = tint)
             // An unread dot rather than a count: there is one message per card,
             // so a number would always read "1".
-            if (!n.isRead) Box(Modifier.size(6.dp).background(c.brandPrimary, CircleShape))
+            if (isNew) Box(Modifier.size(6.dp).background(c.brandPrimary, CircleShape))
             Spacer(Modifier.weight(1f))
             Text(timeAgo(n.createdAt), style = ZipperTheme.type.caption, color = c.textMuted)
         }

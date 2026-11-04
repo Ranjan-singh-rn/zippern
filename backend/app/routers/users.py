@@ -59,6 +59,7 @@ from app.core.deps import (
 from app.core.roles import Permission
 from app.services import appeals as appeals_svc
 from app.services import live as live_svc
+from app.services import cards as cards_svc
 from app.services import users as svc
 from app.services.appeals import AppealError, AppealNotFound, AppealStatus
 from app.services.live import LiveError
@@ -766,13 +767,19 @@ async def request_balance_change(
     in front of an owner with somebody's name on it, and an owner working
     through a board of them is relying on whoever raised each one being entitled
     to. `can_adjust_balance` is that entitlement: App, Finance and the owners.
+
+    Owner decision (5 Nov 2026): raised BY an Owner, the card is reviewed, verified, signed and executed in the
+    same request — the balance moves now, every stage keeps its own audit entry and the other Owners are told
+    (`cards.complete_if_owner`). An Owner's own account is the exception the board keeps: that card waits for
+    another Owner, and the response says so (`owner_complete_error`).
     """
     try:
-        return await svc.request_balance_change(
+        card = await svc.request_balance_change(
             uid, body.currency, body.amount, body.reason, user
         )
     except UserError as exc:
         raise _fail(exc) from exc
+    return await cards_svc.complete_if_owner(card, user, body.reason)
 
 
 # ── Moderation ────────────────────────────────────────────────────────────────

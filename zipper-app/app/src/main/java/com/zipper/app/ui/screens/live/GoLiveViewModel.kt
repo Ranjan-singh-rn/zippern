@@ -286,6 +286,12 @@ class GoLiveViewModel @Inject constructor(
                         myUid = user.uid, myName = user.name, myPhotoUrl = user.photoUrl,
                     )
                 }
+                // O1: a "Calls off" chosen before the room existed is saved on it now.
+                if (_state.value.callProtectionEnabled) {
+                    try { repo.setCallsBlocked(roomId, true) } catch (_: Exception) {
+                        _state.update { it.copy(callProtectionEnabled = false, error = "Calls are on — turning them off failed. Try again.") }
+                    }
+                }
                 startDurationTimer()
                 collectRoomStreams(roomId)
                 startHeartbeat(roomId)
@@ -687,8 +693,26 @@ class GoLiveViewModel @Inject constructor(
 
     // ── Call protection ───────────────────────────────────────────────────────
 
+    /**
+     * O1: "Calls off" while live — saved on the room, where `startCall` reads it, so nobody's call rings while it is on.
+     * Shown at once; put back (with the reason) if the write fails, so the screen never claims a protection the server
+     * does not have.
+     */
     fun toggleCallProtection() {
-        _state.update { it.copy(callProtectionEnabled = !it.callProtectionEnabled) }
+        val s = _state.value
+        val blocked = !s.callProtectionEnabled
+        _state.update { it.copy(callProtectionEnabled = blocked) }
+        if (s.roomId.isBlank()) return
+        viewModelScope.launch {
+            try { repo.setCallsBlocked(s.roomId, blocked) } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        callProtectionEnabled = !blocked,
+                        error = "Couldn't turn calls ${if (blocked) "off" else "on"}. ${e.localizedMessage ?: ""}".trim(),
+                    )
+                }
+            }
+        }
     }
 
     // ── Viewer management ─────────────────────────────────────────────────────

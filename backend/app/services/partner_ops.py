@@ -5723,6 +5723,9 @@ async def request_repayment(
     payment_ref: str,
     reason: str,
     actor: dict,
+    *,
+    amount_paid_minor: int = 0,
+    extra: dict | None = None,
 ) -> dict:
     """Seller repays credit. Spec 4.3.10.
 
@@ -5762,6 +5765,9 @@ async def request_repayment(
                 "outstanding_before": outstanding,
                 "duplicate_reference": bool(duplicates),
                 "duplicate_of": duplicates,
+                # O7: what the seller says they paid, in paise (0 when staff record a repayment without it).
+                "amount_paid_minor": max(0, int(amount_paid_minor or 0)),
+                **(extra or {}),
             },
         ),
         actor,
@@ -5853,6 +5859,8 @@ async def request_recovery(
     penalty_coins: int,
     reason: str,
     actor: dict,
+    *,
+    extra: dict | None = None,
 ) -> dict:
     """Recover unpaid credit from the seller's own balance. Spec 4.3.13–4.3.15.
 
@@ -5894,10 +5902,74 @@ async def request_recovery(
                 # Stated up front: recovery takes what is there and the rest
                 # stays a receivable (4.3.16).
                 "expected_shortfall": max(0, target - balance),
+                **(extra or {}),
             },
         ),
         actor,
     )
+
+
+#: O7 — the two ways a seller pays back borrowed coins.
+REPAY_METHODS = ("payment", "return_coins")
+
+
+async def request_seller_repayment(
+    seller_id: str,
+    coins: int,
+    method: str,
+    amount_paid_minor: int,
+    payment_ref: str,
+    reason: str,
+    actor: dict,
+) -> dict:
+    """O7 (Owner, 5 Nov 2026): "if a seller borrowed coins from us, for those coins he needs to pay — and that
+    payment is not in the app or the CRM." The seller says how they are paying back, from the app's Work tab or the
+    CRM seller portal; staff can file the same on a seller's behalf.
+
+      * ``payment`` — they paid Zipper for the borrowed coins (bank / UPI, with the reference and the amount). A
+        ``lending_repay`` card: when one Owner approves it, the debt goes down. No coin moves; the coins were
+        already issued.
+      * ``return_coins`` — they hand back borrowed coins they have not sold, from their own inventory. A
+        ``lending_recover`` card with no penalty: when one Owner approves it, those coins leave the inventory and
+        the debt goes down by the same amount.
+
+    Both are requests: nothing moves here. Refused when there is nothing owed, when more is offered than is owed,
+    without a payment reference and amount (payment), or with more coins than the seller holds (return).
+    """
+    method = (method or "payment").strip().lower()
+    if method not in REPAY_METHODS:
+        raise PartnerOpsError("Choose how you are paying back: a payment to Zipper, or returning coins.")
+    reason = _require_reason(reason)
+    coins = _positive(coins, "Coins")
+
+    partner = await _partner(seller_id, PartnerKind.SELLER)
+    outstanding = int((partner.get("credit") or {}).get("outstanding", 0))
+    if outstanding <= 0:
+        raise PartnerOpsError("There are no borrowed coins to pay back.")
+    if coins > outstanding:
+        raise PartnerOpsError(
+            f"{coins:,} coins is more than the {outstanding:,} owed. Pay back at most what is owed."
+        )
+    by_partner = R.is_external(actor.get("role"))
+    extra = {"method": method, "requested_by_partner": by_partner}
+
+    if method == "payment":
+        ref = (payment_ref or "").strip()
+        if not ref:
+            raise PartnerOpsError(
+                "Give the payment reference (UTR or transaction id), so Zipper can match the money to you."
+            )
+        paid = _non_negative(amount_paid_minor, "Amount paid")
+        if paid <= 0:
+            raise PartnerOpsError("Enter the amount paid.")
+        return await request_repayment(seller_id, coins, ref, reason, actor, amount_paid_minor=paid, extra=extra)
+
+    balance = await get_balance(HolderType.SELLER, seller_id, Currency.COINS)
+    if coins > balance:
+        raise PartnerOpsError(
+            f"Only {balance:,} coins are in the inventory, so {coins:,} cannot be returned."
+        )
+    return await request_recovery(seller_id, coins, 0, reason, actor, extra=extra)
 
 
 async def execute_recovery(card_id: str, actor: dict) -> dict:

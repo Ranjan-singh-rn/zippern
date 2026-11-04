@@ -8,11 +8,15 @@
  * Every figure and every decision is the backend's (services/seller_business.py): this panel files requests and
  * shows answers. Nothing here approves, signs or executes — an owner does, on the board and the trades page.
  * `audience="seller"` is the seller portal; `audience="staff"` adds the tier and credit-limit controls.
+ *
+ * O7 (Owner, 5 Nov 2026): "Pay back borrowed coins" — a payment to Zipper with its reference, or unsold borrowed
+ * coins handed back. Shown while something is owed; one Owner's approval lowers the debt.
  */
 
 import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, CheckCircle, Loader2 } from 'lucide-react'
 import { sellerBusiness, type SellerProfit, type SellerTrade } from '@/lib/apiPartners'
+import { raisedSentence } from '@/lib/ownerFastPath'
 
 const inputCls = 'w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-pink-500'
 const inr = (minor: number) => `₹${(minor / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
@@ -30,6 +34,8 @@ export default function SellerBusinessPanel({ sellerId, audience }: { sellerId: 
   const [selfKey, setSelfKey] = useState(newId())
   const [tier, setTier] = useState({ tier: '', reason: '' })
   const [limit, setLimit] = useState({ coins: 0, reason: '' })
+  const [repay, setRepay] = useState<{ method: 'payment' | 'return_coins'; coins: number; rupees: number; ref: string; reason: string }>(
+    { method: 'payment', coins: 0, rupees: 0, ref: '', reason: '' })
 
   const load = useCallback(async () => {
     try { setProfit(await sellerBusiness.profit(sellerId)) } catch { setProfit(null) }
@@ -38,11 +44,11 @@ export default function SellerBusinessPanel({ sellerId, audience }: { sellerId: 
 
   useEffect(() => { load() }, [load])
 
-  async function act(fn: () => Promise<unknown>, done: string) {
+  async function act(fn: () => Promise<unknown>, done: string | ((result: unknown) => string)) {
     setBusy(true)
     try {
-      await fn()
-      setNotice({ ok: true, msg: done })
+      const result = await fn()
+      setNotice({ ok: true, msg: typeof done === 'function' ? done(result) : done })
       await load()
     } catch (e: unknown) {
       setNotice({ ok: false, msg: e instanceof Error ? e.message : 'That did not go through.' })
@@ -120,6 +126,49 @@ export default function SellerBusinessPanel({ sellerId, audience }: { sellerId: 
             }, 'Trade filed. It moves when an owner approves it.')}>File trade</button>
         </div>
       </div>
+
+      {profit && profit.credit_outstanding > 0 && (
+        <div className="bg-slate-800 rounded-xl p-4 space-y-2">
+          <h3 className="text-white font-semibold">Pay back borrowed coins</h3>
+          <p className="text-xs text-slate-400">
+            {profit.credit_outstanding.toLocaleString('en-IN')} coins owed. Pay Zipper for them (with the payment reference),
+            or hand back coins you have not sold. Nothing changes until an Owner approves it.
+          </p>
+          <div className="grid md:grid-cols-3 gap-2">
+            <select className={inputCls} value={repay.method}
+              onChange={(e) => setRepay({ ...repay, method: e.target.value === 'return_coins' ? 'return_coins' : 'payment' })}>
+              <option value="payment">I paid Zipper (bank / UPI)</option>
+              <option value="return_coins">Return unsold coins from stock</option>
+            </select>
+            <input className={inputCls} type="number" placeholder="Borrowed coins this pays back" value={repay.coins || ''}
+              onChange={(e) => setRepay({ ...repay, coins: Number(e.target.value) })} />
+            {repay.method === 'payment' && (
+              <>
+                <input className={inputCls} type="number" placeholder="Amount paid (₹)" value={repay.rupees || ''}
+                  onChange={(e) => setRepay({ ...repay, rupees: Number(e.target.value) })} />
+                <input className={inputCls} placeholder="Payment reference (UTR)" value={repay.ref}
+                  onChange={(e) => setRepay({ ...repay, ref: e.target.value })} />
+              </>
+            )}
+            <input className={inputCls} placeholder="Note for Zipper" value={repay.reason}
+              onChange={(e) => setRepay({ ...repay, reason: e.target.value })} />
+            <button
+              disabled={busy || repay.coins <= 0 || repay.reason.trim().length < 3
+                || (repay.method === 'payment' && (repay.rupees <= 0 || !repay.ref.trim()))}
+              className="bg-pink-600 hover:bg-pink-500 disabled:opacity-50 text-white rounded-lg px-3 py-1.5 text-sm"
+              onClick={() => act(async () => {
+                const card = await sellerBusiness.requestRepayment(sellerId, {
+                  coins: repay.coins, method: repay.method, reason: repay.reason.trim(),
+                  ...(repay.method === 'payment' ? { amount_paid_minor: Math.round(repay.rupees * 100), payment_ref: repay.ref.trim() } : {}),
+                })
+                setRepay({ method: repay.method, coins: 0, rupees: 0, ref: '', reason: '' })
+                return card
+              }, (card) => raisedSentence(repay.method === 'payment' ? 'Repayment sent to Zipper' : 'Coin return sent to Zipper', card))}>
+              Send to Zipper
+            </button>
+          </div>
+        </div>
+      )}
 
       {audience === 'seller' && (
         <div className="bg-slate-800 rounded-xl p-4 space-y-2">

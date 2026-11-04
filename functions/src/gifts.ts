@@ -283,6 +283,18 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         }
       }
 
+      /*
+       * O5 (5 Nov 2026): a gift sent outside a room (`dm` — from a chat, a profile or a call) follows the chat's
+       * own rule: nothing reaches somebody who has blocked the sender (firestore.rules `notBlockedByPeer` refuses
+       * the chat message itself). Read here, before the first write, and refused with nothing moved.
+       */
+      if (giftContext === 'dm') {
+        const dmBlocked = await tx.get(receiverRef.collection('blocked').doc(senderUid))
+        if (dmBlocked.exists) {
+          throw new HttpsError('permission-denied', "You can't send gifts to this person.", { code: 'BLOCKED' })
+        }
+      }
+
       const gift = giftSnap.data() as Record<string, any>
 
       // ── Field names come from the CRM, not from what reads nicely ──────────
@@ -664,6 +676,9 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
           emoji:       gift.emoji ?? '',
           imageUrl:    gift.imageUrl ?? gift.iconUrl ?? '',
           svgaUrl:     gift.svgaUrl ?? '',
+          // O2 (5 Nov 2026): the CRM's Lottie (a bundled `gifts/…json` or a URL) — the room plays it full screen when
+          // the gift has no SVGA. It was on `giftEvents` only, so a live or party room never animated a Lottie gift.
+          lottieAsset: gift.lottieAsset ?? '',
           quantity,
           diamondCost: totalCost,
           // Millis, not serverTimestamp: liveGiftsFlow orders on this field and
@@ -734,6 +749,26 @@ export const settleGift = onCall(HOT, async (req: CallableRequest<SettleGiftRequ
         timestamp:     now,
       })
 
+      /*
+       * O5 (5 Nov 2026): a `dm` gift is shown in the two people's chat — as a message ONLY this function writes
+       * (firestore.rules refuses a client-written `type: 'gift'`, so a chat can never claim a gift nobody paid
+       * for). In this transaction, so it lands exactly once with the money, under an id derived from the gift's.
+       * The conversation is upserted the way the app writes it; a name or photo is written only when known, so a
+       * blank never overwrites one the app already stored.
+       */
+      if (giftContext === 'dm') {
+        const chat = dmGiftChatWrites({
+          senderUid, receiverUid, transactionId: txRef.id, giftId, quantity,
+          gift: { name: gift.name ?? gift.displayName, imageUrl: gift.imageUrl ?? gift.iconUrl, emoji: gift.emoji },
+          sender: { name: senderSnap.get('name'), photoUrl: senderSnap.get('photoUrl') },
+          receiver: { name: receiverSnap.get('name'), photoUrl: receiverSnap.get('photoUrl') },
+          now: Date.now(),
+        })
+        const convoRef = db.collection('conversations').doc(chat.convoId)
+        tx.set(convoRef.collection('messages').doc(chat.messageId), chat.message)
+        tx.set(convoRef, chat.conversation, { merge: true })
+      }
+
       const result = {
         transactionId: txRef.id,
         totalCost,
@@ -780,5 +815,53 @@ function receiverPctFor(category: string, rates: Record<string, any>): number {
       return num(rates.luckyReceiverPct, 50)
     default:
       return num(rates.normalReceiverPct, 50)
+  }
+}
+
+/**
+ * O5 — the chat writes for a gift sent outside a room: the gift message (its id derived from the gift's
+ * transaction) and the conversation upsert (written with `{ merge: true }`). Pure apart from the one increment
+ * sentinel, so `functions/test/chatGift.test.js` checks it directly as well as through `settleGift`.
+ */
+export function dmGiftChatWrites(p: {
+  senderUid: string
+  receiverUid: string
+  transactionId: string
+  giftId: string
+  quantity: number
+  gift: { name?: unknown; imageUrl?: unknown; emoji?: unknown }
+  sender: { name?: unknown; photoUrl?: unknown }
+  receiver: { name?: unknown; photoUrl?: unknown }
+  now: number
+}): { convoId: string; messageId: string; message: Record<string, unknown>; conversation: Record<string, unknown> } {
+  const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
+  const convoId = pairIdOf(p.senderUid, p.receiverUid)
+  const giftName = str(p.gift.name) || 'a gift'
+  const label = `🎁 ${giftName}${p.quantity > 1 ? ` ×${p.quantity}` : ''}`
+  const senderName = str(p.sender.name)
+  const convo: Record<string, unknown> = {
+    participants: [p.senderUid, p.receiverUid],
+    lastMessage: label,
+    lastMessageAt: p.now,
+    lastMessageSenderUid: p.senderUid,
+    unreadCount: { [p.receiverUid]: admin.firestore.FieldValue.increment(1) },
+  }
+  // Each side stores its COUNTERPART's name and photo (ChatRepository.sendMessage); blanks are left out.
+  const receiverName = str(p.receiver.name)
+  if (receiverName) convo[`otherUserName_${p.senderUid}`] = receiverName
+  if (senderName) convo[`otherUserName_${p.receiverUid}`] = senderName
+  const receiverPhoto = str(p.receiver.photoUrl)
+  if (receiverPhoto) convo[`otherUserPhotoUrl_${p.senderUid}`] = receiverPhoto
+  const senderPhoto = str(p.sender.photoUrl)
+  if (senderPhoto) convo[`otherUserPhotoUrl_${p.receiverUid}`] = senderPhoto
+  return {
+    convoId,
+    messageId: `gift_${p.transactionId}`,
+    message: {
+      senderUid: p.senderUid, senderName, type: 'gift', text: label,
+      giftId: p.giftId, giftName, giftImageUrl: str(p.gift.imageUrl), giftEmoji: str(p.gift.emoji),
+      quantity: p.quantity, transactionId: p.transactionId, timestamp: p.now, isRead: false,
+    },
+    conversation: convo,
   }
 }

@@ -78,7 +78,8 @@ export function themeOf(raw: unknown): string {
   return (ROOM_THEMES as readonly string[]).includes(t) ? t : 'classic'
 }
 
-const DEFAULT_WELCOME = 'welcome to my room have fun'
+// QA #21 (4 Nov 2026): a sentence, not a lower-case fragment. The app shows the same text (PartyRoom.DEFAULT_WELCOME).
+export const DEFAULT_WELCOME = 'Welcome to my room. Have fun!'
 const WELCOME_MAX = 250
 
 /**
@@ -975,6 +976,8 @@ export const joinPartyRoom = functions
 
         return {
           joined: true,
+          // QA #22: already in the room (a restored screen, a reconnect) — the app posts no second "joined" line.
+          rejoined: listenerSnap.exists,
           role,
           seatCount: Number(roomSnap.get('seatCount') ?? 0),
           mode: String(roomSnap.get('mode') ?? MODE_AUDIO),

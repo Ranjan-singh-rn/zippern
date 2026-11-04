@@ -278,8 +278,12 @@ class SignInRoutingTest {
         val start = repo.indexOf("private suspend fun generateSession(")
         val fn = repo.substring(start, repo.indexOf("private suspend fun mintQuickLoginCredential(", start))
         val restricted = fn.indexOf("com.zipper.app.util.ServerRefusals.Kind.Restricted")
-        val connection = fn.indexOf("Check your connection and try again.")
+        // QA #9 (4 Nov 2026): the generic "check your connection" fallback is now SESSION_NOT_STARTED_MESSAGE (it
+        // also sends the person back for a new code). The order this test pins is unchanged: a restricted account
+        // gets the server's own sentence BEFORE — and instead of — that fallback.
+        val connection = fn.indexOf("AuthResult.Error(SESSION_NOT_STARTED_MESSAGE)")
         assertTrue(restricted > 0 && restricted < connection)
         assertTrue(fn.substring(restricted, connection).contains("AuthResult.Error(res.userMessage)"))
+        assertTrue("the fallback still points at the connection", SESSION_NOT_STARTED_MESSAGE.contains("Check your connection"))
     }
 }

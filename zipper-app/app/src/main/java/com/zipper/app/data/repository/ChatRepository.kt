@@ -3,7 +3,11 @@ package com.zipper.app.data.repository
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.QuerySnapshot
+import com.google.firebase.storage.FirebaseStorage
+import com.google.firebase.storage.StorageMetadata
 import com.zipper.app.data.model.BroadcastMessage
 import com.zipper.app.data.model.ChatMessage
 import com.zipper.app.data.model.Conversation
@@ -16,12 +20,16 @@ import kotlinx.coroutines.tasks.await
 import javax.inject.Inject
 import javax.inject.Singleton
 import com.zipper.app.util.millis
+import com.zipper.app.util.ChatParse
 
 @Singleton
 class ChatRepository @Inject constructor(
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
+    private val storage: FirebaseStorage,
 ) {
+
+    private companion object { const val TAG = "Chat" }
 
     private val convoCol get() = firestore.collection("conversations")
     private val broadcastCol get() = firestore.collection("broadcasts")
@@ -37,56 +45,156 @@ class ChatRepository @Inject constructor(
 
     // ── Conversations list ────────────────────────────────────────────────────
 
-    fun conversationsFlow(myUid: String): Flow<List<Conversation>> = callbackFlow {
-        val listener = convoCol
+    /**
+     * O5: the list, and whether reading it FAILED. The listener used to drop its error on the floor, so a refused or
+     * broken query looked exactly like "No chats yet" — somebody with a new message saw nothing and nothing said so.
+     */
+    data class ConversationsUpdate(val conversations: List<Conversation>, val failed: Boolean = false)
+
+    fun conversationsFlow(myUid: String): Flow<ConversationsUpdate> = callbackFlow {
+        var fallback: ListenerRegistration? = null
+        val primary = convoCol
             .whereArrayContains("participants", myUid)
             .orderBy("lastMessageAt", Query.Direction.DESCENDING)
-            .addSnapshotListener { snap, _ ->
-                val list = snap?.documents?.mapNotNull { doc ->
-                    val participants = doc.get("participants") as? List<*> ?: return@mapNotNull null
-                    val otherUid = participants.firstOrNull { it != myUid }?.toString() ?: ""
-                    Conversation(
-                        id                   = doc.id,
-                        participants         = participants.mapNotNull { it?.toString() },
-                        otherUserUid         = otherUid,
-                        otherUserName        = doc.getString("otherUserName_$myUid") ?: doc.getString("name_$otherUid") ?: "",
-                        otherUserPhotoUrl    = doc.getString("otherUserPhotoUrl_$myUid") ?: "",
-                        lastMessage          = doc.getString("lastMessage") ?: "",
-                        lastMessageAt        = doc.getLong("lastMessageAt") ?: 0L,
-                        lastMessageSenderUid = doc.getString("lastMessageSenderUid") ?: "",
-                        unreadCount          = (doc.get("unreadCount") as? Map<*, *>)
-                            ?.mapNotNull { (k, v) -> if (k is String && v is Long) k to v else null }
-                            ?.toMap() ?: emptyMap(),
-                    )
-                } ?: emptyList()
-                trySend(list)
+            .addSnapshotListener { snap, err ->
+                if (err != null) {
+                    android.util.Log.w(TAG, "conversations listener failed; reading them unordered", err)
+                    // The ordered query needs its composite index; the unordered one needs none, and
+                    // ChatParse.visible sorts the rows here. Started once.
+                    if (fallback == null) {
+                        fallback = convoCol.whereArrayContains("participants", myUid)
+                            .addSnapshotListener { s2, e2 ->
+                                if (e2 != null) {
+                                    android.util.Log.w(TAG, "conversations fallback failed", e2)
+                                    trySend(ConversationsUpdate(emptyList(), failed = true))
+                                } else trySend(ConversationsUpdate(parseConversations(s2, myUid)))
+                            }
+                    }
+                    return@addSnapshotListener
+                }
+                trySend(ConversationsUpdate(parseConversations(snap, myUid)))
             }
+        awaitClose { primary.remove(); fallback?.remove() }
+    }
+
+    /** One unreadable document is skipped on its own; it never takes the list down (ChatParse). */
+    private fun parseConversations(snap: QuerySnapshot?, myUid: String): List<Conversation> =
+        ChatParse.visible(snap?.documents?.mapNotNull { d ->
+            runCatching { ChatParse.conversation(d.id, d.data ?: emptyMap(), myUid) }.getOrNull()
+        }.orEmpty())
+
+    /**
+     * This viewer's own deletion mark on one conversation (`clearedAt.{uid}`), live. 0 when there is none — and also
+     * when the conversation does not exist yet, which the rules answer with a refusal (they read `participants` of a
+     * document that is not there); a new chat has nothing to hide, so that refusal means 0 too.
+     */
+    fun clearedAtFlow(convoId: String, myUid: String): Flow<Long> = callbackFlow {
+        val listener = convoCol.document(convoId).addSnapshotListener { snap, err ->
+            if (err != null) { trySend(0L); return@addSnapshotListener }
+            trySend(ChatParse.long((snap?.get("clearedAt") as? Map<*, *>)?.get(myUid)))
+        }
         awaitClose { listener.remove() }
+    }
+
+    /**
+     * O5: "delete chat" for the selected conversations — for THIS viewer only. Their list hides each one until a
+     * newer message arrives, and their thread shows only what came after; the other person's copy is untouched
+     * (the messages are as much theirs). Marked at the later of now and the last message, so a sender whose clock
+     * runs ahead cannot leave the chat showing.
+     */
+    suspend fun clearForMe(convos: Collection<Conversation>, myUid: String) {
+        if (convos.isEmpty() || myUid.isBlank()) return
+        val now = System.currentTimeMillis()
+        val batch = firestore.batch()
+        convos.forEach { c ->
+            batch.update(convoCol.document(c.id), mapOf(
+                "clearedAt.$myUid" to maxOf(now, c.lastMessageAt),
+                "unreadCount.$myUid" to 0L,
+            ))
+        }
+        batch.commit().await()
     }
 
     // ── Messages in a conversation ────────────────────────────────────────────
 
-    fun messagesFlow(convoId: String): Flow<List<ChatMessage>> = callbackFlow {
+    data class MessagesUpdate(val messages: List<ChatMessage>, val failed: Boolean = false)
+
+    fun messagesFlow(convoId: String): Flow<MessagesUpdate> = callbackFlow {
         val listener = convoCol.document(convoId).collection("messages")
             .orderBy("timestamp", Query.Direction.ASCENDING)
-            .addSnapshotListener { snap, _ ->
+            .addSnapshotListener { snap, err ->
+                if (err != null) {
+                    android.util.Log.w(TAG, "messages listener failed for $convoId", err)
+                    trySend(MessagesUpdate(emptyList(), failed = true))
+                    return@addSnapshotListener
+                }
                 val msgs = snap?.documents?.mapNotNull { doc ->
-                    ChatMessage(
-                        id              = doc.id,
-                        senderUid       = doc.getString("senderUid") ?: "",
-                        senderName      = doc.getString("senderName") ?: "",
-                        text            = doc.getString("text") ?: "",
-                        imageUrl        = doc.getString("imageUrl") ?: "",
-                        type            = doc.getString("type") ?: "text",
-                        inviteRoomId    = doc.getString("inviteRoomId") ?: "",
-                        inviteHostName  = doc.getString("inviteHostName") ?: "",
-                        timestamp       = doc.millis("timestamp"),
-                        isRead          = doc.getBoolean("isRead") ?: false,
-                    )
-                } ?: emptyList()
-                trySend(msgs)
+                    runCatching { ChatParse.message(doc.id, doc.data ?: emptyMap()) }.getOrNull()
+                }.orEmpty()
+                trySend(MessagesUpdate(msgs))
             }
         awaitClose { listener.remove() }
+    }
+
+    // ── Send ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Send one message of a kind a phone may send (text, photo, voice; firestore.rules allows exactly those and
+     * `invite`). A gift is NOT sent from here: settleGift writes it with the money.
+     */
+    suspend fun send(
+        myUid: String,
+        myName: String,
+        myPhotoUrl: String,
+        otherUid: String,
+        otherName: String,
+        otherPhotoUrl: String,
+        type: String,
+        text: String = "",
+        extra: Map<String, Any> = emptyMap(),
+    ): String {
+        require(type in ChatParse.CLIENT_TYPES) { "not a message kind a phone sends: $type" }
+        val cid = convoId(myUid, otherUid)
+        val msgRef = convoCol.document(cid).collection("messages").document()
+        val now = System.currentTimeMillis()
+
+        val batch = firestore.batch()
+        batch.set(msgRef, mapOf(
+            "senderUid"  to myUid,
+            "senderName" to myName,
+            "text"       to text,
+            "type"       to type,
+            "timestamp"  to now,
+            "isRead"     to false,
+        ) + extra)
+        batch.set(
+            convoCol.document(cid),
+            conversationUpsert(myUid, myName, myPhotoUrl, otherUid, otherName, otherPhotoUrl, ChatParse.preview(type, text), now),
+            com.google.firebase.firestore.SetOptions.merge(),
+        )
+        batch.commit().await()
+        return cid
+    }
+
+    /** The conversation fields a send writes. A blank name or photo is left out, so it never blanks a stored one. */
+    private fun conversationUpsert(
+        myUid: String, myName: String, myPhotoUrl: String,
+        otherUid: String, otherName: String, otherPhotoUrl: String,
+        lastMessage: String, now: Long,
+    ): Map<String, Any> {
+        val m = linkedMapOf<String, Any>(
+            "participants"         to listOf(myUid, otherUid),
+            "lastMessage"          to lastMessage,
+            "lastMessageAt"        to now,
+            "lastMessageSenderUid" to myUid,
+            "unreadCount"          to mapOf(otherUid to FieldValue.increment(1L)),
+        )
+        // Per-viewer display names (each side sees their counterpart's info)
+        if (otherName.isNotBlank()) m["otherUserName_$myUid"] = otherName
+        if (otherPhotoUrl.isNotBlank()) m["otherUserPhotoUrl_$myUid"] = otherPhotoUrl
+        if (myName.isNotBlank()) m["otherUserName_$otherUid"] = myName
+        if (myPhotoUrl.isNotBlank()) m["otherUserPhotoUrl_$otherUid"] = myPhotoUrl
+        return m
     }
 
     // ── Send text message ─────────────────────────────────────────────────────
@@ -99,40 +207,17 @@ class ChatRepository @Inject constructor(
         otherName: String,
         otherPhotoUrl: String,
         text: String,
-    ): String {
-        val cid = convoId(myUid, otherUid)
-        val msgRef = convoCol.document(cid).collection("messages").document()
-        val now = System.currentTimeMillis()
+    ): String = send(myUid, myName, myPhotoUrl, otherUid, otherName, otherPhotoUrl, type = "text", text = text)
 
-        val batch = firestore.batch()
-
-        // Message doc
-        batch.set(msgRef, mapOf(
-            "senderUid"  to myUid,
-            "senderName" to myName,
-            "text"       to text,
-            "type"       to "text",
-            "timestamp"  to now,
-            "isRead"     to false,
-        ))
-
-        // Conversation doc — upsert
-        val convoRef = convoCol.document(cid)
-        batch.set(convoRef, mapOf(
-            "participants"              to listOf(myUid, otherUid),
-            "lastMessage"               to text,
-            "lastMessageAt"             to now,
-            "lastMessageSenderUid"      to myUid,
-            // Per-viewer display names (each side sees their counterpart's info)
-            "otherUserName_$myUid"      to otherName,
-            "otherUserPhotoUrl_$myUid"  to otherPhotoUrl,
-            "otherUserName_$otherUid"   to myName,
-            "otherUserPhotoUrl_$otherUid" to myPhotoUrl,
-            "unreadCount"               to mapOf(otherUid to FieldValue.increment(1L)),
-        ), com.google.firebase.firestore.SetOptions.merge())
-
-        batch.commit().await()
-        return cid
+    /**
+     * O5: a chat photo or voice note, uploaded under `chatMedia/{convoId}/{myUid}/` (storage.rules: the two people in
+     * the chat read it; only its sender writes it). Returns the download URL the message stores.
+     */
+    suspend fun uploadChatMedia(convoId: String, myUid: String, bytes: ByteArray, contentType: String, ext: String): String {
+        val name = "${System.currentTimeMillis()}_${java.util.UUID.randomUUID().toString().take(8)}.$ext"
+        val ref = storage.reference.child(ChatParse.mediaPath(convoId, myUid, name))
+        ref.putBytes(bytes, StorageMetadata.Builder().setContentType(contentType).build()).await()
+        return ref.downloadUrl.await().toString()
     }
 
     // ── Send live invite ──────────────────────────────────────────────────────
@@ -147,38 +232,11 @@ class ChatRepository @Inject constructor(
         roomId: String,
         hostName: String,
     ) {
-        val cid = convoId(myUid, otherUid)
-        val msgRef = convoCol.document(cid).collection("messages").document()
-        val now = System.currentTimeMillis()
-        val inviteText = "📺 $hostName is live! Tap to join."
-
-        val batch = firestore.batch()
-
-        batch.set(msgRef, mapOf(
-            "senderUid"      to myUid,
-            "senderName"     to myName,
-            "text"           to inviteText,
-            "type"           to "invite",
-            "inviteRoomId"   to roomId,
-            "inviteHostName" to hostName,
-            "timestamp"      to now,
-            "isRead"         to false,
-        ))
-
-        val convoRef = convoCol.document(cid)
-        batch.set(convoRef, mapOf(
-            "participants"              to listOf(myUid, otherUid),
-            "lastMessage"               to inviteText,
-            "lastMessageAt"             to now,
-            "lastMessageSenderUid"      to myUid,
-            "otherUserName_$myUid"      to otherName,
-            "otherUserPhotoUrl_$myUid"  to otherPhotoUrl,
-            "otherUserName_$otherUid"   to myName,
-            "otherUserPhotoUrl_$otherUid" to myPhotoUrl,
-            "unreadCount"               to mapOf(otherUid to FieldValue.increment(1L)),
-        ), com.google.firebase.firestore.SetOptions.merge())
-
-        batch.commit().await()
+        send(
+            myUid, myName, myPhotoUrl, otherUid, otherName, otherPhotoUrl,
+            type = "invite", text = "📺 $hostName is live! Tap to join.",
+            extra = mapOf("inviteRoomId" to roomId, "inviteHostName" to hostName),
+        )
     }
 
     // ── Mark conversation as read ─────────────────────────────────────────────

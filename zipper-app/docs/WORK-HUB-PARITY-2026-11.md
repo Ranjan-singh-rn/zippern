@@ -67,7 +67,7 @@ reason) · **Not a Work-hub capability** (public form, app edge, machine).
 | Other CRM clients + Android-first routes (§ C, the 9 app-edge routes as one row) | 132 rows: 72 mobile (10 Android-first, 7 Owner-only writes), 29 CRM-only (8 governance), 4 gaps, 8 no client yet, 17 not Work-hub, 1 app door, 1 removed everywhere |
 | Backend routes | 257 |
 | Permission keys / roles | 20 / 16 |
-| Work-hub screens / distinct actions | 84 / 156 |
+| Work-hub screens / distinct actions | 87 / 167 (5 Nov 2026: + the B9 seller-business screens below; O7: + "Pay back borrowed coins") |
 
 ## Per-role counts (pinned by `WorkParityTest`)
 
@@ -83,23 +83,23 @@ holds an agency record, `seller` a seller record, `agency+seller` both,
 <!-- role-counts:begin -->
 | Session | Screens | Writes | Reads | Links | CRM-only markers |
 |---|---|---|---|---|---|
-| `owner` | 81 | 118 | 13 | 22 | 2 |
-| `observer` | 50 | 0 | 8 | 17 | 2 |
-| `app_admin` | 65 | 46 | 11 | 18 | 2 |
-| `app_member` | 40 | 26 | 8 | 11 | 2 |
-| `ops_admin` | 68 | 57 | 11 | 20 | 2 |
-| `ops_member` | 43 | 19 | 10 | 18 | 2 |
-| `finance_admin` | 69 | 54 | 11 | 20 | 2 |
-| `finance_member` | 50 | 28 | 11 | 20 | 2 |
-| `tech_admin` | 63 | 33 | 7 | 11 | 2 |
-| `tech_member` | 41 | 12 | 7 | 11 | 2 |
-| `support_admin` | 61 | 36 | 7 | 11 | 2 |
-| `support_member` | 40 | 22 | 7 | 11 | 2 |
-| `marketing_admin` | 60 | 29 | 7 | 11 | 2 |
-| `marketing_member` | 38 | 12 | 7 | 11 | 2 |
+| `owner` | 83 | 125 | 13 | 24 | 2 |
+| `observer` | 52 | 0 | 8 | 19 | 2 |
+| `app_admin` | 66 | 46 | 11 | 19 | 2 |
+| `app_member` | 41 | 26 | 8 | 11 | 2 |
+| `ops_admin` | 69 | 57 | 11 | 21 | 2 |
+| `ops_member` | 44 | 19 | 10 | 19 | 2 |
+| `finance_admin` | 71 | 58 | 11 | 22 | 2 |
+| `finance_member` | 52 | 32 | 11 | 22 | 2 |
+| `tech_admin` | 64 | 33 | 7 | 11 | 2 |
+| `tech_member` | 42 | 12 | 7 | 11 | 2 |
+| `support_admin` | 62 | 36 | 7 | 11 | 2 |
+| `support_member` | 41 | 22 | 7 | 11 | 2 |
+| `marketing_admin` | 61 | 29 | 7 | 11 | 2 |
+| `marketing_member` | 39 | 12 | 7 | 11 | 2 |
 | `agency` | 10 | 3 | 0 | 1 | 0 |
-| `seller` | 8 | 5 | 1 | 2 | 0 |
-| `agency+seller` | 14 | 5 | 1 | 3 | 0 |
+| `seller` | 10 | 10 | 1 | 2 | 0 |
+| `agency+seller` | 16 | 10 | 1 | 3 | 0 |
 | `pending partner` | 3 | 3 | 0 | 0 | 0 |
 <!-- role-counts:end -->
 
@@ -509,3 +509,25 @@ recommend + Owner decide (`/operations/appeals`), ban scope/category/evidence fo
 sessions (`/sessions`), held items, replica drift and Owner notices (`/finance/integrity`), payout policy
 (`/finance/payouts`), transfer recommendation/hold (`/transfers`), and Host suspend/resume (user page). The Android
 "Decide in the CRM" note for the fast path now points at a real screen.
+
+## Addendum — 5 Nov 2026: the coin seller's business (B9) in the Work tab
+
+The CRM's `SellerBusinessPanel` (`/seller-dashboard`, `/sellers/[id]`) and `/seller-trades` page, on the same routes.
+Every partner write below is on `PARTNER_REACHABLE` and scoped by `own_partner_id_or_403` on the server; nothing here
+approves, signs or executes for a partner.
+
+| CRM call (`lib/apiPartners.ts` `sellerBusiness`) | Route | Android | Who is offered it |
+|---|---|---|---|
+| `profit` | GET `/api/partner-ops/sellers/{seller_id}/profit` | `seller.business` (screen) | the seller; any staff |
+| `requestBorrow` | POST `/api/partner-ops/sellers/{seller_id}/borrow-requests` | `seller.business/seller.borrow` | the seller; `can_coin_operations` |
+| `fileTrade` | POST `/api/partner-ops/seller-trades` | `seller.business/trade.file`, `seller.trades/trade.file` | the seller (as buyer); `can_coin_operations` |
+| `selfUse` | POST `/api/partner-ops/sellers/{seller_id}/self-use` | `seller.business/seller.selfUse` | the seller only (server: Owner switch `sellerSelfUseAllowed`, default off) |
+| `setTier` | POST `/api/partner-ops/sellers/{seller_id}/tier` | `seller.business/seller.tier` | Owner with `can_coin_operations` |
+| `setCreditLimit` | POST `/api/partner-ops/sellers/{seller_id}/credit-limit` | `seller.business/seller.creditLimit` | Owner with `can_coin_operations` |
+| `listTrades` | GET `/api/partner-ops/seller-trades` | `seller.trades` (own), `sellerTrades` (staff) | the seller; Owner, Observer, Finance |
+| `disputeTrade` | POST `/api/partner-ops/seller-trades/{trade_id}/dispute` | `seller.trades/trade.dispute` | the SELLING seller, pending trades |
+| `approveTrade` | POST `/api/partner-ops/seller-trades/{trade_id}/approve` | `sellerTrades/trade.approve` | Owner with `can_coin_operations` |
+| `rejectTrade` | POST `/api/partner-ops/seller-trades/{trade_id}/reject` | `sellerTrades/trade.reject` | `can_coin_operations` |
+
+Staff reach a seller's business and trades from the partner record (`partner.sellerBusiness`, `partner.sellerTrades`).
+

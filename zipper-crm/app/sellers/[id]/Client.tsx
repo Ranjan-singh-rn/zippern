@@ -50,6 +50,7 @@ import { SellerHistoryPanel } from '@/components/SellerHistoryPanel'
 import SellerBusinessPanel from '@/components/SellerBusinessPanel'
 import { canAccess } from '@/lib/auth'
 import api, { ApiError } from '@/lib/api'
+import { raisedSentence } from '@/lib/ownerFastPath'
 import { roleButtons, type UserRoles } from '@/lib/userRoleActions'
 import { restoreGate } from '@/lib/governanceRequests'
 import { awaitingLabel } from '@/lib/contactVerification'
@@ -1328,36 +1329,32 @@ function CreditDialog({
     setErr('')
     try {
       if (kind === 'lend') {
-        await lending.request(sellerId, {
+        const card = await lending.request(sellerId, {
           coins: coinsNum,
           due_at: new Date(dueAt).toISOString(),
           reason: reason.trim(),
         })
-        onRaised(
-          'Lending card raised. Nothing has been credited — an owner signs it first.',
-        )
+        onRaised(raisedSentence('Lending card', card))
       } else if (kind === 'repay') {
-        await lending.requestRepayment(sellerId, {
+        const card = await lending.requestRepayment(sellerId, {
           coins: coinsNum,
           payment_ref: paymentRef.trim(),
           reason: reason.trim(),
         })
-        onRaised('Repayment card raised. The debt is unchanged until it is executed.')
+        onRaised(raisedSentence('Repayment card', card))
       } else if (kind === 'recover') {
-        await lending.requestRecovery(sellerId, {
+        const card = await lending.requestRecovery(sellerId, {
           coins: coinsNum,
           penalty_coins: penaltyNum,
           reason: reason.trim(),
         })
-        onRaised(
-          'Recovery card raised. Nothing has been taken back yet — an owner signs it first.',
-        )
+        onRaised(raisedSentence('Recovery card', card))
       } else {
-        await lending.requestWriteOff(sellerId, {
+        const card = await lending.requestWriteOff(sellerId, {
           coins: coinsNum,
           reason: reason.trim(),
         })
-        onRaised('Write-off card raised. The loss is booked when an owner signs it.')
+        onRaised(raisedSentence('Write-off card', card))
       }
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'The request was not accepted.')

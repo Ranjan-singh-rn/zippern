@@ -30,6 +30,7 @@ import { Denied, Warning } from '@/components/ui/States'
 import { useAuth } from '@/components/AuthProvider'
 import { canAccess } from '@/lib/auth'
 import { ApiError } from '@/lib/api'
+import { raisedSentence } from '@/lib/ownerFastPath'
 import {
   credit as creditApi, lending, partnerOps,
   coins as coinText, daysOverdue, standingOf, when,
@@ -245,7 +246,7 @@ export default function Lending() {
           <p className="text-slate-400 text-sm mt-1 max-w-2xl">
             Every coin lent to a seller, what came back, and what is still out.
             Nothing on this page moves money on its own —{' '}
-            <span className="text-white font-medium">an owner signs before anything moves</span>.
+            <span className="text-white font-medium">one Owner approves before anything moves — and that approval is final</span>.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -464,38 +465,30 @@ function CreditDialog({
     setErr('')
     try {
       if (mode === 'lend') {
-        await lending.request(row.id, {
+        const card = await lending.request(row.id, {
           coins,
           due_at: new Date(`${dueDate}T00:00:00`).toISOString(),
           terms: terms.trim(),
           reason: reason.trim(),
         })
-        onRaised(
-          `Lending card raised for ${row.name}. No coins have moved — an owner signs first.`,
-        )
+        onRaised(raisedSentence(`Lending ${coins.toLocaleString('en-IN')} coins to ${row.name}`, card))
       } else if (mode === 'repay') {
-        await lending.requestRepayment(row.id, {
+        const card = await lending.requestRepayment(row.id, {
           coins,
           payment_ref: paymentRef.trim(),
           reason: reason.trim(),
         })
-        onRaised(
-          `Repayment card raised for ${row.name}. The debt closes when an owner signs it.`,
-        )
+        onRaised(raisedSentence(`Repayment of ${coins.toLocaleString('en-IN')} coins from ${row.name}`, card))
       } else if (mode === 'recover') {
-        await lending.requestRecovery(row.id, {
+        const card = await lending.requestRecovery(row.id, {
           coins,
           penalty_coins: penaltyCoins,
           reason: reason.trim(),
         })
-        onRaised(
-          `Recovery card raised for ${row.name}. Nothing is taken from their balance until an owner signs.`,
-        )
+        onRaised(raisedSentence(`Recovery of ${coins.toLocaleString('en-IN')} coins from ${row.name}`, card))
       } else {
-        await lending.requestWriteOff(row.id, { coins, reason: reason.trim() })
-        onRaised(
-          `Write-off card raised for ${row.name}. It becomes a recorded loss when an owner signs it.`,
-        )
+        const card = await lending.requestWriteOff(row.id, { coins, reason: reason.trim() })
+        onRaised(raisedSentence(`Write-off of ${coins.toLocaleString('en-IN')} coins for ${row.name}`, card))
       }
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : 'That was not accepted.')
@@ -696,8 +689,7 @@ function CreditDialog({
 
           <p className="text-slate-500 text-xs flex items-start gap-1.5">
             <Wallet size={12} className="mt-0.5 shrink-0" />
-            This raises a card. Nothing moves until an owner signs it on the money
-            board.
+            This raises a card. Nothing moves until one Owner approves it — at once, if you are an Owner.
           </p>
 
           {err && (

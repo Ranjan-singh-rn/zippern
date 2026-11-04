@@ -1051,9 +1051,12 @@ reachable = [row for row in table if row[2] == "scoped"]
 # (A trade's SELLER may only DISPUTE it — `POST /seller-trades/{trade_id}/dispute` — which decides nothing; the
 # rejection stays with staff, so the rule below that no partner route ends in `reject` still holds.)
 # Every write is scoped to the caller's own seller record (asserted above); nothing executes or signs.
-check("exactly thirty-four routes are partner-reachable", len(reachable), 34)
+# Thirty-five since O7 (Owner, 5 Nov 2026): a coin seller pays back borrowed coins
+# (`POST …/sellers/{seller_id}/repayment-requests`) — a payment with its reference, or unsold coins handed back —
+# scoped to their own seller record, a request that moves nothing until one Owner approves it.
+check("exactly thirty-five routes are partner-reachable", len(reachable), 35)
 check(
-    "and they are the thirty-four named in PARTNER_REACHABLE",
+    "and they are the thirty-five named in PARTNER_REACHABLE",
     {(row[0], row[1]) for row in reachable},
     set(deps.PARTNER_REACHABLE),
 )
@@ -1262,8 +1265,9 @@ partner_writes = sorted(
 # B9 (3 Nov 2026): nine. Four more for the coin-seller business — a borrow request within the limit Zipper set,
 # a trade filed as its buyer, a dispute raised as its seller, and self-use where Zipper allows it. Each names the
 # caller's own seller record and is scoped to it (asserted above); none decides, signs or executes.
+# O7 (5 Nov 2026): ten — a repayment request for borrowed coins, scoped the same way, deciding nothing.
 check(
-    "the only nine writes a partner may make",
+    "the only ten writes a partner may make",
     partner_writes,
     [
         ("POST", "/api/partner-ops/agencies/{agency_id}/sub-agencies/reapply"),
@@ -1274,6 +1278,7 @@ check(
         ("POST", "/api/partner-ops/seller-trades/{trade_id}/dispute"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/borrow-requests"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/coin-purchases"),
+        ("POST", "/api/partner-ops/sellers/{seller_id}/repayment-requests"),
         ("POST", "/api/partner-ops/sellers/{seller_id}/self-use"),
     ],
 )

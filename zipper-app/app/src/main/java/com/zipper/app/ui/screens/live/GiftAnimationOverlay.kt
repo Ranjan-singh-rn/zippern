@@ -75,6 +75,11 @@ fun GiftAnimationOverlay(
         SvgaGiftOverlay(giftEvent, onDismiss, modifier)
         return
     }
+    // O2 (5 Nov 2026): the CRM's Lottie for the gift, full screen, when it has no SVGA.
+    if (giftEvent.lottieAsset.isNotBlank()) {
+        LottieGiftOverlay(giftEvent, onDismiss, modifier)
+        return
+    }
     val c = ZipperTheme.colors
 
     val scale = remember(giftEvent.id) { Animatable(0.6f) }
@@ -222,3 +227,60 @@ private fun SvgaGiftOverlay(giftEvent: LiveGiftEvent, onDismiss: () -> Unit, mod
 
 /** The longest an SVGA gift may hold the queue, whatever its own length says. */
 private const val SVGA_GIFT_WATCHDOG_MS = 8_000L
+
+/**
+ * O2: the Lottie path — a gift the CRM gave a Lottie (one of the bundled `gifts/….json`, or an uploaded URL) plays it
+ * once, full screen, with the sender caption; a file that will not load, or never ends, is cut off by the same
+ * watchdog as an SVGA so the queue always moves on.
+ */
+@Composable
+private fun LottieGiftOverlay(giftEvent: LiveGiftEvent, onDismiss: () -> Unit, modifier: Modifier) {
+    val c = ZipperTheme.colors
+    var done by remember(giftEvent.id) { mutableStateOf(false) }
+    val finish = {
+        if (!done) {
+            done = true
+            onDismiss()
+        }
+    }
+    val spec = remember(giftEvent.lottieAsset) { lottieSpecOf(giftEvent.lottieAsset) }
+    val composition by com.airbnb.lottie.compose.rememberLottieComposition(spec)
+    val progress by com.airbnb.lottie.compose.animateLottieCompositionAsState(composition, iterations = 1)
+    LaunchedEffect(giftEvent.id) {
+        delay(SVGA_GIFT_WATCHDOG_MS)
+        finish()
+    }
+    LaunchedEffect(composition, progress) {
+        if (composition != null && progress >= 1f) finish()
+    }
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        com.airbnb.lottie.compose.LottieAnimation(composition, { progress }, modifier = Modifier.fillMaxSize())
+        Row(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 180.dp)
+                .background(c.scrimStrong, CircleShape)
+                .border(1.dp, c.glassMid, CircleShape)
+                .padding(start = 2.dp, end = Space.md, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Space.sm),
+        ) {
+            Avatar(giftEvent.senderPhotoUrl.ifBlank { null }, size = AvatarSize.SM, ring = AvatarRing.Vip, initial = giftEvent.senderName)
+            Text(
+                "${giftEvent.senderName.ifBlank { "Someone" }} sent ${giftEvent.giftName} ×${giftEvent.quantity}",
+                style = ZipperTheme.type.labelM,
+                color = c.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 260.dp),
+            )
+        }
+    }
+}
+
+/** O2: a CRM `lottieAsset` is either a URL (uploaded) or a path inside the app's assets (`gifts/g1_rose.json`). */
+internal fun lottieSpecOf(asset: String): com.airbnb.lottie.compose.LottieCompositionSpec {
+    val a = asset.trim()
+    return if (a.startsWith("http://") || a.startsWith("https://")) com.airbnb.lottie.compose.LottieCompositionSpec.Url(a)
+    else com.airbnb.lottie.compose.LottieCompositionSpec.Asset(a.removePrefix("/"))
+}

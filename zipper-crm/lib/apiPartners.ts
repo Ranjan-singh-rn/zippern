@@ -301,6 +301,14 @@ export interface PartnerCard {
   rejection_reason: string | null
   /** Set by the API when the payment reference has been seen before. */
   warning?: string
+  /**
+   * O6 (Owner decision, 5 Nov 2026): raised by an Owner, the card is approved and — for coins — carried out in the
+   * same request. Read through `raisedOutcome` in `lib/ownerFastPath.ts`.
+   */
+  auto_executed?: boolean
+  auto_execute_error?: string
+  owner_complete_error?: string
+  fast_path?: { steps: { stage: string; action: string }[]; executed: Record<string, unknown> | null }
 }
 
 export interface CreditExposure {
@@ -1735,4 +1743,15 @@ export const sellerBusiness = {
     post<{ coins: number; credited_uid: string; replayed: boolean }>(
       `/partner-ops/sellers/${encodeURIComponent(sellerId)}/self-use`, { coins, client_request_id: clientRequestId, reason }),
   profit: (sellerId: string) => get<SellerProfit>(`/partner-ops/sellers/${encodeURIComponent(sellerId)}/profit`),
+  /**
+   * O7 (Owner, 5 Nov 2026): pay back borrowed coins — `payment` (paid Zipper; amount + reference) or `return_coins`
+   * (unsold borrowed coins handed back from stock). A card that moves nothing until one Owner approves it; filed by an
+   * Owner for a seller, it is done in the same step.
+   */
+  requestRepayment: (sellerId: string, body: {
+    coins: number; method: 'payment' | 'return_coins'; amount_paid_minor?: number; payment_ref?: string; reason: string
+  }) =>
+    post<PartnerCard>(`/partner-ops/sellers/${encodeURIComponent(sellerId)}/repayment-requests`, {
+      amount_paid_minor: 0, payment_ref: '', ...body,
+    }),
 }

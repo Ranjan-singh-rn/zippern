@@ -25,7 +25,9 @@
  *   * leaderboards public to signed-in accounts and written by nobody; settlements for the Owner and Finance;
  *   * the music catalogue (enabled tracks only, Tech writes); Party Pro (the holder and staff read, nobody writes);
  *   * a party room's access log (its owner and staff) and PIN misses (nobody);
- *   * seller-to-seller trades (the two sellers and staff read, nobody writes).
+ *   * seller-to-seller trades (the two sellers and staff read, nobody writes);
+ *   * O5: a chat message names its writer, is text / photo / voice / invite (never a gift — settleGift writes
+ *     those), and only its sender edits or deletes it; "delete chat" is a participant's own `clearedAt`.
  */
 
 import { readFileSync } from 'node:fs'
@@ -139,6 +141,8 @@ async function main() {
   await no('B: start a PK by hand', () => updateDoc(D(host, 'liveRooms/R1'), { pkActive: true }))
   await no('B: give the room to somebody else', () => updateDoc(D(host, 'liveRooms/R1'), { hostUid: 'uidOther' }))
   await ok('B: queue for PK (their own pkWaiting)', () => updateDoc(D(host, 'liveRooms/R1'), { pkWaiting: true }))
+  await ok('B (O1): switch incoming calls off while live', () => updateDoc(D(host, 'liveRooms/R1'), { hostBlocksCalls: true }))
+  await ok('B (O1): …and back on', () => updateDoc(D(host, 'liveRooms/R1'), { hostBlocksCalls: false }))
 
   console.log('C — what a viewer may change')
   await ok('C: a like adds one', () => updateDoc(D(viewer, 'liveRooms/R1'), { likeCount: increment(1) }))
@@ -146,6 +150,7 @@ async function main() {
   await ok('C: an older build\'s join moves the count by one', () => updateDoc(D(viewer, 'liveRooms/R1'), { viewerCount: increment(1) }))
   await no('C: …not by a hundred', () => updateDoc(D(viewer, 'liveRooms/R1'), { viewerCount: increment(100) }))
   await no('C: a viewer pins a message', () => updateDoc(D(viewer, 'liveRooms/R1'), { pinnedMessage: 'spam' }))
+  await no('C (O1): a viewer cannot switch the host\'s calls off', () => updateDoc(D(viewer, 'liveRooms/R1'), { hostBlocksCalls: true }))
 
   console.log('D — comments')
   await seed('users/uidHost/blocked/uidBlocked', { blockedAt: 1 })
@@ -280,6 +285,27 @@ async function trackB() {
   await no('N: …nor an app user', () => getDoc(D(viewer, 'sellerTrades/TR1')))
   await ok('N: staff read it', () => getDoc(D(ops, 'sellerTrades/TR1')))
   await no('N: a seller cannot change the coins', () => updateDoc(D(crm('uidSellerA'), 'sellerTrades/TR1'), { coins: 1 }))
+
+  console.log('O — chat messages and "delete chat" (O5)')
+  const CH = 'conversations/uidOther_uidViewer'
+  const msg = (from, extra = {}) => ({ senderUid: from, senderName: from, text: 'hi', type: 'text', timestamp: Date.now(), isRead: false, ...extra })
+  await ok('O: a participant sends a text', () => setDoc(D(viewer, `${CH}/messages/o1`), msg('uidViewer')))
+  await ok('O: …a photo', () => setDoc(D(viewer, `${CH}/messages/o2`), msg('uidViewer', { type: 'image', imageUrl: 'https://x/y.jpg', text: '' })))
+  await ok('O: …a voice message', () => setDoc(D(viewer, `${CH}/messages/o3`), msg('uidViewer', { type: 'voice', audioUrl: 'https://x/y.m4a', durationMs: 3000, text: '' })))
+  await ok('O: …an older build\'s message with no type', () => setDoc(D(viewer, `${CH}/messages/o3b`), { senderUid: 'uidViewer', text: 'hi', timestamp: Date.now() }))
+  await no('O: …but never a gift (only settleGift writes one, with the money)', () => setDoc(D(viewer, `${CH}/messages/o4`), msg('uidViewer', { type: 'gift', giftName: 'Rose' })))
+  await no('O: …nor a message signed as the other person', () => setDoc(D(viewer, `${CH}/messages/o5`), msg('uidOther')))
+  await no('O: …nor into a conversation they are not in', () => setDoc(D(viewer, 'conversations/uidHost_uidOther/messages/o6'), msg('uidViewer')))
+  await seed(`${CH}/messages/g1`, msg('uidOther', { type: 'gift', giftName: 'Rose' }))
+  await no('O: a gift message cannot be edited, even by its sender', () => updateDoc(D(other, `${CH}/messages/g1`), { giftName: 'Castle' }))
+  await no('O: …nor deleted', () => deleteDoc(D(other, `${CH}/messages/g1`)))
+  await no('O: a text cannot be turned into a gift', () => updateDoc(D(viewer, `${CH}/messages/o1`), { type: 'gift' }))
+  await no('O: …nor somebody else\'s message edited', () => updateDoc(D(other, `${CH}/messages/o1`), { text: 'changed' }))
+  await ok('O: the sender deletes their own message', () => deleteDoc(D(viewer, `${CH}/messages/o2`)))
+  await seed(CH, { participants: ['uidViewer', 'uidOther'], lastMessageAt: 1, unreadCount: { uidViewer: 3 } })
+  await ok('O: a participant clears the chat for themselves ("delete chat")',
+    () => updateDoc(D(viewer, CH), { 'clearedAt.uidViewer': Date.now(), 'unreadCount.uidViewer': 0 }))
+  await no('O: …somebody outside it cannot', () => updateDoc(D(host, CH), { 'clearedAt.uidHost': 1 }))
 }
 
 let aborted = false

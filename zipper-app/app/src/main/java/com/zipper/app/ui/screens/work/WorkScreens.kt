@@ -103,6 +103,8 @@ fun WorkHubScreen(nav: WorkNav, viewModel: WorkHubViewModel = hiltViewModel()) {
                             if (caps.isObserver) Text("Read-only account.", style = ZipperTheme.type.bodyS, color = c.textMuted)
                         }
                     }
+                    // Every CRM page without a screen here yet, one tap away (the CRM signs in and decides itself).
+                    item(key = "crm.web") { CrmWebCard(caps) }
                     if (state.groups.isEmpty()) {
                         item { EmptyState(Icons.Outlined.WorkOutline, "Nothing to work on here", "This account has no work screens on mobile yet.") }
                     }
