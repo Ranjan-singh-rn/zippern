@@ -36,7 +36,7 @@ WEEKLY_REGION="us-central1"
 # defined in it). After a reviewed change here: tools/write-scripts-sha256.command, commit, make-release-txt.sh.
 #
 # WAVE A (20) — no new-client dependency:
-#   changed since cf64145 (81): emailOtp/identity (#30 e-mail bind rescue), hosts/hostEligibility (#51/#49), mail
+#   changed since cf64145 (85): emailOtp/identity (#30 e-mail bind rescue), hosts/hostEligibility (#51/#49), mail
 #   (#47 identities), quickLogin (B10 per-device cap of 5, forgetQuickLogin, restriction notice), party (B7 Party Pro
 #   gate on PRIVATE rooms, PIN lockout, access log, official access, themes), wallet (B2 daily-reward history id),
 #   profiles (B12 server start mark and duration), index.ts (e-mail support address, emulator-only loopback, the new
@@ -55,7 +55,8 @@ scheduledMonthlyReports scheduledPartnerStatements scheduledReconciliation sched
 scheduledWeeklyBusinessReport setCallRate setPartyAdmin setPartySeatLock setPartySeatMute submitAccountAppeal \
 submitHostApplication submitHostCapture submitPartnerApplication submitRechargeRequest submitRoleAppeal \
 sweepHostLevels sweepQuickLoginTokens syncLivePresence syncPhoneKey syncPublicSeller syncStorageRoleClaim \
-takePartySeat updatePartyRoom verifyEmailBindCode verifyLoginEmailCode"
+takePartySeat updatePartyRoom verifyEmailBindCode verifyLoginEmailCode \
+pushCallStatus pushChatMessage pushIncomingCall pushLiveStarted"
 #   NEW (53): old apps never call them — games (OFF until the Owner switches a game on in appConfig/games), Party Pro
 #   subscription, leaderboards settlement, live (viewer recount, sweep with a 12 h fuse for rooms without a heartbeat,
 #   PK callables), party heartbeat and music, the account switcher's forgetQuickLogin and the restriction notice.
@@ -75,13 +76,13 @@ WAVE_2A="$WAVE_2A_CHANGED $WAVE_2A_NEW"
 #   removes a listener whose lastSeenAt is 3 minutes old — APK 19 never sends the party heartbeat, so with BOTH live
 #   every APK 19 listener would be dropped from the room after 3 minutes. Either one alone is harmless to APK 19.
 WAVE_2B="generateAgoraToken settleGift startCall acceptCall tickCall endCall declineCall sweepStaleCalls joinPartyRoom sweepEmptyPartyRooms"
-# Not redeployed (13): their code is unchanged since the tree production runs (accounts.ts, payouts.ts, push.ts,
-# social.ts: unchanged since cf64145; invitationCleanup.ts: unchanged since the 20 Oct tree).
-NOT_REDEPLOYED="releaseBeansForWeek getPayoutStatus purgeDeletedAccounts purgeMyAccountNow pushCallStatus pushChatMessage \
-pushIncomingCall pushLiveStarted recoverAccount requestAccountDeletion syncMyRoles toggleLike \
-onHostInvitationWithdrawn"
+# Not redeployed (9): their code is unchanged since the tree production runs (accounts.ts, payouts.ts, social.ts:
+# unchanged since cf64145; invitationCleanup.ts: unchanged since the 20 Oct tree). push.ts changed on 5 Nov (O5: the
+# chat push says "Sent a voice message" / "Sent you a gift: …"), so its four triggers moved to wave A.
+NOT_REDEPLOYED="releaseBeansForWeek getPayoutStatus purgeDeletedAccounts purgeMyAccountNow recoverAccount \
+requestAccountDeletion syncMyRoles toggleLike onHostInvitationWithdrawn"
 # Rollback bases (29), per function — what each one runs TODAY:
-#   FN_BASE_LIVE: the 83 completion-wave-2a names this release redeploys -> back to LIVE_FN_COMMIT (cf64145)
+#   FN_BASE_LIVE: the 87 completion-wave-2a names this release redeploys -> back to LIVE_FN_COMMIT (cf64145)
 #   FN_BASE_PROD: the 8 completion-wave-2b names -> back to PROD_FN_COMMIT (prod-live-20261030)
 #   WAVE_2A_NEW: new in this release -> NOT rolled back (no older code exists; left in place, never deleted here)
 FN_BASE_LIVE="weeklyPayoutReportGenerator syncPublicProfile backfillPublicProfiles startMobileSession requestEmailBindCode \
@@ -98,7 +99,8 @@ scheduledMonthlyReports scheduledPartnerStatements scheduledReconciliation sched
 scheduledWeeklyBusinessReport setCallRate setPartyAdmin setPartySeatLock setPartySeatMute submitAccountAppeal \
 submitHostApplication submitHostCapture submitPartnerApplication submitRechargeRequest submitRoleAppeal \
 sweepEmptyPartyRooms sweepHostLevels sweepQuickLoginTokens syncLivePresence syncPhoneKey syncPublicSeller \
-syncStorageRoleClaim takePartySeat updatePartyRoom verifyEmailBindCode verifyLoginEmailCode"
+syncStorageRoleClaim takePartySeat updatePartyRoom verifyEmailBindCode verifyLoginEmailCode \
+pushCallStatus pushChatMessage pushIncomingCall pushLiveStarted"
 FN_BASE_PROD="generateAgoraToken settleGift startCall acceptCall tickCall endCall declineCall sweepStaleCalls"
 EMAIL_FNS="requestEmailBindCode requestLoginEmailCode onAgencyApproved onAgencyRegistered onSellerRegistered onSellerApproved onAgencyResendEmail onSellerResendEmail"
 # Functions declared without .region() run in us-central1 (Firebase's default region): the weekly report and the eight

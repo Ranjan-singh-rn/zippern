@@ -5,6 +5,16 @@ indexes, the RC2 Storage rules, and APK 21 (1.2.7) to the "debug" channel of the
 to test. Every step that changes production needs **its own explicit approval** (the `STEP-n` line in
 `APPROVAL-COMMANDS.txt`) and **the typed word** the script asks for. Nothing in this folder has been run against production.
 
+**Updated 5 Nov 2026 — the Owner's list is in this release too** (commits e18f7b6, 7a8512a, 0a0ad4e on top of
+e6ce378): live calls switch (O1), Lottie gifts in rooms (O2), the seller business in the Work tab (O3), Messages —
+photos, voice notes, gifts, block/report, delete (O5), the chat call button and currency glyphs (O5b), Call from a
+live room and from party members (O5c), one Owner's approval is final on the money board (O6), sellers pay back
+borrowed coins (O7), decorations everywhere with a Store (O9), the speed pass (O10) and the Home order with officials
+hidden (O11). `functions/src/push.ts` changed (the chat push names voice notes and gifts), so its four triggers moved
+from NOT_REDEPLOYED to wave A: wave A is now **138** (85 changed + 53 new), NOT_REDEPLOYED 9. New rules: O1's
+`hostBlocksCalls` host field, O5's chat message create/update/delete and `chatMedia/` in Storage — the rules emulator
+run below must be repeated at this HEAD.
+
 **Where:** `~/Documents/Projects/zippern/release/trackb-20261104/`. Run each script from Terminal in that folder
 (`./NN-name.command`, or double-click). Project `zipper-83816`, region `asia-south1`.
 
@@ -49,7 +59,7 @@ carry RC2 + Track B). Its folder and evidence stay as they are.
 |---|---|---|---|---|
 | 1 | Preflight | `00-preflight-readonly.command` | — | — |
 | 2 | Backend: new revision at 0%, smoke, one e-mail, canary | `11-…` → `12 10` → `13` → `12 50` → `13` → `12 100` | DEPLOY, EMAIL/SKIP, UNTAG; CANARY10/50/100 | `19-rollback-backend.command` ROLLBACK or `12 back` BACK |
-| 3 | Functions wave A (134: 81 changed + 53 new) | `20-deploy-functions-wave2a.command` | DEPLOY2A | `29-rollback-functions.command 2a [<20-evidence>]` ROLLBACK |
+| 3 | Functions wave A (138: 85 changed + 53 new) | `20-deploy-functions-wave2a.command` | DEPLOY2A | `29-rollback-functions.command 2a [<20-evidence>]` ROLLBACK |
 | 4 | CRM | `50-deploy-crm.command` (runs `deploy-crm.command`) | CRM, then DEPLOY | `H-CRM-ROLLBACK` (console, to bf4066501e5f593a) |
 | 5 | Firestore indexes (until READY) | `33-deploy-indexes.command` | INDEXES | none (additive) |
 | 6 | Build + publish APK 21 (1.2.7) | `./gradlew :app:assembleProd`, device smoke, `60-publish-apk.command` | PUBLISH | `61-withdraw-apk.command <60-evidence>` WITHDRAW |
@@ -84,15 +94,15 @@ secret grants; live rules hashes (hotfix-1 texts); Hosting `bf4066501e5f593a`; t
 - **Rollback:** `./19-rollback-backend.command` (ROLLBACK) or `./12-canary-backend.command back` (BACK). After step 4 a
   backend rollback goes together with the CRM rollback (the new CRM calls routes 00057-xiq does not have).
 
-## Step 3 — Functions wave A (134)
+## Step 3 — Functions wave A (138)
 - **Do:** `./20-deploy-functions-wave2a.command` (DEPLOY2A). Not within Sunday 16:29–21:00 UTC (refused). Fresh tree
   from HEAD, npm ci, tsc, every test; the exports of the built `lib/index.js` must be exactly WAVE_2A + WAVE_2B +
   NOT_REDEPLOYED in their regions, and every deployed name must have one rollback base; then deploy by name.
-- **Verify:** SCOPE PASS (`changed=134`; the 53 new ones appear), all ACTIVE, identities, env unchanged, the weekly
+- **Verify:** SCOPE PASS (`changed=138`; the 53 new ones appear), all ACTIVE, identities, env unchanged, the weekly
   report and the 8 e-mail functions keep `ZIPPER_SENDGRID_API_KEY`.
 - **Write quota:** as in the completion release — on `SCOPE PARTIAL` re-run 20, or roll back exactly `updated.txt`.
 - **Rollback:** `./29-rollback-functions.command 2a [production/20-functions-2a-<UTC>]` (ROLLBACK, typed once): the
-  81 changed functions go back to the cf64145 tree (what they ran before); the 53 new ones are **left deployed** (no
+  85 changed functions go back to the cf64145 tree (what they ran before); the 53 new ones are **left deployed** (no
   older code exists; old apps never call them; nothing here deletes a function).
 
 ## Step 4 — CRM
@@ -123,9 +133,8 @@ secret grants; live rules hashes (hotfix-1 texts); Hosting `bf4066501e5f593a`; t
   (GRANT) → `./41-deploy-storage-rules.command` (RELEASE; refuses unless the role is live). Each rules script saves
   the live text (hotfix-1) first.
 - **Verify:** both `live … rules = …` PASS; an Owner with a bound MFA session reads/uploads one CRM image.
-- **Known gap (before the first CRM upload of an animation):** `storage.rules` admits uploads under `contentAssets/`
-  only as image/*, video/*, application/json or text/plain. A `.svga` file uploads as application/octet-stream and is
-  refused — the gift editor's and bag-items page's SVGA slots cannot store a file until that is fixed in code.
+- **SVGA uploads:** `storage.rules` admits a name ending in `.svga` as application/octet-stream (at most 5 MB) under
+  `contentAssets/` — the gift editor's and bag-items page's SVGA slots store files (fixed before this release).
 - **Rollback:** `./39-rollback-rules.command production/31-rules-rc2-<UTC>` (ROLLBACK);
   `./49-rollback-storage.command production/41-storage-rules-<UTC>` (ROLLBACK, then REVOKE or KEEP).
 
