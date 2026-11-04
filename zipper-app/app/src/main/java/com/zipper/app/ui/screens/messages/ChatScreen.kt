@@ -47,6 +47,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
@@ -154,7 +155,7 @@ fun ChatScreen(
             ) {
                 IconButtonCircle(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack, background = Color.Transparent)
                 Row(Modifier.weight(1f).clickableNoRipple { onOpenProfile(otherUid) }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
-                    Avatar(state.otherUserPhotoUrl, size = AvatarSize.SM, initial = state.otherUserName, ring = if (state.otherUserOnline) AvatarRing.Online else AvatarRing.None)
+                    Avatar(state.otherUserPhotoUrl, size = AvatarSize.SM, initial = state.otherUserName, ring = if (state.otherUserOnline) AvatarRing.Online else AvatarRing.None, decorUid = otherUid)
                     Column {
                         Text(name, style = ZipperTheme.type.labelL, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -371,13 +372,19 @@ private fun MessageRow(
 ) {
     val c = ZipperTheme.colors
     val shape = if (isMe) RoundedCornerShape(Radius.lg, Radius.lg, Radius.xs, Radius.lg) else RoundedCornerShape(Radius.lg, Radius.lg, Radius.lg, Radius.xs)
-    val onBubble = if (isMe) Color.White else c.textPrimary
+    // O9 (5 Nov 2026): the chat bubble the SENDER wears (their public profile — what they own now, not a field they
+    // wrote on the message), in its colours; the plain bubbles otherwise.
+    val worn = rememberDecorBrush("chat_bubble", rememberUserDecor(msg.senderUid.ifBlank { null })?.bubbleId)
+    val onBubble = if (isMe || worn != null) Color.White else c.textPrimary
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isMe) Arrangement.End else Arrangement.Start) {
         Column(
             Modifier.widthIn(max = 260.dp)
                 .then(
-                    if (isMe) Modifier.background(Brush.linearGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), shape)
-                    else Modifier.background(Brush.verticalGradient(listOf(Color(0x12FFFFFF), Color(0x05FFFFFF))), shape).border(1.dp, c.borderSubtle, shape)
+                    when {
+                        worn != null -> Modifier.background(worn, shape)
+                        isMe -> Modifier.background(Brush.linearGradient(listOf(c.brandGradientFrom, c.brandGradientTo)), shape)
+                        else -> Modifier.background(Brush.verticalGradient(listOf(Color(0x12FFFFFF), Color(0x05FFFFFF))), shape).border(1.dp, c.borderSubtle, shape)
+                    }
                 )
                 .clip(shape)
                 .padding(horizontal = Space.md, vertical = Space.sm),
@@ -402,7 +409,7 @@ private fun MessageRow(
                 }
                 "gift" -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
                     if (msg.giftImageUrl.isNotBlank()) AsyncImage(msg.giftImageUrl, msg.giftName, modifier = Modifier.size(44.dp))
-                    else Text(msg.giftEmoji.ifBlank { "🎁" }, style = ZipperTheme.type.headingL)
+                    else HoppingEmoji(msg.giftEmoji.ifBlank { "🎁" }, msg.id)
                     Column {
                         Text(if (isMe) "You sent a gift" else "Sent you a gift", style = ZipperTheme.type.caption, color = if (isMe) Color.White.copy(0.8f) else c.textSecondary)
                         Text(msg.giftName + if (msg.quantity > 1) " ×${msg.quantity}" else "", style = ZipperTheme.type.labelL, color = onBubble)
@@ -470,4 +477,25 @@ private fun TextComposer(
             else Icon(Icons.Default.Mic, "Record a voice message", tint = Color.White, modifier = Modifier.size(22.dp))
         }
     }
+}
+
+
+/** O9: an emoji gift in the chat hops when it appears — a few bounces, then it rests. */
+@Composable
+private fun HoppingEmoji(emoji: String, key: String) {
+    val hop = remember(key) { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(key) {
+        repeat(3) {
+            hop.animateTo(1f, androidx.compose.animation.core.tween(180))
+            hop.animateTo(0f, androidx.compose.animation.core.tween(220))
+        }
+    }
+    Text(
+        emoji, style = ZipperTheme.type.headingL,
+        modifier = Modifier.graphicsLayer {
+            translationY = -hop.value * 18.dp.toPx()
+            val s = 1f + hop.value * 0.25f
+            scaleX = s; scaleY = s
+        },
+    )
 }

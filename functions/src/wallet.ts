@@ -433,7 +433,9 @@ export const purchaseBagItem = functions
       let price = Number(item.price ?? 0)
       let days = 0
       if (durations && durations.length > 0) {
-        const chosen = durationDays
+        // O9 (5 Nov 2026): 0 days is a real choice ("for ever"), so the absence of a choice is null/undefined, not
+        // falsy — `durationDays ? … : durations[0]` sold the FIRST term to somebody who chose "for ever".
+        const chosen = durationDays !== undefined && durationDays !== null
           ? durations.find((d) => Number(d.days) === Number(durationDays))
           : durations[0]
         if (!chosen) {

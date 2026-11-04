@@ -164,12 +164,16 @@ export function project(
     // while the account is banned, suspended or deleted. (F-16: a suspension
     // writes `isSuspended` and `accountState: 'suspended'`; both are checked,
     // whichever the writer set.)
+    // O11 (Owner, 5 Nov 2026): "never show an official owner ID in the home screen … those should be kept invisible
+    // from others." An official account (an Owner's or staff's app account, `isOfficial`) is never listed in the feed;
+    // agencies, sub-agencies and coin sellers still are.
     isListed:
       u.isProfileComplete === true &&
       u.isBanned !== true &&
       u.isSuspended !== true &&
       String(u.accountState ?? '') !== 'suspended' &&
-      u.isDeleted !== true,
+      u.isDeleted !== true &&
+      u.isOfficial !== true,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }
 }

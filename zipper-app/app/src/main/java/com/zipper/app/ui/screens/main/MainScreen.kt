@@ -97,6 +97,7 @@ fun MainScreen(
     /** Opens one party room — from the Live tab's "Party" page. */
     onNavigateToPartyRoom: (String) -> Unit = {},
     onNavigateToMyBag: () -> Unit = {},
+    onNavigateToStore: () -> Unit = {},
     onNavigateToEarnings: () -> Unit = {},
     onNavigateToCallHistory: () -> Unit = {},
     onNavigateToLikes: (Int) -> Unit = {},
@@ -200,6 +201,7 @@ fun MainScreen(
                     onNavigateToDiamondShop         = onNavigateToDiamondShop,
                     onNavigateToBeansCenter         = onNavigateToBeansCenter,
                     onNavigateToMyBag               = onNavigateToMyBag,
+                    onNavigateToStore               = onNavigateToStore,
                     onNavigateToEarnings            = onNavigateToEarnings,
                     onNavigateToCallHistory         = onNavigateToCallHistory,
                     onNavigateToLikes               = onNavigateToLikes,

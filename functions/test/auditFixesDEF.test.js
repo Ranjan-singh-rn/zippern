@@ -94,6 +94,10 @@ describe('E: the public projection', () => {
     expect(project('U', { ...complete, isBanned: true }, false).isListed).toBe(false)
     expect(project('U', { ...complete, isDeleted: true }, false).isListed).toBe(false)
     expect(project('U', { isProfileComplete: false }, false).isListed).toBe(false)
+    // O11 (Owner, 5 Nov 2026): an official account is never listed in the Home feed.
+    expect(project('U', { ...complete, isOfficial: true }, false).isListed).toBe(false)
+    expect(project('U', { ...complete, isOfficial: true }, false).isOfficial).toBe(true)
+    expect(project('U', { ...complete, isAgent: true, isSeller: true }, false).isListed).toBe(true)
   })
   test('a suspension re-projects: the trigger watches the two flags', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'profiles.ts'), 'utf8')

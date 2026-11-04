@@ -81,6 +81,11 @@ fun GiftAnimationOverlay(
         LottieGiftOverlay(giftEvent, onDismiss, modifier)
         return
     }
+    // O9 (5 Nov 2026): an emoji gift (no artwork) is not a still picture — the emoji jumps across the room.
+    if (giftEvent.imageUrl.isBlank() && giftEvent.emoji.isNotBlank()) {
+        EmojiGiftOverlay(giftEvent, onDismiss, modifier)
+        return
+    }
     val c = ZipperTheme.colors
 
     val scale = remember(giftEvent.id) { Animatable(0.6f) }
@@ -292,4 +297,35 @@ internal fun lottieSpecOf(asset: String): com.airbnb.lottie.compose.LottieCompos
     val a = asset.trim()
     return if (a.startsWith("http://") || a.startsWith("https://")) com.airbnb.lottie.compose.LottieCompositionSpec.Url(a)
     else com.airbnb.lottie.compose.LottieCompositionSpec.Asset(a.removePrefix("/"))
+}
+
+
+/** O9: the emoji hops up from the bottom, several at once (more for a bigger quantity), with the sender's line. */
+@Composable
+private fun EmojiGiftOverlay(giftEvent: LiveGiftEvent, onDismiss: () -> Unit, modifier: Modifier) {
+    val c = ZipperTheme.colors
+    Box(modifier.fillMaxSize()) {
+        com.zipper.app.ui.components.EmojiJump(
+            emoji = giftEvent.emoji,
+            count = (4 + giftEvent.quantity).coerceAtMost(12),
+            onFinished = onDismiss,
+        )
+        Row(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 180.dp)
+                .background(c.scrimStrong, CircleShape)
+                .border(1.dp, c.glassMid, CircleShape)
+                .padding(start = 2.dp, end = Space.md, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Space.sm),
+        ) {
+            Avatar(giftEvent.senderPhotoUrl.ifBlank { null }, size = AvatarSize.SM, ring = AvatarRing.Vip, initial = giftEvent.senderName)
+            Text(
+                "${giftEvent.senderName.ifBlank { "Someone" }} sent ${giftEvent.giftName} ×${giftEvent.quantity}",
+                style = ZipperTheme.type.labelM, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 260.dp),
+            )
+        }
+    }
 }

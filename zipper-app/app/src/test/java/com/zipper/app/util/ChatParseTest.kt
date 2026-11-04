@@ -57,6 +57,22 @@ class ChatParseTest {
         assertEquals(listOf("1", "2"), ChatParse.after(msgs, 0L).map { it.id })
     }
 
+    @Test fun `the thread is oldest first by each message's own time, whatever order the query gave`() {
+        // Firestore puts every number before every Timestamp: a server-stamped 2:05 message came back AFTER a 4:14
+        // text, and the screen showed the newest message at the top.
+        val queryOrder = listOf(
+            ChatMessage(id = "new-text", timestamp = 4_14L),
+            ChatMessage(id = "old-server-stamped", timestamp = 2_05L),
+            ChatMessage(id = "same-time-a", timestamp = 5_00L),
+            ChatMessage(id = "same-time-b", timestamp = 5_00L),
+        )
+        assertEquals(
+            listOf("old-server-stamped", "new-text", "same-time-a", "same-time-b"),
+            ChatParse.after(queryOrder, 0L).map { it.id },
+        )
+        assertEquals(listOf("new-text", "same-time-a", "same-time-b"), ChatParse.after(queryOrder, 3_00L).map { it.id })
+    }
+
     // ── Messages ─────────────────────────────────────────────────────────────
 
     @Test fun `messages of every kind read, an older message with no type is text`() {

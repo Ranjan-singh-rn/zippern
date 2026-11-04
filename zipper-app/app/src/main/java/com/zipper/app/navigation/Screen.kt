@@ -218,6 +218,8 @@ sealed class Screen(val route: String) {
     object OwnProfile    : Screen("own_profile")          // Full ProfileScreen for own profile
     object EditProfile   : Screen("edit_profile")
     object MyBag         : Screen("my_bag")
+    /** O9 (5 Nov 2026): the Store — the same catalogue as My Bag, opened on what is for sale. */
+    object Store         : Screen("store")
     object DiamondShop   : Screen("diamond_shop")
     object BeansCenter   : Screen("beans_center")
     object Settings      : Screen("settings")

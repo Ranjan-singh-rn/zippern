@@ -163,9 +163,13 @@ private val LOTTIE: Map<String, String> = mapOf(
  * them playing alone in a sheet costs nothing.
  */
 private fun bundledLottieSpecFor(item: BagItem): LottieCompositionSpec? = when {
-    item.animationAsset.isNotBlank() && !item.animationAsset.endsWith(".svga") ->
-        LottieCompositionSpec.Asset(item.animationAsset)
+    // O9: the starter set's bundled art by id first — frames and entrances (DecorDefaults) — because the CRM's
+    // stored `animationAsset` for those ids is a web path ("/lottie/entrances/…") the app does not bundle.
+    com.zipper.app.ui.components.DecorDefaults.FRAME_LOTTIE[item.id] != null ->
+        LottieCompositionSpec.Asset(com.zipper.app.ui.components.DecorDefaults.FRAME_LOTTIE[item.id]!!)
     LOTTIE[item.id] != null -> LottieCompositionSpec.Asset(LOTTIE[item.id]!!)
+    item.animationAsset.isNotBlank() && item.animationAsset.endsWith(".json") && !item.animationAsset.startsWith("/") ->
+        LottieCompositionSpec.Asset(item.animationAsset)
     else -> null
 }
 
@@ -188,13 +192,19 @@ private val TABS = listOf(
 @Composable
 fun MyBagScreen(
     videoCards: Int = 0,
+    /** O9 (5 Nov 2026): the balance, on the bar — buying is spending it. */
+    diamonds: Long = 0L,
+    /** O9: opened as the Store (everything on sale) rather than My Bag (what this account holds). */
+    storeFirst: Boolean = false,
     onBack: () -> Unit = {},
     onEquip: (BagItem) -> Unit = {},
     onBuy: (BagItem) -> Unit = {},
+    onRecharge: () -> Unit = {},
     viewModel: MyBagViewModel = hiltViewModel(),
 ) {
     val vmState by viewModel.state.collectAsStateWithLifecycle()
     val c = ZipperTheme.colors
+    var storeMode by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(storeFirst) }
     var selectedTabIdx by remember { mutableIntStateOf(0) }
     var selectedItemId by remember { mutableStateOf<String?>(null) }
 
@@ -249,8 +259,9 @@ fun MyBagScreen(
             )
         }
     }
-    val items = remember(merged, tab.category, isVideoCardTab) {
-        if (isVideoCardTab) emptyList() else merged.filter { it.category == tab.category }
+    val items = remember(merged, tab.category, isVideoCardTab, storeMode) {
+        // O9: the Store shows everything on sale in this category; My Bag shows only what this account holds.
+        if (isVideoCardTab) emptyList() else merged.filter { it.category == tab.category && (storeMode || it.isOwned) }
     }
     val expiringSoon = remember(merged, nowMs) {
         merged.filter { it.isOwned && it.isTimed && it.daysLeftAt(nowMs) <= EXPIRY_WARNING_DAYS }
@@ -261,8 +272,8 @@ fun MyBagScreen(
 
     ZipperScreen(
         topBar = {
-            TopBar("My Bag", onBack = onBack) {
-                // TODO(design): MyBagViewModel does not expose the diamond balance; add it to MyBagUiState and show CurrencyPill(Currency.Diamond, balance) here.
+            TopBar(if (storeMode) "Store" else "My Bag", onBack = onBack) {
+                CurrencyPill(Currency.Diamond, diamonds, onClick = onRecharge)
             }
         },
     ) { _ ->
@@ -282,6 +293,14 @@ fun MyBagScreen(
                     modifier = Modifier.padding(start = Space.lg, end = Space.lg, top = Space.sm),
                 )
             }
+            // O9: Store | My items — one catalogue, two questions: what can I buy, what do I have.
+            Row(
+                Modifier.padding(start = Space.lg, end = Space.lg, top = Space.sm),
+                horizontalArrangement = Arrangement.spacedBy(Space.sm),
+            ) {
+                SelectChip("Store", storeMode) { storeMode = true; selectedItemId = null }
+                SelectChip("My items", !storeMode) { storeMode = false; selectedItemId = null }
+            }
             LazyRow(
                 contentPadding = PaddingValues(horizontal = Space.lg, vertical = Space.sm),
                 horizontalArrangement = Arrangement.spacedBy(Space.sm),
@@ -300,7 +319,11 @@ fun MyBagScreen(
                     Icons.Outlined.ErrorOutline, "Couldn't load the shop", loadError,
                     actionLabel = "Try again", onAction = viewModel::retry,
                 )
-                items.isEmpty() -> EmptyState(Icons.Outlined.Inventory2, "Nothing here yet", "Level up or visit the shop to unlock ${tab.label.lowercase()}.")
+                items.isEmpty() && !storeMode -> EmptyState(
+                    Icons.Outlined.Inventory2, "Nothing here yet", "Buy ${tab.label.lowercase()} in the Store, or level up to unlock them.",
+                    actionLabel = "Open the Store", onAction = { storeMode = true },
+                )
+                items.isEmpty() -> EmptyState(Icons.Outlined.Inventory2, "Coming soon", "New ${tab.label.lowercase()} are added to the Store by Zipper — check back soon.")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(3),
                     modifier = Modifier.fillMaxWidth().weight(1f),
@@ -397,6 +420,7 @@ fun MyBagScreen(
                              */
                             Text(
                                 when {
+                                    chosenDuration != null && chosenDuration.days == 0 -> "Permanent"
                                     chosenDuration != null -> "${chosenDuration.days} days"
                                     item.durationDaysTotal > 0 -> "${item.durationDaysTotal} days"
                                     // Owned, timed, but bought before the term
@@ -430,7 +454,7 @@ fun MyBagScreen(
                                 horizontalArrangement = Arrangement.spacedBy(Space.sm),
                             ) {
                                 item.durations.forEach { d ->
-                                    SelectChip("${d.days}d · ${indianGrouping(d.priceDiamonds.toLong())}", d.days == chosenDays) {
+                                    SelectChip("${if (d.days == 0) "Forever" else "${d.days}d"} · ${indianGrouping(d.priceDiamonds.toLong())}", d.days == chosenDays) {
                                         chosenDays = d.days
                                     }
                                 }
@@ -656,7 +680,7 @@ private fun ItemPreviewLarge(item: BagItem) {
         "entrance" -> Box(
             Modifier.size(100.dp).background(Brush.radialGradient(listOf(Color(0xFF6B00A8), Color(0xFF1A0040))), RoundedCornerShape(14.dp)),
             contentAlignment = Alignment.Center,
-        ) { Text("🚀", fontSize = 40.sp) }
+        ) { Text(entranceEmoji(item), fontSize = 40.sp) }
     }
 }
 
@@ -691,10 +715,10 @@ private fun ItemThumbnail(item: BagItem) {
     when (item.category) {
         "frame" -> { val t = TIER[tierOf(item.id)]!!; RingFrameThumb(t.ring1, t.ring2, t.glow, size = 64.dp) }
         "chat_bubble" -> Box(
-            Modifier.fillMaxWidth(0.78f).height(30.dp).background(Brush.horizontalGradient(bubbleGradient(item.id)), RoundedCornerShape(15.dp)),
+            Modifier.fillMaxWidth(0.78f).height(30.dp).background(Brush.horizontalGradient(decorColors("chat_bubble", item) ?: bubbleGradient(item.id)), RoundedCornerShape(15.dp)),
             contentAlignment = Alignment.Center,
         ) { Text("hi", style = ZipperTheme.type.labelS, color = Color.White) }
-        "profile_card" -> Box(Modifier.fillMaxWidth(0.88f).height(52.dp).background(Brush.horizontalGradient(cardGradient(item.id)), RoundedCornerShape(8.dp)).padding(7.dp)) {
+        "profile_card" -> Box(Modifier.fillMaxWidth(0.88f).height(52.dp).background(Brush.horizontalGradient(decorColors("profile_card", item) ?: cardGradient(item.id)), RoundedCornerShape(8.dp)).padding(7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 Box(Modifier.size(26.dp).background(Color.White.copy(0.22f), CircleShape), contentAlignment = Alignment.Center) { Text("👤", fontSize = 13.sp) }
                 Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -704,13 +728,42 @@ private fun ItemThumbnail(item: BagItem) {
             }
         }
         "id_frame" -> Box(
-            Modifier.fillMaxWidth(0.88f).height(22.dp).background(Brush.horizontalGradient(bannerGradient(item.id)), RoundedCornerShape(11.dp)),
+            Modifier.fillMaxWidth(0.88f).height(22.dp).background(Brush.horizontalGradient(decorColors("id_frame", item) ?: bannerGradient(item.id)), RoundedCornerShape(11.dp)),
             contentAlignment = Alignment.Center,
         ) { Text("• joined •", color = Color.White, fontSize = 8.sp) }
-        "entrance" -> Box(
-            Modifier.size(54.dp).background(Brush.radialGradient(listOf(Color(0xFF3D007A), Color(0xFF180030))), RoundedCornerShape(8.dp)),
-            contentAlignment = Alignment.Center,
-        ) { Text("🚀", fontSize = 26.sp) }
+        "entrance" -> {
+            // O9: every entrance used to be the same rocket. A bundled entrance is small vector art, so its tile shows
+            // ONE still frame of it (no animation clock — see above); anything else gets its own emoji.
+            val spec = bundledLottieSpecFor(item)
+            if (spec != null) {
+                val composition by rememberLottieComposition(spec)
+                LottieAnimation(composition = composition, progress = { ENTRANCE_STILL_PROGRESS }, modifier = Modifier.size(72.dp))
+            } else {
+                Box(
+                    Modifier.size(54.dp).background(Brush.radialGradient(listOf(Color(0xFF3D007A), Color(0xFF180030))), RoundedCornerShape(8.dp)),
+                    contentAlignment = Alignment.Center,
+                ) { Text(entranceEmoji(item), fontSize = 26.sp) }
+            }
+        }
+    }
+}
+
+/** Where in an entrance's own animation its still is taken: the vehicle is on screen by the middle. */
+private const val ENTRANCE_STILL_PROGRESS = 0.5f
+
+/** A fallback picture per kind of entrance, read from its id or name — not one rocket for all of them. */
+internal fun entranceEmoji(item: BagItem): String {
+    val key = (item.id + " " + item.name).lowercase()
+    return when {
+        "bike" in key || "moto" in key -> "🏍️"
+        "horse" in key -> "🐎"
+        "lambo" in key || "sports" in key || "car" in key -> "🏎️"
+        "jet" in key || "plane" in key -> "✈️"
+        "ship" in key || "yacht" in key || "boat" in key -> "🛳️"
+        "tiger" in key -> "🐅"
+        "king" in key || "crown" in key -> "👑"
+        "dragon" in key -> "🐉"
+        else -> "🚀"
     }
 }
 
@@ -760,6 +813,10 @@ private fun VideoCardSection(count: Int) {
 }
 
 // ── Gradient helpers (original colour schemes per item) ───────────────────────
+
+/** O9: the same colours the rooms and chats draw (DecorDefaults / the CRM's `style`), so the Store shows what you get. */
+private fun decorColors(category: String, item: BagItem): List<Color>? =
+    com.zipper.app.ui.components.DecorDefaults.colorsFor(category, item.id, item.style)
 
 private fun bubbleGradient(id: String): List<Color> = when (id) {
     "cb_default" -> listOf(Color(0xFF2C1654), Color(0xFF4A1080))

@@ -124,6 +124,7 @@ class MyBagViewModel @Inject constructor(
                             animationUrl   = d.getString("animationUrl")   ?: "",
                             videoUrl       = d.getString("videoUrl")       ?: "",
                             svgaUrl        = d.getString("svgaUrl")        ?: "",
+                            style          = d.getString("style")          ?: "",
                             targetGender   = d.getString("targetGender")  ?: "all",
                             targetRole     = d.getString("targetRole")    ?: "all",
                             targetUserId   = d.getString("targetUserId")  ?: "",
@@ -206,7 +207,9 @@ class MyBagViewModel @Inject constructor(
             @Suppress("UNCHECKED_CAST")
             val row = entry as? Map<String, Any?> ?: return@mapNotNull null
             val days = (row["days"] as? Number)?.toInt() ?: return@mapNotNull null
-            if (days <= 0) return@mapNotNull null
+            // O9 (5 Nov 2026): 0 days is "for ever" — the Store sells for some days OR permanently, and the server
+            // writes no expiry for a 0-day term.
+            if (days < 0) return@mapNotNull null
             BagDuration(
                 days = days,
                 // `priceGems` is the CRM's name and `price` the older one; the
@@ -215,7 +218,7 @@ class MyBagViewModel @Inject constructor(
                 // charged price the same number.
                 priceDiamonds = ((row["priceGems"] ?: row["price"]) as? Number)?.toInt() ?: 0,
             )
-        }.sortedBy { it.days }
+        }.sortedBy { if (it.days == 0) Int.MAX_VALUE else it.days }   // the shortest first, "for ever" last
     }
 
     fun equip(item: BagItem) {
@@ -236,6 +239,9 @@ class MyBagViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 bagRepo.equipItem(item)
+                // O9: rooms and chats read what a person wears from their public profile, cached five minutes —
+                // forget this person's entry so the next screen shows the new item.
+                auth.currentUser?.uid?.let { com.zipper.app.ui.components.UserDecorCache.invalidate(it) }
                 _state.update { s ->
                     s.copy(
                         equippedByCategory = s.equippedByCategory + (item.category to item.id),

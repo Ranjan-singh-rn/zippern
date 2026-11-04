@@ -57,6 +57,8 @@ fun MyProfileScreen(
     onNavigateToDiamondShop: () -> Unit,
     onNavigateToBeansCenter: () -> Unit,
     onNavigateToMyBag: () -> Unit,
+    /** O9 (5 Nov 2026): the Store — frames, bubbles, entrances and cards to buy for days or for ever. */
+    onNavigateToStore: () -> Unit = {},
     onNavigateToEarnings: () -> Unit,
     onNavigateToCallHistory: () -> Unit,
     onNavigateToLikes: (Int) -> Unit = {},
@@ -268,6 +270,7 @@ fun MyProfileScreen(
 
             // Cells
             val cells = buildList {
+                add(Cell(Icons.Outlined.Storefront, "Store", onNavigateToStore))
                 add(Cell(Icons.Outlined.CardGiftcard, "My Bag", onNavigateToMyBag))
                 add(Cell(Icons.Outlined.BarChart, "My Level", onNavigateToLevel, badge = "Lv ${user.level}", badgeTint = c.brandPrimary))
                 add(Cell(Icons.Outlined.CalendarMonth, "Daily Reward", onNavigateToDailyRewards, badge = if (rewardReady) "!" else "D${user.dailyStreak}", badgeTint = if (rewardReady) c.statusDanger else c.brandPrimary))

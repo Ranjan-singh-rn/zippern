@@ -176,9 +176,26 @@ fun PartyRoomScreen(
     onOpenProfile: (uid: String) -> Unit = {},
     /** B7: "Message" on a member's card. */
     onOpenChat: (uid: String) -> Unit = {},
+    /** O5c (5 Nov 2026): "Call" on a member's card — the outgoing call screen. */
+    onStartCall: (callId: String) -> Unit = {},
     viewModel: PartyRoomViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    LaunchedEffect(state.navigateToCall) {
+        val id = state.navigateToCall ?: return@LaunchedEffect
+        viewModel.consumeCallNavigation()
+        onStartCall(id)
+    }
+    state.callTo?.let { to ->
+        com.zipper.app.ui.screens.profile.CallConfirmDialog(
+            name = to.name.ifBlank { "them" },
+            perMinuteDiamonds = to.perMinDiamonds,
+            balanceDiamonds = to.myDiamonds,
+            onCall = { viewModel.placeCall(to.uid) },
+            onRecharge = { viewModel.dismissCall(); onRecharge() },
+            onDismiss = viewModel::dismissCall,
+        )
+    }
     val c = ZipperTheme.colors
     val context = LocalContext.current
     val activity = context as? Activity
@@ -400,9 +417,9 @@ fun PartyRoomScreen(
         // The slot is full: this arrival gets no animation at all rather than a
         // place in a queue that would still be draining in four minutes.
         if (entrance != null) return@LaunchedEffect
-        val arrival = state.listeners.lastOrNull {
-            it.uid !in before && it.uid != state.myUid && it.entranceItemId.isNotBlank()
-        }
+        // O9 (5 Nov 2026): EVERY arrival is announced ("joining not showing"), not only one wearing an entrance —
+        // the banner alone for most, the banner and their entrance effect for those who wear one.
+        val arrival = state.listeners.lastOrNull { it.uid !in before && it.uid != state.myUid }
         if (arrival != null) entrance = arrival
     }
 
@@ -602,9 +619,16 @@ fun PartyRoomScreen(
                     onDismiss = { animatedGiftId = g.id },
                 )
             }
-            entrance?.let { arrival ->
-                PartyEntranceOverlay(
-                    listener = arrival,
+            entrance?.let { l ->
+                // O9: the shared arrival — SVGA / video resolved by `joinPartyRoom` onto the listener row, or the
+                // bundled / CRM Lottie of their entrance, with the sliding banner (photo, frame, level) either way.
+                com.zipper.app.ui.components.ArrivalOverlay(
+                    com.zipper.app.ui.components.Arrival(
+                        uid = l.uid, name = l.name, photoUrl = l.photoUrl, level = l.level,
+                        entranceItemId = l.entranceItemId, svgaUrl = l.entranceSvgaUrl,
+                        videoUrl = l.entranceVideoUrl, posterUrl = l.entrancePosterUrl,
+                        key = "${l.uid}:${l.joinedAt}",
+                    ),
                     onFinished = { entrance = null },
                 )
             }
@@ -840,7 +864,7 @@ private fun RoomHeader(
         horizontalArrangement = Arrangement.spacedBy(Space.xs),
     ) {
         Avatar(
-            room.hostPhotoUrl, size = AvatarSize.SM, initial = room.hostName,
+            room.hostPhotoUrl, size = AvatarSize.SM, initial = room.hostName, decorUid = room.hostUid,
             modifier = Modifier.clickableNoRipple(onOpenOwner),
         )
         Column(Modifier.weight(1f)) {
@@ -973,6 +997,8 @@ private fun AudioSeat(
                 Avatar(
                     seat.photoUrl,
                     size = AvatarSize.MD,
+                    // O9: the frame this person wears, read from their public profile.
+                    decorUid = seat.uid,
                     // The ring is the speaking indicator, and an Agora uid is now
                     // a seat index — so the ring lights on the seat that is
                     // actually talking rather than on whoever the old
@@ -1134,6 +1160,7 @@ private fun VideoTile(
             Avatar(
                 seat.photoUrl, size = AvatarSize.MD, initial = seat.name,
                 ring = if (speaking) AvatarRing.Online else AvatarRing.None,
+                decorUid = seat.uid,
             )
         } else {
             EmptySeatDisc(
@@ -1424,11 +1451,23 @@ private fun ChatLine(message: PartyMessage, onOpenProfile: () -> Unit) {
             Text(message.senderName, style = ZipperTheme.type.labelS, color = c.textBrand, maxLines = 1)
             Text("joined", style = ZipperTheme.type.bodyS, color = c.textSecondary)
         } else {
-            Text("${message.senderName}:", style = ZipperTheme.type.labelS, color = c.brandVip, maxLines = 1)
-            Text(
-                message.text, style = ZipperTheme.type.bodyS, color = c.textPrimary,
-                maxLines = 3, overflow = TextOverflow.Ellipsis,
+            // O9 (5 Nov 2026): the sender's chat bubble (what they wear now, from their public profile).
+            val worn = com.zipper.app.ui.components.rememberDecorBrush(
+                "chat_bubble", com.zipper.app.ui.components.rememberUserDecor(message.senderUid.ifBlank { null })?.bubbleId,
             )
+            Row(
+                Modifier.then(
+                    if (worn != null) Modifier.background(worn, RoundedCornerShape(Radius.md)).padding(horizontal = Space.sm, vertical = 2.dp)
+                    else Modifier,
+                ),
+                horizontalArrangement = Arrangement.spacedBy(Space.xxs),
+            ) {
+                Text("${message.senderName}:", style = ZipperTheme.type.labelS, color = if (worn != null) Color.White else c.brandVip, maxLines = 1)
+                Text(
+                    message.text, style = ZipperTheme.type.bodyS, color = if (worn != null) Color.White else c.textPrimary,
+                    maxLines = 3, overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

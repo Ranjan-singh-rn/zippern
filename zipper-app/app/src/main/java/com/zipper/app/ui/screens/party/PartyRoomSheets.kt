@@ -673,7 +673,7 @@ internal fun PartyMembersSheet(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(Space.md),
                 ) {
-                    Avatar(m.photoUrl, size = AvatarSize.MD, initial = m.name)
+                    Avatar(m.photoUrl, size = AvatarSize.MD, initial = m.name, decorUid = m.uid)
                     Column(Modifier.weight(1f)) {
                         Text(
                             if (m.uid == state.myUid) "${m.name.ifBlank { "You" }} (you)" else m.name.ifBlank { "Guest" },
@@ -711,6 +711,8 @@ internal fun PartyMembersSheet(
             viewModel = viewModel,
             onMessage = { actionFor = null; onDismiss(); onOpenChat(m.uid) },
             onGift = { actionFor = null; onDismiss(); onGift() },
+            // O5c: call them from the card — the confirmation and the call screen are the room screen's.
+            onCall = { actionFor = null; onDismiss(); viewModel.prepareCall(m.uid, m.name) },
         )
     }
 
@@ -758,6 +760,7 @@ private fun PartyMemberActionsDialog(
     viewModel: PartyRoomViewModel? = null,
     onMessage: () -> Unit = {},
     onGift: () -> Unit = {},
+    onCall: () -> Unit = {},
 ) {
     val c = ZipperTheme.colors
     val room = state.room
@@ -777,12 +780,18 @@ private fun PartyMemberActionsDialog(
         containerColor = c.bgElevated,
         title = {
             // B7: a profile card — photo, name, level and where they are in the room; tap it for the full profile.
+            // O9 (5 Nov 2026): drawn on the profile card this person wears (their public profile), when they wear one.
+            val card = com.zipper.app.ui.components.rememberDecorBrush(
+                "profile_card", com.zipper.app.ui.components.rememberUserDecor(member.uid)?.cardId,
+            )
             Row(
-                Modifier.fillMaxWidth().clickableNoRipple(onOpenProfile),
+                Modifier.fillMaxWidth()
+                    .then(if (card != null) Modifier.background(card, RoundedCornerShape(Radius.lg)).padding(Space.md) else Modifier)
+                    .clickableNoRipple(onOpenProfile),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(Space.md),
             ) {
-                Avatar(member.photoUrl, size = AvatarSize.LG, initial = member.name)
+                Avatar(member.photoUrl, size = AvatarSize.LG, initial = member.name, decorUid = member.uid, animatedFrame = true)
                 Column(Modifier.weight(1f)) {
                     Text(
                         member.name.ifBlank { "Guest" }, style = ZipperTheme.type.headingS,
@@ -810,6 +819,13 @@ private fun PartyMemberActionsDialog(
                         c.textPrimary, enabled = f != null,
                     ) { viewModel.follow(member.uid, f != true); following = f != true }
                     PartySheetRow(Icons.Outlined.Person, "Message", c.textPrimary, onClick = onMessage)
+                    // O5c: call this person. The room's owner may have switched calls off while hosting — then the row
+                    // says so and does nothing (the server refuses such a call anyway).
+                    val ownerCallsOff = room?.isOwner(member.uid) == true && room.ownerBlocksCalls
+                    PartySheetRow(
+                        Icons.Default.Videocam, if (ownerCallsOff) "Calls off while hosting" else "Call",
+                        if (ownerCallsOff) c.textMuted else c.statusSuccess, enabled = !ownerCallsOff, onClick = onCall,
+                    )
                     if (member.seatIndex > 0) PartySheetRow(Icons.Default.Add, "Send a gift", c.textPrimary, onClick = onGift)
                     PartySheetRow(Icons.Default.Block, "Report", c.textPrimary) { reporting = true }
                     PartySheetRow(Icons.Default.Block, "Block", c.statusDanger) { confirmBlock = true }

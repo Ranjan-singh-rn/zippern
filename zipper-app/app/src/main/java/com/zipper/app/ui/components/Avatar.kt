@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
@@ -64,11 +65,15 @@ fun Avatar(
      */
     frameItemId: String? = null,
     animatedFrame: Boolean = false,
+    /**
+     * O9 (5 Nov 2026): whose avatar this is. With no [frameItemId] given, the frame they wear NOW is read from their
+     * public profile (cached) — so a seat, a viewer, a chat header shows the frame without every caller fetching it.
+     */
+    decorUid: String? = null,
 ) {
     val c = ZipperTheme.colors
-    val frameItem = rememberCosmetic(frameItemId)
-    val resolvedFrameUrl = frameUrl ?: frameItem?.stillUrl?.takeIf { it.isNotBlank() }
-    val frameSvga = frameItem?.svgaUrl?.takeIf { animatedFrame && it.isNotBlank() }
+    val decor = if (frameItemId == null && frameUrl == null) rememberUserDecor(decorUid) else null
+    val frameId = frameItemId ?: decor?.frameId?.takeIf { it.isNotBlank() }
     val ringColor = when (ring) {
         AvatarRing.None -> null
         AvatarRing.Online -> c.statusOnline
@@ -107,18 +112,18 @@ fun Avatar(
                 )
             }
         }
-        if (frameSvga != null) {
-            // B13: an animated frame, looping, at the same 1.3× as the still ones.
-            Svga(source = frameSvga, modifier = Modifier.size(size.dp * 1.3f), loops = 0)
-        } else if (!resolvedFrameUrl.isNullOrBlank()) {
-            // Frames are authored at ~1.3× the avatar diameter so the artwork
-            // clears the photo edge. Not clipped — frames have wings and crowns.
+        if (!frameUrl.isNullOrBlank()) {
+            // A frame image handed in directly (a listener row's resolved URL). Authored at ~1.3× the avatar so the
+            // artwork clears the photo edge; not clipped — frames have wings and crowns.
             AsyncImage(
-                model = resolvedFrameUrl,
+                model = frameUrl,
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
-                modifier = Modifier.size(size.dp * 1.3f),
+                modifier = Modifier.requiredSize(size.dp * 1.3f),
             )
+        } else {
+            // O9: SVGA (animated where asked) → Lottie ring → colour ring → image, by what the catalogue row carries.
+            DecorFrame(frameId, size.dp, animated = animatedFrame)
         }
     }
 }

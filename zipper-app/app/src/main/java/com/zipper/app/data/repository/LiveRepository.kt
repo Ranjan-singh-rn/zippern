@@ -284,12 +284,13 @@ class LiveRepository @Inject constructor(
         liveRoomsCol.document(roomId).collection("comments").add(comment).await()
     }
 
-    suspend fun sendJoinEvent(roomId: String, userName: String) {
+    suspend fun sendJoinEvent(roomId: String, userName: String, photoUrl: String = "") {
         val uid = auth.currentUser?.uid ?: return
         val comment = hashMapOf(
             "uid" to uid,
             "name" to userName,
-            "photoUrl" to "",
+            // O9: the arrival banner shows the photo (with the frame they wear, read from their public profile).
+            "photoUrl" to photoUrl,
             "message" to "$userName joined",
             "timestamp" to System.currentTimeMillis(),
             "isJoin" to true,

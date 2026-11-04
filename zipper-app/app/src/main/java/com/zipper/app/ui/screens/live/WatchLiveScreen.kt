@@ -22,6 +22,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.draw.alpha
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Visibility
@@ -55,6 +56,7 @@ import com.zipper.app.ui.theme.Radius
 import com.zipper.app.ui.theme.Space
 import com.zipper.app.ui.theme.ZipperTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /*
  * Watch live — Figma "02 Watch live" (43:2), with the viewer list (157:476),
@@ -74,9 +76,19 @@ fun WatchLiveScreen(
     onBack: () -> Unit = {},
     onRecharge: () -> Unit = {},
     onOpenProfile: (uid: String) -> Unit = {},
+    /** O5c (5 Nov 2026): call the host from the room — the same paid call the profile starts. */
+    onStartCall: (callId: String) -> Unit = {},
     viewModel: WatchLiveViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    var showCallConfirm by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(state.room?.hostUid) { viewModel.prepareCallPrice() }
+    LaunchedEffect(state.navigateToCall) {
+        val id = state.navigateToCall ?: return@LaunchedEffect
+        viewModel.consumeCallNavigation()
+        onStartCall(id)
+    }
     val c = ZipperTheme.colors
     val context = LocalContext.current
     val activity = context as? Activity
@@ -143,7 +155,7 @@ fun WatchLiveScreen(
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFFE81E6E), Color(0xFF7038E8), Color(0xFF0E0F21)))))
             if (room != null) {
                 Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.md)) {
-                    Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName)
+                    Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName, decorUid = room.hostUid)
                     Text(if (state.isHostOffline) "Host is away" else "Connecting…", style = ZipperTheme.type.bodyM, color = c.textSecondary)
                 }
             }
@@ -154,7 +166,7 @@ fun WatchLiveScreen(
         if (room != null && state.remoteUid != 0 && (state.isCameraOff || state.isPaused)) {
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF2A1A4A), Color(0xFF0E0F21)))))
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.md)) {
-                Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName)
+                Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName, decorUid = room.hostUid)
                 if (state.isPaused) {
                     Text(LiveRoomUi.PAUSED_TITLE, style = ZipperTheme.type.headingM, color = c.textPrimary)
                     Text(LiveRoomUi.PAUSED_BODY, style = ZipperTheme.type.bodyM, color = c.textSecondary)
@@ -189,7 +201,7 @@ fun WatchLiveScreen(
                         .clickableNoRipple { room?.hostUid?.let(onOpenProfile) },
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm),
                 ) {
-                    Avatar(room?.hostPhotoUrl, size = AvatarSize.SM, ring = AvatarRing.Live, initial = room?.hostName ?: "")
+                    Avatar(room?.hostPhotoUrl, size = AvatarSize.SM, ring = AvatarRing.Live, initial = room?.hostName ?: "", decorUid = room?.hostUid)
                     Column(Modifier.widthIn(max = 100.dp)) {
                         Text(room?.hostName ?: "Live", style = ZipperTheme.type.labelS, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         // One source of truth: the presence docs the viewer
@@ -220,7 +232,7 @@ fun WatchLiveScreen(
                     Box(Modifier.clickableNoRipple { showLeaderboard = true }) {
                         state.giftLeaderboard.take(3).forEachIndexed { i, e ->
                             Avatar(
-                                e.photoUrl, size = AvatarSize.XS, initial = e.name,
+                                e.photoUrl, size = AvatarSize.XS, initial = e.name, decorUid = e.uid,
                                 ring = if (i == 0) AvatarRing.Vip else AvatarRing.None,
                                 modifier = Modifier.padding(start = (18 * i).dp),
                             )
@@ -274,6 +286,17 @@ fun WatchLiveScreen(
             verticalArrangement = Arrangement.spacedBy(Space.lg), horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             RailButton(Icons.Default.People, compactCount(state.viewers.size.toLong())) { showViewers = true }
+            // O5c: call the broadcaster — offered while they take calls; "Calls off" (dimmed) when they switched them
+            // off for this live. The server enforces the switch either way (`startCall`).
+            val callsOff = state.room?.hostBlocksCalls == true
+            RailButton(
+                Icons.Default.Videocam, if (callsOff) "Calls off" else "Call",
+                tint = if (callsOff) c.textMuted else c.statusSuccess, enabled = !callsOff,
+            ) {
+                if (callsOff) scope.launch { snackbar.showSnackbar("${state.room?.hostName ?: "The host"} is not taking calls during this live.") }
+                else if (state.callPerMinDiamonds > 0L) showCallConfirm = true
+                else viewModel.callHost()
+            }
             RailButton(Icons.Default.Star, "Gifts", tint = c.brandVip) { showLeaderboard = true }
             RailButton(Icons.Default.Share, "Share") { showShare = true }
             RailButton(Icons.Default.PictureInPicture, "PIP") { enterPip() }
@@ -330,6 +353,11 @@ fun WatchLiveScreen(
 
         // Gift animation
         state.recentGifts.firstOrNull()?.let { GiftAnimationOverlay(giftEvent = it, onDismiss = viewModel::dismissGift) }
+        // O9 (5 Nov 2026): who walks in is announced to the whole room — a sliding banner with their photo, frame
+        // and level, and their entrance effect when they wear one. One at a time; a join that lands while one
+        // plays is not queued (forty arrivals at the top of the hour must not play for four minutes).
+        LiveArrivals(state.comments)
+
 
         // Spec §11: the server's lucky roll, celebrated for a few seconds.
         state.luckyWin?.let { win ->
@@ -350,6 +378,17 @@ fun WatchLiveScreen(
     }
 
     // ── Sheets ─────────────────────────────────────────────────────────────
+    if (showCallConfirm) {
+        com.zipper.app.ui.screens.profile.CallConfirmDialog(
+            name = state.room?.hostName.orEmpty().ifBlank { "the host" },
+            perMinuteDiamonds = state.callPerMinDiamonds,
+            balanceDiamonds = state.myDiamonds,
+            onCall = { showCallConfirm = false; viewModel.callHost() },
+            onRecharge = { showCallConfirm = false; onRecharge() },
+            onDismiss = { showCallConfirm = false },
+        )
+    }
+
     if (showGifts && room != null) {
         val recipients = if (state.pkActive) listOf(
             GiftRecipient(roomId, room.hostName, room.hostPhotoUrl),
@@ -398,10 +437,12 @@ fun WatchLiveScreen(
 // ── Pieces ───────────────────────────────────────────────────────────────────
 
 @Composable
-private fun RailButton(icon: ImageVector, label: String, tint: Color = ZipperTheme.colors.textPrimary, onClick: () -> Unit) {
+private fun RailButton(icon: ImageVector, label: String, tint: Color = ZipperTheme.colors.textPrimary, enabled: Boolean = true, onClick: () -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Box(
-            Modifier.size(48.dp).background(ZipperTheme.colors.glassMid, CircleShape).border(1.dp, ZipperTheme.colors.glassMid, CircleShape).clickableNoRipple(onClick),
+            Modifier.size(48.dp).background(ZipperTheme.colors.glassMid, CircleShape).border(1.dp, ZipperTheme.colors.glassMid, CircleShape)
+                .then(if (enabled) Modifier else Modifier.alpha(0.55f))
+                .clickableNoRipple(onClick),
             contentAlignment = Alignment.Center,
         ) { Icon(icon, label, tint = tint, modifier = Modifier.size(24.dp)) }
         Text(label, style = ZipperTheme.type.caption, color = ZipperTheme.colors.textPrimary)
@@ -422,8 +463,11 @@ private fun LikeButton(onLike: () -> Unit) {
 @Composable
 private fun CommentPill(comment: LiveComment) {
     val c = ZipperTheme.colors
+    // O9: the sender's chat bubble — the one they wear now, read from their public profile.
+    val bubble = rememberDecorBrush("chat_bubble", rememberUserDecor(comment.uid.takeIf { !comment.isJoin })?.bubbleId)
     Row(
-        Modifier.background(c.scrimMedium, CircleShape).padding(horizontal = 12.dp, vertical = 2.dp),
+        Modifier.then(if (bubble != null) Modifier.background(bubble, CircleShape) else Modifier.background(c.scrimMedium, CircleShape))
+            .padding(horizontal = 12.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         if (comment.isJoin) {
@@ -459,7 +503,7 @@ private fun ViewerListSheet(viewers: List<ViewerPresence>, onOpen: (String) -> U
         } else LazyColumn(Modifier.heightIn(max = 420.dp)) {
             items(viewers, key = { it.uid }) { v ->
                 Row(Modifier.fillMaxWidth().clickableNoRipple { onOpen(v.uid) }.padding(horizontal = Space.lg, vertical = Space.sm), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
-                    Avatar(v.photoUrl, size = AvatarSize.MD, initial = v.name)
+                    Avatar(v.photoUrl, size = AvatarSize.MD, initial = v.name, decorUid = v.uid)
                     Text(v.name, style = ZipperTheme.type.labelM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (v.level > 0) LevelChip(v.level)
                 }
@@ -479,7 +523,7 @@ private fun LeaderboardSheet(entries: List<GiftLeaderboardEntry>, onOpen: (Strin
                 val e = entries[i]
                 Row(Modifier.fillMaxWidth().clickableNoRipple { onOpen(e.uid) }.padding(horizontal = Space.lg, vertical = Space.sm), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
                     Text("${i + 1}", style = ZipperTheme.type.numericM, color = if (i == 0) c.brandVip else c.textSecondary, modifier = Modifier.width(20.dp))
-                    Avatar(e.photoUrl, size = AvatarSize.MD, initial = e.name, ring = if (i == 0) AvatarRing.Vip else AvatarRing.None)
+                    Avatar(e.photoUrl, size = AvatarSize.MD, initial = e.name, ring = if (i == 0) AvatarRing.Vip else AvatarRing.None, decorUid = e.uid)
                     Text(e.name, style = ZipperTheme.type.labelM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Price(Currency.Diamond, e.totalDiamonds, color = c.textPrimary)
                 }

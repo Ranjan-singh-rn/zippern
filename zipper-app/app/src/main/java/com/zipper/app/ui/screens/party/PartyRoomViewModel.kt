@@ -112,6 +112,10 @@ data class PartyRoomUiState(
     val savingSettings: Boolean = false,
     val notice: String? = null,
     val error: String? = null,
+    /** O5c (5 Nov 2026): a call about to be placed to someone in the room — its quote, for the confirmation. */
+    val callTo: PartyCallTo? = null,
+    /** The call the server just started — the screen opens it. */
+    val navigateToCall: String? = null,
 ) {
     val isVideo: Boolean get() = room?.isAudio == false
     val seatCount: Int get() = room?.seatCount ?: PartyRoom.AUDIO_SEAT_CHOICES.first()
@@ -191,6 +195,9 @@ data class GiftTapResult(
 }
 
 /** A person in the room, seated or not. [seatIndex] is 0 for a listener. */
+/** O5c: the confirmation before calling someone in a party room. */
+data class PartyCallTo(val uid: String, val name: String, val perMinDiamonds: Long, val myDiamonds: Long)
+
 data class PartyMember(
     val uid: String,
     val name: String,
@@ -209,6 +216,8 @@ class PartyRoomViewModel @Inject constructor(
     private val liveRepo: com.zipper.app.data.repository.LiveRepository,
     private val agoraTokenRepo: AgoraTokenRepository,
     private val auth: FirebaseAuth,
+    /** O5c: calling someone in the room — the same quote and server call as the profile. */
+    private val callStarter: com.zipper.app.data.repository.CallStarter,
 ) : ViewModel() {
 
     private val roomId: String = savedStateHandle.get<String>("roomId") ?: ""
@@ -1143,6 +1152,38 @@ class PartyRoomViewModel @Inject constructor(
 
     fun clearError() { _state.update { it.copy(error = null) } }
     fun clearNotice() { _state.update { it.copy(notice = null) } }
+
+    // ── O5c: call someone in the room ─────────────────────────────────────────
+
+    /**
+     * "Call" on a member's card: quote the price first (the confirmation shows it); a call this person would not pay
+     * for — a host ringing a user — goes straight to the server. The owner's "calls off" switch is enforced there too.
+     */
+    fun prepareCall(uid: String, name: String) {
+        if (uid.isBlank() || uid == state.value.myUid) return
+        viewModelScope.launch {
+            val q = callStarter.quote(uid)
+            if (q != null && q.perMinDiamonds > 0L) {
+                _state.update { it.copy(callTo = PartyCallTo(uid, name, q.perMinDiamonds, q.myDiamonds)) }
+            } else placeCall(uid)
+        }
+    }
+
+    fun dismissCall() { _state.update { it.copy(callTo = null) } }
+
+    fun placeCall(uid: String) {
+        _state.update { it.copy(callTo = null) }
+        viewModelScope.launch {
+            when (val res = callStarter.start(uid)) {
+                is com.zipper.app.data.repository.CallRepository.CallStart.Ok ->
+                    _state.update { it.copy(navigateToCall = res.callId) }
+                is com.zipper.app.data.repository.CallRepository.CallStart.Failed ->
+                    _state.update { it.copy(notice = res.message) }
+            }
+        }
+    }
+
+    fun consumeCallNavigation() { _state.update { it.copy(navigateToCall = null) } }
     fun setPip(inPip: Boolean) { _state.update { it.copy(inPip = inPip) } }
 
     // ── Staying in the room ──────────────────────────────────────────────────

@@ -322,6 +322,11 @@ fun GoLiveScreen(
             }
 
             state.recentGifts.firstOrNull()?.let { GiftAnimationOverlay(giftEvent = it, onDismiss = viewModel::dismissGift) }
+            // O9 (5 Nov 2026): who walks in is announced to the whole room — a sliding banner with their photo, frame
+            // and level, and their entrance effect when they wear one. One at a time; a join that lands while one
+            // plays is not queued (forty arrivals at the top of the hour must not play for four minutes).
+            LiveArrivals(state.comments)
+
         }
 
         SnackbarHost(snackbar, Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 120.dp)) { data ->
@@ -469,7 +474,9 @@ private fun Rail(icon: ImageVector, label: String, tint: Color = ZipperTheme.col
 @Composable
 private fun HostCommentPill(comment: LiveComment) {
     val c = ZipperTheme.colors
-    Row(Modifier.background(c.scrimMedium, CircleShape).padding(horizontal = 12.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+    // O9: the sender's chat bubble — the one they wear now, read from their public profile.
+    val bubble = rememberDecorBrush("chat_bubble", rememberUserDecor(comment.uid.takeIf { !comment.isJoin })?.bubbleId)
+    Row(Modifier.then(if (bubble != null) Modifier.background(bubble, CircleShape) else Modifier.background(c.scrimMedium, CircleShape)).padding(horizontal = 12.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
         if (comment.isJoin) {
             Text(comment.name, style = ZipperTheme.type.labelS, color = c.textBrand, maxLines = 1)
             Text(" joined", style = ZipperTheme.type.bodyS, color = c.textSecondary)
@@ -528,7 +535,7 @@ private fun ViewerManagementSheet(
                     items(viewers, key = { it.uid }) { v ->
                         val removing = v.uid in kickPending
                         Row(Modifier.fillMaxWidth().clickableNoRipple { onOpenProfile(v.uid) }.padding(horizontal = Space.lg, vertical = Space.sm), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
-                            Avatar(v.photoUrl, size = AvatarSize.MD, initial = v.name)
+                            Avatar(v.photoUrl, size = AvatarSize.MD, initial = v.name, decorUid = v.uid)
                             Text(v.name, style = ZipperTheme.type.labelM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (v.level > 0) LevelChip(v.level)
                             // B12: mute in chat (they keep watching) — a tap toggles it.
@@ -563,7 +570,7 @@ private fun ViewerManagementSheet(
                         val e = leaderboard[i]
                         Row(Modifier.fillMaxWidth().clickableNoRipple { onOpenProfile(e.uid) }.padding(horizontal = Space.lg, vertical = Space.sm), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.md)) {
                             Text("${i + 1}", style = ZipperTheme.type.numericM, color = if (i == 0) c.brandVip else c.textSecondary, modifier = Modifier.width(20.dp))
-                            Avatar(e.photoUrl, size = AvatarSize.MD, initial = e.name, ring = if (i == 0) AvatarRing.Vip else AvatarRing.None)
+                            Avatar(e.photoUrl, size = AvatarSize.MD, initial = e.name, ring = if (i == 0) AvatarRing.Vip else AvatarRing.None, decorUid = e.uid)
                             Text(e.name, style = ZipperTheme.type.labelM, color = c.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Price(Currency.Diamond, e.totalDiamonds, color = c.textPrimary)
                         }

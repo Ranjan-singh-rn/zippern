@@ -194,32 +194,12 @@ class OtherUserViewModel @Inject constructor(
              * whichever of them dialled, and two of a kind means the caller
              * pays.
              */
-            val cost = when {
-                // Exactly one host: the user pays, the host earns.
-                target.isHost != currentUserIsHost -> {
-                    val iAmTheHost = currentUserIsHost
-                    val earnerIncome = if (iAmTheHost) {
-                        if (currentUserIsVerifiedHost && currentUserCallRate > 0) currentUserCallRate
-                        else cfg.callRateBeansPerMin
-                    } else {
-                        if (target.isVerifiedHost) target.callRateBeans.toLong()
-                        else cfg.callRateBeansPerMin
-                    }
-                    val payerGender  = if (iAmTheHost) target.gender else currentUserGender
-                    val earnerGender = if (iAmTheHost) currentUserGender else target.gender
-                    // I only pay when I am the user.
-                    if (iAmTheHost) 0L
-                    else cfg.payerDiamondsPerMin(earnerIncome, payerGender, earnerGender)
-                }
-                // Two hosts: I dialled, so I pay, priced from their income.
-                target.isHost && currentUserIsHost -> {
-                    val income = if (target.isVerifiedHost) target.callRateBeans.toLong()
-                                 else cfg.callRateBeansPerMin
-                    cfg.payerDiamondsPerMin(income, currentUserGender, target.gender)
-                }
-                // Two users: the flat rate, paid by whoever dials.
-                else -> cfg.userCallRatePerMin
-            }
+            // One estimate for the profile, the chat and the rooms (util/CallPrice — mirrors `rateFor`).
+            val cost = com.zipper.app.util.CallPrice.callerPaysPerMin(
+                cfg,
+                me = com.zipper.app.util.CallPrice.Side(currentUserIsHost, currentUserIsVerifiedHost, currentUserCallRate, currentUserGender),
+                target = com.zipper.app.util.CallPrice.Side(target.isHost, target.isVerifiedHost, target.callRateBeans.toLong(), target.gender),
+            )
             _uiState.update { it.copy(callCostDiamonds = cost) }
         }
     }

@@ -434,6 +434,7 @@ fun ZipperNavGraph(
                     onNavigateToWatchLive    = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
                     onNavigateToPartyRoom    = { roomId -> navController.navigate(Screen.PartyRoom.createRoute(roomId)) },
                     onNavigateToMyBag        = { navController.navigate(Screen.MyBag.route) },
+                    onNavigateToStore        = { navController.navigate(Screen.Store.route) },
                     onNavigateToEarnings     = { navController.navigate(Screen.Earnings.route) },
                     onNavigateToCallHistory  = { navController.navigate(Screen.CallHistory.route) },
                     onNavigateToLikes        = { tab -> navController.navigate(Screen.LikesScreen.createRoute(tab)) },
@@ -590,6 +591,8 @@ fun ZipperNavGraph(
                 onBack        = { navController.popBackStack() },
                 onRecharge    = { navController.navigate(Screen.DiamondShop.route) },
                 onOpenProfile = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
+                // O5c: the Call button in the room — the outgoing call screen, the room left behind.
+                onStartCall   = { callId -> navController.navigate(Screen.VideoCall.createRoute(callId, isOutgoing = true)) },
             )
         }
 
@@ -612,6 +615,8 @@ fun ZipperNavGraph(
                 onRecharge    = { navController.navigate(Screen.DiamondShop.route) },
                 onOpenProfile = { uid -> navController.navigate(Screen.UserProfile.createRoute(uid)) },
                 onOpenChat    = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
+                // O5c: "Call" on a member's card.
+                onStartCall   = { callId -> navController.navigate(Screen.VideoCall.createRoute(callId, isOutgoing = true)) },
             )
         }
 
@@ -818,9 +823,24 @@ fun ZipperNavGraph(
             val state by vm.state.collectAsStateWithLifecycle()
             MyBagScreen(
                 videoCards = state.user?.videoCards ?: 0,
+                diamonds   = state.user?.diamonds ?: 0L,
                 onBack     = { navController.popBackStack() },
                 onEquip    = { /* handled inside MyBagScreen ViewModel */ },
                 onBuy      = { /* handled inside MyBagScreen ViewModel */ },
+                onRecharge = { navController.navigate(Screen.DiamondShop.route) },
+            )
+        }
+
+        // ── Store (O9) ────────────────────────────────────────────────────
+        composable(Screen.Store.route) {
+            val vm: ProfileViewModel = hiltViewModel()
+            val state by vm.state.collectAsStateWithLifecycle()
+            MyBagScreen(
+                videoCards = state.user?.videoCards ?: 0,
+                diamonds   = state.user?.diamonds ?: 0L,
+                storeFirst = true,
+                onBack     = { navController.popBackStack() },
+                onRecharge = { navController.navigate(Screen.DiamondShop.route) },
             )
         }
 

@@ -25,6 +25,11 @@ import javax.inject.Inject
 
 data class WatchLiveUiState(
     val room: LiveRoom? = null,
+    /** O5c (5 Nov 2026): what a minute with the host would cost this viewer (0 = they would not pay, or unknown). */
+    val callPerMinDiamonds: Long = 0L,
+    /** The call the server just started with the host — the screen opens it. */
+    val navigateToCall: String? = null,
+    val callStarting: Boolean = false,
     val comments: List<LiveComment> = emptyList(),
     val recentGifts: List<LiveGiftEvent> = emptyList(),
     val viewers: List<ViewerPresence> = emptyList(),
@@ -100,6 +105,8 @@ class WatchLiveViewModel @Inject constructor(
     private val agoraTokenRepo: AgoraTokenRepository,
     private val giftRepo: GiftRepository,
     private val auth: FirebaseAuth,
+    /** O5c: calling the host from the room — the same paid call the profile and the chat start. */
+    private val callStarter: com.zipper.app.data.repository.CallStarter,
 ) : ViewModel() {
 
     private val roomId: String = savedStateHandle.get<String>("roomId") ?: ""
@@ -310,7 +317,7 @@ class WatchLiveViewModel @Inject constructor(
                 if (user != null) {
                     currentUser = user
                     repo.addViewerPresence(roomId, user)
-                    repo.sendJoinEvent(roomId, user.name.ifBlank { "Someone" })
+                    repo.sendJoinEvent(roomId, user.name.ifBlank { "Someone" }, user.photoUrl)
                 }
                 _state.update { it.copy(isConnected = true, isRejoining = false) }
                 startCommentCollection(joinedAt)
@@ -391,6 +398,41 @@ class WatchLiveViewModel @Inject constructor(
             }
         }
     }
+
+    // ── O5c: call the host ────────────────────────────────────────────────────
+
+    private var priceFor: String = ""
+
+    /** The price a minute, estimated once per host the same way the profile does (util/CallPrice). */
+    fun prepareCallPrice() {
+        val hostUid = _state.value.room?.hostUid.orEmpty()
+        if (hostUid.isBlank() || hostUid == priceFor) return
+        priceFor = hostUid
+        viewModelScope.launch {
+            val q = callStarter.quote(hostUid)
+            if (q == null) priceFor = "" else _state.update { it.copy(callPerMinDiamonds = q.perMinDiamonds, myDiamonds = q.myDiamonds) }
+        }
+    }
+
+    /**
+     * Ring the host. The server decides everything — the price, the balance, the host's "calls off" switch for this
+     * broadcast, blocks — and its refusal is said on screen in its own words.
+     */
+    fun callHost() {
+        val hostUid = _state.value.room?.hostUid.orEmpty()
+        if (hostUid.isBlank() || hostUid == auth.currentUser?.uid || _state.value.callStarting) return
+        _state.update { it.copy(callStarting = true) }
+        viewModelScope.launch {
+            when (val res = callStarter.start(hostUid)) {
+                is com.zipper.app.data.repository.CallRepository.CallStart.Ok ->
+                    _state.update { it.copy(callStarting = false, navigateToCall = res.callId) }
+                is com.zipper.app.data.repository.CallRepository.CallStart.Failed ->
+                    _state.update { it.copy(callStarting = false, toastMessage = res.message) }
+            }
+        }
+    }
+
+    fun consumeCallNavigation() { _state.update { it.copy(navigateToCall = null) } }
 
     fun onCommentInput(v: String) { _state.update { it.copy(commentInput = v) } }
 

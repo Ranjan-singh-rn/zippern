@@ -44,6 +44,8 @@ data class LiveRoom(
     val isPaused: Boolean = false,
     /** The host turned the camera off (still live, still talking): viewers see the host's photo. */
     val isCameraOff: Boolean = false,
+    /** O1/O5c: the host switched incoming calls off for this broadcast (enforced by `startCall`; shown as "Calls off"). */
+    val hostBlocksCalls: Boolean = false,
     /** The host's pinned announcement, shown above the chat (≤ 140 characters). */
     val pinnedMessage: String = "",
     /** Viewers the host muted in the chat (they still watch). */
@@ -108,6 +110,7 @@ data class LiveRoom(
                 pkChannelId        = doc.getString("pkChannelId") ?: "",
                 isPaused           = doc.getBoolean("isPaused") ?: false,
                 isCameraOff        = doc.getBoolean("isCameraOff") ?: false,
+                hostBlocksCalls    = doc.getBoolean("hostBlocksCalls") ?: false,
                 pinnedMessage      = doc.getString("pinnedMessage") ?: "",
                 mutedViewers       = muted,
                 peakViewers        = (doc.getLong("peakViewers") ?: 0L).toInt(),

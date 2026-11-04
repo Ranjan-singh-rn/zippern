@@ -24,6 +24,17 @@ data class Cosmetic(
     val previewUrl: String,
     val svgaUrl: String,
     val videoUrl: String,
+    // O9 (5 Nov 2026): the rest of what decides how an item is drawn (see Decor.kt) — no new build for a new item.
+    val category: String = "",
+    val name: String = "",
+    /** A Lottie bundled in the app (`anim/…json`), for the starter set. */
+    val animationAsset: String = "",
+    /** A Lottie from the CRM (Storage URL). */
+    val animationUrl: String = "",
+    /** Colours, "#RRGGBB,#RRGGBB" — chat bubbles, profile cards, ID frames, plain frames. */
+    val style: String = "",
+    /** How much larger than the avatar the CRM says this frame is drawn (B13a); 0 = the default. */
+    val frameScale: Float = 0f,
 ) {
     /** The best still for this item. */
     val stillUrl: String get() = imageUrl.ifBlank { previewUrl }
@@ -45,6 +56,12 @@ object CosmeticsCatalog {
             previewUrl = snap.getString("previewUrl").orEmpty(),
             svgaUrl = snap.getString("svgaUrl").orEmpty(),
             videoUrl = snap.getString("videoUrl").orEmpty(),
+            category = snap.getString("category").orEmpty(),
+            name = snap.getString("name").orEmpty(),
+            animationAsset = snap.getString("animationAsset").orEmpty(),
+            animationUrl = snap.getString("animationUrl").orEmpty(),
+            style = snap.getString("style").orEmpty(),
+            frameScale = (snap.getDouble("frameScale") ?: 0.0).toFloat(),
         )
         cache[id] = c
         return c

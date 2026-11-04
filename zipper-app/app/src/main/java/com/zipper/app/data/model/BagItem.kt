@@ -39,6 +39,8 @@ data class BagItem(
     val videoUrl: String = "",
     /** B13: the SVGA animation (tools/decor) — frames and entrances that move over live video, transparent. */
     val svgaUrl: String = "",
+    /** O9 (5 Nov 2026): colours from the CRM, "#RRGGBB,#RRGGBB" — chat bubbles, cards, ID frames, plain frames. */
+    val style: String = "",
 
     // ── This account's copy of the item, and the terms on offer ──────────────
     //

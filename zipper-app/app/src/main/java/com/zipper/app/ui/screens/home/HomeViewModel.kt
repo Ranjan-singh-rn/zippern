@@ -139,6 +139,9 @@ class HomeViewModel @Inject constructor(
             .addSnapshotListener { snap, _ ->
                 val diamonds = snap?.getLong("diamonds") ?: 0L
                 _uiState.update { it.copy(currentUserDiamonds = diamonds) }
+                // O11: the viewer's gender decides who the feed shows first.
+                val gender = snap?.getString("gender").orEmpty()
+                if (gender != myGender) { myGender = gender; applyFiltersAndSort() }
             }
     }
 
@@ -164,16 +167,22 @@ class HomeViewModel @Inject constructor(
     //   hobbies  — Firestore allows one array-contains per query, and language
     //   likes      already spends it. See DiscoverRepository.matchesLocalFacets.
     //
-    // There is no sort step. The order is `presenceRank desc, lastSeen desc`
-    // from the query, and re-sorting here would only reorder the page.
+    // The order is `presenceRank desc, lastSeen desc` from the query. O11 (Owner, 5 Nov 2026): officials are never
+    // shown, and the opposite gender comes first for a male or female viewer — a stable sort, so the server's order
+    // holds within each group (util/HomeOrder).
+
+    private var myGender: String = ""
 
     private fun applyFiltersAndSort() {
         val filters = _uiState.value.filters
         val blocked = _blockedUids.value
 
-        val result = _rawUsers.value
-            .filter { it.uid !in blocked }
-            .filter { discover.matchesLocalFacets(it, filters.hobbies, filters.likes) }
+        val result = com.zipper.app.util.HomeOrder.order(
+            _rawUsers.value
+                .filter { it.uid !in blocked }
+                .filter { discover.matchesLocalFacets(it, filters.hobbies, filters.likes) },
+            myGender,
+        )
 
         _uiState.update { it.copy(users = result, isLoading = false) }
     }

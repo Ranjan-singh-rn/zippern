@@ -73,9 +73,14 @@ object ChatParse {
         quantity = long(data["quantity"]).toInt().coerceAtLeast(1),
     )
 
-    /** The thread a viewer sees after deleting the chat: only what came after. */
+    /**
+     * The thread a viewer sees after deleting the chat: only what came after, oldest first by the time each message
+     * carries. Sorted here as well as by the query: Firestore orders every number before every Timestamp, so one
+     * message stamped by a server clock (a fixture did exactly this, 5 Nov 2026) jumped below newer texts. Stable,
+     * so messages with the same time keep the query's order.
+     */
     fun after(messages: List<ChatMessage>, clearedAtMine: Long): List<ChatMessage> =
-        if (clearedAtMine <= 0L) messages else messages.filter { it.timestamp > clearedAtMine }
+        (if (clearedAtMine <= 0L) messages else messages.filter { it.timestamp > clearedAtMine }).sortedBy { it.timestamp }
 
     /** The line the Chats list shows for a message this phone sends. */
     fun preview(type: String, text: String): String = when (type) {
