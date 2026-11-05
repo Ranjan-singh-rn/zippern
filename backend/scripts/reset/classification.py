@@ -151,6 +151,10 @@ FIRESTORE_DELETE: dict[str, str] = {
     "subscriptionPayments": "Party Pro payments (money history)",
     "subscriptionIdempotency": "Party Pro replay guards",
     "sellerTrades": "seller-to-seller trade mirror (money history)",
+    # ── O12 / O13 (5 Nov 2026): monitoring and safety ──
+    "monitorSessions": "who watched which room silently (O12) — names staff and agency logins",
+    "safetyFlags": "safety flags (O13): live stills the AI check flagged, people the word screen silenced",
+    "safetyStrikes": "word-screen strikes per person (O13)",
 }
 
 #: Subcollections the walker may meet UNDER A DELETE DOCUMENT, keyed by the
@@ -271,6 +275,7 @@ STORAGE_UNDECIDED: dict[str, str] = {
     "hostPhotos": "host photos per agency",
     "crmProfilePhotos": "CRM profile photos (flat; the Owners' own pictures live here)",
     "chatMedia": "chat photos and voice notes between two people (O5, 5 Nov 2026: chatMedia/{convoId}/{uid}/…)",
+    "liveSnapshots": "live stills of broadcasters for the live wall (O13, 5 Nov 2026: liveSnapshots/{uid}/{roomId}/…; only each room's newest is kept) — recommend DELETE",
     # Prefixes an earlier planner listed as owned-by-user; none seen in 2026-10.
     "users": "legacy per-user files", "profiles": "legacy per-user files",
     "avatars": "legacy per-user files", "agencies": "legacy per-partner files",
