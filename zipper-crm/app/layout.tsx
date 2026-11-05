@@ -6,6 +6,7 @@ import { usePathname, useRouter } from 'next/navigation'
 import { createContext, useContext, useEffect, useState } from 'react'
 import { AuthProvider, useAuth } from '@/components/AuthProvider'
 import { PartnerRoleSwitcher } from '@/components/PartnerRoleSwitcher'
+import WorkAlerts from '@/components/WorkAlerts'
 import {
   crmSignOut, ROLE_LABELS, ROLE_COLORS, CrmRole, CrmUser,
   approvedPartnerRoles, isDualRolePartner, resolvePartnerRedirect,
@@ -532,6 +533,8 @@ function Sidebar() {
   const initial = crmUser?.name ? crmUser.name[0].toUpperCase() : '?'
 
   return (
+    <>
+    <WorkAlerts enabled={!loading && canAccess(['superadmin', 'finance_admin', 'finance_member', 'ops_admin', 'ops_member', 'app_admin'])} owner={crmUser?.role === 'superadmin'} />
     <aside className={asideClass(drawerOpen, 'overflow-hidden')} onClick={closeOnLink(setDrawerOpen)}>
       {/* Logo */}
       <div className="px-6 py-5 border-b border-slate-800 flex-shrink-0">
@@ -639,6 +642,7 @@ function Sidebar() {
         </div>
       </div>
     </aside>
+    </>
   )
 }
 
