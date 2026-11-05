@@ -11,9 +11,17 @@ photos, voice notes, gifts, block/report, delete (O5), the chat call button and 
 live room and from party members (O5c), one Owner's approval is final on the money board (O6), sellers pay back
 borrowed coins (O7), decorations everywhere with a Store (O9), the speed pass (O10) and the Home order with officials
 hidden (O11). `functions/src/push.ts` changed (the chat push names voice notes and gifts), so its four triggers moved
-from NOT_REDEPLOYED to wave A: wave A is now **144** (85 changed + 59 new — O12 adds monitorRoomToken and myMonitorRooms; O13 adds reportLiveSnapshot and the three chat-screen triggers), NOT_REDEPLOYED 9. New rules: O1's
+from NOT_REDEPLOYED to wave A: wave A is now **149** (85 changed + 64 new — O8 adds claimDailyTask, dailyTasksDiamondLedger and dailyTasksBeanLedger; the call work adds syncCallPresence and screenCallMessage; O12 adds monitorRoomToken and myMonitorRooms; O13 adds reportLiveSnapshot and the three chat-screen triggers), NOT_REDEPLOYED 9. New rules: O1's
 `hostBlocksCalls` host field, O5's chat message create/update/delete and `chatMedia/` in Storage — the rules emulator
 run below must be repeated at this HEAD.
+
+**Updated 5 Nov 2026 evening — the Owner's second list** (merge of o14): daily tasks + the rewards audit (O8: Functions
+claimDailyTask + two ledger triggers, backend promotions report/audit list, CRM Daily Tasks / Rewards Audit / dashboard),
+call buttons that follow each person's calls switch + the in-call menu and buy-diamonds sheet (syncCallPresence,
+screenCallMessage), and the party-room music player from the phone (setPartyMusic takes a device song). **The backend
+changed again**: run 11 again at this HEAD (the 0% revision zipper-api-00064-nay from 1b63f7b is never given traffic) and
+canary the new revision. Rules changed (users/{uid}/dailyTasks, dailyTaskSeen, appConfig/dailyTasks Owner-only): the rules
+emulator run must be repeated at this HEAD.
 
 **Where:** `~/Documents/Projects/zippern/release/trackb-20261104/`. Run each script from Terminal in that folder
 (`./NN-name.command`, or double-click). Project `zipper-83816`, region `asia-south1`.
@@ -59,7 +67,7 @@ carry RC2 + Track B). Its folder and evidence stay as they are.
 |---|---|---|---|---|
 | 1 | Preflight | `00-preflight-readonly.command` | — | — |
 | 2 | Backend: new revision at 0%, smoke, one e-mail, canary | `11-…` → `12 10` → `13` → `12 50` → `13` → `12 100` | DEPLOY, EMAIL/SKIP, UNTAG; CANARY10/50/100 | `19-rollback-backend.command` ROLLBACK or `12 back` BACK |
-| 3 | Functions wave A (144: 85 changed + 59 new) | `20-deploy-functions-wave2a.command` | DEPLOY2A | `29-rollback-functions.command 2a [<20-evidence>]` ROLLBACK |
+| 3 | Functions wave A (149: 85 changed + 64 new) | `20-deploy-functions-wave2a.command` | DEPLOY2A | `29-rollback-functions.command 2a [<20-evidence>]` ROLLBACK |
 | 4 | CRM | `50-deploy-crm.command` (runs `deploy-crm.command`) | CRM, then DEPLOY | `H-CRM-ROLLBACK` (console, to bf4066501e5f593a) |
 | 5 | Firestore indexes (until READY) | `33-deploy-indexes.command` | INDEXES | none (additive) |
 | 6 | Build + publish APK 21 (1.2.7) | `./gradlew :app:assembleProd`, device smoke, `60-publish-apk.command` | PUBLISH | `61-withdraw-apk.command <60-evidence>` WITHDRAW |
@@ -70,7 +78,7 @@ carry RC2 + Track B). Its folder and evidence stay as they are.
 | — | Owner MFA enforcement — **not part of this release** (a separate Owner decision) | `45`, `46` | ENFORCE-NEW, ENFORCE | `47` ROLLBACK |
 
 **Why this order.** Everything an APK 19 phone uses keeps working until step 6: wave A changes nothing an old app
-sends (its new refusals are messages the app shows), and the 59 new functions are never called by old apps. Step 6
+sends (its new refusals are messages the app shows), and the 64 new functions are never called by old apps. Step 6
 forces the update (minSupportedVersionCode 21). The rules (7) come right after it: they refuse APK 19's own PK
 writes (the client created `pkInvites` and wrote both rooms' `pkActive`/`pkScore`) and APK 21 needs them for
 leaderboards, Party Pro status, music and game history reads. Wave B (8) needs APK 21 on the phones: the new
@@ -94,15 +102,15 @@ secret grants; live rules hashes (hotfix-1 texts); Hosting `bf4066501e5f593a`; t
 - **Rollback:** `./19-rollback-backend.command` (ROLLBACK) or `./12-canary-backend.command back` (BACK). After step 4 a
   backend rollback goes together with the CRM rollback (the new CRM calls routes 00057-xiq does not have).
 
-## Step 3 — Functions wave A (144)
+## Step 3 — Functions wave A (149)
 - **Do:** `./20-deploy-functions-wave2a.command` (DEPLOY2A). Not within Sunday 16:29–21:00 UTC (refused). Fresh tree
   from HEAD, npm ci, tsc, every test; the exports of the built `lib/index.js` must be exactly WAVE_2A + WAVE_2B +
   NOT_REDEPLOYED in their regions, and every deployed name must have one rollback base; then deploy by name.
-- **Verify:** SCOPE PASS (`changed=144`; the 59 new ones appear), all ACTIVE, identities, env unchanged, the weekly
+- **Verify:** SCOPE PASS (`changed=149`; the 64 new ones appear), all ACTIVE, identities, env unchanged, the weekly
   report and the 8 e-mail functions keep `ZIPPER_SENDGRID_API_KEY`.
 - **Write quota:** as in the completion release — on `SCOPE PARTIAL` re-run 20, or roll back exactly `updated.txt`.
 - **Rollback:** `./29-rollback-functions.command 2a [production/20-functions-2a-<UTC>]` (ROLLBACK, typed once): the
-  85 changed functions go back to the cf64145 tree (what they ran before); the 59 new ones are **left deployed** (no
+  85 changed functions go back to the cf64145 tree (what they ran before); the 64 new ones are **left deployed** (no
   older code exists; old apps never call them; nothing here deletes a function).
 
 ## Step 4 — CRM

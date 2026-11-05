@@ -68,7 +68,8 @@ crashCashout gameFairness rotateGameSeed playDice tossCoin spinWheel playKeno pl
 playDragonTiger playAndarBahar hiloStart hiloGuess hiloCashout minesStart minesReveal minesCashout \
 privateRoomSubscriptionStatus subscribePrivateRooms cancelPrivateRoomSubscription renewPrivateRoomSubscriptions \
 settleLeaderboards liveViewerCount sweepLiveRooms pkMatch pkRespond pkEnd quickLoginRestriction forgetQuickLogin \
-monitorRoomToken myMonitorRooms reportLiveSnapshot screenLiveComment screenPartyMessage screenDirectMessage"
+monitorRoomToken myMonitorRooms reportLiveSnapshot screenLiveComment screenPartyMessage screenDirectMessage \
+claimDailyTask dailyTasksDiamondLedger dailyTasksBeanLedger syncCallPresence screenCallMessage"
 WAVE_2A="$WAVE_2A_CHANGED $WAVE_2A_NEW"
 # WAVE B (21) — needs APK 21 on the phones (60 publishes it with minSupportedVersionCode 21 first):
 #   the completion wave 2b (8, still 20 Oct code): the new generateAgoraToken signs for a derived uid (APK 19 joins with

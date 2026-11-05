@@ -4,7 +4,7 @@
 STEP-0: one-time setup — tools/check-function-lists.py RESULT ok, tools/run-trackb-rules-tests.command TRACKB-RULES-RUN: PASS (local test copy stopped), tools/test-release-scripts-mac.command N/N PASS, commit the release (no push), ./make-release-txt.sh
 STEP-1: run 00-preflight-readonly.command (read-only)
 STEP-2: run 11-deploy-backend-no-traffic.command (DEPLOY, EMAIL or SKIP, UNTAG), then 12-canary-backend.command 10/50/100 (CANARY10/CANARY50/CANARY100) with a 13-canary-monitor-readonly.command CONTINUE before 50 and 100
-STEP-3: run 20-deploy-functions-wave2a.command and type DEPLOY2A (wave A: 85 changed + 59 new functions; not Sunday 16:29-21:00 UTC)
+STEP-3: run 20-deploy-functions-wave2a.command and type DEPLOY2A (wave A: 85 changed + 64 new functions; not Sunday 16:29-21:00 UTC)
 STEP-4: run 50-deploy-crm.command, type CRM, then DEPLOY in deploy-crm.command
 STEP-5: run 33-deploy-indexes.command and type INDEXES (firestore:indexes only; refused unless the file is a superset of the live indexes; re-run until every index is READY)
 STEP-6: build ./gradlew :app:assembleProd at HEAD, device smoke on one APK 19 phone, run 60-publish-apk.command and type PUBLISH (APK 21 / 1.2.7 to the debug channel, minSupportedVersionCode 21)
