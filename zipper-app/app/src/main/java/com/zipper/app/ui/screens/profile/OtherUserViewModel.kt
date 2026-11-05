@@ -58,6 +58,11 @@ data class OtherUserUiState(
     val navigateToCall: String? = null,   // non-null = callId to navigate to
     /** Spec §11: the server's roll on the last lucky gift sent from this profile, for the celebration. */
     val luckyWin: GiftResult.LuckyWin? = null,
+    /**
+     * WP2 (5 Nov 2026): whether a call to them would ring right now — "Calls off" while they broadcast or host a party
+     * with calls switched off, "Busy" while they are on another call. Every Call button for this person reads it.
+     */
+    val callAvailability: com.zipper.app.util.CallAvailability.Result = com.zipper.app.util.CallAvailability.AVAILABLE,
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -73,6 +78,7 @@ class OtherUserViewModel @Inject constructor(
     private val discover: DiscoverRepository,
     private val economyConfig: EconomyConfigRepository,
     private val liveRepo: com.zipper.app.data.repository.LiveRepository,
+    private val callAvailabilityRepo: com.zipper.app.data.repository.CallAvailabilityRepository,
 ) : ViewModel() {
 
     val targetUid: String = checkNotNull(savedStateHandle["uid"])
@@ -96,6 +102,23 @@ class OtherUserViewModel @Inject constructor(
         checkIsLiked()
         attachGiftsReceivedListener()
         loadGiftCatalogue()
+        observeCallAvailability()
+    }
+
+    /** WP2: the Call buttons follow this person's calls switch (live / party) and whether they are on a call. */
+    private fun observeCallAvailability() {
+        viewModelScope.launch {
+            callAvailabilityRepo.observe(targetUid).collect { a -> _uiState.update { it.copy(callAvailability = a) } }
+        }
+    }
+
+    /**
+     * A Call button was tapped. Off or busy: say so and ring nobody. Otherwise [onAvailable] (the price confirmation,
+     * or the call itself when it is free) — and `startCall` still has the last word.
+     */
+    fun onCallTapped(onAvailable: () -> Unit) {
+        val a = _uiState.value.callAvailability
+        if (a.canCall) onAvailable() else _uiState.update { it.copy(toastMessage = a.message) }
     }
 
     /** The user tapped "Try again" on a catalogue that failed to load. */

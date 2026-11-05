@@ -307,7 +307,7 @@ export function nextStrikes(prev: { count?: unknown; windowStart?: unknown } | u
   return { count, windowStart: fresh ? nowMs : start, muted: count >= config.muteAfterStrikes }
 }
 
-type ChatPlace = { kind: 'live' | 'party' | 'dm'; roomId: string; field: 'message' | 'text'; senderField: 'uid' | 'senderUid' }
+type ChatPlace = { kind: 'live' | 'party' | 'dm' | 'call'; roomId: string; field: 'message' | 'text'; senderField: 'uid' | 'senderUid' }
 
 async function screenMessage(snap: functions.firestore.QueryDocumentSnapshot, place: ChatPlace): Promise<void> {
   const data = snap.data()
@@ -341,7 +341,8 @@ async function screenMessage(snap: functions.firestore.QueryDocumentSnapshot, pl
   }
   await db().collection('safetyFlags').add({
     kind: `${place.kind}_chat`, level: 'words', roomId: place.roomId, uid: sender, words: hits.slice(0, 10),
-    strikes: strikes.count, muted: place.kind !== 'dm', status: 'open',
+    // Only a room has a chat to silence somebody in; a direct message or a call's chat is masked and flagged.
+    strikes: strikes.count, muted: place.kind === 'live' || place.kind === 'party', status: 'open',
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   })
 }
@@ -357,3 +358,8 @@ export const screenPartyMessage = functions.region('asia-south1').firestore
 export const screenDirectMessage = functions.region('asia-south1').firestore
   .document('conversations/{convoId}/messages/{messageId}')
   .onCreate((snap, ctx) => screenMessage(snap, { kind: 'dm', roomId: ctx.params.convoId, field: 'text', senderField: 'senderUid' }))
+
+/** WP2 (5 Nov 2026): the in-call chat (`calls/{callId}/messages`, `message` + `senderUid`) gets the same word screen. */
+export const screenCallMessage = functions.region('asia-south1').firestore
+  .document('calls/{callId}/messages/{messageId}')
+  .onCreate((snap, ctx) => screenMessage(snap, { kind: 'call', roomId: ctx.params.callId, field: 'message', senderField: 'senderUid' }))

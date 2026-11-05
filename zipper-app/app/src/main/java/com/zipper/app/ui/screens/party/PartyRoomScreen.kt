@@ -511,6 +511,8 @@ fun PartyRoomScreen(
                     onRequests = { showRequests = true },
                     onMenu = { showRoomMenu = true },
                     onClose = { showExit = true },
+                    // WP2 (Owner): the room's owner — host or not — turns incoming calls on and off from the header.
+                    onToggleCalls = if (state.isOwner) ({ viewModel.saveSettings(blockCalls = !room.ownerBlocksCalls) }) else null,
                 )
 
                 // Capped, and scrolling inside the cap. Without a ceiling the seat
@@ -855,6 +857,8 @@ private fun RoomHeader(
     onRequests: () -> Unit,
     onMenu: () -> Unit,
     onClose: () -> Unit,
+    /** WP2: the owner's calls switch (the same one as Settings → "No calls while I'm in this room"); null for others. */
+    onToggleCalls: (() -> Unit)? = null,
 ) {
     val c = ZipperTheme.colors
     val room = state.room ?: return
@@ -905,6 +909,15 @@ private fun RoomHeader(
         if (state.canModerate && state.seatRequests.isNotEmpty()) {
             Box(Modifier.clickableNoRipple(onRequests)) {
                 GlassChip(Icons.Outlined.Groups, state.seatRequests.size.toString())
+            }
+        }
+        // WP2: "Calls on" / "Calls off" for the owner, one tap — startCall refuses calls to them while it is off.
+        if (onToggleCalls != null) {
+            Box(Modifier.clickableNoRipple { if (!state.savingSettings) onToggleCalls() }) {
+                GlassChip(
+                    if (room.ownerBlocksCalls) Icons.Default.PhoneDisabled else Icons.Default.Phone,
+                    if (room.ownerBlocksCalls) "Calls off" else "Calls on",
+                )
             }
         }
         // The presence collection, never `room.listenerCount`: this chip opens the

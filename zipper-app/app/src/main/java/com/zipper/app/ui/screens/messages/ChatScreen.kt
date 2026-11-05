@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.AlertDialog
@@ -165,11 +166,16 @@ fun ChatScreen(
                     }
                 }
                 // O5b: call them from the chat. Not offered to a person this viewer blocked (the server refuses it too).
+                // WP2: it follows their calls switch — "Calls off" while they broadcast or host a party with calls off,
+                // "Busy" on another call — and says why on a tap instead of ringing.
                 if (!peerState.isBlocked) {
+                    val callable = peerState.callAvailability.canCall
                     IconButtonCircle(
-                        Icons.Default.Videocam, "Call $name",
-                        { if (peerState.callCostDiamonds > 0L) showCallConfirm = true else peer.initiateCall() },
+                        if (callable) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                        if (callable) "Call $name" else "$name: ${peerState.callAvailability.label}",
+                        { peer.onCallTapped { if (peerState.callCostDiamonds > 0L) showCallConfirm = true else peer.initiateCall() } },
                         background = Color.Transparent,
+                        tint = if (callable) c.textPrimary else c.textMuted,
                     )
                 }
                 Box {
@@ -273,6 +279,14 @@ fun ChatScreen(
                         background = Color.Transparent, tint = c.textSecondary, enabled = !busy)
                     IconButtonCircle(Icons.Default.CardGiftcard, "Send a gift", { showGifts = true },
                         background = Color.Transparent, tint = c.currencyDiamond)
+                    // WP2 (Owner): a call button beside the gift and photo buttons, following the same switch as the top bar.
+                    val canRing = peerState.callAvailability.canCall
+                    IconButtonCircle(
+                        if (canRing) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                        if (canRing) "Call $name" else "$name: ${peerState.callAvailability.label}",
+                        { peer.onCallTapped { if (peerState.callCostDiamonds > 0L) showCallConfirm = true else peer.initiateCall() } },
+                        background = Color.Transparent, tint = if (canRing) c.statusSuccess else c.textMuted,
+                    )
                     TextComposer(
                         input = viewModel.input, onInput = viewModel::onInput, onSend = viewModel::sendMessage,
                         onVoice = { if (!busy) startVoice() }, modifier = Modifier.weight(1f),

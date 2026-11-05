@@ -85,6 +85,8 @@ fun VideoCallScreen(
     isOutgoing: Boolean,
     onCallEnded: () -> Unit,
     onRecharge: () -> Unit = {},
+    /** WP2: a reseller's chat, opened from the in-call Buy diamonds sheet — the call keeps running underneath. */
+    onOpenChat: (uid: String) -> Unit = {},
     viewModel: VideoCallViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -94,6 +96,14 @@ fun VideoCallScreen(
     val chatState = rememberLazyListState()
     val snackbar = remember { SnackbarHostState() }
     var showGifts by remember { mutableStateOf(false) }
+    // WP2: the menu (both sides), Buy diamonds (the paying side), report and block from the menu.
+    var showMenu by remember { mutableStateOf(false) }
+    var showBuy by remember { mutableStateOf(false) }
+    var showReport by remember { mutableStateOf(false) }
+    var confirmBlock by remember { mutableStateOf(false) }
+    val controls = com.zipper.app.util.CallControls.visible(
+        state.myUid, state.callerUid, state.receiverUid, state.earner, state.callLoaded,
+    )
 
     // ── PIP ────────────────────────────────────────────────────────────────
     var isInPip by remember { mutableStateOf(false) }
@@ -123,6 +133,12 @@ fun VideoCallScreen(
     // factory ran before the engine existed and left the self-view black.
     val localSurface = remember { SurfaceView(context).apply { setZOrderMediaOverlay(true) } }
     LaunchedEffect(Unit) { viewModel.initAgora(context); AgoraManager.setupLocalVideo(localSurface) }
+    // WP2: the preview is taken off screen while my camera is off; it is bound again when the camera comes back.
+    var cameraWasOff by remember { mutableStateOf(false) }
+    LaunchedEffect(state.isCameraOn) {
+        if (!state.isCameraOn) cameraWasOff = true
+        else if (cameraWasOff) AgoraManager.setupLocalVideo(localSurface)
+    }
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) chatState.animateScrollToItem(state.messages.size - 1)
     }
@@ -213,7 +229,13 @@ fun VideoCallScreen(
                 .border(1.dp, c.glassHigh, RoundedCornerShape(Radius.lg))
                 .background(c.bgRaised),
         ) {
-            AndroidView(factory = { localSurface }, modifier = Modifier.fillMaxSize())
+            if (state.isCameraOn) {
+                AndroidView(factory = { localSurface }, modifier = Modifier.fillMaxSize())
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.VideocamOff, "Your camera is off", tint = c.textMuted, modifier = Modifier.size(24.dp))
+                }
+            }
             Box(
                 Modifier.align(Alignment.BottomStart).padding(6.dp)
                     .background(c.scrimMedium, CircleShape).padding(horizontal = 8.dp, vertical = 2.dp)
@@ -263,7 +285,8 @@ fun VideoCallScreen(
                 }
                 Spacer(Modifier.weight(1f))
                 if (state.isPayer) {
-                    CurrencyPill(Currency.Diamond, state.myDiamonds, onClick = onRecharge)
+                    // WP2: buying more never leaves the call.
+                    CurrencyPill(Currency.Diamond, state.myDiamonds, onClick = { showBuy = true })
                 } else {
                     CurrencyPill(Currency.Bean, state.beansEarned)
                 }
@@ -271,7 +294,7 @@ fun VideoCallScreen(
 
             // Cost bar (caller) / earnings bar (host)
             if (state.status == CallStatus.CONNECTED) {
-                CostBar(state, state.isPayer, onRecharge)
+                CostBar(state, state.isPayer) { showBuy = true }
             }
         }
 
@@ -334,30 +357,33 @@ fun VideoCallScreen(
                         modifier = Modifier.size(20.dp).clickableNoRipple { viewModel.sendMessage() },
                     )
                 }
-                if (state.isPayer) {
-                    Box(
-                        Modifier.size(48.dp)
-                            .background(Brush.linearGradient(listOf(Color(0xFFFFE08A), Color(0xFFFFB627), Color(0xFFE89806))), CircleShape)
-                            .clickableNoRipple { showGifts = true },
-                        contentAlignment = Alignment.Center,
-                    ) { Icon(painterResource(R.drawable.ic_gift), "Gift", tint = Color(0xFF0E0F21), modifier = Modifier.size(22.dp)) }
-                }
             }
 
-            // Controls
+            // Controls (WP2, the Owner's layout): a menu for both sides — flip, microphone, speaker, camera, minimise,
+            // report, block; End for both; and for the side that pays, Gift and Buy diamonds. The side that earns has
+            // End and the menu only. Who pays is the server's (`earner` on the call), not who dialled.
             Row(
                 Modifier.fillMaxWidth().padding(top = Space.xs),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.Bottom,
             ) {
-                ControlButton(Icons.Default.FlipCameraAndroid, "Flip", viewModel::flipCamera)
                 ControlButton(
-                    if (state.isMicOn) Icons.Default.Mic else Icons.Default.MicOff,
-                    if (state.isMicOn) "Mute" else "Unmute",
-                    viewModel::toggleMic,
+                    Icons.Default.MoreVert, "More", { showMenu = true },
+                    // The microphone's state is still visible from the bar while the menu is closed.
                     background = if (state.isMicOn) c.glassMid else c.statusWarning,
                     tint = if (state.isMicOn) c.textPrimary else Color(0xFF0E0F21),
                 )
+                if (com.zipper.app.util.CallControls.Control.GIFT in controls) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Box(
+                            Modifier.size(48.dp)
+                                .background(Brush.linearGradient(listOf(Color(0xFFFFE08A), Color(0xFFFFB627), Color(0xFFE89806))), CircleShape)
+                                .clickableNoRipple { showGifts = true },
+                            contentAlignment = Alignment.Center,
+                        ) { Icon(painterResource(R.drawable.ic_gift), "Gift", tint = Color(0xFF0E0F21), modifier = Modifier.size(22.dp)) }
+                        Text("Gift", style = ZipperTheme.type.caption, color = c.textPrimary)
+                    }
+                }
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Box(
                         Modifier.size(64.dp).background(c.statusDanger, CircleShape).clickableNoRipple { viewModel.endCall() },
@@ -365,7 +391,17 @@ fun VideoCallScreen(
                     ) { Icon(painterResource(R.drawable.ic_call_end), "End call", tint = Color.White, modifier = Modifier.size(30.dp)) }
                     Text("End", style = ZipperTheme.type.caption, color = c.textPrimary)
                 }
-                ControlButton(Icons.Default.PictureInPicture, "PIP", { enterPip() })
+                if (com.zipper.app.util.CallControls.Control.BUY_DIAMONDS in controls) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Box(
+                            Modifier.size(48.dp).background(c.tintDiamondSubtle, CircleShape)
+                                .border(1.dp, c.currencyDiamond, CircleShape)
+                                .clickableNoRipple { showBuy = true },
+                            contentAlignment = Alignment.Center,
+                        ) { Icon(painterResource(R.drawable.ic_diamond), "Buy diamonds", tint = c.currencyDiamond, modifier = Modifier.size(22.dp)) }
+                        Text("Buy", style = ZipperTheme.type.caption, color = c.textPrimary)
+                    }
+                }
             }
         }
 
@@ -374,7 +410,7 @@ fun VideoCallScreen(
             visible = state.isPayer && state.lowBalanceWarning && state.status == CallStatus.CONNECTED,
             modifier = Modifier.align(Alignment.Center),
             enter = fadeIn(), exit = fadeOut(),
-        ) { LowBalanceCard(onRecharge) }
+        ) { LowBalanceCard { showBuy = true } }
 
         // Spec §11: the server's lucky roll on an in-call gift, celebrated for a few seconds.
         state.lastLuckyWin?.let { win ->
@@ -394,8 +430,65 @@ fun VideoCallScreen(
                 recipientPhotoUrl = state.otherPartyPhotoUrl,
                 sending = state.giftSending,
                 onSend = { gift, qty -> viewModel.sendGiftInCall(state.otherPartyUid, gift, qty); showGifts = false },
-                onRecharge = { showGifts = false; onRecharge() },
+                onRecharge = { showGifts = false; showBuy = true },
                 onDismiss = { showGifts = false },
+            )
+        }
+
+        // ── WP2: the menu, Buy diamonds, report, block ─────────────────────
+        if (showMenu) {
+            InCallMenuSheet(
+                otherName = state.otherPartyName,
+                isMicOn = state.isMicOn, isSpeakerOn = state.isSpeakerOn, isCameraOn = state.isCameraOn,
+                onFlip = viewModel::flipCamera,
+                onMic = viewModel::toggleMic,
+                onSpeaker = viewModel::toggleSpeaker,
+                onCamera = viewModel::toggleCamera,
+                onMinimise = { enterPip() },
+                onReport = { showReport = true },
+                onBlock = { confirmBlock = true },
+                onDismiss = { showMenu = false },
+            )
+        }
+        if (showBuy && state.isPayer) {
+            InCallDiamondSheet(
+                balance = state.myDiamonds,
+                sending = state.buySending,
+                notice = state.buyNotice,
+                noticeSellerUid = state.buySellerUid,
+                onRequest = { uid, name, photo, msg -> viewModel.requestDiamonds(uid, name, photo, msg) },
+                onOpenChat = { uid -> showBuy = false; viewModel.clearBuyNotice(); onOpenChat(uid) },
+                onDismiss = { showBuy = false; viewModel.clearBuyNotice() },
+            )
+        }
+        if (showReport) {
+            val reasons = listOf("Inappropriate content", "Nudity or sexual content", "Harassment or abuse", "Scam or fraud", "Underage", "Something else")
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showReport = false },
+                containerColor = c.bgElevated,
+                title = { Text("Report ${state.otherPartyName.ifBlank { "them" }}", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+                text = {
+                    Column {
+                        reasons.forEach { r ->
+                            Text(
+                                r, style = ZipperTheme.type.bodyM, color = c.textPrimary,
+                                modifier = Modifier.fillMaxWidth().clickableNoRipple { showReport = false; viewModel.reportOtherParty(r) }.padding(vertical = 10.dp),
+                            )
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { androidx.compose.material3.TextButton({ showReport = false }) { Text("Cancel", color = c.textSecondary) } },
+            )
+        }
+        if (confirmBlock) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { confirmBlock = false },
+                containerColor = c.bgElevated,
+                title = { Text("Block ${state.otherPartyName.ifBlank { "them" }}?", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+                text = { Text("The call ends now, and they can no longer call or message you. You can unblock them from Settings.", style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+                confirmButton = { androidx.compose.material3.TextButton({ confirmBlock = false; viewModel.blockOtherPartyAndEnd() }) { Text("Block and hang up", color = c.statusDanger) } },
+                dismissButton = { androidx.compose.material3.TextButton({ confirmBlock = false }) { Text("Cancel", color = c.textSecondary) } },
             )
         }
     }

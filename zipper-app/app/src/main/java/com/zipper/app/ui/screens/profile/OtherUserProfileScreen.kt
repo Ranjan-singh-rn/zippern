@@ -102,7 +102,8 @@ fun OtherUserProfileScreen(
                 onBack = onBack,
                 onMore = { showMore = true },
                 onLike = viewModel::toggleLike,
-                onCall = { if (state.callCostDiamonds > 0L) showCallConfirm = true else viewModel.initiateCall() },
+                // WP2: "Calls off" / "Busy" say why on a tap instead of ringing; startCall still decides.
+                onCall = { viewModel.onCallTapped { if (state.callCostDiamonds > 0L) showCallConfirm = true else viewModel.initiateCall() } },
                 onGift = { showGifts = true },
                 onMessage = { onMessage(user.uid) },
                 onJoinLive = { if (user.liveRoomId.isNotBlank()) onJoinLive(user.liveRoomId) },
@@ -296,8 +297,13 @@ private fun ProfileBody(
                 if (state.isLiked) "Liked" else "Like",
                 c.tintBrandSubtle, if (state.isLiked) c.brandPrimary else c.textPrimary, onLike,
             )
-            ActionDisc(Icons.Default.Videocam, "Call", c.tintSuccessSubtle, c.statusSuccess, onCall,
-                enabled = !state.isBlocked && !user.isInCall,
+            // WP2: the disc follows their calls switch (live / party) and whether they are on another call.
+            val callable = state.callAvailability.canCall
+            ActionDisc(
+                if (callable) Icons.Default.Videocam else Icons.Default.VideocamOff,
+                state.callAvailability.label,
+                if (callable) c.tintSuccessSubtle else c.glassMid, if (callable) c.statusSuccess else c.textMuted, onCall,
+                enabled = !state.isBlocked,
                 sub = {
                     if (state.callCostDiamonds > 0) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {

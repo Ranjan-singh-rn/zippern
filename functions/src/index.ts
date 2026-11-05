@@ -4901,7 +4901,11 @@ export { monitorRoomToken, myMonitorRooms } from './monitoring'
 
 // O13 (5 Nov 2026): safety — the live wall's stills (and the AI check, OFF until the Owner turns it on), and the word
 // screen on live, party and direct chat (mask, strike, mute after the Owner's count).
-export { reportLiveSnapshot, screenLiveComment, screenPartyMessage, screenDirectMessage } from './safety'
+export { reportLiveSnapshot, screenLiveComment, screenPartyMessage, screenDirectMessage, screenCallMessage } from './safety'
+
+// ── WP2 (Owner, 5 Nov 2026): calls — "Busy" on every Call button ───────────────
+// `users/{uid}.isInCall` from the call documents (connected / ending), outside the money path.
+export { syncCallPresence } from './callPresence'
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC SELLER DIRECTORY

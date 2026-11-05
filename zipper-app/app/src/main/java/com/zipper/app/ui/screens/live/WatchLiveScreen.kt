@@ -290,7 +290,7 @@ fun WatchLiveScreen(
             // off for this live. The server enforces the switch either way (`startCall`).
             val callsOff = state.room?.hostBlocksCalls == true
             RailButton(
-                Icons.Default.Videocam, if (callsOff) "Calls off" else "Call",
+                if (callsOff) Icons.Default.VideocamOff else Icons.Default.Videocam, if (callsOff) "Calls off" else "Call",
                 tint = if (callsOff) c.textMuted else c.statusSuccess, enabled = !callsOff,
             ) {
                 if (callsOff) scope.launch { snackbar.showSnackbar("${state.room?.hostName ?: "The host"} is not taking calls during this live.") }

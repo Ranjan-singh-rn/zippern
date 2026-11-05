@@ -516,6 +516,8 @@ fun ZipperNavGraph(
                     navController.popBackStack()
                 },
                 onRecharge = { navController.navigate(Screen.DiamondShop.route) },
+                // WP2: a reseller's chat from the in-call Buy diamonds sheet; the call stays on the back stack and runs on.
+                onOpenChat = { uid -> navController.navigate(Screen.Chat.createRoute(uid)) },
             )
         }
 

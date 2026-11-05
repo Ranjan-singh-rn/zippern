@@ -6,17 +6,21 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.ListenerRegistration
 import com.zipper.app.data.model.ActiveCall
 import com.zipper.app.data.model.CallChatMessage
 import com.zipper.app.data.repository.AgoraTokenRepository
 import com.zipper.app.data.repository.CallRepository
+import com.zipper.app.data.repository.ChatRepository
 import com.zipper.app.data.repository.GiftItem
 import com.zipper.app.data.repository.GiftRepository
+import com.zipper.app.data.repository.LiveRepository
 import com.zipper.app.data.repository.MoneyFunctions
 import com.zipper.app.data.repository.ProfileRepository
 import com.zipper.app.data.repository.ProfileResult
 import com.zipper.app.ui.screens.live.AgoraManager
 import com.zipper.app.util.CallBilling
+import com.zipper.app.util.SafetyWords
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +83,22 @@ data class VideoCallUiState(
     val lastGiftEvent: GiftEvent? = null,       // floats over video for a few seconds
     /** The sender's lucky reward on the last in-call lucky gift, for the celebration. */
     val lastLuckyWin: com.zipper.app.data.repository.GiftResult.LuckyWin? = null,
+    // ── WP2 (Owner, 5 Nov 2026): the call screen's buttons by side, the menu, buying diamonds during the call ──
+    /** The call document has been read: who pays is known, so the paying side's buttons may show. */
+    val callLoaded: Boolean = false,
+    val myUid: String = "",
+    val callerUid: String = "",
+    val receiverUid: String = "",
+    /** "caller" | "receiver" — who earns, as the server wrote it on the call (`rateFor`). */
+    val earner: String = "receiver",
+    val isSpeakerOn: Boolean = true,
+    val isCameraOn: Boolean = true,
+    /** A recharge request is on its way to a reseller (the in-call Buy diamonds sheet). */
+    val buySending: Boolean = false,
+    /** What became of the last recharge request — shown in the sheet. */
+    val buyNotice: String? = null,
+    /** The reseller the last request went to, so the sheet can offer their chat. */
+    val buySellerUid: String? = null,
 )
 
 data class GiftEvent(val senderName: String, val senderPhotoUrl: String?, val giftName: String, val quantity: Int, val at: Long = System.currentTimeMillis())
@@ -92,6 +112,8 @@ class VideoCallViewModel @Inject constructor(
     private val agoraTokenRepo: AgoraTokenRepository,
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
+    private val liveRepo: LiveRepository,
+    private val chatRepo: ChatRepository,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(VideoCallUiState())
@@ -107,6 +129,12 @@ class VideoCallViewModel @Inject constructor(
 
     private var callerUid: String = ""
     private var receiverUid: String = ""
+
+    /** WP2: the payer's balance, live (see [observeMyDiamonds]). */
+    private var meListener: ListenerRegistration? = null
+
+    /** WP2: the channel is joined once per call — coming back from the Diamond Shop or a chat must not join again. */
+    private var joinRequested = false
 
     /**
      * What the server last said about the billing, and how far this device's
@@ -125,10 +153,15 @@ class VideoCallViewModel @Inject constructor(
          * actually experiences, so it should fire first.
          */
         const val RING_TIMEOUT_MS = 45_000L
+
+        /** The in-call chat's longest message — the same limit firestore.rules enforces on `calls/{id}/messages`. */
+        const val CALL_CHAT_MAX = 300
     }
 
     init {
-        _state.update { it.copy(callId = callId, isOutgoing = isOutgoing) }
+        _state.update { it.copy(callId = callId, isOutgoing = isOutgoing, myUid = auth.currentUser?.uid ?: "") }
+        // O13: the in-call chat is checked against the same word list as every other chat.
+        viewModelScope.launch { SafetyWords.ensureLoaded(firestore) }
         observeCall()
         observeChat()
         startRingTimeout()
@@ -216,6 +249,10 @@ class VideoCallViewModel @Inject constructor(
                 _state.update {
                     it.copy(
                         isPayer             = iPay,
+                        callLoaded          = true,
+                        callerUid           = call.callerId,
+                        receiverUid         = call.receiverId,
+                        earner              = call.earner,
                         otherPartyUid       = otherUid,
                         otherPartyName      = otherName,
                         otherPartyPhotoUrl  = otherPhoto,
@@ -239,10 +276,8 @@ class VideoCallViewModel @Inject constructor(
                     checkLiked(otherUid)
                 }
 
-                // Load my current diamond balance (caller only)
-                if (iPay && _state.value.myDiamonds == 0L) {
-                    loadMyDiamonds()
-                }
+                // The payer's balance, live (WP2): a recharge confirmed during the call shows at once.
+                if (iPay) observeMyDiamonds()
             }
         }
     }
@@ -442,6 +477,13 @@ class VideoCallViewModel @Inject constructor(
         // engine warns ahead and AgoraManager renews through the one
         // repository that mints tokens.
         AgoraManager.tokenRenewer = { channel -> agoraTokenRepo.renewToken(channel) }
+        /*
+         * WP2: this screen can be left and come back to while the call runs — the Diamond Shop or a reseller's chat
+         * opened from the call. The call never left the channel, so coming back re-binds the video and nothing else:
+         * a second join would cost a token and, worse, a dropped connection the other side reads as a hang-up.
+         */
+        if (joinRequested || AgoraManager.isInChannel(callId)) return
+        joinRequested = true
         // Fetch a server-generated RTC token before joining — production safe.
         // A-7: joined with the uid the token was signed for, never 0.
         viewModelScope.launch {
@@ -467,6 +509,82 @@ class VideoCallViewModel @Inject constructor(
         _state.update { it.copy(isCameraFront = !it.isCameraFront) }
     }
 
+    /** WP2 menu: the call through the loudspeaker or the earpiece. */
+    fun toggleSpeaker() {
+        val on = !_state.value.isSpeakerOn
+        AgoraManager.setSpeakerphone(on)
+        _state.update { it.copy(isSpeakerOn = on) }
+    }
+
+    /** WP2 menu: stop / start sending my camera. The call (and its billing) carries on either way. */
+    fun toggleCamera() {
+        val on = !_state.value.isCameraOn
+        AgoraManager.muteLocalVideo(!on)
+        _state.update { it.copy(isCameraOn = on) }
+    }
+
+    /** WP2 menu: report the other person — the same report the profile and the chat send. */
+    fun reportOtherParty(reason: String) {
+        val other = _state.value.otherPartyUid
+        if (other.isBlank()) return
+        viewModelScope.launch {
+            try {
+                liveRepo.reportUser(other, reason)
+                _state.update { it.copy(error = "Thanks — our team will review this.") }
+            } catch (_: Exception) {
+                _state.update { it.copy(error = "Couldn't send the report. Try again.") }
+            }
+        }
+    }
+
+    /**
+     * WP2 menu: block the other person and hang up. Blocking is the same as from their profile (they can no longer
+     * call or message); the call is then ended the ordinary way, so it is settled to the minute like any other.
+     */
+    fun blockOtherPartyAndEnd() {
+        val other = _state.value.otherPartyUid
+        if (other.isBlank()) return
+        viewModelScope.launch {
+            profileRepo.blockUser(other, _state.value.otherPartyName, _state.value.otherPartyPhotoUrl)
+            endCall()
+        }
+    }
+
+    /**
+     * WP2 — "buy diamonds while the call is ongoing". Diamonds are bought from a verified reseller (payment is off the
+     * platform; the reseller confirms and the diamonds are credited by the server), so the request goes to the reseller
+     * as a chat message from this screen, without leaving the call. The balance on the call screen is live, so the
+     * diamonds show the moment they are added.
+     */
+    fun requestDiamonds(sellerUid: String, sellerName: String, sellerPhotoUrl: String, message: String) {
+        val me = auth.currentUser ?: return
+        if (_state.value.buySending || sellerUid.isBlank() || message.isBlank()) return
+        _state.update { it.copy(buySending = true, buyNotice = null) }
+        viewModelScope.launch {
+            try {
+                val snap = firestore.collection("users").document(me.uid).get().await()
+                chatRepo.sendMessage(
+                    myUid = me.uid,
+                    myName = snap.getString("name") ?: me.displayName ?: "",
+                    myPhotoUrl = snap.getString("photoUrl") ?: "",
+                    otherUid = sellerUid, otherName = sellerName, otherPhotoUrl = sellerPhotoUrl,
+                    text = message,
+                )
+                _state.update {
+                    it.copy(
+                        buySending = false, buySellerUid = sellerUid,
+                        buyNotice = "Sent to ${sellerName.ifBlank { "the reseller" }}. They will reply in Messages with how " +
+                            "to pay; your diamonds show here as soon as they add them. Your call keeps running.",
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(buySending = false, buyNotice = "Couldn't send that — check your connection and try again.") }
+            }
+        }
+    }
+
+    fun clearBuyNotice() { _state.update { it.copy(buyNotice = null, buySellerUid = null) } }
+
     // ── Chat ──────────────────────────────────────────────────────────────────
 
     fun onMessageInput(v: String) { _state.update { it.copy(messageInput = v) } }
@@ -474,10 +592,22 @@ class VideoCallViewModel @Inject constructor(
     fun sendMessage() {
         val msg = _state.value.messageInput.trim()
         if (msg.isBlank()) return
+        // O13 / WP2: the in-call chat keeps to the same word list as every other chat, and to the rules' 300 characters.
+        if (!SafetyWords.allowed(msg)) {
+            _state.update { it.copy(error = SafetyWords.HELD_NOTICE) }
+            return
+        }
+        if (msg.length > CALL_CHAT_MAX) {
+            _state.update { it.copy(error = "Keep a message under $CALL_CHAT_MAX characters.") }
+            return
+        }
         _state.update { it.copy(messageInput = "") }
         viewModelScope.launch {
             try { callRepo.sendChatMessage(callId, msg) }
-            catch (_: Exception) {}
+            catch (_: Exception) {
+                // Put it back so nothing typed is lost (the call may just have ended, or the network dropped).
+                _state.update { it.copy(messageInput = if (it.messageInput.isEmpty()) msg else it.messageInput, error = "Message not sent.") }
+            }
         }
     }
 
@@ -511,6 +641,20 @@ class VideoCallViewModel @Inject constructor(
                     .collection("liked").document(otherUid).get().await()
                 _state.update { it.copy(isOtherPartyLiked = snap.exists()) }
             } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * WP2: the payer's balance, live — a recharge a reseller confirms while the call runs shows at once, and "minutes
+     * left" follows it. One listener for the life of the call screen.
+     */
+    private fun observeMyDiamonds() {
+        if (meListener != null) return
+        val uid = auth.currentUser?.uid ?: return
+        meListener = firestore.collection("users").document(uid).addSnapshotListener { snap, _ ->
+            val diamonds = snap?.getLong("diamonds") ?: return@addSnapshotListener
+            _state.update { it.copy(myDiamonds = diamonds) }
+            refreshDisplay()
         }
     }
 
@@ -590,6 +734,8 @@ class VideoCallViewModel @Inject constructor(
             }
         }
         super.onCleared()
+        meListener?.remove()
+        meListener = null
         displayJob?.cancel()
         tickJob?.cancel()
         ringTimeoutJob?.cancel()
