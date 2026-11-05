@@ -212,6 +212,9 @@ data class PartyRoom(
                         url = m["url"] as? String ?: "",
                         playing = m["playing"] as? Boolean ?: false,
                         by = m["by"] as? String ?: "",
+                        source = m["source"] as? String ?: "",
+                        durationMs = (m["durationMs"] as? Number)?.toLong() ?: 0L,
+                        startedAtMs = (m["startedAtMs"] as? Number)?.toLong() ?: 0L,
                     )
                 }?.takeIf { it.trackId.isNotBlank() },
             )
@@ -322,7 +325,10 @@ data class PartySeatInvite(
 }
 
 
-/** B7: room music — a track from Zipper's licensed catalogue (`musicTracks`), played by [by]'s phone into the room. */
+/**
+ * B7: room music, played by [by]'s phone into the room — a track from Zipper's catalogue (`musicTracks`, [source]
+ * "catalogue"), or O14 (5 Nov 2026) a song from that phone itself ([source] "device": only its name is here, no URL).
+ */
 data class PartyMusic(
     val trackId: String,
     val title: String,
@@ -330,4 +336,10 @@ data class PartyMusic(
     val url: String,
     val playing: Boolean,
     val by: String,
-)
+    val source: String = "",
+    val durationMs: Long = 0L,
+    /** The server's clock when this song (or this pause/resume) was set. */
+    val startedAtMs: Long = 0L,
+) {
+    val fromDevice: Boolean get() = source == "device"
+}

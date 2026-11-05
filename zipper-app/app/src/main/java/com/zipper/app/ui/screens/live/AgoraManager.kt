@@ -115,6 +115,14 @@ object AgoraManager {
     var onAudioVolume: ((Array<out IRtcEngineEventHandler.AudioVolumeInfo>) -> Unit)? = null
 
     /**
+     * O14 (5 Nov 2026): the party music player's ears — Agora's audio-mixing reports (state, reason), e.g. 710
+     * playing, 713 + 723 "the song ended", 714 + 701 "could not open the file". Set by the party room while it plays
+     * music from this phone; cleared when it leaves. See `DeviceMusic.mixEventOf`.
+     */
+    @Volatile
+    var onMusicState: ((state: Int, reason: Int) -> Unit)? = null
+
+    /**
      * True while video is switched off for an audio-only party.
      *
      * The engine is one process-wide object shared by the call screen, Go Live,
@@ -209,6 +217,10 @@ object AgoraManager {
                     /* O13: a still of what this phone publishes, for the live wall — see [takeLocalSnapshot]. */
                     override fun onSnapshotTaken(uid: Int, filePath: String?, width: Int, height: Int, errCode: Int) {
                         filePath?.let { snapshotWaiters.remove(it)?.complete(errCode == 0) }
+                    }
+                    /* O14: the music player — a song started, paused, ended, or could not be opened. */
+                    override fun onAudioMixingStateChanged(state: Int, reason: Int) {
+                        onMusicState?.invoke(state, reason)
                     }
                 }
             }
@@ -508,6 +520,18 @@ object AgoraManager {
     fun stopMusic() { engine?.stopAudioMixing() }
     /** 0–100: how loud the music is in the room, against the voices. */
     fun setMusicVolume(volume: Int) { engine?.adjustAudioMixingVolume(volume.coerceIn(0, 100)) }
+
+    /**
+     * O14: play one song from this phone into the channel, ONCE (the player decides what comes next). [path] is a
+     * content:// URI — Agora 4.x opens those itself — or, after the cache fallback, a file path. 0 on success, an
+     * Agora error code otherwise; a file that cannot be opened is reported later through [onMusicState] (714/701).
+     */
+    fun startMusicOnce(path: String): Int = engine?.startAudioMixing(path, false, 1) ?: -1
+    /** Where the song is, in ms; negative when nothing is playing. */
+    fun musicPositionMs(): Int = engine?.getAudioMixingCurrentPosition() ?: -1
+    /** The song's length, in ms; negative when nothing is playing. */
+    fun musicDurationMs(): Int = engine?.getAudioMixingDuration() ?: -1
+    fun seekMusic(positionMs: Int) { engine?.setAudioMixingPosition(positionMs.coerceAtLeast(0)) }
 
     fun muteLocalAudio(mute: Boolean) { engine?.muteLocalAudioStream(mute) }
 

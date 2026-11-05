@@ -805,6 +805,21 @@ class PartyRepository @Inject constructor(
             if (trackId != null) { put("trackId", trackId); put("playing", playing) }
         }) { m -> m["playing"] as? Boolean ?: false }
 
+    /**
+     * O14 (5 Nov 2026): owner or admin, ON A SEAT — a song from this phone is playing ([playing] true) or paused.
+     * Only its name goes to the server (title/artist, which it caps and word-screens; the masked title comes back);
+     * the audio goes out through Agora with this phone's microphone. Stop with [setMusic] (trackId null).
+     */
+    suspend fun setDeviceMusic(roomId: String, title: String, artist: String, durationMs: Long, playing: Boolean): Result<String> =
+        call("setPartyMusic", buildMap {
+            put("roomId", roomId)
+            put("source", "device")
+            put("title", title)
+            put("artist", artist)
+            put("durationMs", durationMs)
+            put("playing", playing)
+        }) { m -> m["title"] as? String ?: title }
+
     data class AccessEntry(val uid: String, val name: String, val result: String, val atMs: Long, val role: String)
 
     /** The room's access log, newest first — the owner's (and staff's) to read. Empty on any error. */

@@ -308,6 +308,7 @@ class PartyRoomViewModel @Inject constructor(
                 // the room for the first time is exactly when this must fire.
                 val myUid = auth.currentUser?.uid.orEmpty()
                 _state.update { it.copy(room = room, myUid = myUid, chatMuted = myUid.isNotBlank() && room.chatMutedUsers.contains(myUid)) }
+                watchRoomMusic(room)
                 if (myUid.isNotBlank() && room.kickedUsers.contains(myUid)) onKicked()
                 if (!room.isActive) onRoomEnded()
             }
@@ -490,18 +491,41 @@ class PartyRoomViewModel @Inject constructor(
     /** B7: the room's access log (the owner's to read). */
     fun accessLogFlow() = repo.accessLogFlow(roomId)
 
-    // ── B7: room music ──────────────────────────────────────────────────────
+    // ── B7 / O14: room music ────────────────────────────────────────────────
     fun musicTracksFlow() = repo.musicTracksFlow()
     private var mixingTrackId: String? = null
 
+    /**
+     * O14 (Owner, 5 Nov 2026): the music player — "access from your device if some audios are there, grab them to
+     * play, like a music player". This phone's songs, the queue and the controls; the audio goes into the room through
+     * Agora audio mixing (it goes out with this phone's microphone, so the player is on a seat), and only the song's
+     * name goes to the server for everybody's "Now playing".
+     */
+    private val _music = MutableStateFlow(DeviceMusicState())
+    val music: StateFlow<DeviceMusicState> = _music.asStateFlow()
+
+    /** The application context (never an Activity), for the library and the cache fallback. */
+    @Volatile private var musicContext: android.content.Context? = null
+    /** A copy of the current song in the app cache, when Agora could not open its content:// URI itself. */
+    private var musicCacheFile: java.io.File? = null
+    /** The cache fallback has been tried for the current song: a second failure is reported, not retried. */
+    private var musicFallbackTried = false
+    /** When this phone last started a song — room snapshots older than this are not "somebody stopped it". */
+    @Volatile private var musicStartedAtMs = 0L
+    private var musicJob: Job? = null
+
     /** Owner/admin: play a catalogue track into the room — this phone mixes it into what it publishes. */
     fun playMusic(track: PartyRepository.MusicTrack) {
+        stopDeviceSongLocally()
         viewModelScope.launch {
             when (val r = repo.setMusic(roomId, track.id)) {
                 is PartyRepository.Result.Ok -> {
                     AgoraManager.stopMusic()
-                    if (AgoraManager.startMusic(track.url) == 0) mixingTrackId = track.id
-                    else _state.update { it.copy(error = "Could not play that track on this phone.") }
+                    if (AgoraManager.startMusic(track.url) == 0) {
+                        mixingTrackId = track.id
+                        musicStartedAtMs = System.currentTimeMillis()
+                        AgoraManager.setMusicVolume(_music.value.volume)
+                    } else _state.update { it.copy(error = "Could not play that track on this phone.") }
                 }
                 is PartyRepository.Result.Failed -> _state.update { it.copy(error = r.userMessage) }
             }
@@ -509,12 +533,251 @@ class PartyRoomViewModel @Inject constructor(
     }
 
     fun pauseMusic(pause: Boolean) { if (pause) AgoraManager.pauseMusic() else AgoraManager.resumeMusic() }
-    fun musicVolume(v: Int) = AgoraManager.setMusicVolume(v)
+    fun musicVolume(v: Int) = setMusicVolumeLevel(v)
 
+    /** Stop the room's music — this phone's song, or (a moderator's Stop) whoever is playing. */
     fun stopMusic() {
+        stopDeviceSongLocally()
         AgoraManager.stopMusic()
         mixingTrackId = null
         viewModelScope.launch { repo.setMusic(roomId, null) }
+    }
+
+    /**
+     * The sheet checked ([asked] false) or asked for ([asked] true) access to the phone's music. Granted loads the
+     * library once; a check that finds no access leaves it Unknown, so the sheet still offers to ask.
+     */
+    fun onMusicAccess(context: android.content.Context, granted: Boolean, asked: Boolean) {
+        musicContext = context.applicationContext
+        _music.update {
+            it.copy(access = when {
+                granted -> MusicAccess.Granted
+                asked -> MusicAccess.Denied
+                else -> it.access
+            })
+        }
+        if (granted && !_music.value.loaded && !_music.value.loading) loadDeviceMusic()
+    }
+
+    /** Read (or re-read) the phone's songs. */
+    fun loadDeviceMusic() {
+        val ctx = musicContext ?: return
+        _music.update { it.copy(loading = true) }
+        viewModelScope.launch {
+            val songs = DeviceMusicLibrary.load(ctx)
+            _music.update { it.copy(library = songs, loading = false, loaded = true) }
+        }
+    }
+
+    fun setMusicQuery(q: String) { _music.update { it.copy(query = q.take(60)) } }
+
+    /** A file chosen with the system picker (no permission needed): put at the top of the list and played. */
+    fun addPickedSong(context: android.content.Context, uri: android.net.Uri) {
+        musicContext = context.applicationContext
+        val ctx = musicContext ?: return
+        viewModelScope.launch {
+            val song = DeviceMusicLibrary.fromPicked(ctx, uri)
+            if (song == null) {
+                _state.update { it.copy(error = "That file could not be read.") }
+                return@launch
+            }
+            _music.update { it.copy(query = "", picked = listOf(song) + it.picked.filter { p -> p.key != song.key }) }
+            val all = _music.value.all
+            playDevice(all, all.indexOfFirst { it.key == song.key }.coerceAtLeast(0))
+        }
+    }
+
+    /** Play [tracks] (what the list showed) from [index]. Needs a seat: the music goes out with the microphone. */
+    fun playDevice(tracks: List<DeviceTrack>, index: Int) {
+        if (tracks.isEmpty() || index !in tracks.indices) return
+        if (!_state.value.amSeated) {
+            _state.update { it.copy(error = "Take a seat to play music — it goes out with your microphone.") }
+            return
+        }
+        val q = MusicQueue.of(tracks.size, index, _music.value.shuffle)
+        _music.update { it.copy(queueTracks = tracks, queue = q) }
+        startCurrentSong()
+    }
+
+    fun toggleDevicePause() {
+        val m = _music.value
+        val song = m.current ?: return
+        if (m.busy) return
+        val pause = m.playing
+        if (pause) AgoraManager.pauseMusic() else AgoraManager.resumeMusic()
+        _music.update { it.copy(playing = !pause) }
+        // Everybody's header says "(paused)". The server re-screens the name; a refusal here changes nothing audible.
+        viewModelScope.launch {
+            repo.setDeviceMusic(roomId, song.title, song.artist, DeviceMusic.durationToSend(m.durationMs), playing = !pause)
+        }
+    }
+
+    fun nextDeviceSong() {
+        val q = _music.value.queue ?: return
+        _music.update { it.copy(queue = q.skip()) }
+        startCurrentSong()
+    }
+
+    /** More than a few seconds in, "previous" starts the song again; otherwise it goes back one. */
+    fun previousDeviceSong() {
+        val q = _music.value.queue ?: return
+        if (AgoraManager.musicPositionMs() > DeviceMusic.RESTART_AFTER_MS) {
+            AgoraManager.seekMusic(0)
+            return
+        }
+        _music.update { it.copy(queue = q.back()) }
+        startCurrentSong()
+    }
+
+    fun seekDeviceSong(positionMs: Long) {
+        if (_music.value.current != null) AgoraManager.seekMusic(positionMs.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt())
+    }
+
+    fun cycleMusicRepeat() {
+        _music.update {
+            it.copy(repeat = when (it.repeat) {
+                MusicRepeat.Off -> MusicRepeat.All
+                MusicRepeat.All -> MusicRepeat.One
+                MusicRepeat.One -> MusicRepeat.Off
+            })
+        }
+    }
+
+    fun toggleMusicShuffle() {
+        _music.update { m -> val on = !m.shuffle; m.copy(shuffle = on, queue = m.queue?.reshuffled(on)) }
+    }
+
+    /** 0–100: the music against the voices, for everyone in the room. */
+    fun setMusicVolumeLevel(v: Int) {
+        val vol = v.coerceIn(0, 100)
+        _music.update { it.copy(volume = vol) }
+        AgoraManager.setMusicVolume(vol)
+    }
+
+    /** Where the song is, for the seek bar (0 when nothing plays). */
+    fun musicPositionMs(): Long = AgoraManager.musicPositionMs().toLong().coerceAtLeast(0L)
+
+    /** The room's name for the song first (the server checks moderator + seat and screens it), then the audio. */
+    private fun startCurrentSong() {
+        val song = _music.value.current ?: return
+        musicJob?.cancel()
+        musicJob = viewModelScope.launch {
+            _music.update { it.copy(busy = true, playing = false, durationMs = song.durationMs) }
+            when (val r = repo.setDeviceMusic(roomId, song.title, song.artist, DeviceMusic.durationToSend(song.durationMs), playing = true)) {
+                is PartyRepository.Result.Failed -> {
+                    _music.update { it.copy(busy = false, queue = null, queueTracks = emptyList()) }
+                    _state.update { it.copy(error = r.userMessage) }
+                    return@launch
+                }
+                is PartyRepository.Result.Ok -> Unit
+            }
+            musicStartedAtMs = System.currentTimeMillis()
+            mixingTrackId = null
+            AgoraManager.onMusicState = { state, reason -> viewModelScope.launch { onMixState(state, reason) } }
+            AgoraManager.stopMusic()
+            dropMusicCache()
+            musicFallbackTried = false
+            val rc = AgoraManager.startMusicOnce(song.uri)
+            AgoraManager.setMusicVolume(_music.value.volume)
+            if (rc != 0 && !playFromCache(song)) failSong("This song could not be played on this phone.")
+            _music.update { it.copy(busy = false) }
+        }
+    }
+
+    /** Agora's report on this phone's song. Catalogue tracks (looped, no queue) are not touched here. */
+    private fun onMixState(state: Int, reason: Int) {
+        val m = _music.value
+        val song = m.current ?: return
+        when (DeviceMusic.mixEventOf(state, reason)) {
+            DeviceMusic.MixEvent.Playing -> {
+                val d = AgoraManager.musicDurationMs().toLong()
+                _music.update { it.copy(playing = true, busy = false, durationMs = if (d > 0L) d else it.durationMs) }
+                AgoraManager.setMusicVolume(m.volume)
+            }
+            DeviceMusic.MixEvent.Paused -> _music.update { it.copy(playing = false) }
+            DeviceMusic.MixEvent.Finished -> {
+                // A stop we caused by switching songs can be reported as an end; a real end is never this soon.
+                if (System.currentTimeMillis() - musicStartedAtMs < MUSIC_SWITCH_GRACE_MS) return
+                val next = m.queue?.afterFinished(m.repeat)
+                if (next == null) {
+                    stopDeviceSongLocally()
+                    if (musicIsMine()) viewModelScope.launch { repo.setMusic(roomId, null) }
+                } else {
+                    _music.update { it.copy(queue = next) }
+                    startCurrentSong()
+                }
+            }
+            DeviceMusic.MixEvent.CannotOpen -> viewModelScope.launch {
+                // Only if it is still this song's turn — the person may have moved on while the copy was made.
+                if (!playFromCache(song) && _music.value.current?.key == song.key) {
+                    failSong("This song could not be played on this phone.")
+                }
+            }
+            DeviceMusic.MixEvent.Failed -> failSong("The music stopped — this phone could not play that song.")
+            DeviceMusic.MixEvent.Ignore -> Unit
+        }
+    }
+
+    /** Agora could not open the content:// URI: copy the song into the app cache, once, and play the copy. */
+    private suspend fun playFromCache(song: DeviceTrack): Boolean {
+        if (musicFallbackTried || !song.uri.startsWith("content://")) return false
+        musicFallbackTried = true
+        val ctx = musicContext ?: return false
+        val file = DeviceMusicLibrary.copyToCache(ctx, song) ?: return false
+        if (_music.value.current?.key != song.key) { file.delete(); return false }   // moved on meanwhile
+        musicCacheFile = file
+        return AgoraManager.startMusicOnce(file.absolutePath) == 0
+    }
+
+    private fun failSong(message: String) {
+        val mine = musicIsMine()
+        stopDeviceSongLocally()
+        if (mine) viewModelScope.launch { repo.setMusic(roomId, null) }
+        _state.update { it.copy(error = message) }
+    }
+
+    private fun musicIsMine(): Boolean {
+        val myUid = auth.currentUser?.uid.orEmpty()
+        return myUid.isNotBlank() && _state.value.room?.music?.by == myUid
+    }
+
+    /** Stop this phone's song without telling the server (it already knows, or is told by the caller). */
+    private fun stopDeviceSongLocally() {
+        musicJob?.cancel()
+        if (_music.value.current != null) AgoraManager.stopMusic()
+        _music.update { it.copy(queue = null, queueTracks = emptyList(), playing = false, busy = false, durationMs = 0L) }
+        dropMusicCache()
+    }
+
+    private fun dropMusicCache() {
+        musicCacheFile?.let { f -> try { f.delete() } catch (_: Exception) {} }
+        musicCacheFile = null
+    }
+
+    /**
+     * O14: the room's line says the music stopped, or another moderator took over (each phone plays its own songs, so
+     * two at once would be two songs over each other) — this phone stops. Its own start is given a moment to arrive.
+     */
+    private fun watchRoomMusic(room: PartyRoom) {
+        if (_music.value.current == null && mixingTrackId == null) return
+        if (System.currentTimeMillis() - musicStartedAtMs < MUSIC_ROOM_GRACE_MS) return
+        val myUid = auth.currentUser?.uid.orEmpty()
+        val m = room.music
+        if (m == null || m.by != myUid) {
+            stopDeviceSongLocally()
+            AgoraManager.stopMusic()
+            mixingTrackId = null
+            _state.update { it.copy(notice = if (m == null) "The music was stopped." else "Someone else is playing music now.") }
+        }
+    }
+
+    /** O14: off the seat is off the air — this phone's music stops (the server clears the room's line itself). */
+    private fun stopMusicOffSeat(notice: String) {
+        if (_music.value.current == null && mixingTrackId == null) return
+        stopDeviceSongLocally()
+        AgoraManager.stopMusic()
+        mixingTrackId = null
+        _state.update { it.copy(notice = notice) }
     }
 
     // ── B7: the member card's social actions — the same calls the profile screen makes ──
@@ -685,6 +948,11 @@ class PartyRoomViewModel @Inject constructor(
                             }
                             seatUidTried = seatUid
                             myAgoraUid = joinUid
+                            // O14: the rejoin leaves the channel, and the song with it — say so rather than go quiet.
+                            if (_music.value.current != null || mixingTrackId != null) {
+                                stopMusic()
+                                _state.update { it.copy(notice = "You moved seats — start the music again.") }
+                            }
                             AgoraManager.rejoinPartyAs(channelName, r.token, joinUid, video)
                             AgoraManager.enableSpeakingIndicator(true)
                             publishing = true
@@ -707,7 +975,10 @@ class PartyRoomViewModel @Inject constructor(
         if (shouldPublish != publishing) {
             AgoraManager.setPartyRole(shouldPublish, video)
             publishing = shouldPublish
-            if (!shouldPublish) { myAgoraUid = 0; seatUidTried = -1 }
+            if (!shouldPublish) {
+                myAgoraUid = 0; seatUidTried = -1
+                stopMusicOffSeat("You left your seat — the music stopped.")
+            }
         }
         applyLocalMediaState(mySeat)
     }
@@ -1321,6 +1592,11 @@ class PartyRoomViewModel @Inject constructor(
      * turned it off on an engine the call screen also owns.
      */
     private fun releaseAgora() {
+        // O14: the song goes with us (the server clears the room's line in leavePartyRoom).
+        AgoraManager.onMusicState = null
+        stopDeviceSongLocally()
+        AgoraManager.stopMusic()
+        mixingTrackId = null
         AgoraManager.onUserJoined = null
         AgoraManager.onUserOffline = null
         AgoraManager.onAudioVolume = null
@@ -1342,6 +1618,12 @@ class PartyRoomViewModel @Inject constructor(
          * echo; a ring that lights for those is noise rather than signal.
          */
         const val SPEAKING_VOLUME = 20
+
+        /** O14: how long after its own start a song's "stopped" report is taken for the switch, not the end. */
+        const val MUSIC_SWITCH_GRACE_MS = 1_500L
+
+        /** O14: how long a just-started song waits for the room's line to name it before trusting the line. */
+        const val MUSIC_ROOM_GRACE_MS = 4_000L
 
         val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
