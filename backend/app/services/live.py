@@ -74,6 +74,8 @@ class Act:
     #: reversible and an ended room is not.
     HOST_MUTED = "live.host_muted"
     HOST_UNMUTED = "live.host_unmuted"
+    #: O12 (5 Nov 2026) — a party room closed by ops. Its own action, like the live end.
+    PARTY_ROOM_ENDED = "party.room_ended"
 
 
 #: Who may intervene in a live room. Owners, and the ops team who do the
@@ -356,5 +358,119 @@ async def mute_host(room_id: str, muted: bool, reason: str, actor: dict) -> dict
             "the media path and cannot silence anybody on its own. If the app "
             "does not yet read hostMuted, this has changed nothing the audience "
             "can hear."
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Ending a party room — O12 (5 Nov 2026)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: The party rooms the app writes and the CRM's party monitor reads.
+PARTY_ROOMS = "partyRooms"
+#: The listeners whose presence flag is cleared in the one batch (the app's own teardown clears 400).
+PARTY_LISTENERS_CLEARED = 400
+
+
+def _party_teardown(room_id: str, staff_fields: dict) -> dict:
+    """Blocking — close the party room exactly the way `closeRoom` (functions/src/party.ts) does, plus who and why.
+
+    Seats are removed and everyone's `isInParty` / `partyRoomId` is cleared — the seat holders, up to 400 listeners and
+    the host — so nobody is left "in a party" at the top of discovery; the room is flagged inactive with its counts
+    at 0; a private room's password hash goes with it. One batch: all of it or none of it.
+    """
+    client = firebase.firestore_client()
+    room_ref = client.collection(PARTY_ROOMS).document(room_id)
+    seats = list(room_ref.collection("seats").stream())
+    listeners = list(room_ref.collection("listeners").limit(PARTY_LISTENERS_CLEARED).stream())
+    snapshot = room_ref.get()
+    room = (snapshot.to_dict() or {}) if snapshot.exists else {}
+    batch = client.batch()
+    cleared: set[str] = set()
+
+    def clear(uid: str) -> None:
+        if uid and uid not in cleared:
+            cleared.add(uid)
+            batch.set(client.collection("users").document(uid), {"isInParty": False, "partyRoomId": ""}, merge=True)
+
+    for seat in seats:
+        clear(str((seat.to_dict() or {}).get("uid") or ""))
+        batch.delete(seat.reference)
+    for listener in listeners:
+        clear(str((listener.to_dict() or {}).get("uid") or listener.id or ""))
+    clear(str(room.get("hostUid") or ""))
+    batch.update(room_ref, {"isActive": False, "listenerCount": 0, "occupantCount": 0, **staff_fields})
+    batch.delete(room_ref.collection("private").document("secret"))
+    batch.commit()
+    return {"seats_cleared": len(seats), "people_cleared": len(cleared)}
+
+
+def _read_party_room(room_id: str) -> dict | None:
+    snapshot = firebase.firestore_client().collection(PARTY_ROOMS).document(room_id).get()
+    return (snapshot.to_dict() or {}) if snapshot.exists else None
+
+
+async def end_party_room(room_id: str, reason: str, actor: dict) -> dict:
+    """End a party room. Ops or an owner, audited, reason mandatory — the party twin of [end_room].
+
+    Refused for a room that does not exist or has already closed (a second press is not a second intervention).
+    The host's account is untouched: closing a room is not a ban.
+    """
+    room_id = _room_id(room_id)
+    reason = _require_reason(reason)
+    try:
+        room = await asyncio.to_thread(_read_party_room, room_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Could not read party room %s", room_id)
+        raise LiveError(
+            f"The party room '{room_id}' could not be read, so nothing was changed. Try again."
+        ) from exc
+    if room is None:
+        raise LiveError(f"No party room '{room_id}'. Nothing was changed.")
+    if not room.get("isActive", False):
+        raise LiveError(f"'{room_id}' has already closed. Nothing was changed, and nothing was recorded a second time.")
+
+    now = _now()
+    fields = {"endedAt": now, "endedBy": _who(actor), "endedByStaff": True, "endReason": reason}
+    try:
+        result = await asyncio.to_thread(_party_teardown, room_id, fields)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Could not end party room %s", room_id)
+        raise LiveError(
+            f"The room could not be closed: {exc}. Nothing was changed and nothing was recorded — it is still open."
+        ) from exc
+
+    host_uid = str(room.get("hostUid") or "")
+    audit_id = await audit.record(
+        actor=actor,
+        action=Act.PARTY_ROOM_ENDED,
+        subject_type="party_room",
+        subject_id=room_id,
+        reason=reason,
+        before={"isActive": True, "listenerCount": room.get("listenerCount", 0), "occupantCount": room.get("occupantCount", 0)},
+        after={"isActive": False},
+        meta={
+            "host_uid": host_uid,
+            "host_name": room.get("hostName", ""),
+            "title": room.get("title", ""),
+            "visibility": room.get("visibility", "public"),
+            **result,
+            "enforcement": (
+                "The room is flagged closed and its seats removed; each phone in it leaves when it reads the flag. "
+                "The host's account is untouched."
+            ),
+        },
+    )
+    return {
+        "room_id": room_id,
+        "host_uid": host_uid,
+        "ended": True,
+        "ended_at": now,
+        "reason": reason,
+        "audit_id": audit_id,
+        **result,
+        "note": (
+            "The room is closed and the reason is on the record. Everyone in it is taken out when their app reads the "
+            "flag. The host's account is unchanged — closing a room is not a ban."
         ),
     }

@@ -1529,6 +1529,30 @@ export const live = {
       `/users/live-rooms/${encodeURIComponent(roomId)}/mute`,
       { muted, reason },
     ),
+
+  /**
+   * O12 (5 Nov 2026): close a party room. Ops or an owner, reason of six characters or more, audited. The room is
+   * flagged closed with who and why, its seats removed and everybody's in-party flag cleared; each phone in it leaves
+   * when it reads the flag. Not a ban.
+   */
+  endParty: (roomId: string, reason: string) =>
+    post<PartyRoomEnded>(
+      `/users/party-rooms/${encodeURIComponent(roomId)}/end`,
+      { reason },
+    ),
+}
+
+export interface PartyRoomEnded {
+  room_id: string
+  host_uid: string
+  ended: boolean
+  ended_at: string
+  reason: string
+  audit_id: string
+  seats_cleared: number
+  people_cleared: number
+  /** The server's own words for what happened — shown as they are. */
+  note: string
 }
 
 // ── Small shared helpers the partner screens all need ─────────────────────────

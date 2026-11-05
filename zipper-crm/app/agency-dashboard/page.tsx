@@ -8,6 +8,7 @@ import { createSubAgencyAccount, partnerRolesOf } from '@/lib/auth'
 import { SecondRoleCard } from '@/components/SecondRoleCard'
 import { AgencyMoney } from './AgencyMoney'
 import HostReports from './HostReports'
+import MonitorRoomsPanel from '@/components/MonitorRoomsPanel'
 import { auth, db, storage } from '@/lib/firebase'
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage'
 import { KYC_MAX_MB, kycFileProblem, kycUploadErrorText } from '@/lib/kycUpload'
@@ -2548,6 +2549,9 @@ export default function AgencyDashboardPage() {
       )}
 
       {agency && <SetupNeeded agency={agency} />}
+
+      {/* O12 (5 Nov 2026): the agency watches its own hosts' rooms — and its sub-agencies' — silently. */}
+      {agency && <MonitorRoomsPanel />}
 
       {/* Directly under the banner that points at it.
           This used to sit after the whole commission block — the period

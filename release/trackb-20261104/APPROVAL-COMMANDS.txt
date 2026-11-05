@@ -4,7 +4,7 @@
 STEP-0: one-time setup — tools/check-function-lists.py RESULT ok, tools/run-trackb-rules-tests.command TRACKB-RULES-RUN: PASS (local test copy stopped), tools/test-release-scripts-mac.command N/N PASS, commit the release (no push), ./make-release-txt.sh
 STEP-1: run 00-preflight-readonly.command (read-only)
 STEP-2: run 11-deploy-backend-no-traffic.command (DEPLOY, EMAIL or SKIP, UNTAG), then 12-canary-backend.command 10/50/100 (CANARY10/CANARY50/CANARY100) with a 13-canary-monitor-readonly.command CONTINUE before 50 and 100
-STEP-3: run 20-deploy-functions-wave2a.command and type DEPLOY2A (wave A: 85 changed + 53 new functions; not Sunday 16:29-21:00 UTC)
+STEP-3: run 20-deploy-functions-wave2a.command and type DEPLOY2A (wave A: 85 changed + 55 new functions; not Sunday 16:29-21:00 UTC)
 STEP-4: run 50-deploy-crm.command, type CRM, then DEPLOY in deploy-crm.command
 STEP-5: run 33-deploy-indexes.command and type INDEXES (firestore:indexes only; refused unless the file is a superset of the live indexes; re-run until every index is READY)
 STEP-6: build ./gradlew :app:assembleProd at HEAD, device smoke on one APK 19 phone, run 60-publish-apk.command and type PUBLISH (APK 21 / 1.2.7 to the debug channel, minSupportedVersionCode 21)
@@ -17,7 +17,7 @@ AFTER-SIGN-OFF-RESET: after the stakeholders' green signal and a verified backup
 
 # Rollbacks inside scripts (pre-authorised as the rollback of their step; each still asks its word):
 ROLLBACK-2: 19-rollback-backend.command   (ROLLBACK; 100% back to zipper-api-00057-xiq)   or   12-canary-backend.command back   (BACK)
-ROLLBACK-3: 29-rollback-functions.command 2a   (ROLLBACK; the 85 changed functions back to the cf64145 tree = RELEASE.txt LIVE_FN_COMMIT; the 53 new ones stay); after a partial deploy: 29-rollback-functions.command 2a production/20-functions-2a-<UTC>   (exactly that run's updated.txt)
+ROLLBACK-3: 29-rollback-functions.command 2a   (ROLLBACK; the 85 changed functions back to the cf64145 tree = RELEASE.txt LIVE_FN_COMMIT; the 55 new ones stay); after a partial deploy: 29-rollback-functions.command 2a production/20-functions-2a-<UTC>   (exactly that run's updated.txt)
 ROLLBACK-6: 61-withdraw-apk.command production/60-publish-apk-<UTC>   (WITHDRAW; refused while wave B is live)
 ROLLBACK-7: 39-rollback-rules.command production/31-rules-rc2-<UTC>   (ROLLBACK, back to hotfix-1) and 49-rollback-storage.command production/41-storage-rules-<UTC>   (ROLLBACK, back to hotfix-1; then REVOKE or KEEP)
 ROLLBACK-8: 29-rollback-functions.command 2b [production/21-functions-2b-<UTC>]   (ROLLBACK; the 8 call/gift functions to the 20 Oct tree prod-live-20261030 = RELEASE.txt BASE_COMMIT 4e21b7f…, never f1af30a; joinPartyRoom + sweepEmptyPartyRooms to cf64145) — before any 61

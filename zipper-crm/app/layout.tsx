@@ -20,6 +20,7 @@ import {
   DollarSign,
   Building2,
   Radio,
+  Headphones,
   ShoppingBag,
   MessageSquare,
   Megaphone,
@@ -307,6 +308,8 @@ const navGroups: NavGroup[] = [
     id: 'live', label: 'Live & Comms', icon: Radio,
     links: [
       { href: '/live',       label: 'Live Monitor', icon: Radio,      roles: ['superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member', 'tech_admin', 'tech_member', 'support_admin'] },
+      // O12 (5 Nov 2026): the party twin of /live — listen silently, warn, ban, close.
+      { href: '/party',      label: 'Party Monitor', icon: Headphones, roles: ['superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member', 'tech_admin', 'tech_member', 'support_admin'] },
       // `app_member` is NOT here, though the page's own PAGE_ROLES still lists
       // them. Feedback is Firestore `feedbackTickets`, read-gated on
       // `isOps() || isAdmin() || isSupport()` (firestore.rules:920). `isApp()`

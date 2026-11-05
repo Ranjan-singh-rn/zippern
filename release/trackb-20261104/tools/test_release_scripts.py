@@ -15,7 +15,7 @@ Two parts:
      IAM role, unpublished APK, wave B live, and a Functions rollback base that is not refs/heads/prod-live-20261030
      (f1af30a refused; the short name, shadowed by a same-named tag, never resolved). The fake project holds the 104
      production functions as they run on 4 Nov (95 from the cf64145 stand-in LIVE, 9 from the prod-live stand-in PROD;
-     9 gen2; 9 in us-central1) and the release exports 157 (53 new); 20/21 refuse an export split other than WAVE_2A +
+     9 gen2; 9 in us-central1) and the release exports 159 (55 new); 20/21 refuse an export split other than WAVE_2A +
      WAVE_2B + NOT_REDEPLOYED or rollback bases that do not cover the deployed names (the `node -e` enumeration is
      stubbed); a deploy that stops part-way is reported per name and 29 rolls back exactly the updated ones, each to
      the tree it ran before (LIVE or PROD; new functions are left in place); 33 refuses an index file that is not a
@@ -225,14 +225,14 @@ ok("rel_common.sh lists readable (%s)" % ", ".join(LIST_NAMES), set(LISTS) == se
 ALL3 = LISTS.get("WAVE_2A", []) + LISTS.get("WAVE_2B", []) + LISTS.get("NOT_REDEPLOYED", [])
 ok("WAVE_2A, WAVE_2B and NOT_REDEPLOYED are disjoint and no name appears twice", len(ALL3) == len(set(ALL3)),
    sorted(n for n in set(ALL3) if ALL3.count(n) > 1))
-ok("WAVE_2A ∪ WAVE_2B ∪ NOT_REDEPLOYED = 157 names (the 104 production functions + 53 new)", len(set(ALL3)) == 157, len(set(ALL3)))
+ok("WAVE_2A ∪ WAVE_2B ∪ NOT_REDEPLOYED = 159 names (the 104 production functions + 55 new)", len(set(ALL3)) == 159, len(set(ALL3)))
 ORIG_2B = ["generateAgoraToken", "settleGift", "startCall", "acceptCall", "tickCall", "endCall", "declineCall", "sweepStaleCalls"]
 UNCHANGED = ["releaseBeansForWeek", "getPayoutStatus", "purgeDeletedAccounts", "purgeMyAccountNow",
              "recoverAccount", "requestAccountDeletion", "syncMyRoles", "toggleLike",
              "onHostInvitationWithdrawn"]
-ok("WAVE_2A = 85 changed + 53 new; WAVE_2B = the 8 call/gift functions + joinPartyRoom + sweepEmptyPartyRooms; NOT_REDEPLOYED = the 9 unchanged; the 8 EMAIL_FNS in wave A",
+ok("WAVE_2A = 85 changed + 55 new; WAVE_2B = the 8 call/gift functions + joinPartyRoom + sweepEmptyPartyRooms; NOT_REDEPLOYED = the 9 unchanged; the 8 EMAIL_FNS in wave A",
    LISTS.get("WAVE_2A") == LISTS.get("WAVE_2A_CHANGED", []) + LISTS.get("WAVE_2A_NEW", [])
-   and len(LISTS.get("WAVE_2A_CHANGED", [])) == 85 and len(LISTS.get("WAVE_2A_NEW", [])) == 53
+   and len(LISTS.get("WAVE_2A_CHANGED", [])) == 85 and len(LISTS.get("WAVE_2A_NEW", [])) == 55
    and LISTS.get("WAVE_2B") == ORIG_2B + ["joinPartyRoom", "sweepEmptyPartyRooms"]
    and LISTS.get("NOT_REDEPLOYED") == UNCHANGED and len(LISTS.get("EMAIL_FNS", [])) == 8
    and set(LISTS.get("EMAIL_FNS", [])) <= set(LISTS.get("WAVE_2A_CHANGED", [])), {k: len(v) for k, v in LISTS.items()})
@@ -280,7 +280,7 @@ SECRET_VALUES = ["fake-agora-cert-value", "SG.fake-old-key", "ops-mailbox@exampl
 PEOPLE = ["someone@example.com", "operator@example.com", "alerts.owner@example.org"]
 WAVE_2A, WAVE_2B, NOT_REDEPLOYED = LISTS.get("WAVE_2A", []), LISTS.get("WAVE_2B", []), LISTS.get("NOT_REDEPLOYED", [])
 EMAIL_FNS = LISTS.get("EMAIL_FNS", [])
-ALL_FNS = WAVE_2A + WAVE_2B + NOT_REDEPLOYED   # the 157 functions functions/src/index.ts exports at the release HEAD
+ALL_FNS = WAVE_2A + WAVE_2B + NOT_REDEPLOYED   # the 159 functions functions/src/index.ts exports at the release HEAD
 NEW_FNS = LISTS.get("WAVE_2A_NEW", [])
 PROD_FNS = [n for n in ALL_FNS if n not in NEW_FNS]   # the 104 production runs today
 ON_PROD_TREE = set(ORIG_2B + ["onHostInvitationWithdrawn"])   # still 20 Oct code; every other one runs the cf64145 stand-in
@@ -782,7 +782,7 @@ def live_field(cg, fp, cfgs):
 
 
 def fresh_state():
-    fns = {n: fn_obj(n) for n in PROD_FNS}   # the 53 new functions do not exist before 20
+    fns = {n: fn_obj(n) for n in PROD_FNS}   # the 55 new functions do not exist before 20
     return {
         "service": {"traffic": [{"revisionName": SERVING, "percent": 100}], "tags": {}, "latest": TEMPLATE,
                     "template_env": TEMPLATE_ENV, "generation": 57},
@@ -887,7 +887,7 @@ def git(*args, check=True):
                            "-c", "commit.gpgsign=false", *args], capture_output=True, text=True, check=check).stdout.strip()
 
 
-# stubs (node -e prints the export list of the harness's control file T/exports.txt: the 157 functions of the release)
+# stubs (node -e prints the export list of the harness's control file T/exports.txt: the 159 functions of the release)
 EXPORTS = T / "exports.txt"
 GOOD_EXPORTS = "".join("EXPORT %s %s\n" % (n, "us-central1" if n in US_CENTRAL1 else "asia-south1") for n in ALL_FNS)
 EXPORTS.write_text(GOOD_EXPORTS)
@@ -1193,7 +1193,7 @@ WAVE_2A_ONLY = ",".join("functions:" + n for n in WAVE_2A)
 rc, o = run(C20, "NO\n")
 ok("20 refuses without DEPLOY2A (exit 4), after building, testing and classifying the exact tree",
    rc == 4 and "firebase deploy" not in calls() and "node --test on the exact tree: 3/3" in o and "CLASSIFY ok" in o
-   and "each of the 157 exported functions is in exactly one of WAVE_2A, WAVE_2B, NOT_REDEPLOYED" in o
+   and "each of the 159 exported functions is in exactly one of WAVE_2A, WAVE_2B, NOT_REDEPLOYED" in o
    and "BASES ok" in o and "every deployed function has one rollback base" in o, o[-800:])
 ncalls = Path(str(EXPORTS) + ".calls").read_text() if Path(str(EXPORTS) + ".calls").exists() else ""
 ok("20 lists the exports with node -e in the built deploy tree, empty environment (no stub log, demo project id)",
@@ -1201,7 +1201,7 @@ ok("20 lists the exports with node -e in the built deploy tree, empty environmen
 EXPORTS.write_text("module load says hello (not an export line)\n" + GOOD_EXPORTS + "EXPORT brandNewFunction asia-south1\n")
 rc, o = run(C20, "DEPLOY2A\n")
 ok("20 refuses an exported function that is in no list (UNCLASSIFIED), nothing deployed",
-   rc == 3 and "UNCLASSIFIED brandNewFunction" in o and "EXPORTS 158 " in o and "firebase deploy" not in calls(), o[-600:])
+   rc == 3 and "UNCLASSIFIED brandNewFunction" in o and "EXPORTS 160 " in o and "firebase deploy" not in calls(), o[-600:])
 EXPORTS.write_text("".join(l + "\n" for l in GOOD_EXPORTS.splitlines() if not l.startswith("EXPORT syncPhoneKey ")))
 rc, o = run(C20, "DEPLOY2A\n")
 ok("20 refuses a listed function the deploy tree does not export (NOT-EXPORTED), nothing deployed",
@@ -1216,8 +1216,8 @@ rc, o = run(C20, "DEPLOY2A\n")
 ev20p = newest("20-functions-2a-")
 upd = (ev20p / "updated.txt").read_text().split() if (ev20p / "updated.txt").exists() else []
 nupd = (ev20p / "not-updated.txt").read_text().split() if (ev20p / "not-updated.txt").exists() else []
-ok("20 after a deploy that stops part-way (CLI exit 2): FAIL, SCOPE PARTIAL, updated.txt = the 40 updated, not-updated.txt = the other 98",
-   rc == 1 and "SCOPE PARTIAL" in o and "WAVE updated=40 of 138" in o and upd == sorted(WAVE_2A[:40]) and nupd == sorted(WAVE_2A[40:])
+ok("20 after a deploy that stops part-way (CLI exit 2): FAIL, SCOPE PARTIAL, updated.txt = the 40 updated, not-updated.txt = the other 100",
+   rc == 1 and "SCOPE PARTIAL" in o and "WAVE updated=40 of 140" in o and upd == sorted(WAVE_2A[:40]) and nupd == sorted(WAVE_2A[40:])
    and "29-rollback-functions.command 2a %s" % ev20p in o, o[-1500:])
 rc, o = run(C29, "ROLLBACK\n", ("2b", str(ev20p)))
 ok("29 refuses an evidence folder of another wave", rc == 3 and "not an evidence folder of wave 2b" in o and "firebase deploy" not in calls(), o[-300:])
@@ -1231,13 +1231,13 @@ ok("29 2a <that evidence> rolls back EXACTLY the 40 updated functions, each to t
 time.sleep(1.1)
 s = st(); s["deploy_in_progress"] = "partyHeartbeat"; put(s)
 rc, o = run(C20, "DEPLOY2A\n")
-ok("20 deploys wave A only and verifies (SCOPE PASS, changed=138 incl. the 53 new), after waiting for an update still running: PASS",
-   rc == 0 and "RESULT: PASS" in o and "SCOPE PASS" in o and "changed=138" in o and "still deploying (1/20" in o
+ok("20 deploys wave A only and verifies (SCOPE PASS, changed=140 incl. the 55 new), after waiting for an update still running: PASS",
+   rc == 0 and "RESULT: PASS" in o and "SCOPE PASS" in o and "changed=140" in o and "still deploying (1/20" in o
    and "note: partyHeartbeat does not exist yet (new in this release)" in o, o[-1500:])
-ok("20 checked every function's own runtime identity (1st gen App Engine; new ones by generation) and region", "all 138 functions keep their runtime identity" in o
-   and "all 138 functions ACTIVE" in o, o[-1500:])
+ok("20 checked every function's own runtime identity (1st gen App Engine; new ones by generation) and region", "all 140 functions keep their runtime identity" in o
+   and "all 140 functions ACTIVE" in o, o[-1500:])
 ok("20 ran exactly the reviewed command", "firebase deploy --only %s --project zipper-83816 --non-interactive" % WAVE_2A_ONLY in calls())
-ok("20 deployed the RELEASE tree (functions v2) to the 138, nothing to wave B or NOT_REDEPLOYED (they keep LIVE / PROD)",
+ok("20 deployed the RELEASE tree (functions v2) to the 140, nothing to wave B or NOT_REDEPLOYED (they keep LIVE / PROD)",
    all(st()["functions"][n]["source"].startswith("// functions v2") for n in WAVE_2A)
    and all(st()["functions"][n]["source"] == (PROD_SRC if n in ON_PROD_TREE else LIVE_SRC) for n in WAVE_2B + NOT_REDEPLOYED))
 ok("20 left no .env copy and no node_modules", not list((RELC / "production").glob("20-*/deploy/functions/.env")) and not list((RELC / "production").glob("20-*/deploy/functions/node_modules")))
@@ -1257,7 +1257,7 @@ relp.write_text(good_rel)
 rc, o = run(C29, "NO\n", ("2a",))
 ok("29 2a refuses without ROLLBACK (exit 4)", rc == 4 and "firebase deploy" not in calls(), o[-400:])
 rc, o = run(C29, "ROLLBACK\n", ("2a",))
-ok("29 2a redeploys the 85 changed functions from the LIVE tree (cf64145 stand-in) with the reviewed command and leaves the 53 new ones: PASS",
+ok("29 2a redeploys the 85 changed functions from the LIVE tree (cf64145 stand-in) with the reviewed command and leaves the 55 new ones: PASS",
    rc == 0 and "RESULT: PASS" in o
    and "firebase deploy --only %s --project zipper-83816 --non-interactive" % ",".join("functions:" + n for n in LISTS["WAVE_2A_CHANGED"]) in calls()
    and all(st()["functions"][n]["source"] == LIVE_SRC for n in LISTS["WAVE_2A_CHANGED"])

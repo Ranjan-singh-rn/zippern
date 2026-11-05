@@ -4895,6 +4895,10 @@ export { syncPublicProfile, syncLivePresence, backfillPublicProfiles } from './p
 // Data-only FCM messages; the app's messaging service renders them.
 export { pushIncomingCall, pushCallStatus, pushChatMessage, pushLiveStarted } from './push'
 
+// O12 (5 Nov 2026): silent monitoring — staff any room, an agency its hosts and its sub-agencies' hosts, a sub-agency
+// its own hosts. A subscriber token and a `monitorSessions` record; nothing written in the room.
+export { monitorRoomToken, myMonitorRooms } from './monitoring'
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC SELLER DIRECTORY
 // ══════════════════════════════════════════════════════════════════════════════

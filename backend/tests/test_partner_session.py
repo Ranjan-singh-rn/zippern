@@ -1204,7 +1204,10 @@ writes = {(row[0], row[1]) for row in table if "require_write" in row[3].split("
 # 63 since B9 (3 Nov 2026): `POST /partner-ops/seller-trades/{id}/reject` — staff refusing a seller-to-seller
 # trade. It decides a trade between two partners, so neither of them may reach it (the selling seller may only
 # DISPUTE, which decides nothing).
-check("require_write guards sixty-three routes", len(writes), 63)
+# 64 since O12 (5 Nov 2026): `POST /users/party-rooms/{room_id}/end` — Ops or an Owner closing a party room from the
+# party monitor, the twin of the live end. It cuts a room off in front of everyone in it, so no partner may reach it
+# (an agency WATCHES its own hosts' rooms; it does not close them).
+check("require_write guards sixty-four routes", len(writes), 64)
 # The four moderation operations are four distinct routes on this guard. Named
 # rather than counted, so that collapsing resume back into unban — which is the
 # defect this pins shut — is a diff somebody reads rather than a number that

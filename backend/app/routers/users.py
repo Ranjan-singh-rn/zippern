@@ -334,6 +334,22 @@ async def end_live_room(
         raise _live_fail(exc) from exc
 
 
+@router.post("/party-rooms/{room_id}/end")
+async def end_party_room(
+    room_id: str, body: LiveReason, user: dict = Depends(require_write)
+):
+    """O12 (5 Nov 2026): close a party room from the CRM's party monitor. Ops or an owner, audited, reason mandatory.
+
+    The party twin of `/live-rooms/{room_id}/end`: the room is flagged closed with who and why, its seats removed and
+    everybody's in-party flag cleared (the app's own teardown), so each phone in it leaves. Not a ban.
+    """
+    _require_intervener(user)
+    try:
+        return await live_svc.end_party_room(room_id, body.reason, user)
+    except LiveError as exc:
+        raise _live_fail(exc) from exc
+
+
 @router.post("/live-rooms/{room_id}/mute")
 async def mute_live_host(
     room_id: str, body: MuteHost, user: dict = Depends(require_write)
