@@ -44,6 +44,7 @@ import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
 import { assertActiveSession } from './mobileSession'
 import { privateRoomGate } from './partySubscription'
+import { recordPartyPresence } from './dailyTasks'
 
 const db = admin.firestore()
 
@@ -1064,6 +1065,10 @@ export const partyHeartbeat = functions
     if (!roomSnap.exists || roomSnap.get('isActive') === false) return { active: false, present: false }
     if (!listenerSnap.exists) return { active: true, present: false }
     await listenerRef.update({ lastSeenAt: admin.firestore.FieldValue.serverTimestamp() })
+    // O8 (5 Nov 2026): a beat the server accepted is a minute in a party room, and the room is "joined" once a day,
+    // for the daily tasks (dailyTasks.ts). Never fails the heartbeat.
+    await recordPartyPresence(uid, roomId).catch((err) =>
+      functions.logger.warn('partyHeartbeat: daily task progress not recorded', { roomId, err: String(err) }))
     return { active: true, present: true, nextInMs: PARTY_HEARTBEAT_EVERY_MS }
   })
 

@@ -3,6 +3,7 @@ import * as admin from 'firebase-admin'
 import { normaliseCrmRole, OWNER_ROLE } from './crmRoles'
 import { ownerMfaVerified, type OwnerMfaToken } from './ownerMfa'
 import { serverDurationSeconds } from './live'
+import { recordLiveMinutes } from './dailyTasks'
 
 const db = admin.firestore()
 
@@ -295,14 +296,22 @@ export const syncLivePresence = functions
     if (isActive && !wasActive && roomRef) {
       await roomRef.update({ serverStartedAt: admin.firestore.FieldValue.serverTimestamp() })
     }
+    let closedSeconds = 0
     if (!isActive && wasActive) {
       const secs = serverDurationSeconds(after ?? {}, Date.now())
+      closedSeconds = secs
       if (secs > 0) {
         userPatch.streamedTimeSeconds = admin.firestore.FieldValue.increment(secs)
       }
       if (roomRef) await roomRef.update({ serverDurationSeconds: secs })
     }
     await db.collection('users').doc(hostUid).set(userPatch, { merge: true })
+    // O8 (5 Nov 2026): the same server-measured length counts towards the host's "go live" daily task — once per
+    // room (dailyTasks.ts). A failure there never undoes the presence written above.
+    if (closedSeconds > 0) {
+      await recordLiveMinutes(hostUid, roomId, closedSeconds).catch((err) =>
+        functions.logger.warn('syncLivePresence: daily task minutes not recorded', { roomId, err: String(err) }))
+    }
     return null
   })
 

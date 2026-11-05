@@ -4903,6 +4903,11 @@ export { monitorRoomToken, myMonitorRooms } from './monitoring'
 // screen on live, party and direct chat (mask, strike, mute after the Owner's count).
 export { reportLiveSnapshot, screenLiveComment, screenPartyMessage, screenDirectMessage } from './safety'
 
+// O8 (5 Nov 2026): daily tasks — the Owner's tasks for users and hosts (`appConfig/dailyTasks`), progress measured on
+// the server from rows it already writes (the two ledger triggers; live, party and DM hooks in their own modules),
+// and the claim: wallet, history row and a `promoCredits` record (kind `daily_task`) in one transaction.
+export { claimDailyTask, dailyTasksDiamondLedger, dailyTasksBeanLedger } from './dailyTasks'
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC SELLER DIRECTORY
 // ══════════════════════════════════════════════════════════════════════════════

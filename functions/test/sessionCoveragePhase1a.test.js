@@ -64,6 +64,8 @@ const GUARDED = [
   ['settleGift', v2(gifts.settleGift), { giftId: 'g', receiverUid: 'R' }],
   ['convertBeans', v1(wallet.convertBeans), { beansAmount: 10 }],
   ['claimDailyReward', v1(wallet.claimDailyReward), {}],
+  // O8 (5 Nov 2026): a daily task's reward is money too.
+  ['claimDailyTask', v1(index.claimDailyTask), { taskId: 'gift1' }],
   ['purchaseBagItem', v1(wallet.purchaseBagItem), { itemId: 'i' }],
   ['equipBagItem', v1(wallet.equipBagItem), { itemId: 'i' }],
   ['activateHost', v1(hosts.activateHost), { referralCode: 'ABC123' }],

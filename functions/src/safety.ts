@@ -26,6 +26,7 @@
 
 import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
+import { recordDirectMessage } from './dailyTasks'
 
 const db = (): admin.firestore.Firestore => admin.firestore()
 
@@ -356,4 +357,11 @@ export const screenPartyMessage = functions.region('asia-south1').firestore
 
 export const screenDirectMessage = functions.region('asia-south1').firestore
   .document('conversations/{convoId}/messages/{messageId}')
-  .onCreate((snap, ctx) => screenMessage(snap, { kind: 'dm', roomId: ctx.params.convoId, field: 'text', senderField: 'senderUid' }))
+  .onCreate(async (snap, ctx) => {
+    // O8 (5 Nov 2026): the same new message counts its other person once a day for the "chat with N people" daily
+    // task (dailyTasks.ts) — on its own, so a screening failure and a progress failure never stop each other.
+    const at = ctx.timestamp ? new Date(ctx.timestamp) : new Date()
+    await recordDirectMessage(String(ctx.params.convoId), snap.data() ?? {}, Number.isFinite(at.getTime()) ? at : new Date())
+      .catch((err) => functions.logger.warn('screenDirectMessage: daily task progress not recorded', { err: String(err) }))
+    return screenMessage(snap, { kind: 'dm', roomId: ctx.params.convoId, field: 'text', senderField: 'senderUid' })
+  })
