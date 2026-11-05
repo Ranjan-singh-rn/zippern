@@ -157,7 +157,10 @@ class ChatParseTest {
 
     @Test fun `the chat header calls the person through the same paid call the profile starts`() {
         val screen = src("zipper-app/app/src/main/java/com/zipper/app/ui/screens/messages/ChatScreen.kt")
-        assertTrue("a call button in the header", screen.contains("Icons.Default.Videocam, \"Call \$name\""))
+        // O14 (5 Nov 2026): the header button follows the person's calls switch ("Calls off" / "Busy" when they cannot take one).
+        assertTrue("a call button in the header", screen.contains("if (callable) Icons.Default.Videocam else Icons.Default.VideocamOff"))
+        assertTrue("…named for the person while callable", screen.contains("if (callable) \"Call \$name\""))
+        assertTrue("…and a call button beside the gift button too", screen.contains("if (canRing) \"Call \$name\""))
         assertTrue("…not offered to a blocked person", screen.contains("if (!peerState.isBlocked) {"))
         assertTrue("…the price is confirmed first", screen.contains("CallConfirmDialog("))
         assertTrue("…and the server starts it", screen.contains("peer.initiateCall()"))
