@@ -132,3 +132,6 @@ validation-logs/
 
 # tests/run-p1mfa-verify.command writes a summary next to its (ignored) log
 outputs/verify/p1mfa-rules-*.log.summary
+
+# Kotlin 2 compiler session data (Gradle writes it next to the build)
+zipper-app/.kotlin/
