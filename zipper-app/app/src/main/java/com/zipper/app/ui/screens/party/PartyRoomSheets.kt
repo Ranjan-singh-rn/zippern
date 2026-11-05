@@ -820,11 +820,19 @@ private fun PartyMemberActionsDialog(
                     ) { viewModel.follow(member.uid, f != true); following = f != true }
                     PartySheetRow(Icons.Outlined.Person, "Message", c.textPrimary, onClick = onMessage)
                     // O5c: call this person. The room's owner may have switched calls off while hosting — then the row
-                    // says so and does nothing (the server refuses such a call anyway).
+                    // says so and does nothing (the server refuses such a call anyway). WP2: and "Busy" while they are on
+                    // another call — the same answer the profile and the chat give (CallAvailability).
                     val ownerCallsOff = room?.isOwner(member.uid) == true && room.ownerBlocksCalls
+                    val availability by com.zipper.app.ui.components.rememberCallAvailability(member.uid)
+                    val cannotRing = ownerCallsOff || !availability.canCall
                     PartySheetRow(
-                        Icons.Default.Videocam, if (ownerCallsOff) "Calls off while hosting" else "Call",
-                        if (ownerCallsOff) c.textMuted else c.statusSuccess, enabled = !ownerCallsOff, onClick = onCall,
+                        if (cannotRing) Icons.Default.VideocamOff else Icons.Default.Videocam,
+                        when {
+                            ownerCallsOff -> "Calls off while hosting"
+                            !availability.canCall -> availability.message.ifBlank { availability.label }
+                            else -> "Call"
+                        },
+                        if (cannotRing) c.textMuted else c.statusSuccess, enabled = !cannotRing, onClick = onCall,
                     )
                     if (member.seatIndex > 0) PartySheetRow(Icons.Default.Add, "Send a gift", c.textPrimary, onClick = onGift)
                     PartySheetRow(Icons.Default.Block, "Report", c.textPrimary) { reporting = true }

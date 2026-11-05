@@ -511,6 +511,9 @@ object AgoraManager {
 
     fun muteLocalAudio(mute: Boolean) { engine?.muteLocalAudioStream(mute) }
 
+    /** WP2 (call menu): play the call through the loudspeaker (true) or the earpiece (false). */
+    fun setSpeakerphone(on: Boolean) { engine?.setEnableSpeakerphone(on) }
+
     /**
      * The viewer's stream-quality choice, applied to the host's video.
      *   Auto — the main stream, falling back to the low stream when the link is weak;
