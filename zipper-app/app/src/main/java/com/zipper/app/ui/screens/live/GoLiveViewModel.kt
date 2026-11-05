@@ -159,6 +159,9 @@ class GoLiveViewModel @Inject constructor(
     private val auth: FirebaseAuth,
     private val firestore: FirebaseFirestore,
     private val discover: DiscoverRepository,
+    /** O13: the live wall's stills. */
+    private val safety: com.zipper.app.data.repository.SafetyRepository,
+    @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(GoLiveUiState())
@@ -302,6 +305,7 @@ class GoLiveViewModel @Inject constructor(
                 startDurationTimer()
                 collectRoomStreams(roomId)
                 startHeartbeat(roomId)
+                startStills(roomId)
                 listenForPKInvites(user.uid)
                 sendAutoInvitesToLikedOnlineUsers(
                     myUid = user.uid,
@@ -380,6 +384,35 @@ class GoLiveViewModel @Inject constructor(
             }
         }
         viewModelScope.launch { AgoraManager.link.collect { l -> _state.update { it.copy(link = l) } } }
+    }
+
+    /**
+     * O13 (Owner, 5 Nov 2026): "keep nudity and vulgarity out of the rooms". A still of what this phone publishes,
+     * every minute or so (the Owner sets how often), for the CRM's live wall — and for the AI check when the Owner has
+     * turned it on. Quiet: a still that fails is skipped, never retried in a loop, and never interrupts the live. When
+     * the server has closed the room on an explicit-content check, the room's own `isActive` flag ends the screen.
+     */
+    private var stillsJob: kotlinx.coroutines.Job? = null
+    private fun startStills(roomId: String) {
+        stillsJob?.cancel()
+        stillsJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            delay(com.zipper.app.data.repository.SafetyRepository.FIRST_STILL_AFTER_MS)
+            var every = com.zipper.app.data.repository.SafetyRepository.DEFAULT_EVERY_SECONDS
+            while (true) {
+                val file = java.io.File(appContext.cacheDir, "live_still_$roomId.jpg")
+                try {
+                    file.delete()
+                    if (!_state.value.isPaused && AgoraManager.takeLocalSnapshot(file.absolutePath)) {
+                        safety.reportStill(roomId, file)?.let { answer -> every = answer.nextSeconds }
+                    }
+                } catch (_: Exception) {
+                    // Offline, refused, or the camera is off: the next one is a minute away.
+                } finally {
+                    file.delete()
+                }
+                delay(every * 1000)
+            }
+        }
     }
 
     private fun startDurationTimer() {
@@ -537,6 +570,11 @@ class GoLiveViewModel @Inject constructor(
     fun sendComment() {
         val msg = _state.value.commentInput.trim()
         if (msg.isBlank()) return
+        // O13: the host is held to the same words as everyone else.
+        if (!com.zipper.app.util.SafetyWords.allowed(msg)) {
+            _state.update { it.copy(notice = com.zipper.app.util.SafetyWords.HELD_NOTICE) }
+            return
+        }
         _state.update { it.copy(commentInput = "") }
         viewModelScope.launch {
             try { repo.sendComment(_state.value.roomId, msg) }
@@ -578,6 +616,7 @@ class GoLiveViewModel @Inject constructor(
         val durationAtEnd = _duration.value
         faceCountdownJob?.cancel()
         heartbeatJob?.cancel()
+        stillsJob?.cancel()
         _state.update { it.copy(isLive = false, pkState = PKState.IDLE) }
         // Drop any PK join still in flight before leaving. A token fetch that
         // lands after the leave would put the engine straight back into

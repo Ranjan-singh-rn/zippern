@@ -40,6 +40,25 @@ object AgoraManager {
     }
 
     private var engine: RtcEngine? = null
+
+    /** O13: stills asked for and not yet written, by file path. */
+    private val snapshotWaiters = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Boolean>>()
+
+    /**
+     * O13 (5 Nov 2026): one still of what this phone is publishing (uid 0 = the local video), written to [filePath] as a
+     * JPEG. Answers false when there is no engine, the engine refused, or the still did not arrive within [timeoutMs] —
+     * a missed still is skipped, never retried in a loop.
+     */
+    suspend fun takeLocalSnapshot(filePath: String, timeoutMs: Long = 5_000L): Boolean {
+        val e = engine ?: return false
+        val waiter = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        snapshotWaiters[filePath] = waiter
+        val rc = try { e.takeSnapshot(0, filePath) } catch (_: Throwable) { -1 }
+        if (rc != 0) { snapshotWaiters.remove(filePath); return false }
+        val ok = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { waiter.await() } ?: false
+        snapshotWaiters.remove(filePath)
+        return ok
+    }
     var onUserJoined: ((Int) -> Unit)? = null
     var onUserOffline: ((Int) -> Unit)? = null
     var onError: ((Int) -> Unit)? = null
@@ -186,6 +205,10 @@ object AgoraManager {
                      */
                     override fun onRequestToken() {
                         renewCurrentToken(rejoin = true)
+                    }
+                    /* O13: a still of what this phone publishes, for the live wall — see [takeLocalSnapshot]. */
+                    override fun onSnapshotTaken(uid: Int, filePath: String?, width: Int, height: Int, errCode: Int) {
+                        filePath?.let { snapshotWaiters.remove(it)?.complete(errCode == 0) }
                     }
                 }
             }

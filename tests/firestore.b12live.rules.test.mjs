@@ -28,6 +28,9 @@
  *   * seller-to-seller trades (the two sellers and staff read, nobody writes);
  *   * O5: a chat message names its writer, is text / photo / voice / invite (never a gift — settleGift writes
  *     those), and only its sender edits or deletes it; "delete chat" is a participant's own `clearedAt`.
+ *   * O13: `appConfig/safety` is the Owner's; a person the word screen silenced posts nothing in that party room;
+ *     safety flags are read by staff and closed by Ops (status fields only), created by nobody; strikes and the
+ *     record of who watched a room are nobody's.
  */
 
 import { readFileSync } from 'node:fs'
@@ -80,7 +83,7 @@ const code = RULES.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '').r
 fact('S: the host may change only hostLiveFields()', code.includes('(isLiveHost() && hostLiveWriteOk())'))
 fact('S: pkInvites take no client create', /match \/pkInvites\/\{inviteId\} \{ allow read: if request\.auth != null; allow create: if false;/.test(code))
 fact('S: a comment carries the writer\'s own uid', code.includes('request.resource.data.uid == request.auth.uid'))
-fact('S (Track B): games, leaderboards and partySubscription are the Owner\'s config', code.includes("return docId in ['games', 'leaderboards', 'partySubscription'];"))
+fact('S (Track B, O13): games, leaderboards, partySubscription and safety are the Owner\'s config', code.includes("return docId in ['games', 'leaderboards', 'partySubscription', 'safety'];"))
 fact('S (Track B): the game ledger is deny-all', /match \/gameLedger\/\{rowId\} \{ allow read, write: if false; \}/.test(code))
 if (process.env.ZIPPER_STATIC_ONLY === '1') {
   if (tally.failures === 0) console.log(`\nAll ${tally.checks} B12 static checks passed (emulator checks NOT run).`)
@@ -220,7 +223,7 @@ async function trackB() {
   }
 
   console.log('I — the Owner-only appConfig documents (E4, E6, E7)')
-  for (const id of ['games', 'leaderboards', 'partySubscription']) {
+  for (const id of ['games', 'leaderboards', 'partySubscription', 'safety']) {
     await ok(`I: the MFA-bound Owner writes appConfig/${id}`, () => setDoc(D(owner, `appConfig/${id}`), { enabled: true }, { merge: true }))
     await no(`I: Tech does not write appConfig/${id}`, () => setDoc(D(tech, `appConfig/${id}`), { enabled: true }, { merge: true }))
     await no(`I: Finance does not write appConfig/${id}`, () => setDoc(D(fin, `appConfig/${id}`), { enabled: true }, { merge: true }))
@@ -306,6 +309,28 @@ async function trackB() {
   await ok('O: a participant clears the chat for themselves ("delete chat")',
     () => updateDoc(D(viewer, CH), { 'clearedAt.uidViewer': Date.now(), 'unreadCount.uidViewer': 0 }))
   await no('O: …somebody outside it cannot', () => updateDoc(D(host, CH), { 'clearedAt.uidHost': 1 }))
+
+  console.log('P — O13 safety: the word screen\'s party mute, flags, strikes, monitor sessions')
+  await seed('partyRooms/PR2', { hostUid: 'uidHost', isActive: true, visibility: 'public', chatMutedUsers: ['uidViewer'] })
+  await seed('partyRooms/PR2/listeners/uidViewer', { uid: 'uidViewer' })
+  await seed('partyRooms/PR2/listeners/uidOther', { uid: 'uidOther' })
+  const pmsg = (from) => ({ senderUid: from, senderName: from, text: 'hello', timestamp: Date.now(), isJoin: false })
+  await no('P: a person the word screen silenced posts nothing in that party room', () => setDoc(D(viewer, 'partyRooms/PR2/messages/p1'), pmsg('uidViewer')))
+  await ok('P: …everyone else still does', () => setDoc(D(other, 'partyRooms/PR2/messages/p2'), pmsg('uidOther')))
+  await no('P: …and nobody silences or un-silences themselves', () => updateDoc(D(viewer, 'partyRooms/PR2'), { chatMutedUsers: [] }))
+  await seed('safetyFlags/F1', { kind: 'live_chat', uid: 'uidViewer', roomId: 'R1', status: 'open' })
+  await ok('P: staff read a safety flag', () => getDoc(D(ops, 'safetyFlags/F1')))
+  await no('P: …an app user does not (a flag names a person)', () => getDoc(D(viewer, 'safetyFlags/F1')))
+  await ok('P: Ops closes a flag (status and review fields only)', () => updateDoc(D(ops, 'safetyFlags/F1'), { status: 'closed', reviewedBy: 'uidOps', reviewedAt: 1 }))
+  await no('P: …but changes nothing else on it', () => updateDoc(D(ops, 'safetyFlags/F1'), { uid: 'uidOther' }))
+  await no('P: …and Finance does not close one', () => updateDoc(D(fin, 'safetyFlags/F1'), { status: 'open' }))
+  await no('P: nobody creates a flag (the server does)', () => setDoc(D(owner, 'safetyFlags/F2'), { kind: 'x', status: 'open' }))
+  await seed('safetyStrikes/uidViewer', { count: 2 })
+  await seed('monitorSessions/M1', { monitorUid: 'uidOps', roomId: 'R1' })
+  await no('P: strikes are nobody\'s to read — not staff', () => getDoc(D(ops, 'safetyStrikes/uidViewer')))
+  await no('P: …nor the person struck', () => getDoc(D(viewer, 'safetyStrikes/uidViewer')))
+  await no('P: who watched a room is nobody\'s to read — not the host', () => getDoc(D(host, 'monitorSessions/M1')))
+  await no('P: …not staff from a browser either', () => getDoc(D(owner, 'monitorSessions/M1')))
 }
 
 let aborted = false

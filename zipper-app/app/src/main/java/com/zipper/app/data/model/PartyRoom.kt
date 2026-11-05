@@ -73,6 +73,8 @@ data class PartyRoom(
     val lockedSeats: List<Int> = emptyList(),
     /** Removed from the room. Refused a token, so it is a real removal and not a request. */
     val kickedUsers: List<String> = emptyList(),
+    /** O13: silenced in this room's chat by the server's word screen (firestore.rules refuses their messages). */
+    val chatMutedUsers: List<String> = emptyList(),
     /** B7: Zipper officials who entered this private room without its PIN — shown to everyone in it. */
     val officialPresentUids: List<String> = emptyList(),
     /** B7: the room's background (one of ROOM_THEMES in functions/src/party.ts). */
@@ -195,6 +197,8 @@ data class PartyRoom(
                 lockedSeats   = (doc.get("lockedSeats") as? List<*>)
                     ?.mapNotNull { (it as? Number)?.toInt() } ?: emptyList(),
                 kickedUsers   = (doc.get("kickedUsers") as? List<*>)
+                    ?.mapNotNull { it as? String } ?: emptyList(),
+                chatMutedUsers = (doc.get("chatMutedUsers") as? List<*>)
                     ?.mapNotNull { it as? String } ?: emptyList(),
                 officialPresentUids = (doc.get("officialPresentUids") as? List<*>)
                     ?.mapNotNull { it as? String } ?: emptyList(),

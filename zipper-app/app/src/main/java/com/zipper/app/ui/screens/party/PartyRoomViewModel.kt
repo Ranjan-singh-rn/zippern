@@ -112,6 +112,8 @@ data class PartyRoomUiState(
     val savingSettings: Boolean = false,
     val notice: String? = null,
     val error: String? = null,
+    /** O13: the word screen silenced this person in this room's chat. */
+    val chatMuted: Boolean = false,
     /** O5c (5 Nov 2026): a call about to be placed to someone in the room — its quote, for the confirmation. */
     val callTo: PartyCallTo? = null,
     /** The call the server just started — the screen opens it. */
@@ -281,6 +283,7 @@ class PartyRoomViewModel @Inject constructor(
     private var heartbeatJob: Job? = null
 
     init {
+        viewModelScope.launch { com.zipper.app.util.SafetyWords.ensureLoaded(com.google.firebase.firestore.FirebaseFirestore.getInstance()) }
         if (roomId.isNotBlank()) {
             collectRoom()
             collectSeats()
@@ -304,7 +307,7 @@ class PartyRoomViewModel @Inject constructor(
                 // open the profile has not arrived yet, and a kicked user opening
                 // the room for the first time is exactly when this must fire.
                 val myUid = auth.currentUser?.uid.orEmpty()
-                _state.update { it.copy(room = room, myUid = myUid) }
+                _state.update { it.copy(room = room, myUid = myUid, chatMuted = myUid.isNotBlank() && room.chatMutedUsers.contains(myUid)) }
                 if (myUid.isNotBlank() && room.kickedUsers.contains(myUid)) onKicked()
                 if (!room.isActive) onRoomEnded()
             }
@@ -1045,6 +1048,15 @@ class PartyRoomViewModel @Inject constructor(
     fun sendMessage() {
         val text = _state.value.messageInput.trim()
         if (text.isBlank() || roomId.isBlank()) return
+        // O13: silenced by the word screen in this room — the rules refuse it; say so instead of failing quietly.
+        if (_state.value.chatMuted) {
+            _state.update { it.copy(notice = "You can't chat in this room right now.") }
+            return
+        }
+        if (!com.zipper.app.util.SafetyWords.allowed(text)) {
+            _state.update { it.copy(notice = com.zipper.app.util.SafetyWords.HELD_NOTICE) }
+            return
+        }
         _state.update { it.copy(messageInput = "") }
         viewModelScope.launch {
             try { repo.sendMessage(roomId, text) }

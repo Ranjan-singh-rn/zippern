@@ -57,7 +57,8 @@ submitHostApplication submitHostCapture submitPartnerApplication submitRechargeR
 sweepHostLevels sweepQuickLoginTokens syncLivePresence syncPhoneKey syncPublicSeller syncStorageRoleClaim \
 takePartySeat updatePartyRoom verifyEmailBindCode verifyLoginEmailCode \
 pushCallStatus pushChatMessage pushIncomingCall pushLiveStarted"
-#   NEW (55): old apps never call them — O12 silent monitoring (monitorRoomToken, myMonitorRooms: CRM only), — games (OFF until the Owner switches a game on in appConfig/games), Party Pro
+#   NEW (59): old apps never call them — O12 silent monitoring (monitorRoomToken, myMonitorRooms: CRM only), O13
+#   safety (reportLiveSnapshot: APK 21; the three chat-screen triggers mask what any build writes), — games (OFF until the Owner switches a game on in appConfig/games), Party Pro
 #   subscription, leaderboards settlement, live (viewer recount, sweep with a 12 h fuse for rooms without a heartbeat,
 #   PK callables), party heartbeat and music, the account switcher's forgetQuickLogin and the restriction notice.
 WAVE_2A_NEW="partyHeartbeat setPartyMusic gameCatalog createGameMatch joinGameMatch quickGameMatch ludoAction claimGameTimeout \
@@ -67,7 +68,7 @@ crashCashout gameFairness rotateGameSeed playDice tossCoin spinWheel playKeno pl
 playDragonTiger playAndarBahar hiloStart hiloGuess hiloCashout minesStart minesReveal minesCashout \
 privateRoomSubscriptionStatus subscribePrivateRooms cancelPrivateRoomSubscription renewPrivateRoomSubscriptions \
 settleLeaderboards liveViewerCount sweepLiveRooms pkMatch pkRespond pkEnd quickLoginRestriction forgetQuickLogin \
-monitorRoomToken myMonitorRooms"
+monitorRoomToken myMonitorRooms reportLiveSnapshot screenLiveComment screenPartyMessage screenDirectMessage"
 WAVE_2A="$WAVE_2A_CHANGED $WAVE_2A_NEW"
 # WAVE B (21) — needs APK 21 on the phones (60 publishes it with minSupportedVersionCode 21 first):
 #   the completion wave 2b (8, still 20 Oct code): the new generateAgoraToken signs for a derived uid (APK 19 joins with

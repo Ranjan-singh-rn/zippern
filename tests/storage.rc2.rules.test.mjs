@@ -260,6 +260,30 @@ await no('O5: mallory cannot delete alice\'s photo',
 await ok('O5: alice deletes her own',
   deleteObject(S(appUser, 'chatMedia/alice_mallory/alice/p1.jpg')))
 
+// ════════════════════════════════════════════════════════════════════════════
+console.log('O13 — live stills: the broadcaster writes their own, staff who monitor read, nobody else')
+// ════════════════════════════════════════════════════════════════════════════
+await ok('O13: alice sends a still of her own room',
+  uploadBytes(S(appUser, 'liveSnapshots/alice/R1/1.jpg'), jpegOf(200 * 1024), img))
+await no('O13: …a still over 1 MB is refused',
+  uploadBytes(S(appUser, 'liveSnapshots/alice/R1/2.jpg'), jpegOf(1 * MiB + 1), img))
+await no('O13: …a video is not a still',
+  uploadBytes(S(appUser, 'liveSnapshots/alice/R1/3.mp4'), jpegOf(1024), vid))
+await no('O13: mallory cannot write a still under alice\'s name',
+  uploadBytes(S(otherUser, 'liveSnapshots/alice/R1/4.jpg'), jpegOf(1024), img))
+await ok('O13: Ops reads a still (the live wall)',
+  getBytes(S(opsAdmin, 'liveSnapshots/alice/R1/1.jpg')))
+await ok('O13: …the Owner too',
+  getBytes(S(owner, 'liveSnapshots/alice/R1/1.jpg')))
+await no('O13: another user cannot see a still',
+  getBytes(S(otherUser, 'liveSnapshots/alice/R1/1.jpg')))
+await no('O13: …nor an agency, nor marketing',
+  getBytes(S(agencyA, 'liveSnapshots/alice/R1/1.jpg')))
+await no('O13: …marketing',
+  getBytes(S(marketing, 'liveSnapshots/alice/R1/1.jpg')))
+await no('O13: alice cannot replace or delete a still (the server keeps the newest)',
+  deleteObject(S(appUser, 'liveSnapshots/alice/R1/1.jpg')))
+
 // ── Result ──────────────────────────────────────────────────────────────────
 await testEnv.cleanup()
 

@@ -3725,10 +3725,13 @@ service cloud.firestore {
          * check — `notKicked()` stays anyway, because a room can be re-entered
          * and the two answers are not the same question.
          */
+        // O13 (5 Nov 2026): and not silenced by the word screen (`chatMutedUsers`, written only by the server after
+        // the Owner's count of strikes) — the party twin of a live room's `mutedViewers`.
         allow create: if isActiveAppUser()
                       && request.resource.data.senderUid == request.auth.uid
                       && inRoom()
-                      && notKicked();
+                      && notKicked()
+                      && !(request.auth.uid in room().get('chatMutedUsers', []));
         allow update, delete: if isOps() || isAdmin();
       }
 
@@ -4209,8 +4212,11 @@ service cloud.firestore {
       // B8 / B7: `leaderboards` (ranking rewards) and `partySubscription` (Party Pro's price, level and period) are
       // money too — the Owner's alone, like `games`. Listed once, here, and kept apart from the bank account's arm
       // so that arm reads exactly as it always has.
+      // O13 (5 Nov 2026): `safety` — the AI check (a paid Google API), automatic ending, the word list and the mute
+      // threshold — is the Owner's too. Readable like the rest: the app checks a message against the list before
+      // sending it.
       function ownerOnlyConfig() {
-        return docId in ['games', 'leaderboards', 'partySubscription'];
+        return docId in ['games', 'leaderboards', 'partySubscription', 'safety'];
       }
       function appConfigWriter() {
         return docId != 'androidUpdate'
@@ -4666,6 +4672,23 @@ service cloud.firestore {
 
     match /{path=**}/beanTransactions/{txId} {
       allow read: if isFinance() || isAdmin();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SAFETY FLAGS — O13 (5 Nov 2026)
+    //
+    // Written only by the server: a live still SafeSearch flagged, or a person
+    // the word screen silenced. Staff who monitor read them on the CRM's live
+    // wall; Ops and the Owner close them. Nobody else reads them — a flag
+    // names a person. `safetyStrikes` (the per-person count) and
+    // `monitorSessions` (who watched which room) have no rule at all: the deny
+    // below is the whole of their access.
+    // ══════════════════════════════════════════════════════════════════════════
+    match /safetyFlags/{flagId} {
+      allow read:   if isStaff();
+      allow update: if (isOps() || isSuperAdmin())
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt', 'note']);
+      allow create, delete: if false;
     }
 
     // ══════════════════════════════════════════════════════════════════════════

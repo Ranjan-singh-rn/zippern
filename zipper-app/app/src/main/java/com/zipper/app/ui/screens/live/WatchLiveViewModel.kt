@@ -138,6 +138,7 @@ class WatchLiveViewModel @Inject constructor(
     private var lastPkSeen = 0L
 
     init {
+        viewModelScope.launch { com.zipper.app.util.SafetyWords.ensureLoaded(com.google.firebase.firestore.FirebaseFirestore.getInstance()) }
         collectRoomData()
         loadCurrentUser()
         loadGiftCatalogue()
@@ -442,6 +443,11 @@ class WatchLiveViewModel @Inject constructor(
         // B12: muted by the host — the rules would refuse it; say why instead.
         if (_state.value.isMutedInChat) {
             _state.update { it.copy(toastMessage = LiveRoomUi.MUTED_NOTICE) }
+            return
+        }
+        // O13: held back here, with the text left in the box to fix — the server would mask it and count a strike.
+        if (!com.zipper.app.util.SafetyWords.allowed(message)) {
+            _state.update { it.copy(toastMessage = com.zipper.app.util.SafetyWords.HELD_NOTICE) }
             return
         }
         _state.update { it.copy(commentInput = "") }

@@ -31,10 +31,21 @@
 import * as functions from 'firebase-functions/v1'
 import * as logger from 'firebase-functions/logger'
 import * as admin from 'firebase-admin'
+import { findBadWords, maskText, safetyConfig, wordListOf } from './safety'
 
 const db = admin.firestore()
 const messaging = admin.messaging()
 const asia = functions.region('asia-south1').firestore
+
+/** O13: [text] with the words the chat screen masks already masked. Never throws — a push must still go. */
+async function screenedText(text: string): Promise<string> {
+  try {
+    const hits = findBadWords(text, wordListOf(await safetyConfig()))
+    return maskText(text, hits)
+  } catch {
+    return text
+  }
+}
 
 type Data = Record<string, string>
 
@@ -183,8 +194,10 @@ export const pushChatMessage = asia
     if (blocked.exists) return null
 
     const type = String(msg.type ?? 'text')
+    // O13: the push preview is screened too — the message is masked a moment after it lands, the notification is not.
+    const shown = type === 'text' ? await screenedText(String(msg.text ?? '')) : ''
     const preview =
-      type === 'text' ? String(msg.text ?? '').slice(0, 120)
+      type === 'text' ? shown.slice(0, 120)
       : type === 'image' ? 'Sent a photo'
       : type === 'voice' ? 'Sent a voice message'
       // O5: written by settleGift only (firestore.rules refuses a client-written gift message).

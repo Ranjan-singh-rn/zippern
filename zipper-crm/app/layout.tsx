@@ -310,6 +310,8 @@ const navGroups: NavGroup[] = [
       { href: '/live',       label: 'Live Monitor', icon: Radio,      roles: ['superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member', 'tech_admin', 'tech_member', 'support_admin'] },
       // O12 (5 Nov 2026): the party twin of /live — listen silently, warn, ban, close.
       { href: '/party',      label: 'Party Monitor', icon: Headphones, roles: ['superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member', 'tech_admin', 'tech_member', 'support_admin'] },
+      // O13 (5 Nov 2026): every live room's newest still at a glance, flagged rooms first, and the open safety flags.
+      { href: '/live/wall',  label: 'Live Wall',     icon: ShieldAlert, roles: ['superadmin', 'app_admin', 'app_member', 'ops_admin', 'ops_member', 'tech_admin', 'tech_member', 'support_admin'] },
       // `app_member` is NOT here, though the page's own PAGE_ROLES still lists
       // them. Feedback is Firestore `feedbackTickets`, read-gated on
       // `isOps() || isAdmin() || isSupport()` (firestore.rules:920). `isApp()`
@@ -352,6 +354,7 @@ const navGroups: NavGroup[] = [
       { href: '/app-config/packages',        label: 'Packages',       icon: ShoppingBag, roles: ['superadmin'] },
       { href: '/app-config/daily-rewards',   label: 'Daily Rewards',  icon: Gift,        roles: ['superadmin'] },
       { href: '/app-config/games',           label: 'Games',          icon: Gamepad2,    roles: ['superadmin'] },
+      { href: '/app-config/safety',          label: 'Safety',         icon: ShieldCheck, roles: ['superadmin'] },
       { href: '/leaderboards',               label: 'Leaderboards',   icon: Trophy,      roles: ['superadmin'] },
       { href: '/app-config/music',           label: 'Room music',     icon: Music,       roles: ['superadmin', 'tech_admin', 'tech_member'] },
       { href: '/app-config/party-pro',       label: 'Party Pro',      icon: Crown,       roles: ['superadmin'] },

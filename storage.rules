@@ -1009,6 +1009,21 @@ service firebase.storage {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // LIVE STILLS (O13, 5 Nov 2026)
+    // /liveSnapshots/{uid}/{roomId}/{fileName}
+    // ══════════════════════════════════════════════════════════════
+    // One still of what a broadcaster is publishing, every minute or so, for
+    // the CRM's live wall (and the AI check when the Owner turns it on). The
+    // broadcaster writes their own, a JPEG of at most 1 MB; staff who monitor
+    // rooms read them; the server (`reportLiveSnapshot`) keeps the newest and
+    // deletes the rest. No user reads another's still.
+    match /liveSnapshots/{uid}/{roomId}/{fileName} {
+      allow read:   if isSupport() || isKycReviewer();
+      allow create: if isOwner(uid) && isImage() && maxSize(1);
+      allow update, delete: if false;
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // DENY EVERYTHING ELSE
     // ══════════════════════════════════════════════════════════════
     match /{allPaths=**} {

@@ -179,8 +179,8 @@ describe('monitorRoomToken', () => {
 
   test('no client can read or write the record of who watched (firestore.rules)', () => {
     const rules = fs.readFileSync(path.join(__dirname, '..', '..', 'firestore.rules'), 'utf8')
-    // No rule names the collection, so the deny-everything-else match covers it.
-    expect(rules.includes('monitorSessions')).toBe(false)
+    // No rule matches the collection (comments may name it), so the deny-everything-else match covers it.
+    expect(/match \/monitorSessions\//.test(rules)).toBe(false)
     expect(/match \/\{document=\*\*\} \{\s*allow read, write: if false;/.test(rules)).toBe(true)
   })
 })

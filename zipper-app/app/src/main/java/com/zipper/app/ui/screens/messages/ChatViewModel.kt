@@ -85,6 +85,7 @@ class ChatViewModel @Inject constructor(
     private var me: Pair<String, String>? = null
 
     init {
+        viewModelScope.launch { com.zipper.app.util.SafetyWords.ensureLoaded(com.google.firebase.firestore.FirebaseFirestore.getInstance()) }
         loadOtherUser()
         observeMessages()
         // While this chat is open, its messages must not also arrive as notifications.
@@ -173,6 +174,11 @@ class ChatViewModel @Inject constructor(
     fun sendMessage() {
         val text = _input.value.trim()
         if (text.isBlank()) return
+        // O13: abuse in a private chat is still abuse — held back here, masked by the server if it gets through.
+        if (!com.zipper.app.util.SafetyWords.allowed(text)) {
+            _state.update { it.copy(notice = com.zipper.app.util.SafetyWords.HELD_NOTICE) }
+            return
+        }
         _input.value = ""
         viewModelScope.launch {
             // Put the text back when it did not go, so nothing typed is lost.
