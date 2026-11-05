@@ -35,6 +35,10 @@
       a flavour-specific manifest) as well as the flag flipped.
     -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- O14 (5 Nov 2026): the party-room music player lists the songs on this phone (asked only when Music is opened;
+         the system file picker works without it). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <!-- Features -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />

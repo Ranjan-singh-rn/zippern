@@ -324,7 +324,8 @@ internal fun PartyRoomMenuSheet(
         return
     }
     if (showMusic) {
-        PartyMusicSheet(state, viewModel, onDismiss = { showMusic = false })
+        // O14 (5 Nov 2026): the music player — the songs on this phone (or the catalogue) — replaces the catalogue-only sheet.
+        PartyMusicPlayerSheet(state, viewModel, onDismiss = { showMusic = false })
         return
     }
 
