@@ -61,9 +61,21 @@ class Apk20WiringTest {
 
     // Track B release (4 Nov 2026): APK 21 / 1.2.7 — release/trackb-20261104 publishes it with minSupported 21.
     // The prod-type checks below are unchanged from build 20.
+    @Test fun `screenshots are blocked only in the Play release build`() {
+        val release = gradle.substring(gradle.indexOf("release {"), gradle.indexOf("debug {"))
+        assertTrue(release.contains("buildConfigField(\"boolean\", \"ALLOW_SCREENSHOTS\", \"false\")"))
+        val prod = gradle.substring(gradle.indexOf("create(\"prod\")"), gradle.indexOf("create(\"emu\")"))
+        assertTrue(prod.contains("buildConfigField(\"boolean\", \"ALLOW_SCREENSHOTS\", \"true\")"))
+        assertTrue("prod stays non-debuggable", prod.contains("isDebuggable = false"))
+        val act = src("MainActivity.kt")
+        assertTrue(act.contains("if (!BuildConfig.ALLOW_SCREENSHOTS)"))
+        assertTrue(act.contains("FLAG_SECURE"))
+    }
+
     @Test fun `build 21 ships a non-debuggable prod type on the debug key and reads its channel by name`() {
-        assertTrue(gradle.contains("versionCode = 21"))
-        assertTrue(gradle.contains("versionName = \"1.2.7\""))
+        // 6 Nov 2026: APK 22 / 1.2.8 — same as 21 plus screenshots allowed in the prod test build.
+        assertTrue(gradle.contains("versionCode = 22"))
+        assertTrue(gradle.contains("versionName = \"1.2.8\""))
         val prod = gradle.substring(gradle.indexOf("create(\"prod\")"))
         assertTrue(prod.contains("initWith(getByName(\"release\"))"))
         assertTrue(prod.contains("isDebuggable = false"))
