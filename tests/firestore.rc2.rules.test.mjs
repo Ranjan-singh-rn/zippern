@@ -142,7 +142,9 @@ function staticChecks() {
     ['notifications', 1], ['hostKyc', 1], ['staffRoster', 1], ['ownerMfaSessions', 1], ['feedbackTickets', 1],
     ['supportTickets', 1], ['techTickets', 1], ['salaryRequests', 1], ['weeklyPayoutReports', 1], ['appConfig', 1],
     ['calls', 1], ['callHistory', 1], ['coinPurchaseRequests', 1], ['followers', 1], ['giftsReceived', 1],
-    ['rateLimits', 1], ['private', 1], ['partyRooms', 1],
+    // `private`: D13's partyRooms/{id}/private (the PIN secret) and, since Track B (4 Nov 2026, e6ce378),
+    // gameMatches/{id}/private (game seeds and invite codes). Both deny-all — pinned one by one below.
+    ['rateLimits', 1], ['private', 2], ['partyRooms', 1],
     ['hostPayouts', 2], // weeklyPayoutReports/{id}/hostPayouts (D1) + the legacy top-level path (D2)
   ]) {
     const got = count(new RegExp(`match /${what}/\\{`, 'g'))
@@ -150,8 +152,19 @@ function staticChecks() {
   }
   fact('S: D12 rateLimits is an explicit deny-all',
     count(/match \/rateLimits\/\{bucket\} \{ allow read, write: if false; \}/g) === 1)
+  // Every `private` subcollection is an explicit deny-all, and each sits where it belongs: the first inside
+  // partyRooms (D13), the second inside gameMatches (Track B) — by position, since partyRooms comes first in the file.
+  const denyPrivate = / match \/private\/\{docId\} \{ allow read, write: if false; \}/g
+  const denyAt = [...code.matchAll(denyPrivate)].map((m) => m.index)
+  const partyAt = code.indexOf('match /partyRooms/{roomId} {')
+  const gamesAt = code.indexOf('match /gameMatches/{matchId} {')
+  fact('S: every `match /private/{…}` is an explicit deny-all', denyAt.length === count(/match \/private\/\{/g),
+    `deny-all ${denyAt.length}, private blocks ${count(/match \/private\/\{/g)}`)
   fact('S: D13 partyRooms/{id}/private/{doc} is an explicit deny-all',
-    count(/match \/private\/\{docId\} \{ allow read, write: if false; \}/g) === 1)
+    partyAt >= 0 && gamesAt > partyAt && denyAt.some((i) => i > partyAt && i < gamesAt),
+    `partyRooms at ${partyAt}, gameMatches at ${gamesAt}, deny-all private at ${denyAt.join(', ')}`)
+  fact('S: Track B gameMatches/{id}/private/{doc} is an explicit deny-all',
+    gamesAt >= 0 && denyAt.some((i) => i > gamesAt))
   fact('S: A1 the Owner MFA demotion is present (superadmin_mfa_pending)', code.includes("'superadmin_mfa_pending'"))
 
   let idx = null
