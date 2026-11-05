@@ -44,6 +44,7 @@ import * as admin from 'firebase-admin'
 import * as crypto from 'crypto'
 import { assertActiveSession } from './mobileSession'
 import { privateRoomGate } from './partySubscription'
+import { findBadWords, maskText, safetyConfig, wordListOf } from './safety'
 
 const db = admin.firestore()
 
@@ -1035,6 +1036,8 @@ export const leavePartyRoom = functions
     const roomRef = db.collection('partyRooms').doc(roomId)
     await vacateAndDrop(roomRef, uid, { alsoListener: true })
     await db.collection('users').doc(uid).set(presence(''), { merge: true })
+    // O14: a song this person was playing went out with them.
+    await stopMusicOf(roomRef, uid)
     // B7: an official who leaves is no longer "present" (the access log keeps the visit).
     const roomNow = await roomRef.get()
     if (((roomNow.get('officialPresentUids') as string[] | undefined) ?? []).includes(uid)) {
@@ -1587,6 +1590,8 @@ export const leavePartySeat = functions
     if (kick) {
       await db.collection('users').doc(target).set(presence(''), { merge: true })
     }
+    // O14: off the seat is off the air — a song the target was playing stops with them.
+    if (vacated || kick) await stopMusicOf(roomRef, target)
 
     return { left: vacated, kicked: kick, roomEmpty }
   })
@@ -1765,21 +1770,108 @@ export const setPartyAdmin = functions
 // ── endPartyRoom ─────────────────────────────────────────────────────────────
 
 /**
- * B7 (3 Nov 2026): room music. The owner or an admin picks a track from Zipper's own catalogue
- * (`musicTracks/{id}` — licensed tracks the Owner adds in the CRM; an empty catalogue plays nothing) and plays it
- * into the room: their phone mixes it into the audio they publish (Agora audio mixing), and the room document says
- * what is playing so everybody sees it. Only a track from the catalogue can be named — never an arbitrary URL.
+ * B7 (3 Nov 2026): room music. The owner or an admin plays music into the room: their phone mixes it into the audio it
+ * publishes (Agora audio mixing), and the room document says what is playing so everybody sees it.
+ *
+ * Two sources:
+ *
+ *   * O14 (Owner, 5 Nov 2026) — "party music is not to add licensed tracks, but to access from your device if some
+ *     audios are there grab them to play, like a music player": `source: 'device'`. The song is a file on the player's
+ *     own phone. Only its NAME travels — title ≤ 80, artist ≤ 60, both through the O13 word screen (a hit is masked
+ *     as in chat) — and the audio goes out through Agora with the player's microphone, so the player must be on a
+ *     seat. Nothing is fetched by anybody else and no URL is stored. The caller becomes the player (`by`): a second
+ *     moderator who starts a song takes over, and the first phone stops on seeing that.
+ *   * Zipper's own catalogue (`musicTracks/{id}`, kept in the CRM): `trackId`. Only a track from the catalogue can be
+ *     named — never an arbitrary URL.
+ *
+ * `trackId: null` without a device source stops the music. `playing: false` pauses (the name stays, shown as
+ * paused). The player leaving their seat or the room stops it too ([stopMusicOf]).
  */
+export const MUSIC_TITLE_MAX = 80
+export const MUSIC_ARTIST_MAX = 60
+/** Longer than any song: a value past this is junk, and stored as 0 ("unknown"). */
+export const MUSIC_DURATION_MAX_MS = 6 * 60 * 60 * 1000
+
+/** Pure, for tests: a device track's name as the room will show it — trimmed, one line, capped, words screened. */
+export function deviceTrackOf(
+  raw: { title?: unknown; artist?: unknown; durationMs?: unknown },
+  words: readonly string[],
+): { title: string; artist: string; durationMs: number } {
+  const line = (v: unknown, max: number): string => {
+    const text = typeof v === 'string' ? v : ''
+    return text.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, ' ')
+      .replace(/\s+/g, ' ').trim().slice(0, max).trim()
+  }
+  const screen = (text: string): string => {
+    if (!text) return text
+    const hits = findBadWords(text, words)
+    return hits.length > 0 ? maskText(text, hits) : text
+  }
+  // Masking can lengthen a two-letter word to three stars, so the cap is applied again after the screen.
+  const title = screen(line(raw.title, MUSIC_TITLE_MAX)).slice(0, MUSIC_TITLE_MAX) || 'Music'
+  const artist = screen(line(raw.artist, MUSIC_ARTIST_MAX)).slice(0, MUSIC_ARTIST_MAX)
+  const d = Number(raw.durationMs)
+  const durationMs = Number.isFinite(d) && d > 0 && d <= MUSIC_DURATION_MAX_MS ? Math.round(d) : 0
+  return { title, artist, durationMs }
+}
+
+/** Pure, for tests: does the room's [music] belong to [uid] (so it stops when they stand up or leave)? */
+export function musicPlayedBy(music: unknown, uid: string): boolean {
+  return !!uid && typeof music === 'object' && music !== null && (music as { by?: unknown }).by === uid
+}
+
+/**
+ * The player stood up or left: their phone is no longer publishing, so the room stops saying a song is playing.
+ * A transaction, so a song somebody else started in the meantime is left alone. Never throws — leaving must not fail
+ * because of music.
+ */
+async function stopMusicOf(roomRef: admin.firestore.DocumentReference, uid: string): Promise<void> {
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(roomRef)
+      if (snap.exists && musicPlayedBy(snap.get('music'), uid)) {
+        tx.update(roomRef, { music: admin.firestore.FieldValue.delete() })
+      }
+    })
+  } catch (err) {
+    functions.logger.warn(`stopMusicOf: ${roomRef.path} ${uid}`, err)
+  }
+}
+
 export const setPartyMusic = functions
   .region('asia-south1')
-  .https.onCall(async (data: { roomId?: string; trackId?: string | null; playing?: boolean }, context) => {
+  .https.onCall(async (data: {
+    roomId?: string; trackId?: string | null; playing?: boolean
+    source?: string; title?: string; artist?: string; durationMs?: number
+  }, context) => {
     const uid = requireAuth(context)
+    await assertActiveSession(uid, data, 'setPartyMusic', context.auth?.token)   // like every other room control
     const roomId = String(data?.roomId ?? '')
     if (!roomId) throw new functions.https.HttpsError('invalid-argument', 'roomId is required.')
     const roomRef = db.collection('partyRooms').doc(roomId)
     const roomSnap = await roomRef.get()
     requireLiveRoom(roomSnap)
     requireHostOrAdmin(roomSnap, uid)
+
+    // O14: a song from the player's own phone.
+    if (data?.source === 'device') {
+      const seated = await roomRef.collection('seats').where('uid', '==', uid).limit(1).get()
+      if (seated.empty) {
+        throw new functions.https.HttpsError(
+          'failed-precondition',
+          'Take a seat to play music — it goes out with your microphone.',
+          { code: 'MUSIC_NEEDS_SEAT' },
+        )
+      }
+      const track = deviceTrackOf(data, wordListOf(await safetyConfig()))
+      const music = {
+        source: 'device', trackId: '', title: track.title, artist: track.artist, url: '', durationMs: track.durationMs,
+        playing: data?.playing !== false, by: uid, startedAtMs: Date.now(),
+      }
+      await roomRef.update({ music })
+      return { playing: music.playing, title: music.title, artist: music.artist }
+    }
+
     const trackId = String(data?.trackId ?? '')
     if (!trackId) {
       await roomRef.update({ music: admin.firestore.FieldValue.delete() })
@@ -1791,7 +1883,8 @@ export const setPartyMusic = functions
       throw new functions.https.HttpsError('not-found', 'That track is not available.')
     }
     const music = {
-      trackId, title: String(track.get('title') ?? 'Music').slice(0, 80), artist: String(track.get('artist') ?? '').slice(0, 80),
+      source: 'catalogue', trackId, title: String(track.get('title') ?? 'Music').slice(0, 80),
+      artist: String(track.get('artist') ?? '').slice(0, 80),
       url, playing: data?.playing !== false, by: uid, startedAtMs: Date.now(),
     }
     await roomRef.update({ music })

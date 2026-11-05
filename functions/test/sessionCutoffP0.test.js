@@ -163,8 +163,9 @@ describe('every call site hands its token to the gate', () => {
   // 31 since B7 (3 Nov 2026): `subscribePrivateRooms` takes diamonds for Party Pro — a protected operation.
   // 34 since B12 (4 Nov 2026): `pkMatch`, `pkRespond` and `pkEnd` (live.ts) write both hosts' rooms for a PK
   // battle — protected operations like every other room action.
+  // 35 since O14 (5 Nov 2026): `setPartyMusic` (party.ts) — the room's music, like every other room control.
   // (The game callables live in src/games/ and gate the same way; this count covers src/*.ts only.)
-  test('there are exactly 34 gated call sites', () => expect(sites.length).toBe(34))
+  test('there are exactly 35 gated call sites', () => expect(sites.length).toBe(35))
   for (const [file, args] of sites) {
     test(`${file}: assertActiveSession(${args.split(',')[2]?.trim() ?? ''}, …) passes the auth token`, () => {
       expect(/context\.auth\?\.token\s*$/.test(args.trim())).toBe(true)
