@@ -83,7 +83,7 @@ const code = RULES.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '').r
 fact('S: the host may change only hostLiveFields()', code.includes('(isLiveHost() && hostLiveWriteOk())'))
 fact('S: pkInvites take no client create', /match \/pkInvites\/\{inviteId\} \{ allow read: if request\.auth != null; allow create: if false;/.test(code))
 fact('S: a comment carries the writer\'s own uid', code.includes('request.resource.data.uid == request.auth.uid'))
-fact('S (Track B, O13): games, leaderboards, partySubscription and safety are the Owner\'s config', code.includes("return docId in ['games', 'leaderboards', 'partySubscription', 'safety'];"))
+fact('S (Track B, O13, O8): games, leaderboards, partySubscription, safety and dailyTasks are the Owner\'s config', code.includes("return docId in ['games', 'leaderboards', 'partySubscription', 'safety', 'dailyTasks'];"))
 fact('S (Track B): the game ledger is deny-all', /match \/gameLedger\/\{rowId\} \{ allow read, write: if false; \}/.test(code))
 if (process.env.ZIPPER_STATIC_ONLY === '1') {
   if (tally.failures === 0) console.log(`\nAll ${tally.checks} B12 static checks passed (emulator checks NOT run).`)
@@ -223,7 +223,7 @@ async function trackB() {
   }
 
   console.log('I — the Owner-only appConfig documents (E4, E6, E7)')
-  for (const id of ['games', 'leaderboards', 'partySubscription', 'safety']) {
+  for (const id of ['games', 'leaderboards', 'partySubscription', 'safety', 'dailyTasks']) {
     await ok(`I: the MFA-bound Owner writes appConfig/${id}`, () => setDoc(D(owner, `appConfig/${id}`), { enabled: true }, { merge: true }))
     await no(`I: Tech does not write appConfig/${id}`, () => setDoc(D(tech, `appConfig/${id}`), { enabled: true }, { merge: true }))
     await no(`I: Finance does not write appConfig/${id}`, () => setDoc(D(fin, `appConfig/${id}`), { enabled: true }, { merge: true }))
@@ -331,6 +331,16 @@ async function trackB() {
   await no('P: …nor the person struck', () => getDoc(D(viewer, 'safetyStrikes/uidViewer')))
   await no('P: who watched a room is nobody\'s to read — not the host', () => getDoc(D(host, 'monitorSessions/M1')))
   await no('P: …not staff from a browser either', () => getDoc(D(owner, 'monitorSessions/M1')))
+
+  console.log('Q — daily tasks (O8): progress is the server\'s; the person reads their own')
+  await seed('users/uidViewer/dailyTasks/2026-11-05', { send_gifts: 3, claimed: {} })
+  await seed('users/uidViewer/dailyTaskSeen/ev_1', { at: 1 })
+  await ok('Q: the person reads their own day', () => getDoc(D(viewer, 'users/uidViewer/dailyTasks/2026-11-05')))
+  await no('Q: …and cannot write it (a phone that could would claim any task)', () => setDoc(D(viewer, 'users/uidViewer/dailyTasks/2026-11-05'), { send_gifts: 99 }, { merge: true }))
+  await no('Q: …nor create tomorrow', () => setDoc(D(viewer, 'users/uidViewer/dailyTasks/2026-11-06'), { send_gifts: 99 }))
+  await no('Q: somebody else does not read it', () => getDoc(D(host, 'users/uidViewer/dailyTasks/2026-11-05')))
+  await no('Q: the exactly-once markers are nobody\'s — not the person', () => getDoc(D(viewer, 'users/uidViewer/dailyTaskSeen/ev_1')))
+  await no('Q: …nor written by them', () => setDoc(D(viewer, 'users/uidViewer/dailyTaskSeen/ev_2'), { at: 2 }))
 }
 
 let aborted = false
