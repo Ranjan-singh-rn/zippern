@@ -167,6 +167,7 @@ FIRESTORE_SUBCOLLECTIONS: dict[str, frozenset[str]] = {
         "weeklyEarnings", "weeklyStatements", "beanTransactions", "giftsSent", "giftsReceived",
         "notifications", "devices", "dailyClaims", "cardDebits",
         "gameHistory",                      # Track B: finished games and rounds
+        "dailyTasks", "dailyTaskSeen",      # O8: daily-task progress and its exactly-once markers
     }),
     "agencies": frozenset({"agencyHosts", "commissionLedger"}),
     "sellers": frozenset({"rechargeHistory", "diamondLending"}),

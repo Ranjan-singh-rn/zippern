@@ -260,6 +260,21 @@ async def promotions(
     return await _deliver(report, fmt, user)
 
 
+@router.get("/promotions/claims")
+async def promotion_claims(
+    since: datetime | None = _SINCE,
+    until: datetime | None = _UNTIL,
+    kind: str | None = Query(None, pattern="^(daily_reward|daily_task|leaderboard_reward)$"),
+    uid: str | None = Query(None, min_length=1, max_length=128),
+    limit: int = Query(500, ge=1, le=2000),
+    user: dict = Depends(require_internal),
+):
+    """O8 (5 Nov 2026): the audit list behind the promotions report — one row per daily reward, daily task or
+    ranking reward granted (who, when, what, how much, the history row). The same gate as the report."""
+    _require_business_financials(user)
+    return await _produce(svc.promotion_claims_list(since, until, kind, uid, limit))
+
+
 @router.get("/payouts")
 async def payouts(
     since: datetime | None = _SINCE,

@@ -1299,6 +1299,9 @@ def summarise_promotions(docs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "leaderboard_rewards": 0,
         "leaderboard_diamonds": 0,
         "leaderboard_beans": 0,
+        "daily_task_claims": 0,
+        "daily_task_diamonds": 0,
+        "daily_task_beans": 0,
         "claimants": 0,
         "other_kinds": {},
     }
@@ -1316,6 +1319,13 @@ def summarise_promotions(docs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             out["card_minutes"] += max(0, _int(d.get("minutes"), 0))
             out["card_diamond_value"] += max(0, _int(d.get("diamondValue"), 0))
             out["card_host_beans"] += max(0, _int(d.get("beansCredited"), 0))
+        elif kind == "daily_task":
+            # O8 (5 Nov 2026): a daily task the person completed and claimed — diamonds, or beans for a host task.
+            out["daily_task_claims"] += 1
+            out["daily_task_diamonds"] += max(0, _int(d.get("diamonds"), 0))
+            out["daily_task_beans"] += max(0, _int(d.get("beans"), 0))
+            if d.get("uid"):
+                claimants.add(str(d.get("uid")))
         elif kind == "leaderboard_reward":
             # B8: a ranking reward the Owner set — diamonds to a supporter, diamonds or beans to a host.
             out["leaderboard_rewards"] += 1
@@ -1347,7 +1357,8 @@ async def promotions_summary(
         day = _utc(at).date().isoformat() if isinstance(at, datetime) else "?"
         row = by_day.setdefault(day, {"daily_reward_claims": 0, "promo_diamonds_issued": 0,
                                       "call_cards_issued": 0, "call_cards_redeemed": 0, "card_host_beans": 0,
-                                      "leaderboard_diamonds": 0, "leaderboard_beans": 0})
+                                      "leaderboard_diamonds": 0, "leaderboard_beans": 0,
+                                      "daily_task_claims": 0, "daily_task_diamonds": 0, "daily_task_beans": 0})
         one = summarise_promotions([d])
         for k in row:
             row[k] += one[k]
@@ -1357,9 +1368,13 @@ async def promotions_summary(
     bean_inr = float(getattr(rt, "bean_to_inr", 0) or 0)
     totals["card_host_cost_inr_minor"] = int(round(s["card_host_beans"] * bean_inr * 100))
     totals["leaderboard_bean_cost_inr_minor"] = int(round(s["leaderboard_beans"] * bean_inr * 100))
+    totals["daily_task_bean_cost_inr_minor"] = int(round(s["daily_task_beans"] * bean_inr * 100))
+    # Every promotional diamond in the window, whatever gave it — the figure the dashboard adds to diamonds sold.
+    totals["promotional_diamonds_total"] = (
+        s["promo_diamonds_issued"] + s["daily_task_diamonds"] + s["leaderboard_diamonds"])
     report = Report(
         name="promotions",
-        title="Promotions — daily rewards and free call cards",
+        title="Promotions — daily rewards, daily tasks, ranking rewards and free call cards",
         period=_period(since, until),
         columns=[
             ("day", "Day (UTC)"),
@@ -1370,6 +1385,9 @@ async def promotions_summary(
             ("card_host_beans", "Host beans paid for card minutes"),
             ("leaderboard_diamonds", "Ranking rewards (diamonds)"),
             ("leaderboard_beans", "Ranking rewards (host beans)"),
+            ("daily_task_claims", "Daily tasks claimed"),
+            ("daily_task_diamonds", "Daily tasks (diamonds)"),
+            ("daily_task_beans", "Daily tasks (host beans)"),
         ],
         rows=rows,
         totals=totals,
@@ -1379,6 +1397,9 @@ async def promotions_summary(
             "card_host_beans": "Beans credited to hosts for card minutes — Zipper's cost of the free minutes.",
             "leaderboard_diamonds": "Diamonds paid as ranking rewards when a period closed. Not revenue; a liability until spent.",
             "leaderboard_beans": "Beans paid to hosts as ranking rewards — a cash cost at payout, valued at the bean rate.",
+            "daily_task_diamonds": "Diamonds paid for daily tasks (CRM → App Config → Daily tasks). Not revenue; a liability until spent.",
+            "daily_task_beans": "Beans paid to hosts for daily tasks — a cash cost at payout, valued at the bean rate.",
+            "promotional_diamonds_total": "Daily rewards + daily tasks + ranking rewards, in diamonds.",
         },
         rates=rt.as_dict(),
     )
@@ -1386,6 +1407,61 @@ async def promotions_summary(
         report.warnings.append(f"Unrecognised promotion kinds in this period: {s['other_kinds']}.")
     report.note_if_empty("No daily rewards were claimed and no free call cards were used in this period.")
     return report
+
+
+#: O8 (5 Nov 2026): the kinds the per-claim audit list shows — every grant a person collected themselves.
+AUDIT_PROMO_KINDS = ("daily_reward", "daily_task", "leaderboard_reward")
+
+
+def promotion_claims(
+    docs: Sequence[Mapping[str, Any]], kind: str | None = None, uid: str | None = None, limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Pure: one row per grant, newest first — who, when, what, how much, and the history row it wrote.
+
+    Only the kinds in AUDIT_PROMO_KINDS; `kind` / `uid` narrow it; at most `limit` rows (1–2000).
+    """
+    lim = max(1, min(2000, int(limit or 500)))
+    rows: list[dict[str, Any]] = []
+    for d in docs:
+        k = str(d.get("kind") or "")
+        if k not in AUDIT_PROMO_KINDS or (kind and k != kind) or (uid and str(d.get("uid") or "") != uid):
+            continue
+        at = d.get("createdAt")
+        rows.append({
+            "at": _utc(at).isoformat() if isinstance(at, datetime) else None,
+            "kind": k,
+            "uid": str(d.get("uid") or ""),
+            "day": str(d.get("dateKey") or ""),
+            "what": (str(d.get("title") or "") if k == "daily_task"
+                     else f"Day {_int(d.get('day'), 0)}" if k == "daily_reward"
+                     else str(d.get("board") or d.get("period") or "Ranking reward")),
+            "diamonds": max(0, _int(d.get("diamonds"), 0)),
+            "beans": max(0, _int(d.get("beans"), 0)),
+            "callCards": max(0, _int(d.get("videoCards"), 0)),
+            "historyRow": str(d.get("historyRow") or d.get("beanHistoryRow") or ""),
+        })
+    rows.sort(key=lambda r: r["at"] or "", reverse=True)
+    return rows[:lim]
+
+
+async def promotion_claims_list(
+    since: datetime | None = None, until: datetime | None = None,
+    kind: str | None = None, uid: str | None = None, limit: int = 500,
+) -> dict[str, Any]:
+    """O8: the audit list — every daily reward, daily task and ranking reward granted in the window."""
+    since, until = resolve_window(since, until)
+    docs = await _fs_scan("promoCredits", "createdAt", since, until)
+    rows = promotion_claims(docs, kind, uid, limit)
+    return {
+        "period": _period(since, until),
+        "count": len(rows),
+        "rows": rows,
+        "totals": {
+            "diamonds": sum(r["diamonds"] for r in rows),
+            "beans": sum(r["beans"] for r in rows),
+            "claims": len(rows),
+        },
+    }
 
 
 # ── Games: entries, payouts, fees, refunds (B6, 3 Nov 2026) ───────────────────
@@ -3100,6 +3176,16 @@ async def dashboard(
                 "Each paid the first minute of a call")
             add("promotions", "card_host_beans_last_30_days", promo["card_host_beans"], "beans",
                 "Paid to hosts for minutes a free call card covered — Zipper's cost")
+            # O8 (5 Nov 2026): daily tasks and ranking rewards are promotional diamonds too.
+            add("promotions", "daily_reward_claims_last_30_days", promo["daily_reward_claims"], "claims")
+            add("promotions", "daily_task_claims_last_30_days", promo["daily_task_claims"], "claims")
+            add("promotions", "daily_task_diamonds_last_30_days", promo["daily_task_diamonds"], "diamonds",
+                "Daily-task diamonds credited — not revenue, a liability until spent")
+            add("promotions", "daily_task_beans_last_30_days", promo["daily_task_beans"], "beans",
+                "Paid to hosts for daily tasks — a cash cost at payout")
+            add("promotions", "promotional_diamonds_last_30_days",
+                promo["promo_diamonds_issued"] + promo["daily_task_diamonds"] + promo["leaderboard_diamonds"],
+                "diamonds", "Daily rewards + daily tasks + ranking rewards")
         except DataUnavailable as exc:
             warnings.append(f"Promotions could not be read: {exc}")
         if rt.provisional and rt.note not in warnings:
