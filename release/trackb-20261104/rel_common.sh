@@ -126,10 +126,11 @@ NOT_PROD_FN_COMMIT="f1af30a1d64fb8f20403fd6e7da5633cfab1234c"
 
 # Android (60/61): the prod build type, signed with the debug key, published to the "debug" channel (build.gradle.kts).
 # APK 20 (1.2.6) was built but never published; APK 21 supersedes it. minSupportedVersionCode 21: the sign-in gate then
-# refuses APK 19 and 20 sessions, and every phone is offered 21.
-APK_VERSION_CODE=21
-APK_VERSION_NAME="1.2.7"
-APK_MIN_SUPPORTED=21
+# refuses APK 19 and 20 sessions, and every phone is offered 21. 6 Nov: APK 22 (1.2.8) = 21 + screenshots allowed in the
+# prod test build (ALLOW_SCREENSHOTS); minSupportedVersionCode 22 so every tester runs it.
+APK_VERSION_CODE=22
+APK_VERSION_NAME="1.2.8"
+APK_MIN_SUPPORTED=22
 APK_CHANNEL="debug"
 # The fleet's signing certificate: SHA-256 of its DER encoding (CN=Android Debug, O=Android, C=US), as tools/apk_cert.py
 # reads it from the APK Signing Block. It is the key that signed APK 19 (1.2.5), i.e. the fleet's update identity: a phone
@@ -137,7 +138,7 @@ APK_CHANNEL="debug"
 # (also "CN=Android Debug") would be refused by every phone. 60 and LOCAL-VERIFY 6b (which reads this line with sed)
 # refuse any other certificate.
 FLEET_CERT_SHA256="4878a35fa2b4d8a0a6bcab84f22b66312385fe02523603ea23d3e190fc1948af"
-APK_NOTES="ZIPPER 1.2.7: games lobby, live streaming upgrades with PK battles, coin seller tools, switch between your accounts, party room upgrades and animated gifts. This update is required."
+APK_NOTES="ZIPPER 1.2.8: screenshots allowed for testers; games lobby, live streaming upgrades with PK battles, coin seller tools, switch between your accounts, party room upgrades and animated gifts. This update is required."
 
 # Backend (11): exactly these settings are added to the service template; everything else is inherited.
 BACKEND_ENV_ADD="EMAIL_PROVIDER=sendgrid,SENDGRID_FROM_EMAIL=no-reply@zipperlive.org,SENDGRID_FROM_NAME=ZIPPER Live"

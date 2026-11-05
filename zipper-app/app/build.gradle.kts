@@ -115,8 +115,8 @@ android {
         // session cut-off (A-9). Publish with `minSupportedVersionCode: 20` —
         // 19 still runs the ten-second tick loop against a server that bills
         // whole minutes and shows a price that no longer matches.
-        versionCode = 21
-        versionName = "1.2.7"
+        versionCode = 22
+        versionName = "1.2.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 
@@ -290,6 +290,9 @@ android {
             // to a tester. Set false for anything going to Play.
             buildConfigField("boolean", "OTA_ENABLED", "true")
             buildConfigField("String", "OTA_CHANNEL", "\"release\"")
+            // Screenshots: blocked (FLAG_SECURE) only in the Play `release` build; allowed in debug/emu and in the
+            // non-debuggable `prod` stakeholder test build so testers can report bugs with pictures.
+            buildConfigField("boolean", "ALLOW_SCREENSHOTS", "false")
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
             // The CRM, opened from the Work tab ("Open the full CRM"): the Hosting site that also serves /api.
             buildConfigField("String", "CRM_WEB_URL", "\"$zipperApiBaseRelease\"")
@@ -301,6 +304,9 @@ android {
             isMinifyEnabled = false
             buildConfigField("boolean", "OTA_ENABLED", "true")
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
+            // Screenshots: blocked (FLAG_SECURE) only in the Play `release` build; allowed in debug/emu and in the
+            // non-debuggable `prod` stakeholder test build so testers can report bugs with pictures.
+            buildConfigField("boolean", "ALLOW_SCREENSHOTS", "true")
             // Opt-in only — see `zipperApiBase` above.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBase\"")
             buildConfigField("String", "CRM_WEB_URL", "\"$zipperApiBase\"")
@@ -353,6 +359,9 @@ android {
             buildConfigField("boolean", "OTA_ENABLED", "true")
             // The channel debug-signed APKs are published to.
             buildConfigField("String", "OTA_CHANNEL", "\"debug\"")
+            // Screenshots: blocked (FLAG_SECURE) only in the Play `release` build; allowed in debug/emu and in the
+            // non-debuggable `prod` stakeholder test build so testers can report bugs with pictures.
+            buildConfigField("boolean", "ALLOW_SCREENSHOTS", "true")
             // Production host by default; `zipper.apiBase` still overrides.
             buildConfigField("String", "ZIPPER_API_BASE", "\"$zipperApiBaseRelease\"")
             // The CRM, opened from the Work tab ("Open the full CRM"): the Hosting site that also serves /api.

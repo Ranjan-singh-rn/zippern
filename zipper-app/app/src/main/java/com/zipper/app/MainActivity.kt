@@ -109,7 +109,8 @@ class MainActivity : ComponentActivity() {
          * is secure whatever state the working tree was in when it was cut;
          * there is no toggle to remember.
          */
-        if (!BuildConfig.DEBUG) {
+        // Per build type (build.gradle.kts): false only for the Play `release` build.
+        if (!BuildConfig.ALLOW_SCREENSHOTS) {
             window.setFlags(
                 android.view.WindowManager.LayoutParams.FLAG_SECURE,
                 android.view.WindowManager.LayoutParams.FLAG_SECURE
