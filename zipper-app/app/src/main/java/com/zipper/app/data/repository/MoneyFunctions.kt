@@ -302,6 +302,19 @@ class MoneyFunctions @Inject constructor(
             )
         }
 
+    /** O8 (5 Nov 2026): what one daily task paid — diamonds, or beans for a host task. */
+    data class DailyTaskClaim(val taskId: String, val diamonds: Long, val beans: Long)
+
+    /** O8: claim a finished daily task (server checks today's progress, pays once, writes the ledger rows). */
+    suspend fun claimDailyTask(taskId: String): Result<DailyTaskClaim> =
+        call("claimDailyTask", mapOf("taskId" to taskId)) { m ->
+            DailyTaskClaim(
+                taskId   = m["taskId"] as? String ?: taskId,
+                diamonds = (m["diamonds"] as? Number)?.toLong() ?: 0L,
+                beans    = (m["beans"] as? Number)?.toLong() ?: 0L,
+            )
+        }
+
     data class BagPurchase(
         val itemId: String,
         val pricePaid: Long,

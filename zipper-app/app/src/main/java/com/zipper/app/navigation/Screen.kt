@@ -239,6 +239,7 @@ sealed class Screen(val route: String) {
     }
     object LevelScreen    : Screen("level_screen")
     object DailyRewards   : Screen("daily_rewards")
+    object DailyTasks     : Screen("daily_tasks")
 
     // Gallery viewer
     object GalleryViewer : Screen("gallery_viewer/{uid}/{startIndex}") {

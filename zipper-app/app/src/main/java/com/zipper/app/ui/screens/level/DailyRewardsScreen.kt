@@ -217,6 +217,7 @@ class DailyRewardsViewModel @Inject constructor(
 @Composable
 fun DailyRewardsScreen(
     onBack: () -> Unit = {},
+    onOpenDailyTasks: () -> Unit = {},
     viewModel: DailyRewardsViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -236,7 +237,12 @@ fun DailyRewardsScreen(
     val todayDay = state.todayDay
     val todayReward = state.todayReward
 
-    ZipperScreen(topBar = { TopBar("Daily rewards", onBack = onBack) }) { _ ->
+    ZipperScreen(topBar = {
+        // O8 (5 Nov 2026): the day's tasks sit next to the daily reward.
+        TopBar("Daily rewards", onBack = onBack, actions = {
+            ZipperButton("Daily tasks", onOpenDailyTasks, size = ButtonSize.Small, style = ButtonStyle.Secondary)
+        })
+    }) { _ ->
         Box(Modifier.fillMaxSize()) {
             Column(
                 Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = Space.lg, vertical = Space.md),

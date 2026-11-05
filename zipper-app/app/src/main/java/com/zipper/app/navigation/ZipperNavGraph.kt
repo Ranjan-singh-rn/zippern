@@ -815,8 +815,14 @@ fun ZipperNavGraph(
         composable(Screen.DailyRewards.route) {
             DailyRewardsScreen(
                 onBack = { navController.popBackStack() },
+                onOpenDailyTasks = { navController.navigate(Screen.DailyTasks.route) },
                 // viewModel provided by hiltViewModel() inside the screen
             )
+        }
+
+        // ── Daily Tasks (O8) ──────────────────────────────────────────────
+        composable(Screen.DailyTasks.route) {
+            com.zipper.app.ui.screens.level.DailyTasksScreen(onBack = { navController.popBackStack() })
         }
 
         // ── My Bag ────────────────────────────────────────────────────────
