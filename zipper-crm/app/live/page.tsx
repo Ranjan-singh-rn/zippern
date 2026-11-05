@@ -36,7 +36,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
   AlertTriangle, Ban, CheckCircle2, Clock, Eye, ExternalLink, Flame, Gift,
-  Loader2, MicOff, Pause, Play, Radio, RefreshCw, ShieldAlert, TrendingUp,
+  Loader2, Mic, MicOff, Pause, Play, Radio, RefreshCw, ShieldAlert, TrendingUp,
   Users, X,
 } from 'lucide-react'
 import { getActiveLiveRooms, type LiveRoom } from '@/lib/firestore'
@@ -132,7 +132,7 @@ type GiftSample = { at: number; gifts: number }
  * `warn` and `ban` act on the **host's account** and are unchanged.
  * `mute` and `end` act on the **room**, are new, and are Ops-or-owner only.
  */
-type RoomAction = 'warn' | 'ban' | 'mute' | 'end'
+type RoomAction = 'warn' | 'ban' | 'mute' | 'unmute' | 'end'
 
 interface ActionCopy {
   title: (room: LiveRoom) => string
@@ -166,6 +166,14 @@ const ACTION: Record<RoomAction, ActionCopy> = {
     blurb:
       'Sets the mute flag on the room and records why. It is an instruction the Android app has to honour by stopping the host’s audio — this API is not in the media path and cannot silence anybody on its own, so if the app does not read the flag yet, nothing the audience can hear changes. The server says which it was and that answer is shown.',
     confirmLabel: 'Mute host',
+    tone: 'warning',
+    intervention: true,
+  },
+  unmute: {
+    title: (r) => `Unmute ${r.hostName || 'this host'}`,
+    blurb:
+      'Lifts the staff mute on this room and records why. The host can turn the microphone back on as soon as the app reads the flag. Recorded in the audit log with your name.',
+    confirmLabel: 'Unmute host',
     tone: 'warning',
     intervention: true,
   },
@@ -588,6 +596,10 @@ export default function LiveMonitor() {
               const result = await live.end(room.roomId, reason)
               // The server's own sentence about what it did and did not do.
               setNotice(`${who}’s stream was ended. ${result.note}`)
+            } else if (action === 'unmute') {
+              const result = await live.mute(room.roomId, false, reason)
+              setNotice(`${who} was unmuted, and the reason is on the record.`)
+              setCaveat(result.app_must_honour)
             } else {
               const result = await live.mute(room.roomId, true, reason)
               setNotice(`${who} was muted, and the reason is on the record.`)
@@ -611,6 +623,7 @@ const ACTION_ICON: Record<RoomAction, React.ReactNode> = {
   warn: <ShieldAlert size={18} />,
   ban: <Ban size={18} />,
   mute: <MicOff size={18} />,
+  unmute: <Mic size={18} />,
   end: <X size={18} />,
 }
 
@@ -825,7 +838,7 @@ function RoomCard({
           <Ban size={13} /> Ban
         </button>
         <button
-          onClick={() => onModerate('mute')}
+          onClick={() => onModerate(room.hostMuted ? 'unmute' : 'mute')}
           disabled={!canIntervene}
           title={
             canIntervene
@@ -834,7 +847,7 @@ function RoomCard({
           }
           className="flex items-center justify-center gap-1.5 text-slate-400 hover:text-amber-300 hover:bg-amber-500/10 disabled:text-slate-700 disabled:hover:bg-transparent disabled:cursor-not-allowed text-xs py-2.5 transition-colors"
         >
-          <MicOff size={13} /> Mute
+          {room.hostMuted ? <><Mic size={13} /> Unmute</> : <><MicOff size={13} /> Mute</>}
         </button>
         <button
           onClick={() => onModerate('end')}

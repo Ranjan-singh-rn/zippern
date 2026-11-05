@@ -123,6 +123,8 @@ export interface LiveRoom {
   startedAt: Timestamp | null
   title: string
   totalGiftsReceived: number
+  /** Staff mute flag on the room (CRM Live → Mute / Unmute). */
+  hostMuted: boolean
 }
 
 export interface RevenueEntry {
@@ -670,6 +672,7 @@ export async function getActiveLiveRooms(): Promise<LiveRoom[]> {
     startedAt:          d.data().startedAt          ?? null,
     title:              d.data().title              ?? '',
     totalGiftsReceived: d.data().totalGiftsReceived ?? 0,
+    hostMuted: d.data().hostMuted === true,
   }))
   // Sort newest-first client-side
   return rooms.sort((a, b) => {
