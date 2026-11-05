@@ -4907,6 +4907,11 @@ export { reportLiveSnapshot, screenLiveComment, screenPartyMessage, screenDirect
 // `users/{uid}.isInCall` from the call documents (connected / ending), outside the money path.
 export { syncCallPresence } from './callPresence'
 
+// O8 (5 Nov 2026): daily tasks — the Owner's tasks for users and hosts (`appConfig/dailyTasks`), progress measured on
+// the server from rows it already writes (the two ledger triggers; live, party and DM hooks in their own modules),
+// and the claim: wallet, history row and a `promoCredits` record (kind `daily_task`) in one transaction.
+export { claimDailyTask, dailyTasksDiamondLedger, dailyTasksBeanLedger } from './dailyTasks'
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  PUBLIC SELLER DIRECTORY
 // ══════════════════════════════════════════════════════════════════════════════

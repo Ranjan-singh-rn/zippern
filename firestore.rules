@@ -2619,6 +2619,17 @@ service cloud.firestore {
         allow read:  if isOwner(uid) || isStaff();
         allow write: if false;
       }
+      // O8 (5 Nov 2026): today's daily-task progress and what was claimed — counted and written only by the
+      // server (functions/src/dailyTasks.ts) from rows it writes itself; the person reads their own to show the
+      // bars. A phone that could write here could claim any task.
+      match /dailyTasks/{dayKey} {
+        allow read:  if isOwner(uid);
+        allow write: if false;
+      }
+      // …and the markers that make each count exactly-once: nobody's.
+      match /dailyTaskSeen/{markerId} {
+        allow read, write: if false;
+      }
       match /weeklyEarnings/{weekKey} {
         // Server-written, like the ledgers above. See the note there on why
         // `isAdmin()` was the wrong spelling of that.
@@ -4215,8 +4226,10 @@ service cloud.firestore {
       // O13 (5 Nov 2026): `safety` — the AI check (a paid Google API), automatic ending, the word list and the mute
       // threshold — is the Owner's too. Readable like the rest: the app checks a message against the list before
       // sending it.
+      // O8 (5 Nov 2026): `dailyTasks` — the daily tasks and the diamonds and beans each one pays — is money, so the
+      // Owner's. Readable like the rest: the app lists today's tasks from it.
       function ownerOnlyConfig() {
-        return docId in ['games', 'leaderboards', 'partySubscription', 'safety'];
+        return docId in ['games', 'leaderboards', 'partySubscription', 'safety', 'dailyTasks'];
       }
       function appConfigWriter() {
         return docId != 'androidUpdate'

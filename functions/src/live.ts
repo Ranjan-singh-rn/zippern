@@ -26,6 +26,7 @@
 import * as functions from 'firebase-functions/v1'
 import * as admin from 'firebase-admin'
 import { assertActiveSession } from './mobileSession'
+import { recordWatchMinute } from './dailyTasks'
 
 const db = (): admin.firestore.Firestore => admin.firestore()
 
@@ -159,6 +160,13 @@ export const liveViewerCount = functions
   .region('asia-south1')
   .firestore.document('liveRooms/{roomId}/viewers/{uid}')
   .onWrite(async (change, context) => {
+    // O8 (5 Nov 2026): a presence row written — the join, then the minute's refresh — is a minute watched for the
+    // "watch lives" daily task, at most one per minute (dailyTasks.ts; nothing at all while no task measures it).
+    if (change.after.exists) {
+      const at = context.timestamp ? new Date(context.timestamp) : new Date()
+      await recordWatchMinute(String(context.params.uid ?? ''), String(context.params.roomId), Number.isFinite(at.getTime()) ? at : new Date())
+        .catch((err) => functions.logger.warn('liveViewerCount: daily task minute not recorded', { err: String(err) }))
+    }
     if (change.before.exists === change.after.exists) return null
     await recountViewers(String(context.params.roomId))
     return null
