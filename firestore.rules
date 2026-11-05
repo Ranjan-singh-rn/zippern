@@ -1,6 +1,184 @@
-// Deployed rules. Comments removed to stay under Firebase's 256 KB rules limit (5 Nov 2026);
-// the annotated copy, line for line the same rules, is docs/firestore.rules.annotated.
 rules_version = '2';
+// Deployed copy: comment lines inside the service block removed to fit Firebase's 256 KB limit;
+// the fully annotated copy, identical rules, is docs/firestore.rules.annotated.
+
+// ════════════════════════════════════════════════════════════════════════════
+// ZIPPER FIRESTORE RULES — RELEASE CANDIDATE 2 ("rules RC2", 2026-11-01)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Lineage: DEPLOYED text 17b8ffee… (ruleset b2104a12…, released 20 Oct 2026)
+//   → Owner-MFA candidate 93453763… (zipper-release/mfa-release-rc2-…/candidate)
+//   → working-tree P1-A1 / P1-D / P1-E hunks (26dac8f5…)
+//   → hotfix-1 hunks ported from hotfix/rules-20261101/ (deployable alone)
+//   → this file. The full diff against DEPLOYED and against hotfix-1, and the
+//   ordered deploy plan, are in hotfix/rules-20261101/RC2-DIFF.md.
+//
+// Tests: tests/firestore.rc2.rules.test.mjs (+ every older suite) through
+// tests/run-rc2-rules-tests.command. Emulator only, demo project, no deploy.
+//
+// EVERY CHANGE SINCE 17b8ffee, WITH WHAT IT DEPENDS ON. "none" = the rule can
+// be released on its own without breaking a live client. Deploy this file ONLY
+// when every "needs" below is already live; see RC2-DIFF.md for the order.
+//
+// ── A. Owner MFA boundary (P1-A3b / P1-A3, from the MFA candidate) ──────────
+//   A1 crmRole(): an Owner (`superadmin`) reads as 'superadmin_mfa_pending'
+//      unless ownerMfaOk() — a backend-minted custom-token session whose
+//      ownerMfaSessions/{uid}.bindings[mfa_sid] is active, matches auth_time
+//      and is unexpired. hasPerm() refuses the pending role explicitly.
+//        needs: backend rc2 key revision (owner_mfa routes, OWNER_MFA_ENCRYPTION_KEY)
+//               serving 100% AND the MFA CRM (replaces the Owner's Firebase
+//               sign-in after TOTP) live. Deployed earlier, every Owner is
+//               locked out of every staff grant.
+//   A2 ownerMfaSessions/{uid}: deny-all for clients.           needs: none.
+//   A3 crmUsers update: the Owner first-login `gateAnswers` arm is removed and
+//      `gateAnswers` joins the refused key list.                needs: MFA CRM
+//      (the old CRM's /login gate writes gateAnswers and would stall).
+//
+// ── B. Hotfix-1 hunks (hotfix/rules-20261101, deployable before RC2) ────────
+//   B1 A-1 ownerContactWriteOk(): an EMPTY email/phoneNumber written over an
+//      absent/empty one is "no change" (pre-19 app builds).     needs: none.
+//   B2 R-3 calls/{id} and callHistory/{id}: `allow write: if false` (Functions
+//      write them with the Admin SDK; `isAdmin()` is spelling-based). needs: none.
+//   B3 A-5 appConfig/androidUpdate: no client writer (publish_apk.py only).
+//                                                               needs: none.
+//   B4 R-2 coinPurchaseRequests list: a partner lists only queries constrained
+//      to its own seller record; admin/finance unchanged.       needs: none
+//      (the seller dashboard already filters on sellerUid).
+//   B5 R-5 techTickets read: isStaff() (partners refused) — superseded by C2
+//      for writes.                                              needs: none.
+//
+// ── C. Working-tree hunks (P1-A1 / P1-D / P1-E) ─────────────────────────────
+//   C1 staffRoster/{uid}: staff read, no client write; crmUsers read narrowed
+//      to self / Owner / same-department admin for a member (callerDept()).
+//        needs: backend roster backfill (`crm_directory.write_roster`) run
+//               AND the staffRoster(role, isActive) index deployed, AND the
+//               CRM that reads names from staffRoster (commit 64f9974).
+//   C2 techTickets: create/update `if false`; read isStaff(); delete Owner.
+//        needs: backend tickets API (`backend/app/routers/tickets.py`,
+//               POST /tickets/team, /tickets/{kind}/{id}/update,
+//               /tickets/support/{id}/route) live AND the CRM calling it
+//               (lib/tech.ts, lib/operations.ts in commit 64f9974).
+//   C3 feedbackTickets / supportTickets: an app user creates in its own name
+//      and reads its own; staff (ops / admins / support) read; staff UPDATE
+//      only through the tickets API (POST /tickets/{feedback|support}/{id}/
+//      update — CRM lib/operations.ts, APK-20 work hub), so client
+//      update/delete is `if false`.                             needs: as C2.
+//
+// ── D. This release (item 5 of the RC2 brief + audit §2) ────────────────────
+//   D1 weeklyPayoutReports/{reportId}/hostPayouts/{payoutId}: read for Finance
+//      and admins and for the report's agency owner on its own rows (the
+//      caller's crmUsers.agencyId == the row's `agencyId` — the generator
+//      writes agencyId + hostUid, never agencyOwnerUid); nobody else; write
+//      `if false` (weeklyPayoutReportGenerator, Admin SDK).
+//        needs: none (the CRM's finance.ts already reads this path and falls
+//               back silently; this rule makes the read succeed).
+//   D2 top-level hostPayouts: the agency `agencyOwnerUid` update arm (any
+//      field) is closed — R-11; nothing writes this legacy path. needs: none.
+//   D3 salaryRequests update: Finance/Owner may also write the actor key
+//      `approvedBy` (the key Client.tsx's C-8 note names and lib/finance.ts /
+//      lib/coinPurchases.ts already write), only as their own uid.
+//        needs: none (the old write without it still passes; the CRM can
+//               start writing it whenever it ships).
+//   D4 users: `banScope`, `banCategory`, `banEvidence`, `payoutHoldReason`,
+//      `payoutHoldAt` join ownerProtectedFields() and staffProtectedFields()
+//      (`credentialsValidAfter` already was). Backend writes them (Admin SDK).
+//                                                               needs: none.
+//   D5 users: `gender` is set once — the owner arm refuses a change once a
+//      non-empty value is stored (A-10; Edit Profile shows it locked).
+//                                                               needs: none.
+//   D6 notifications/{id}: read by the addressee only; no client write
+//      (backend notices.py and Functions write them).           needs: none
+//      (no CRM or app code writes or admin-reads this collection).
+//   D7 R-6 appConfig/paymentCredentials: readable by staff, by a CRM seller
+//      with a started seller role, and by an app seller with a verified
+//      contact and a started seller record — never by a guest or an ordinary
+//      user. Every other appConfig document reads as before.   needs: none
+//      (BuyCoinScreen and the CRM BuyInventoryDialog are the only readers).
+//   D8 R-8 hostKyc/{hostUid}: read by admins and the host only.  needs: none.
+//   D9 R-10 users/{uid}/followers/{followerUid}: the follower writes its own
+//      row; users/{uid}/giftsReceived create `if false`.         needs: none
+//      (ProfileRepository writes followers/{me}; nothing writes giftsReceived).
+//   D10 appConfig/luckyGifts: confirmed covered by the existing appConfig rule
+//      (signed-in read; Tech + Owner write). No change — but see D15.
+//   D11 publicProfiles: no change (the projection omits hostLevel for non-hosts
+//      server-side).
+//   D12 rateLimits/{bucket}: explicit deny-all (functions/src/rateLimit.ts,
+//      Admin SDK). Same answer as the catch-all, stated.        needs: none.
+//   D13 partyRooms/{roomId}/private/{docId}: explicit deny-all — the room PIN
+//      secret functions/src/party.ts keeps at private/secret. No rule ever
+//      admitted it (the catch-all denies); stated.              needs: none.
+//   D14 §5 Host role suspension: users `hostSuspended` / `hostSuspendedUntil` /
+//      `hostSuspendedReason` / `hostSuspensionDays` / `hostStatusBeforeSuspension`
+//      and the `hostSuspended*` / `hostResumed*` stamps on both protected
+//      lists; liveRooms `mayGoLive()` refuses a suspended Host role.
+//                                    needs: backend users.suspend_host / resume_host.
+//   D15 appConfig/luckyGifts.enabled (the lucky-gift switch, off until legal
+//      clearance): Owner only. A Tech write to luckyGifts may not add, change
+//      or remove `enabled`; a delete of luckyGifts is the Owner's. Other
+//      appConfig documents unchanged.   needs: Functions settleGift
+//      LUCKY_GIFTS_DISABLED + the CRM page's Owner-only toggle (Tech saves
+//      merge without `enabled`).
+//
+// ── E. Track B (3 Nov 2026) ──────────────────────────────────────────────────
+//   E1 gameMatches/{matchId}: read by any signed-in account (lobby, spectators);
+//      write `if false` (functions/src/games, Admin SDK). gameMatches/{id}/
+//      private/{doc} (seed, invite code): deny-all.             needs: none.
+//   E2 users/{uid}/gameHistory/{matchId}: the owner, Finance and admins read;
+//      write `if false`.                                         needs: none.
+//   E3 gameLedger, gameIdempotency, promoCredits: deny-all, stated (the CRM
+//      reads through the API).                                   needs: none.
+//   E4 appConfig/games (every game's switch, entries, fee): Owner-only write,
+//      the whole document. Read as every other appConfig document.
+//                                    needs: the CRM Games page (Owner).
+//   E5 partyRooms/{roomId}/admitted/{uid} (who a private room let in): no rule
+//      — the catch-all denies; written by joinPartyRoom (Admin SDK). needs: none.
+//   E7 partyRooms/{roomId}/accessLog: the room's owner and staff read; no
+//      writes. pinMisses: deny-all. partySubscriptions/{uid}: the holder and
+//      staff read; no writes. subscriptionPayments, subscriptionIdempotency:
+//      deny-all. appConfig/partySubscription: Owner-only write.
+//                                    needs: Functions joinPartyRoom (B7),
+//                                    subscribePrivateRooms & co.
+//   E6 leaderboards/{board_period_key} and its entries/{uid}: read by any
+//      signed-in account; written only by settleGift / call billing (Admin
+//      SDK). leaderboardSettlements: Owner and Finance read; no writes.
+//      appConfig/leaderboards (reward tiers): Owner-only write.
+//                                    needs: Functions settleLeaderboards.
+//   E8 (B12, 4 Nov 2026) liveRooms: created live, empty and unpaid; the host
+//      may change only `hostLiveFields()` (no totals, peak, server marks or PK
+//      fields but `pkWaiting`; heartbeat/pause marks = request.time; pinned
+//      ≤ 140; an ended room stays ended); viewers move `viewerCount` by ±1 and
+//      `likeCount` by +1 only. comments: the writer's own uid, 1–300 chars,
+//      not muted (`mutedViewers`) or blocked by the host; the host may delete.
+//      viewers/{uid}: not blocked by the host. pkInvites: no client writes.
+//                                    needs: Functions liveViewerCount,
+//                                    sweepLiveRooms, pkMatch/pkRespond/pkEnd,
+//                                    settleGift (B12) + the B12 app (heart-
+//                                    beat, PK via callables, no client PK
+//                                    score, no client viewerCount increments).
+//
+// ── Indexes (firestore.indexes.json, additive; never accept a deletion) ─────
+//   staffRoster(role, isActive) — needed by C1. The Owner work hub (APK ≥ 20)
+//   needs salaryRequests / hostApplications / supportTickets / techTickets
+//   (status ASC, createdAt DESC). Also in the file: three publicProfiles feed
+//   indexes (isListed, [country,] isVerifiedHost, [languageCodes CONTAINS,]
+//   presenceRank DESC, lastSeen DESC) for DiscoverRepository.feed's filter
+//   combinations. Deploy indexes BEFORE (or with) this file and let them
+//   reach READY before the C1 CRM pickers are used.
+//
+// ── Storage (storage.rules, same release) ───────────────────────────────────
+//   Owner `role` claim gated by ownerMfaOk() through a cross-service Firestore
+//   read — needs the Storage service agent granted
+//   roles/firebaserules.firestoreServiceAgent BEFORE the Storage deploy, or
+//   every Owner Storage request fails closed. profileMedia images 15 MB (B).
+//
+// NOT in RC2: hotfix-1's withheld C-1 (self-signup logins born inactive) —
+// the CRM in this tree still writes `isActive: true` (lib/auth.ts
+// createAgencyAccount / createSellerAccount / createSubAgencyAccount) and
+// signs out inactive logins, so the hunk would break live self-signup.
+// R-1 (users/{uid} get for any signed-in account) needs the publicProfiles
+// migration in the app first. R-7 (public KYC signup prefixes) is a Storage
+// item, documented there.
+// ════════════════════════════════════════════════════════════════════════════
 
 service cloud.firestore {
   match /databases/{database}/documents {
