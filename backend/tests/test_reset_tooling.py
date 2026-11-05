@@ -360,7 +360,8 @@ st_prefixes = {m.split("/")[0] for m in re.findall(r"^\s*match\s+/([A-Za-z0-9_-]
 unclassified_st = [p for p in st_prefixes if p not in T.known_names("storage")]
 ok("every storage.rules prefix is in a storage list (keep / delete / undecided)", not unclassified_st, str(unclassified_st))
 ok("the table has no overlaps", not T.self_check(), str(T.self_check()))
-ok("exactly the three approved uploads prefixes are DELETE", set(T.STORAGE_DELETE) == {"profileMedia", "kyc", "hostVerification"})
+ok("the approved uploads prefixes are DELETE, and (Owner, 5 Nov 2026: a fresh start) the partner and user files too",
+   {"profileMedia", "kyc", "hostVerification", "sellerDocs", "coinPurchaseProofs", "rechargeProofs", "chatMedia", "liveSnapshots"} <= set(T.STORAGE_DELETE))
 ok("KEEP holds the spec's list", {"appConfig", "gifts", "levelConfig", "bagItems"} <= set(T.FIRESTORE_KEEP)
    and {"appBuilds", "contentAssets"} <= set(T.STORAGE_KEEP) and {"rates", "chance_configs"} <= set(T.MONGO_KEEP))
 ok("DELETE holds the spec's list", {"users", "crmUsers", "agencies", "sellers", "rechargeRequests", "appeals",
@@ -369,7 +370,7 @@ ok("DELETE holds the spec's list", {"users", "crmUsers", "agencies", "sellers", 
 ok("everything under a DELETE prefix is DELETE (placeholders too); a bare object named like the prefix is UNKNOWN",
    T.classify_storage("kyc/loose.jpg") == T.DELETE and T.classify_storage("kyc/a1/") == T.DELETE
    and T.classify_storage("kyc") == T.UNKNOWN)
-ok("an undecided prefix is UNKNOWN", T.classify_storage("sellerDocs/s1/doc.pdf") == T.UNKNOWN)
+ok("an undecided prefix is UNKNOWN", T.classify_storage("crmProfilePhotos/o1.jpg") == T.UNKNOWN)
 ok("the table fingerprint is stable", T.table_fingerprint() == T.table_fingerprint() and len(T.table_fingerprint()) == 64)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +432,7 @@ refused("an unknown subcollection under a DELETE document refuses",
 refused("an unknown Mongo collection refuses", plan_with(extra_mongo={"brand_new": [{"_id": "x"}]}), "UNKNOWN")
 refused("an unknown Storage prefix refuses", plan_with(extra_storage=[{"name": "weird/x.bin", "size": 1, "generation": 1}]), "UNKNOWN")
 refused("an undecided Storage prefix refuses (owner decides)",
-        plan_with(extra_storage=[{"name": "sellerDocs/s1/doc.pdf", "size": 1, "generation": 1}]), "UNDECIDED")
+        plan_with(extra_storage=[{"name": "crmProfilePhotos/o1.jpg", "size": 1, "generation": 1}]), "UNDECIDED")
 refused("a Mongo _id of an unsupported type refuses", plan_with(extra_mongo={"cards": [{"_id": 1.5}]}), "_id")
 refused("a stale backup (older than one hour) refuses",
         plan_with(bm=backup_manifest(RUN / "stale.json", finished=NOW - timedelta(minutes=61))), "one hour")

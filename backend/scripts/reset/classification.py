@@ -242,6 +242,32 @@ STORAGE_DELETE: dict[str, str] = {
     "profileMedia": "uploads: profile media of app accounts",
     "kyc": "uploads: KYC of agencies, sub-agencies, hosts and applicants",
     "hostVerification": "uploads: host verification photos",
+    # Owner decision (5 Nov 2026): a fresh start — every user and partner file goes (backed up first).
+    "appealEvidence": "appeal evidence uploaded by users",
+    "sellerDocs": "seller KYC documents (signup/, crm/, {sellerId}/)",
+    "sellerQr": "seller payment QR images",
+    "sellerPaymentProofs": "seller payment proofs",
+    "coinPurchaseProofs": "coin purchase proofs per seller uid",
+    "coinPurchases": "coin purchase files per seller",
+    "recharges": "recharge files per seller",
+    "rechargeProofs": "recharge proofs per buyer",
+    "rechargeScreenshots": "recharge screenshots per request",
+    "payoutScreenshots": "payout screenshots per report/agency",
+    "evidence": "flat evidence files",
+    "feedbackAttachments": "feedback attachments per uid",
+    "roomThumbs": "room thumbnails",
+    "hostPhotos": "host photos per agency",
+    "chatMedia": "chat photos and voice notes between two people (O5, 5 Nov 2026: chatMedia/{convoId}/{uid}/…)",
+    "liveSnapshots": "live stills of broadcasters for the live wall (O13, 5 Nov 2026: liveSnapshots/{uid}/{roomId}/…; only each room's newest is kept) — recommend DELETE",
+    "users": "legacy per-user files",
+    "profiles": "legacy per-user files",
+    "avatars": "legacy per-user files",
+    "agencies": "legacy per-partner files",
+    "sellers": "legacy per-partner files",
+    "chat": "legacy chat media",
+    "moments": "legacy media",
+    "stories": "legacy media",
+    "covers": "legacy media",
 }
 
 STORAGE_KEEP: dict[str, str] = {
@@ -260,28 +286,7 @@ STORAGE_KEEP: dict[str, str] = {
 #: Personal or partner files whose deletion the spec did NOT approve. Reported
 #: as UNKNOWN so the Owner decides; move each to STORAGE_DELETE or STORAGE_KEEP.
 STORAGE_UNDECIDED: dict[str, str] = {
-    "appealEvidence": "appeal evidence uploaded by users",
-    "sellerDocs": "seller KYC documents (signup/, crm/, {sellerId}/)",
-    "sellerQr": "seller payment QR images",
-    "sellerPaymentProofs": "seller payment proofs",
-    "coinPurchaseProofs": "coin purchase proofs per seller uid",
-    "coinPurchases": "coin purchase files per seller",
-    "recharges": "recharge files per seller",
-    "rechargeProofs": "recharge proofs per buyer",
-    "rechargeScreenshots": "recharge screenshots per request",
-    "payoutScreenshots": "payout screenshots per report/agency",
-    "evidence": "flat evidence files",
-    "feedbackAttachments": "feedback attachments per uid",
-    "roomThumbs": "room thumbnails",
-    "hostPhotos": "host photos per agency",
     "crmProfilePhotos": "CRM profile photos (flat; the Owners' own pictures live here)",
-    "chatMedia": "chat photos and voice notes between two people (O5, 5 Nov 2026: chatMedia/{convoId}/{uid}/…)",
-    "liveSnapshots": "live stills of broadcasters for the live wall (O13, 5 Nov 2026: liveSnapshots/{uid}/{roomId}/…; only each room's newest is kept) — recommend DELETE",
-    # Prefixes an earlier planner listed as owned-by-user; none seen in 2026-10.
-    "users": "legacy per-user files", "profiles": "legacy per-user files",
-    "avatars": "legacy per-user files", "agencies": "legacy per-partner files",
-    "sellers": "legacy per-partner files", "chat": "legacy chat media",
-    "moments": "legacy media", "stories": "legacy media", "covers": "legacy media",
 }
 
 #: Prefixes the backup copies: everything that may be deleted or is undecided.
