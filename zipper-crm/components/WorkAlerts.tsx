@@ -18,17 +18,22 @@ import Link from 'next/link'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Bell, X } from 'lucide-react'
 import api, { type Inbox } from '@/lib/api'
+import { recharges as rechargeApi } from '@/lib/apiPartners'
 
 const POLL_MS = 60_000
 
-export function waitingTotal(i: Inbox | null | undefined): number {
+type Waiting = Inbox & { recharges?: number }
+
+export function waitingTotal(i: Waiting | null | undefined): number {
   if (!i) return 0
-  return Math.max(0, (i.to_verify || 0) + (i.to_sign || 0))
+  return Math.max(0, (i.to_verify || 0) + (i.to_sign || 0) + (i.recharges || 0))
 }
 
 /** The toast text for a rise from `before` to `now`; '' when nothing new. */
-export function riseMessage(before: Inbox | null, now: Inbox): string {
+export function riseMessage(before: Waiting | null, now: Waiting): string {
   const parts: string[] = []
+  const dr = (now.recharges || 0) - (before?.recharges || 0)
+  if (dr > 0) parts.push(`${dr} new diamond recharge${dr === 1 ? '' : 's'} to verify (buyer paid a seller)`)
   const dv = (now.to_verify || 0) - (before?.to_verify || 0)
   const ds = (now.to_sign || 0) - (before?.to_sign || 0)
   if (dv > 0) parts.push(`${dv} new request${dv === 1 ? '' : 's'} to check (coin purchases, recharges, payouts…)`)
@@ -37,12 +42,12 @@ export function riseMessage(before: Inbox | null, now: Inbox): string {
 }
 
 export default function WorkAlerts({ enabled, owner = false }: { enabled: boolean; owner?: boolean }) {
-  const last = useRef<Inbox | null>(null)
+  const last = useRef<Waiting | null>(null)
   const [toast, setToast] = useState<{ text: string; href: string } | null>(null)
   const baseTitle = useRef<string>('')
 
   const poll = useCallback(async () => {
-    let now: Inbox
+    let now: Waiting
     try { now = await api.cards.inbox() } catch { return }
     // Owners sign, so the server counts only what awaits their signature. The
     // Owner also wants to hear the moment a seller submits (UTR + screenshot),
@@ -53,6 +58,9 @@ export default function WorkAlerts({ enabled, owner = false }: { enabled: boolea
         now = { ...now, to_verify: a.length + b.length }
       } catch { /* the inbox alone still works */ }
     }
+    // Buyer recharges (Firestore rechargeRequests, verified on /recharges) are
+    // not cards, so the inbox does not count them. Count the pending ones.
+    try { now = { ...now, recharges: (await rechargeApi.list('pending')).length } } catch { /* role without access */ }
     const before = last.current
     last.current = now
     const total = waitingTotal(now)
@@ -64,7 +72,8 @@ export default function WorkAlerts({ enabled, owner = false }: { enabled: boolea
     // announced once, so a person who signs in learns about it immediately.
     const text = before ? riseMessage(before, now) : (total > 0 ? `${total} item${total === 1 ? '' : 's'} waiting for you` : '')
     if (!text) return
-    const href = (now.to_sign || 0) > (before?.to_sign || 0) ? '/board' : '/coin-purchases'
+    const href = (now.to_sign || 0) > (before?.to_sign || 0) ? '/board'
+      : (now.recharges || 0) > (before?.recharges || 0) ? '/recharges' : '/coin-purchases'
     setToast({ text, href })
     try {
       if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
