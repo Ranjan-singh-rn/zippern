@@ -76,7 +76,7 @@ import {
   ArrowRightLeft,
   Lock,
   MonitorSmartphone,
-  ShieldCheck, Gamepad2, Trophy, Music, Crown, Menu as MenuIcon,
+  ShieldCheck, Gamepad2, Trophy, Music, Crown, Menu as MenuIcon, ListChecks,
 } from 'lucide-react'
 
 // Every screen below reads an endpoint behind `_require_oversight` or
@@ -161,6 +161,7 @@ const topLevelLinks: NavLink[] = [
   // Team admins keep it, and for them the original intent holds exactly: they
   // see every card they are entitled to and a clear "not yours" on the rest.
   { href: '/reports',       label: 'Reports',      icon: FileSpreadsheet, roles: OVERSIGHT_ROLES },
+  { href: '/promotions',    label: 'Rewards Audit', icon: Gift,           roles: ['superadmin', 'finance_admin'] },
   { href: '/reports/weekly', label: 'Weekly Report', icon: ScrollText,    roles: OVERSIGHT_ROLES },
   { href: '/alerts',        label: 'Alerts',       icon: Siren,           roles: OVERSIGHT_ROLES },
   // '/tickets' (App Tickets) is retired — audit C-5: it read `supportTickets`,
@@ -355,6 +356,7 @@ const navGroups: NavGroup[] = [
       { href: '/app-config/daily-rewards',   label: 'Daily Rewards',  icon: Gift,        roles: ['superadmin'] },
       { href: '/app-config/games',           label: 'Games',          icon: Gamepad2,    roles: ['superadmin'] },
       { href: '/app-config/safety',          label: 'Safety',         icon: ShieldCheck, roles: ['superadmin'] },
+      { href: '/app-config/daily-tasks',     label: 'Daily Tasks',    icon: ListChecks,  roles: ['superadmin'] },
       { href: '/leaderboards',               label: 'Leaderboards',   icon: Trophy,      roles: ['superadmin'] },
       { href: '/app-config/music',           label: 'Room music',     icon: Music,       roles: ['superadmin', 'tech_admin', 'tech_member'] },
       { href: '/app-config/party-pro',       label: 'Party Pro',      icon: Crown,       roles: ['superadmin'] },

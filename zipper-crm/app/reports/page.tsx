@@ -591,8 +591,8 @@ export default function ReportsHubPage() {
               blurb="What daily rewards and free call cards gave away in the period. Promotional diamonds are never revenue — they are a liability until spent. A free call card pays the first minute of a call; the host is paid for that minute and Zipper bears the cost."
               slot={promotions}
               emptyHint="No daily rewards were claimed and no free call cards were used in this period."
-              href="/app-config/daily-rewards"
-              hrefLabel="Daily reward schedule"
+              href="/promotions"
+              hrefLabel="Every claim (audit)"
               exporting={busy === 'promotions'}
               onExport={() => exportCsv('promotions', '/promotions', p, 'promotions')}
               figures={
@@ -617,6 +617,16 @@ export default function ReportsHubPage() {
                       label="Host cost of free minutes"
                       value={formatInrMinorShort(num(promotions.value.totals, 'card_host_cost_inr_minor'))}
                       tone="text-orange-300"
+                    />
+                    <Line
+                      label="Daily tasks claimed / diamonds"
+                      value={`${formatCount(num(promotions.value.totals, 'daily_task_claims'))} / ${formatCount(num(promotions.value.totals, 'daily_task_diamonds'))}`}
+                      tone="text-slate-200"
+                    />
+                    <Line
+                      label="All promotional diamonds"
+                      value={formatCount(num(promotions.value.totals, 'promotional_diamonds_total'))}
+                      tone="text-sky-300"
                     />
                   </>
                 ) : null

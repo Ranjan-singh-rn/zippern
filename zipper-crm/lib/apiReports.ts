@@ -471,6 +471,26 @@ export async function downloadReportCsv(
 
 // ── The endpoints ─────────────────────────────────────────────────────────────
 
+export type PromotionKind = 'daily_reward' | 'daily_task' | 'leaderboard_reward'
+
+export interface PromotionClaimRow {
+  at: string | null
+  kind: PromotionKind
+  uid: string
+  day: string
+  what: string
+  diamonds: number
+  beans: number
+  callCards: number
+  historyRow: string
+}
+
+export interface PromotionClaims {
+  count: number
+  rows: PromotionClaimRow[]
+  totals: { diamonds: number; beans: number; claims: number }
+}
+
 export interface RangeParams {
   since?: string
   until?: string
@@ -502,6 +522,13 @@ export const reports = {
    * Promotional diamonds are never revenue; this is where they are counted.
    */
   promotions: (p: RangeParams = {}) => getReport<AnyReport>('/promotions', { ...p }),
+
+  /**
+   * O8 (5 Nov 2026): the audit list behind Promotions — one row per daily reward, daily task or ranking reward a
+   * person collected (who, when, what, how much, the history row). Same gate as the report.
+   */
+  promotionClaims: (p: RangeParams & { kind?: PromotionKind; uid?: string; limit?: number } = {}) =>
+    getReport<PromotionClaims>('/promotions/claims', { ...p }),
 
   /** B6: games money — per game diamonds in/out, Zipper's fee, and the zero-difference check on every match. */
   games: (p: RangeParams = {}) => getReport<AnyReport>('/games', { ...p }),

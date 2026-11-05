@@ -22,6 +22,7 @@ import { useAuth } from '@/components/AuthProvider'
 import { canAccess, partnerRolesOf, type CrmRole } from '@/lib/auth'
 import { toFailure, type ReadFailure, type ReadResult } from '@/lib/readState'
 import { Unavailable, UnavailablePanel } from '@/components/ui/States'
+import { reports as reportsApi } from '@/lib/apiReports'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -461,6 +462,32 @@ export default function DashboardPage() {
   // the one read that would have worked — and all three tiles rendered `?? 0`.
   // Three refused reads were being presented to the owner as three measured
   // zeroes. Each read now stands or falls on its own and says which it did.
+  // O8 (5 Nov 2026): promotional diamonds — daily rewards, daily tasks, ranking rewards — next to diamonds sold, from
+  // the API's promotions report (business-financials gate). Today = since midnight IST. A refusal hides the line.
+  const [promo, setPromo] = useState<{ todayClaims: number; todayDiamonds: number; monthDiamonds: number } | null>(null)
+  useEffect(() => {
+    if (!crmUser || !canAccess(crmUser, ['superadmin', 'finance_admin', 'finance_member'])) return
+    let cancelled = false
+    const now = new Date()
+    const ist = new Date(now.getTime() + 330 * 60_000)
+    const todayIst = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) - 330 * 60_000)
+    const n = (t: Record<string, unknown> | undefined, k: string) => Number(t?.[k] ?? 0) || 0
+    Promise.all([
+      reportsApi.promotions({ since: todayIst.toISOString(), until: now.toISOString() }),
+      reportsApi.promotions({ since: new Date(now.getTime() - 30 * 86_400_000).toISOString(), until: now.toISOString() }),
+    ]).then(([today, month]) => {
+      if (cancelled) return
+      const t = (today as { totals?: Record<string, unknown> }).totals
+      const m = (month as { totals?: Record<string, unknown> }).totals
+      setPromo({
+        todayClaims: n(t, 'daily_reward_claims') + n(t, 'daily_task_claims'),
+        todayDiamonds: n(t, 'promotional_diamonds_total'),
+        monthDiamonds: n(m, 'promotional_diamonds_total'),
+      })
+    }).catch(() => { if (!cancelled) setPromo(null) })
+    return () => { cancelled = true }
+  }, [crmUser])
+
   useEffect(() => {
     if (!crmUser || !canAccess(crmUser, ['superadmin', 'finance_admin', 'finance_member'])) return
     let cancelled = false
@@ -710,6 +737,11 @@ export default function DashboardPage() {
               )}
               {!diamondError && (
                 <p className="text-slate-500 text-xs mt-1">Total diamonds distributed from company</p>
+              )}
+              {promo && (
+                <p className="text-sky-300 text-xs mt-1">
+                  + {promo.monthDiamonds.toLocaleString('en-IN')} promotional (30 days) · today {promo.todayClaims.toLocaleString('en-IN')} rewards &amp; tasks = {promo.todayDiamonds.toLocaleString('en-IN')} 💎
+                </p>
               )}
             </button>
 
