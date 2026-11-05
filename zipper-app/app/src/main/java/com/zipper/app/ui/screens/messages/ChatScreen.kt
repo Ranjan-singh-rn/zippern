@@ -89,6 +89,7 @@ fun ChatScreen(
     convoId: String,
     onBack: () -> Unit,
     onJoinLive: (roomId: String) -> Unit = {},
+    onJoinParty: (roomId: String) -> Unit = {},
     onOpenProfile: (uid: String) -> Unit = {},
     onRecharge: () -> Unit = {},
     /** O5b (5 Nov 2026): call this person from the chat — the same paid call the profile starts. */
@@ -205,6 +206,22 @@ fun ChatScreen(
             }
             HairlineDivider()
 
+            // Owner (5 Nov 2026): when this person is live, or sitting in any party room, a banner above the thread
+            // takes you straight into that room — the same banner their profile shows.
+            peerState.user?.let { u ->
+                val pc = ZipperTheme.colors
+                Box(Modifier.padding(horizontal = Space.md, vertical = Space.xs)) {
+                    when {
+                        u.isLive && u.liveRoomId.isNotBlank() -> com.zipper.app.ui.screens.profile.PresenceBanner(
+                            LiveBadgeKind.Live, "${u.name.ifBlank { "They" }} is live — tap to join", pc.statusLive,
+                        ) { onJoinLive(u.liveRoomId) }
+                        u.isInParty && u.partyRoomId.isNotBlank() -> com.zipper.app.ui.screens.profile.PresenceBanner(
+                            LiveBadgeKind.Party, "${u.name.ifBlank { "They" }} is in a party room — tap to join", pc.brandSecondary,
+                        ) { onJoinParty(u.partyRoomId) }
+                    }
+                }
+            }
+
             // Thread
             Box(Modifier.weight(1f)) {
                 when {
@@ -228,7 +245,7 @@ fun ChatScreen(
                         }
                         items(state.messages, key = { it.id }) { msg ->
                             MessageRow(
-                                msg, msg.senderUid == myUid, onJoinLive,
+                                msg, msg.senderUid == myUid, onJoinLive, onJoinParty,
                                 playing = state.playingId == msg.id,
                                 onTogglePlay = { viewModel.togglePlay(msg) },
                                 onOpenImage = { viewing = it },
@@ -380,6 +397,7 @@ private fun MessageRow(
     msg: ChatMessage,
     isMe: Boolean,
     onJoinLive: (String) -> Unit,
+    onJoinParty: (String) -> Unit,
     playing: Boolean = false,
     onTogglePlay: () -> Unit = {},
     onOpenImage: (String) -> Unit = {},
@@ -433,12 +451,12 @@ private fun MessageRow(
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(Space.sm)) {
                         Box(Modifier.size(32.dp).background(c.tintDangerSubtle, CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.Videocam, null, tint = c.statusLive, modifier = Modifier.size(18.dp)) }
                         Column {
-                            Text("${msg.inviteHostName.ifBlank { "Someone" }} is live!", style = ZipperTheme.type.labelM, color = onBubble)
+                            Text(if (msg.inviteKind == "party") "${msg.inviteHostName.ifBlank { "Someone" }}'s party room" else "${msg.inviteHostName.ifBlank { "Someone" }} is live!", style = ZipperTheme.type.labelM, color = onBubble)
                             Text("Tap to join the room", style = ZipperTheme.type.caption, color = if (isMe) Color.White.copy(0.8f) else c.textSecondary)
                         }
                     }
                     Spacer(Modifier.height(Space.xs))
-                    ZipperButton("Join live", { onJoinLive(msg.inviteRoomId) }, size = ButtonSize.Small, style = if (isMe) ButtonStyle.Secondary else ButtonStyle.Primary)
+                    ZipperButton(if (msg.inviteKind == "party") "Join party" else "Join live", { if (msg.inviteKind == "party") onJoinParty(msg.inviteRoomId) else onJoinLive(msg.inviteRoomId) }, size = ButtonSize.Small, style = if (isMe) ButtonStyle.Secondary else ButtonStyle.Primary)
                 }
                 else -> Text(msg.text, style = ZipperTheme.type.bodyM, color = onBubble)
             }

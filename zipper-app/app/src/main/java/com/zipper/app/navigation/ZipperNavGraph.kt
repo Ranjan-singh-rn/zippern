@@ -1004,6 +1004,7 @@ fun ZipperNavGraph(
                 convoId     = "",    // computed inside ChatViewModel from uid + myUid
                 onBack      = { navController.popBackStack() },
                 onJoinLive  = { roomId -> navController.navigate(Screen.LiveViewer.createRoute(roomId)) },
+                onJoinParty = { roomId -> navController.navigate(Screen.PartyRoom.createRoute(roomId)) },
                 onOpenProfile = { u -> navController.navigate(Screen.UserProfile.createRoute(u)) },
                 // O5: the gift drawer's "Recharge" when the balance is short.
                 onRecharge  = { navController.navigate(Screen.DiamondShop.route) },

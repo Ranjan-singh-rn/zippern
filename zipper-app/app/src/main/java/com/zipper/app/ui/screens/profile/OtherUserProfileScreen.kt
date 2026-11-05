@@ -412,7 +412,7 @@ private fun ProfileBody(
 // ── Pieces ───────────────────────────────────────────────────────────────────
 
 @Composable
-private fun PresenceBanner(kind: LiveBadgeKind, hint: String, tint: Color, onClick: () -> Unit) {
+internal fun PresenceBanner(kind: LiveBadgeKind, hint: String, tint: Color, onClick: () -> Unit) {
     val c = ZipperTheme.colors
     Row(
         Modifier.fillMaxWidth().padding(top = Space.md, start = Space.xl, end = Space.xl)

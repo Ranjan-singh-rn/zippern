@@ -121,7 +121,7 @@ class LiveShareViewModel @Inject constructor(
 
     fun onQuery(q: String) { _state.update { it.copy(query = q) } }
 
-    fun sendInvite(contact: ShareContact, roomId: String, hostName: String) {
+    fun sendInvite(contact: ShareContact, roomId: String, hostName: String, kind: String = "live") {
         if (contact.uid in _state.value.sentUids) return
         val myUid  = auth.currentUser?.uid ?: return
         viewModelScope.launch {
@@ -136,6 +136,7 @@ class LiveShareViewModel @Inject constructor(
                     otherPhotoUrl = contact.photoUrl,
                     roomId       = roomId,
                     hostName     = hostName,
+                    kind         = kind,
                 )
                 _state.update { it.copy(sentUids = it.sentUids + contact.uid) }
             } catch (_: Exception) {}
@@ -151,6 +152,8 @@ fun LiveShareSheet(
     roomId: String,
     hostName: String,
     onDismiss: () -> Unit,
+    /** "live" or "party" — what the invite card in the chat opens. */
+    kind: String = "live",
     viewModel: LiveShareViewModel = hiltViewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -215,7 +218,7 @@ fun LiveShareSheet(
                         ShareContactRow(
                             contact   = contact,
                             sent      = contact.uid in state.sentUids,
-                            onInvite  = { viewModel.sendInvite(contact, roomId, hostName) },
+                            onInvite  = { viewModel.sendInvite(contact, roomId, hostName, kind) },
                         )
                     }
                 }

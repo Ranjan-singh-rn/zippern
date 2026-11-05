@@ -63,6 +63,7 @@ object ChatParse {
         type = (data["type"] as? String)?.takeIf { it.isNotBlank() } ?: "text",
         inviteRoomId = (data["inviteRoomId"] as? String).orEmpty(),
         inviteHostName = (data["inviteHostName"] as? String).orEmpty(),
+        inviteKind = if (data["inviteKind"] == "party") "party" else "live",
         timestamp = long(data["timestamp"]),
         isRead = data["isRead"] == true,
         audioUrl = (data["audioUrl"] as? String).orEmpty(),

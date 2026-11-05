@@ -10,6 +10,8 @@ data class ChatMessage(
     val type: String = "text",
     val inviteRoomId: String = "",
     val inviteHostName: String = "",
+    /** "live" | "party" — an invite without one is a live (older app versions). */
+    val inviteKind: String = "live",
     val timestamp: Long = 0L,
     val isRead: Boolean = false,
     /** O5: a voice note — its download URL and length. */

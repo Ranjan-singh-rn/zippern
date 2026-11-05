@@ -245,11 +245,15 @@ class ChatRepository @Inject constructor(
         otherPhotoUrl: String,
         roomId: String,
         hostName: String,
+        /** "live" or "party" (Owner, 5 Nov 2026: party rooms are shared into a chat too). */
+        kind: String = "live",
     ) {
+        val party = kind == "party"
         send(
             myUid, myName, myPhotoUrl, otherUid, otherName, otherPhotoUrl,
-            type = "invite", text = "📺 $hostName is live! Tap to join.",
-            extra = mapOf("inviteRoomId" to roomId, "inviteHostName" to hostName),
+            type = "invite",
+            text = if (party) "🎉 Join $hostName's party room! Tap to join." else "📺 $hostName is live! Tap to join.",
+            extra = mapOf("inviteRoomId" to roomId, "inviteHostName" to hostName, "inviteKind" to if (party) "party" else "live"),
         )
     }
 

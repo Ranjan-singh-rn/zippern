@@ -319,8 +319,17 @@ internal fun PartyRoomMenuSheet(
     var confirmEnd by remember { mutableStateOf(false) }
     var showAccessLog by remember { mutableStateOf(false) }
     var showMusic by remember { mutableStateOf(false) }
+    var showShare by remember { mutableStateOf(false) }
     if (showAccessLog) {
         PartyAccessLogSheet(viewModel, onDismiss = { showAccessLog = false })
+        return
+    }
+    if (showShare) {
+        // Owner (5 Nov 2026): invite friends from Messages — an invite card in the chat that opens this room.
+        com.zipper.app.ui.screens.live.LiveShareSheet(
+            roomId = state.room?.roomId.orEmpty(), hostName = state.room?.hostName.orEmpty(),
+            onDismiss = { showShare = false }, kind = "party",
+        )
         return
     }
     if (showMusic) {
@@ -345,6 +354,7 @@ internal fun PartyRoomMenuSheet(
         PartySheetRow(Icons.Outlined.People, "People in the room", c.textPrimary) {
             onDismiss(); onMembers()
         }
+        PartySheetRow(Icons.Outlined.People, "Invite friends (Messages)", c.textBrand) { showShare = true }
         // B7: room music — the owner and admins pick from Zipper's licensed catalogue.
         if (state.canModerate) {
             PartySheetRow(Icons.Outlined.Settings, state.room?.music?.let { "Music · ${it.title}" } ?: "Music", c.textPrimary) {
