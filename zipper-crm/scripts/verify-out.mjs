@@ -114,7 +114,7 @@ const MUST_BE_PRESENT = [
    'Sign out everywhere else'],
   // §8: the Owner fast path on the board.
   ['board offers the Owner fast path',
-   'Take it through every stage'],
+   'Record the transfer'],  // O6 (5 Nov): one Owner's signature is final — the button was reworded
 ]
 
 function walk(dir) {
