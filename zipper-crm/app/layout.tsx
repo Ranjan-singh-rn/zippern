@@ -284,6 +284,7 @@ const navGroups: NavGroup[] = [
     links: [
       { href: '/gifts',            label: 'Gift Economy',  icon: Gift,     roles: ['superadmin', 'app_admin', 'ops_admin'] },
       { href: '/economy',          label: 'Overview',      icon: BookOpen, roles: ['superadmin', 'finance_admin', 'finance_member', 'ops_admin'] },
+      { href: '/economy/book',     label: 'Economy Book',  icon: BookOpen, roles: ['superadmin', 'finance_admin'] },
       { href: '/economy/config',   label: 'Config',        icon: Settings, roles: ['superadmin', 'finance_admin'] },
       { href: '/economy/currency', label: 'Beans/Diamonds', icon: Gem,     roles: ['superadmin', 'finance_admin', 'finance_member'] },
     ],

@@ -8307,3 +8307,161 @@ if __name__ == "__main__":  # pragma: no cover
     print("  · currency valuation is explicit, and an unknown currency raises")
     print("  · the window defaults to 30 days and refuses anything over 400")
     sys.exit(0)
+
+
+# ── Economy book (Owner, 6 Nov 2026) ─────────────────────────────────────────────
+#
+# "A proper, transparent diamond ledger": one screen that follows every diamond and coin from the moment Zipper
+# sells or lends it to a seller, through the seller's sales to users, to what users spend in the app — and what is
+# still owed. Two stores hold the money, and this report names which figure comes from which:
+#
+#   * Mongo `ledger` / `balances` / `cards` / `recharges`  — seller inventory (coins), wholesale purchases, lending
+#     and repayment, recharges (seller coins → user diamonds), staff credits. Every row: amount, before/after,
+#     action, reason, actor, timestamp, idempotency key.
+#   * Firestore `platformRevenue` and `users`              — what users spent in the app (gifts, calls,
+#     subscriptions: gross diamonds, beans paid to hosts, Zipper's cut) and the diamonds/beans users hold now.
+#
+# Nothing here moves money; it only reads. A part that cannot be read is reported as unavailable, never as zero.
+
+ECONOMY_WALLET_SCAN_LIMIT = 50_000
+
+
+def _wallet_totals() -> dict[str, int]:
+    """Diamonds and beans held in user wallets right now (Firestore `users`), with the number of wallets read."""
+    client = firebase.firestore_client()
+    diamonds = beans = n = 0
+    for snap in client.collection("users").select(["diamonds", "beans"]).limit(ECONOMY_WALLET_SCAN_LIMIT + 1).stream():
+        n += 1
+        if n > ECONOMY_WALLET_SCAN_LIMIT:
+            raise DataUnavailable(f"More than {ECONOMY_WALLET_SCAN_LIMIT:,} wallets — the total would be partial.")
+        d = snap.to_dict() or {}
+        diamonds += max(0, _int(d.get("diamonds"), 0))
+        beans += max(0, _int(d.get("beans"), 0))
+    return {"wallets": n, "diamonds": diamonds, "beans": beans}
+
+
+def summarise_app_spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pure: `platformRevenue` rows → spend by type (gift / call / subscription …)."""
+    by_type: dict[str, dict[str, int]] = {}
+    for r in rows:
+        t = str(r.get("type") or "other")
+        b = by_type.setdefault(t, {"events": 0, "gross_diamonds": 0, "beans_to_hosts": 0, "zipper_cut": 0})
+        b["events"] += 1
+        b["gross_diamonds"] += max(0, _int(r.get("grossDiamonds"), 0))
+        b["beans_to_hosts"] += max(0, _int(r.get("payoutBeans"), 0))
+        b["zipper_cut"] += _int(r.get("platformCut"), 0)
+    total = {k: sum(v[k] for v in by_type.values()) for k in ("events", "gross_diamonds", "beans_to_hosts", "zipper_cut")}
+    return {"by_type": by_type, "total": total}
+
+
+def _ledger_row(d: Mapping[str, Any]) -> dict[str, Any]:
+    actor = d.get("actor") or {}
+    return {
+        "id": str(d.get("_id") or ""),
+        "at": d.get("at"),
+        "holder_type": d.get("holder_type", ""), "holder_id": d.get("holder_id", ""),
+        "currency": d.get("currency", ""), "amount": _int(d.get("amount"), 0),
+        "balance_before": d.get("balance_before"), "balance_after": d.get("balance_after"),
+        "action": str(d.get("action") or ""), "reason": d.get("reason", ""),
+        "actor": {"uid": actor.get("uid", ""), "name": actor.get("name", ""), "role": actor.get("role", "")},
+        "card_id": d.get("card_id"), "reference": d.get("idempotency_key", ""),
+        "meta": d.get("meta") or {},
+    }
+
+
+async def economy_book(
+    since: datetime | None = None, until: datetime | None = None, *,
+    holder_type: str | None = None, holder_id: str | None = None, currency: str | None = None,
+    ledger_limit: int = 200,
+) -> dict[str, Any]:
+    since, until = resolve_window(since, until)
+    db = get_db()
+    unavailable: list[str] = []
+
+    # 1. Sellers: what each holds, owes and has sold.
+    sellers: list[dict[str, Any]] = []
+    async for p in db[C.PARTNERS].find({"kind": str(PartnerKind.SELLER)}):
+        sid = str(p["_id"])
+        bal = await db[C.BALANCES].find_one({"holder_type": str(HolderType.SELLER), "holder_id": sid, "currency": str(Currency.COINS)})
+        credit = p.get("credit") or {}
+        sellers.append({
+            "id": sid, "name": p.get("name", ""), "status": p.get("status", ""),
+            "coins_on_hand": _int((bal or {}).get("amount"), 0),
+            "coins_sold_total": _int(p.get("total_coins_sold"), 0),
+            "credit_limit": _int(credit.get("limit"), 0),
+            "borrowed_outstanding": _int(credit.get("outstanding"), 0),
+            "credit_due_at": credit.get("due_at"),
+        })
+    sellers.sort(key=lambda s: (-s["borrowed_outstanding"], -s["coins_on_hand"]))
+
+    # 2. Wholesale, lending and repayment — executed cards (all time, and inside the window).
+    def _card_totals(kind: str) -> dict[str, Any]:
+        return {"kind": kind, "count": 0, "coins": 0, "paid_minor": 0, "window_count": 0, "window_coins": 0, "window_paid_minor": 0}
+    wholesale, lent, repaid = _card_totals("wholesale"), _card_totals("lent"), _card_totals("repaid")
+    by_type = {str(CardType.SELLER_COIN_PURCHASE): wholesale, str(CardType.LENDING_ISSUE): lent, str(CardType.LENDING_REPAY): repaid}
+    async for c in db[C.CARDS].find({"type": {"$in": list(by_type)}, "stage": str(Stage.EXECUTED)}):
+        t = by_type[str(c.get("type"))]
+        coins = abs(_int(c.get("amount"), 0))
+        paid = _int((c.get("payload") or {}).get("amount_paid_minor"), 0)
+        t["count"] += 1; t["coins"] += coins; t["paid_minor"] += paid
+        at = c.get("executed_at") or c.get("updated_at") or c.get("created_at")
+        if isinstance(at, datetime):
+            at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+            if since <= at < until:
+                t["window_count"] += 1; t["window_coins"] += coins; t["window_paid_minor"] += paid
+
+    # 3. Recharges: seller coins that became user diamonds.
+    recharges = {"approved": 0, "diamonds": 0, "pending": 0, "pending_diamonds": 0, "paid_minor": 0}
+    async for r in db[C.RECHARGES].find({"status": {"$in": ["approved", "pending"]}}):
+        d = _int(r.get("credited_diamonds") or r.get("diamonds"), 0)
+        if r.get("status") == "approved":
+            recharges["approved"] += 1; recharges["diamonds"] += d; recharges["paid_minor"] += _int(r.get("amount_minor"), 0)
+        else:
+            recharges["pending"] += 1; recharges["pending_diamonds"] += d
+
+    # 4. What users spent in the app inside the window (Firestore).
+    try:
+        app_spend: dict[str, Any] | None = summarise_app_spend(await _fs_scan("platformRevenue", "timestamp", since, until))
+    except DataUnavailable as exc:
+        app_spend = None; unavailable.append(f"app spend: {exc}")
+
+    # 5. Wallets now (Firestore).
+    try:
+        wallets: dict[str, int] | None = await asyncio.to_thread(_wallet_totals)
+    except Exception as exc:  # noqa: BLE001
+        wallets = None; unavailable.append(f"wallets: {exc}")
+
+    # 6. The logbook: every ledger movement in the window, newest first, filterable.
+    q: dict[str, Any] = {"at": {"$gte": since, "$lt": until}}
+    if holder_type: q["holder_type"] = holder_type
+    if holder_id: q["holder_id"] = holder_id
+    if currency: q["currency"] = currency
+    entries = [_ledger_row(d) async for d in db[C.LEDGER].find(q).sort("at", -1).limit(max(1, min(ledger_limit, 2000)))]
+
+    coins_on_hand = sum(s["coins_on_hand"] for s in sellers)
+    owed = sum(s["borrowed_outstanding"] for s in sellers)
+    return {
+        "period": _period(since, until),
+        "headline": {
+            "sold_to_sellers_coins": wholesale["coins"], "sold_to_sellers_paid_minor": wholesale["paid_minor"],
+            "lent_to_sellers_coins": lent["coins"], "repaid_by_sellers_coins": repaid["coins"],
+            "borrowed_outstanding_coins": owed,
+            "held_by_sellers_coins": coins_on_hand,
+            "sold_by_sellers_to_users_diamonds": recharges["diamonds"],
+            "in_user_wallets_diamonds": None if wallets is None else wallets["diamonds"],
+            "in_user_wallets_beans": None if wallets is None else wallets["beans"],
+            "spent_in_app_diamonds_window": None if app_spend is None else app_spend["total"]["gross_diamonds"],
+        },
+        "sellers": sellers,
+        "wholesale": wholesale, "lending": lent, "repayments": repaid,
+        "recharges": recharges,
+        "app_spend": app_spend,
+        "wallets": wallets,
+        "ledger": entries,
+        "ledger_count": len(entries),
+        "sources": {
+            "mongo": "ledger, balances, cards (executed), recharges, partners",
+            "firestore": "platformRevenue (window), users (now)",
+        },
+        "unavailable": unavailable,
+    }

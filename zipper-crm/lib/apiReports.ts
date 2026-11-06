@@ -530,6 +530,10 @@ export const reports = {
   promotionClaims: (p: RangeParams & { kind?: PromotionKind; uid?: string; limit?: number } = {}) =>
     getReport<PromotionClaims>('/promotions/claims', { ...p }),
 
+  /** Owner, 6 Nov 2026: the Economy Book — sold, lent, held, sold on, spent, owed, and every ledger movement. */
+  economyBook: (p: RangeParams & { holder_type?: 'user' | 'seller' | 'agency'; holder_id?: string; currency?: string; limit?: number } = {}) =>
+    getReport<EconomyBook>('/economy-book', { ...p }),
+
   /** B6: games money — per game diamonds in/out, Zipper's fee, and the zero-difference check on every match. */
   games: (p: RangeParams = {}) => getReport<AnyReport>('/games', { ...p }),
 
@@ -1375,4 +1379,37 @@ export function totalBoolean(
 export function totalText(totals: Record<string, unknown>, key: string): string | null {
   const v = totals[key]
   return typeof v === 'string' && v !== '' ? v : null
+}
+
+
+/** Owner, 6 Nov 2026 — GET /reports/economy-book. `null` means that part could not be read (never shown as 0). */
+export interface EconomyLedgerRow {
+  id: string; at: string; holder_type: string; holder_id: string; currency: string; amount: number
+  balance_before: number | null; balance_after: number | null; action: string; reason: string
+  actor: { uid: string; name: string; role: string }; card_id: string | null; reference: string
+}
+export interface EconomySeller {
+  id: string; name: string; status: string; coins_on_hand: number; coins_sold_total: number
+  credit_limit: number; borrowed_outstanding: number; credit_due_at: string | null
+}
+export interface EconomyCardTotals {
+  count: number; coins: number; paid_minor: number; window_count: number; window_coins: number; window_paid_minor: number
+}
+export interface EconomyBook {
+  period: { since: string; until: string }
+  headline: {
+    sold_to_sellers_coins: number; sold_to_sellers_paid_minor: number
+    lent_to_sellers_coins: number; repaid_by_sellers_coins: number; borrowed_outstanding_coins: number
+    held_by_sellers_coins: number; sold_by_sellers_to_users_diamonds: number
+    in_user_wallets_diamonds: number | null; in_user_wallets_beans: number | null
+    spent_in_app_diamonds_window: number | null
+  }
+  sellers: EconomySeller[]
+  wholesale: EconomyCardTotals; lending: EconomyCardTotals; repayments: EconomyCardTotals
+  recharges: { approved: number; diamonds: number; pending: number; pending_diamonds: number; paid_minor: number }
+  app_spend: { by_type: Record<string, { events: number; gross_diamonds: number; beans_to_hosts: number; zipper_cut: number }>; total: { events: number; gross_diamonds: number; beans_to_hosts: number; zipper_cut: number } } | null
+  wallets: { wallets: number; diamonds: number; beans: number } | null
+  ledger: EconomyLedgerRow[]
+  ledger_count: number
+  unavailable: string[]
 }

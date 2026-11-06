@@ -260,6 +260,23 @@ async def promotions(
     return await _deliver(report, fmt, user)
 
 
+@router.get("/economy-book")
+async def economy_book(
+    since: datetime | None = _SINCE,
+    until: datetime | None = _UNTIL,
+    holder_type: str | None = Query(None, pattern="^(user|seller|agency)$"),
+    holder_id: str | None = Query(None, min_length=1, max_length=128),
+    currency: str | None = Query(None, pattern="^(diamonds|beans|coins|commission)$"),
+    limit: int = Query(200, ge=1, le=2000),
+    user: dict = Depends(require_internal),
+):
+    """Owner, 6 Nov 2026: the Economy Book — sold, lent, held, sold on, spent, owed, and the logbook of every
+    ledger movement. Read-only. Owners and Finance (the business-financials gate)."""
+    _require_business_financials(user)
+    return await _produce(svc.economy_book(since, until, holder_type=holder_type, holder_id=holder_id,
+                                           currency=currency, ledger_limit=limit))
+
+
 @router.get("/promotions/claims")
 async def promotion_claims(
     since: datetime | None = _SINCE,
