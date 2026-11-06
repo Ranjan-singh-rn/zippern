@@ -102,7 +102,7 @@ data class GoLiveUiState(
     val commentInput: String = "",
     // Face detection
     val faceDetected: Boolean = true,
-    val faceAbsenceCountdown: Int = 120, // seconds remaining before auto-end
+    val faceAbsenceCountdown: Int = LiveModeration.FACE_TIMEOUT_SECONDS, // seconds remaining before auto-end
     // Viewers + leaderboard
     val viewers: List<ViewerPresence> = emptyList(),
     val giftLeaderboard: List<GiftLeaderboardEntry> = emptyList(),
@@ -542,14 +542,14 @@ class GoLiveViewModel @Inject constructor(
         } else if (detected) {
             // Face returned — cancel countdown
             faceCountdownJob?.cancel()
-            _state.update { it.copy(faceAbsenceCountdown = 120) }
+            _state.update { it.copy(faceAbsenceCountdown = LiveModeration.FACE_TIMEOUT_SECONDS) }
         }
     }
 
     private fun startFaceCountdown() {
         faceCountdownJob?.cancel()
         faceCountdownJob = viewModelScope.launch {
-            var seconds = 120
+            var seconds = LiveModeration.FACE_TIMEOUT_SECONDS
             while (seconds > 0) {
                 _state.update { it.copy(faceAbsenceCountdown = seconds) }
                 delay(1000)
@@ -557,7 +557,7 @@ class GoLiveViewModel @Inject constructor(
                 // Check if face came back
                 if (_state.value.faceDetected) return@launch
             }
-            // 2 minutes elapsed with no face — auto end.
+            // 10 minutes elapsed with no face — auto end.
             // B2: and say so. The screen used to drop the host back on the
             // pre-live setup form with no explanation and no summary.
             _state.update { it.copy(endedRemotely = true, remoteEndMessage = LiveModeration.FACE_TIMEOUT_MESSAGE) }

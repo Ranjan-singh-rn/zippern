@@ -270,6 +270,9 @@ object AgoraManager {
     fun joinAsBroadcaster(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
         leaveOtherChannel(eng, channelId)
+        // An audio-only party room switches video OFF for the whole engine; live and calls are video.
+        // Without this, a call or live opened after an audio party showed no picture on either side.
+        useVideo()
         eng.setClientRole(Constants.CLIENT_ROLE_BROADCASTER)
         // Mobile parity (stream quality): publish a second, low-resolution
         // stream next to the main one, so a viewer can choose "Low" — or fall
@@ -296,6 +299,9 @@ object AgoraManager {
     fun joinAsAudience(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
         leaveOtherChannel(eng, channelId)
+        // An audio-only party room switches video OFF for the whole engine; live and calls are video.
+        // Without this, a call or live opened after an audio party showed no picture on either side.
+        useVideo()
         eng.setClientRole(Constants.CLIENT_ROLE_AUDIENCE)
         val options = {
             ChannelMediaOptions().apply {

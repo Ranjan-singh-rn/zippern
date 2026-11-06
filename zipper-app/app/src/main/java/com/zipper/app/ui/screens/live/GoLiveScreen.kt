@@ -271,7 +271,7 @@ fun GoLiveScreen(
                         Box(Modifier.size(64.dp).background(c.tintDangerSubtle, CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.FaceRetouchingOff, null, tint = c.statusDanger, modifier = Modifier.size(32.dp)) }
                         Text("We can't see you", style = ZipperTheme.type.headingM, color = c.textPrimary, textAlign = TextAlign.Center)
                         Text("Come back in front of the camera to keep the live going.", style = ZipperTheme.type.bodyM, color = c.textSecondary, textAlign = TextAlign.Center)
-                        Text("Ends in ${state.faceAbsenceCountdown}s", style = ZipperTheme.type.displayM, color = c.statusDanger)
+                        Text("Ends in ${com.zipper.app.util.LiveModeration.countdownLabel(state.faceAbsenceCountdown)}", style = ZipperTheme.type.displayM, color = c.statusDanger)
                     }
                 }
             }
@@ -445,7 +445,7 @@ private fun PreLive(
                     ) { Text(cat.replaceFirstChar { it.uppercase() }, style = ZipperTheme.type.labelS, color = if (on) Color.White else c.textSecondary) }
                 }
             }
-            Text("Stay in frame — the live ends automatically if you leave the camera for 2 minutes.", style = ZipperTheme.type.caption, color = c.textMuted)
+            Text("Stay in frame — the live ends automatically if you leave the camera for 10 minutes.", style = ZipperTheme.type.caption, color = c.textMuted)
             ZipperButton("Go Live", onGoLive, gradient = true, fullWidth = true, loading = loading, enabled = !loading, icon = Icons.Outlined.Videocam)
         }
     }

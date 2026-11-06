@@ -25,7 +25,12 @@ object LiveModeration {
     /** The host may open their own mic only while no staff mute is in force. */
     fun mayUnmute(hostMuted: Boolean): Boolean = !hostMuted
 
-    const val FACE_TIMEOUT_MESSAGE = "Your live ended because no face was seen on camera for 2 minutes."
+    /** Owner, 6 Nov 2026: 10 minutes (was 2). The countdown is shown to the broadcaster only. */
+    const val FACE_TIMEOUT_SECONDS = 600
+    const val FACE_TIMEOUT_MESSAGE = "Your live ended because no face was seen on camera for 10 minutes."
+
+    /** "9:59" — the broadcaster's countdown. */
+    fun countdownLabel(seconds: Int): String = "%d:%02d".format(seconds.coerceAtLeast(0) / 60, seconds.coerceAtLeast(0) % 60)
 
     fun endedMessage(endedByStaff: Boolean, reason: String?): String {
         val why = reason?.trim().orEmpty()
