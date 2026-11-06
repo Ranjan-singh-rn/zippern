@@ -541,8 +541,15 @@ export const purchaseBagItem = functions
         renewCount: admin.firestore.FieldValue.increment(ownedSnap.exists ? 1 : 0),
       }, { merge: true })
 
+      // Owner, 7 Nov 2026 ("I bought it and nothing shows"): like other apps, a cosmetic bought while nothing of
+      // its kind is worn is put on at once. Something already worn is never swapped — that stays a choice in My Bag.
+      const pointer = EQUIP_POINTERS[String(item.category ?? '')]
+      const autoEquipped = !!pointer && String(userSnap.get(pointer) ?? '') === ''
+      if (autoEquipped) tx.update(userRef, { [pointer]: itemId })
+
       const result = {
         itemId,
+        autoEquipped,
         pricePaid: price,
         durationDays: days,
         expiresAt: expiresAt ? expiresAt.toMillis() : null,
