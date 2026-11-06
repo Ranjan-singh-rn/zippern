@@ -236,6 +236,32 @@ object AgoraManager {
         }
     }
 
+    /*
+     * 6 Nov 2026 — CALLS NOT CONNECTING. The engine is one object shared by Live, Party and Calls. Agora refuses
+     * `joinChannel` while it is still in ANOTHER channel (ERR_JOIN_CHANNEL_REJECTED, -17) and nothing was checking:
+     * a host who was live, or a viewer who called the broadcaster from the live room (O5c), "joined" the call
+     * channel in name only — no video, nobody on the other end. Every join now leaves the previous channel first
+     * (keeping the camera preview), and a refused join is logged instead of being recorded as joined.
+     */
+    private fun leaveOtherChannel(eng: RtcEngine, channelId: String) {
+        if (joinedChannel.isNotEmpty() && joinedChannel != channelId) {
+            runCatching { eng.leaveChannel() }
+            joinedChannel = ""
+            lastJoin = null
+            renewJob?.cancel()
+            renewJob = null
+        }
+    }
+
+    private fun recordJoin(rc: Int, channelId: String): Boolean {
+        if (rc != 0) {
+            android.util.Log.w("AgoraManager", "joinChannel($channelId) refused: $rc")
+            return false
+        }
+        joinedChannel = channelId
+        return true
+    }
+
     /**
      * Join a channel as broadcaster (host or caller).
      * [token] is a server-generated Agora RTC token from the `generateAgoraToken`
@@ -243,6 +269,7 @@ object AgoraManager {
      */
     fun joinAsBroadcaster(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
+        leaveOtherChannel(eng, channelId)
         eng.setClientRole(Constants.CLIENT_ROLE_BROADCASTER)
         // Mobile parity (stream quality): publish a second, low-resolution
         // stream next to the main one, so a viewer can choose "Low" — or fall
@@ -257,8 +284,7 @@ object AgoraManager {
                 publishMicrophoneTrack = true
             }
         }
-        eng.joinChannel(token, channelId, uid, options())
-        joinedChannel = channelId
+        if (!recordJoin(eng.joinChannel(token, channelId, uid, options()), channelId)) return
         lastJoin = JoinSpec(channelId, uid, Constants.CLIENT_ROLE_BROADCASTER, options)
     }
 
@@ -269,6 +295,7 @@ object AgoraManager {
      */
     fun joinAsAudience(channelId: String, token: String? = null, uid: Int = 0) {
         val eng = engine ?: return
+        leaveOtherChannel(eng, channelId)
         eng.setClientRole(Constants.CLIENT_ROLE_AUDIENCE)
         val options = {
             ChannelMediaOptions().apply {
@@ -278,8 +305,7 @@ object AgoraManager {
                 publishMicrophoneTrack = false
             }
         }
-        eng.joinChannel(token, channelId, uid, options())
-        joinedChannel = channelId
+        if (!recordJoin(eng.joinChannel(token, channelId, uid, options()), channelId)) return
         lastJoin = JoinSpec(channelId, uid, Constants.CLIENT_ROLE_AUDIENCE, options)
     }
 
@@ -395,6 +421,7 @@ object AgoraManager {
         video: Boolean = false,
     ) {
         val eng = engine ?: return
+        leaveOtherChannel(eng, channelId)
         if (video) useVideo() else useAudioOnly()
         val role = if (asBroadcaster) Constants.CLIENT_ROLE_BROADCASTER else Constants.CLIENT_ROLE_AUDIENCE
         eng.setClientRole(role)
@@ -408,8 +435,7 @@ object AgoraManager {
                 autoSubscribeVideo = video
             }
         }
-        eng.joinChannel(token, channelId, uid, options())
-        joinedChannel = channelId
+        if (!recordJoin(eng.joinChannel(token, channelId, uid, options()), channelId)) return
         lastJoin = JoinSpec(channelId, uid, role, options)
     }
 

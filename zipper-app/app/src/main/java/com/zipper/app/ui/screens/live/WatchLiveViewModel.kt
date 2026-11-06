@@ -295,8 +295,10 @@ class WatchLiveViewModel @Inject constructor(
             // kicked user is opening the room for the first time.
             when (val r = agoraTokenRepo.requestToken(roomId)) {
                 // A-7: joined with the uid the token was signed for, never 0.
-                is com.zipper.app.data.repository.AgoraTokenResult.Granted ->
+                is com.zipper.app.data.repository.AgoraTokenResult.Granted -> {
                     AgoraManager.joinAsAudience(roomId, r.token, r.uid)
+                    agoraJoinedOnce = true
+                }
                 com.zipper.app.data.repository.AgoraTokenResult.Denied -> onKicked()
                 com.zipper.app.data.repository.AgoraTokenResult.Ended ->
                     _state.update { it.copy(isLiveEnded = true, isConnected = false) }
@@ -304,6 +306,24 @@ class WatchLiveViewModel @Inject constructor(
                     _state.update { it.copy(error = r.message ?: "Could not join this live.") }
             }
         }
+    }
+
+    /**
+     * 6 Nov 2026 — BLACK SCREEN AFTER A CALL. A call borrows the one Agora engine: it takes over the callbacks,
+     * leaves this live's channel and, when it ends, clears the callbacks and leaves the call channel. Coming back,
+     * this screen still believed it was connected (and still held the host's uid), so nothing rejoined and nothing
+     * re-bound the host's video — a black screen. Called on every return to the screen: when the engine is no
+     * longer in this room's channel, forget the old video binding, re-install our callbacks and join again.
+     */
+    private var agoraJoinedOnce = false
+
+    fun ensureConnected(context: android.content.Context) {
+        if (roomId.isBlank() || hasLeft || _state.value.wasKicked || _state.value.isLiveEnded) return
+        // Only a screen that had joined and then lost the channel; the first open joins through LaunchedEffect.
+        if (!agoraJoinedOnce || AgoraManager.isInChannel(roomId)) return
+        agoraJoinedOnce = false
+        _state.update { it.copy(remoteUid = 0) }
+        initAndJoinAgora(context)
     }
 
     fun join() {

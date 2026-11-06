@@ -110,6 +110,8 @@ fun WatchLiveScreen(
             if (event == Lifecycle.Event.ON_RESUME || event == Lifecycle.Event.ON_PAUSE) {
                 isInPip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity?.isInPictureInPictureMode == true
             }
+            // Back from a call (or anything else that used the engine): rejoin if the channel was taken away.
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.ensureConnected(context)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
