@@ -169,6 +169,26 @@ object PushNotifications {
         NotificationManagerCompat.from(ctx).notify(2000 + (senderUid.hashCode() and 0xffff), n)
     }
 
+    // ── Notices (Owner, 6 Nov 2026) ─────────────────────────────────────────
+    //
+    // Every in-app notice (a buyer's payment waiting for the seller, a recharge approved, an application decided,
+    // a payout…) also reaches the phone. A tap opens the app.
+    fun showNotice(ctx: Context, noticeId: String, title: String, body: String) {
+        if (!canPost(ctx)) return
+        val open = activityIntent(ctx, 7000 + (noticeId.hashCode() and 0xfff), Bundle())
+        val n = NotificationCompat.Builder(ctx, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_video_call)
+            .setColor(android.graphics.Color.parseColor(BRAND_COLOR))
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        NotificationManagerCompat.from(ctx).notify(7000 + (noticeId.hashCode() and 0xffff), n)
+    }
+
     // ── Live ───────────────────────────────────────────────────────────────
 
     fun showLiveStarted(ctx: Context, roomId: String, hostName: String, title: String) {

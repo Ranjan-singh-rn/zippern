@@ -4893,7 +4893,7 @@ export { syncPublicProfile, syncLivePresence, backfillPublicProfiles } from './p
 // ── Push notifications ───────────────────────────────────────────────────────
 // Ring the callee, notify chat recipients, tell followers a host went live.
 // Data-only FCM messages; the app's messaging service renders them.
-export { pushIncomingCall, pushCallStatus, pushChatMessage, pushLiveStarted } from './push'
+export { pushIncomingCall, pushCallStatus, pushChatMessage, pushLiveStarted, pushNotice } from './push'
 
 // O12 (5 Nov 2026): silent monitoring — staff any room, an agency its hosts and its sub-agencies' hosts, a sub-agency
 // its own hosts. A subscriber token and a `monitorSessions` record; nothing written in the room.

@@ -42,6 +42,10 @@ class ZipperMessagingService : FirebaseMessagingService() {
                 if (AppState.isForeground && AppState.openChatUid == senderUid) return
                 PushNotifications.showMessage(this, senderUid, d["senderName"] ?: "New message", d["preview"] ?: "")
             }
+            "NOTICE" -> {
+                val title = d["title"] ?: return
+                PushNotifications.showNotice(this, d["noticeId"] ?: title, title, d["body"] ?: "")
+            }
             "LIVE_STARTED" -> {
                 val roomId = d["roomId"] ?: return
                 if (AppState.isForeground) return

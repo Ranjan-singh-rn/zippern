@@ -1438,10 +1438,10 @@ async def recharge_event(
     via = f" via {seller_name}" if seller_name and not for_seller else ""
     bodies = {
         "submitted": (
-            f"Your request for {diamonds} diamonds{via} has been received and is "
-            "being verified by Zipper. Diamonds are credited once the payment is confirmed.",
-            f"A buyer has submitted a recharge of {diamonds} diamonds through you. "
-            "Zipper will verify the payment.",
+            f"Your request for {diamonds} diamonds{via} has been received. "
+            "Diamonds are credited as soon as the seller confirms your payment.",
+            f"A buyer paid you for {diamonds} diamonds. Check your account and approve it in "
+            "Work → Recharges (if you still owe borrowed coins, Zipper verifies it instead).",
         ),
         "approved": (
             f"Your payment has been verified and {diamonds} diamonds have been credited.",

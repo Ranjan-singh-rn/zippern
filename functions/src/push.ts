@@ -295,3 +295,28 @@ export const pushLiveStarted = functions
     }
     return null
   })
+
+
+// ── Notices (Owner, 6 Nov 2026: "we are not getting if something happens") ─────
+//
+// Every in-app notice — a buyer's payment waiting for the seller, a recharge approved, a partner application
+// decided, a payout, a warning — was written to `notifications` and shown only when the person opened the app's
+// notification list. This sends the same title and text to the phone. Data-only, like every other push here; the
+// app shows it in the "Updates" channel and a tap opens the notification list.
+export const pushNotice = asia
+  .document('notifications/{noticeId}')
+  .onCreate(async (snap, context) => {
+    const n = snap.data() as Record<string, any>
+    const uid = String(n.userId ?? '')
+    const title = String(n.title ?? '').slice(0, 120)
+    const body = String(n.body ?? n.message ?? '').slice(0, 400)
+    if (!uid || !title) return null
+    await sendToUser(uid, {
+      type: 'NOTICE',
+      noticeId: String(context.params.noticeId ?? ''),
+      noticeType: String(n.type ?? ''),
+      title,
+      body,
+    })
+    return null
+  })
