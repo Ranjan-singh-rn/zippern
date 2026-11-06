@@ -23,6 +23,13 @@ class ZipperApp : Application() {
         FirebaseApp.initializeApp(this)
         com.zipper.app.service.PushNotifications.createChannels(this)
         registerActivityLifecycleCallbacks(com.zipper.app.service.AppState)
+        /*
+         * Gift / entrance animations (Owner, 6 Nov 2026): download once, reuse from the phone after that.
+         * SVGAPlayer only keeps what it downloads when it is given a FILE cache — its default relies on an
+         * HttpResponseCache this app never installed, so every SVGA gift was fetched again each time it played.
+         * Lottie URLs are already kept on disk by Lottie's own network cache (and in memory by composition).
+         */
+        runCatching { com.opensource.svgaplayer.SVGACache.onCreate(this, com.opensource.svgaplayer.SVGACache.Type.FILE) }
 
         /*
          * Image loading.
