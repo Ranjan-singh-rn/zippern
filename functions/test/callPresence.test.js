@@ -94,3 +94,32 @@ describe('syncCallPresence', () => {
     expect(db.read('users/H1')).toBe(undefined)
   })
 })
+
+describe('Owner 6 Nov: viewers see the call (live overlay, party seat icon, yellow listener dot)', () => {
+  test('a live host on a call marks their live room; the call ending clears it', async () => {
+    db.seed('users/U1', { uid: 'U1' })
+    db.seed('users/H1', { uid: 'H1' })
+    db.seed('liveRooms/L1', { hostUid: 'H1', isActive: true })
+    db.seed('liveRooms/OLD', { hostUid: 'H1', isActive: false })
+    await write('C7', call('ringing'), call('connected'))
+    expect(db.read('liveRooms/L1').hostInCall).toBe(true)
+    expect(db.read('liveRooms/OLD').hostInCall).toBe(undefined)
+    await write('C7', call('connected'), call('ended'))
+    expect(db.read('liveRooms/L1').hostInCall).toBe(false)
+  })
+
+  test('a party member on a call: their seat and their listener row say so', async () => {
+    db.seed('users/U1', { uid: 'U1', partyRoomId: 'P1' })
+    db.seed('users/H1', { uid: 'H1' })
+    db.seed('partyRooms/P1', { hostUid: 'X' })
+    db.seed('partyRooms/P1/listeners/U1', { uid: 'U1' })
+    db.seed('partyRooms/P1/seats/2', { uid: 'U1' })
+    db.seed('partyRooms/P1/seats/3', { uid: 'Z9' })
+    await write('C8', call('ringing'), call('connected'))
+    expect(db.read('partyRooms/P1/listeners/U1').inCall).toBe(true)
+    expect(db.read('partyRooms/P1/seats/2').inCall).toBe(true)
+    expect(db.read('partyRooms/P1/seats/3').inCall).toBe(undefined)
+    await write('C8', call('connected'), call('ended'))
+    expect(db.read('partyRooms/P1/listeners/U1').inCall).toBe(false)
+  })
+})

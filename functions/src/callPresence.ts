@@ -50,7 +50,31 @@ export async function refreshInCall(uid: string): Promise<boolean | null> {
   const snap = await userRef.get()
   if (!snap.exists) return null
   if ((snap.get('isInCall') === true) !== busy) await userRef.update({ isInCall: busy })
+  await mirrorToRooms(uid, String(snap.get('partyRoomId') ?? ''), busy)
   return busy
+}
+
+/**
+ * Owner, 6 Nov 2026 — viewers must SEE that the person is on a call:
+ *   * a live they host shows an "In Call" overlay  → `liveRooms/{id}.hostInCall`
+ *   * in a party room, a seat shows a call icon      → `partyRooms/{id}/seats/{n}.inCall`
+ *     and a listener's dot turns yellow              → `partyRooms/{id}/listeners/{uid}.inCall`
+ * Best effort and idempotent: a failure here never touches the call or its money.
+ */
+export async function mirrorToRooms(uid: string, partyRoomId: string, busy: boolean): Promise<void> {
+  try {
+    const lives = await db().collection('liveRooms').where('hostUid', '==', uid).where('isActive', '==', true).limit(3).get()
+    await Promise.all(lives.docs.filter((d) => (d.get('hostInCall') === true) !== busy).map((d) => d.ref.update({ hostInCall: busy })))
+    if (partyRoomId) {
+      const room = db().collection('partyRooms').doc(partyRoomId)
+      const listener = await room.collection('listeners').doc(uid).get()
+      if (listener.exists && (listener.get('inCall') === true) !== busy) await listener.ref.update({ inCall: busy })
+      const seats = await room.collection('seats').where('uid', '==', uid).limit(3).get()
+      await Promise.all(seats.docs.filter((d) => (d.get('inCall') === true) !== busy).map((d) => d.ref.update({ inCall: busy })))
+    }
+  } catch (e) {
+    functions.logger.warn('callPresence: room mirror failed', { uid, error: String(e) })
+  }
 }
 
 export const syncCallPresence = functions.region('asia-south1').firestore

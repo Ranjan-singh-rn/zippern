@@ -178,6 +178,16 @@ fun WatchLiveScreen(
             }
         }
 
+        // Owner, 6 Nov 2026: the broadcaster is on a call — say so, over whatever the video is doing.
+        if (room != null && room.hostInCall) {
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF1A2A4A), Color(0xFF0E0F21)))))
+            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Space.md)) {
+                Avatar(room.hostPhotoUrl, size = AvatarSize.X3L, ring = AvatarRing.Live, initial = room.hostName, decorUid = room.hostUid)
+                Text("In Call", style = ZipperTheme.type.headingM, color = c.textPrimary)
+                Text("${room.hostName.ifBlank { "The host" }} is on a call and will be back soon.", style = ZipperTheme.type.bodyM, color = c.textSecondary)
+            }
+        }
+
         if (isInPip) return@Box
 
         // Scrims

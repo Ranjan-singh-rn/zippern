@@ -27,6 +27,9 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Campaign
 import androidx.compose.material.icons.outlined.Groups
 import androidx.compose.material.icons.outlined.People
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
@@ -324,6 +327,7 @@ fun PartyRoomScreen(
                         activity?.isInPictureInPictureMode == true
                 )
             }
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.onScreenResumed()
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -345,6 +349,16 @@ fun PartyRoomScreen(
     // join answered by three leaves — and here it would call `leavePartySeat` on
     // a seat somebody else may already have taken.
     val exit: () -> Unit = { viewModel.leave(); onBack() }
+    if (state.returnFromCallPrompt) {
+        val ctx = LocalContext.current
+        AlertDialog(
+            onDismissRequest = { },
+            title = { Text("Your call has ended") },
+            text = { Text("Go back into the party room? Until you choose, nobody can see or hear you, and you still show as in a call.") },
+            confirmButton = { TextButton({ viewModel.returnAfterCall(ctx) }) { Text("Return to party") } },
+            dismissButton = { TextButton({ exit() }) { Text("Leave the room") } },
+        )
+    }
 
     // ── Hardware back ────────────────────────────────────────────────────────
     //
@@ -1191,6 +1205,13 @@ private fun VideoTile(
 
         if (seat != null) {
             SeatRoleBadge(room, seat.uid, Modifier.align(Alignment.TopEnd).padding(Space.xxs))
+            // Owner, 6 Nov 2026: on a call — a call icon over the seat.
+            if (seat.inCall) {
+                Box(
+                    Modifier.align(Alignment.Center).size(28.dp).background(c.statusWarning, androidx.compose.foundation.shape.CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) { Icon(Icons.Default.Call, "In a call", tint = Color.White, modifier = Modifier.size(16.dp)) }
+            }
             Row(
                 Modifier.align(Alignment.BottomStart).padding(Space.xxs),
                 verticalAlignment = Alignment.CenterVertically,

@@ -42,6 +42,8 @@ data class LiveRoom(
     // ── B12 (4 Nov 2026) ─────────────────────────────────────────────────────
     /** The host paused the live: viewers see "back soon", the host's camera and mic are off. */
     val isPaused: Boolean = false,
+    /** The host is on a call (server, from calls) — viewers see an "In Call" overlay. */
+    val hostInCall: Boolean = false,
     /** The host turned the camera off (still live, still talking): viewers see the host's photo. */
     val isCameraOff: Boolean = false,
     /** O1/O5c: the host switched incoming calls off for this broadcast (enforced by `startCall`; shown as "Calls off"). */
@@ -109,6 +111,7 @@ data class LiveRoom(
                 pkEndTime          = doc.millis("pkEndTime"),
                 pkChannelId        = doc.getString("pkChannelId") ?: "",
                 isPaused           = doc.getBoolean("isPaused") ?: false,
+                hostInCall         = doc.getBoolean("hostInCall") ?: false,
                 isCameraOff        = doc.getBoolean("isCameraOff") ?: false,
                 hostBlocksCalls    = doc.getBoolean("hostBlocksCalls") ?: false,
                 pinnedMessage      = doc.getString("pinnedMessage") ?: "",

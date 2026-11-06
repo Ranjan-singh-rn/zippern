@@ -252,6 +252,8 @@ data class PartySeat(
     val selfMuted: Boolean = false,
     /** Camera off, video rooms only. */
     val cameraOff: Boolean = false,
+    /** On a call right now (server) — a call icon over the avatar. */
+    val inCall: Boolean = false,
     val joinedAt: Long = 0L,
     /** Beans this seat has been gifted this session — the per-seat leaderboard. */
     val beansReceived: Long = 0L,
@@ -275,6 +277,7 @@ data class PartySeat(
                 mutedByRole = doc.getString("mutedByRole") ?: "",
                 selfMuted = doc.getBoolean("selfMuted") ?: false,
                 cameraOff = doc.getBoolean("cameraOff") ?: false,
+                inCall    = doc.getBoolean("inCall") ?: false,
                 joinedAt  = doc.millis("joinedAt"),
                 beansReceived = doc.getLong("beansReceived") ?: 0L,
             )

@@ -74,6 +74,8 @@ data class PartyListener(
     val idFrameItemId: String = "",
     val idFrameUrl: String = "",
     val joinedAt: Long = 0L,
+    /** On a call right now (server) — the online dot turns yellow. */
+    val inCall: Boolean = false,
 ) {
     /** Whether there is actually a clip to play for this arrival. */
     val hasEntrance: Boolean get() = entranceVideoUrl.isNotBlank() || entranceSvgaUrl.isNotBlank()
@@ -93,6 +95,7 @@ data class PartyListener(
                 idFrameItemId     = doc.getString("idFrameItemId") ?: "",
                 idFrameUrl        = doc.getString("idFrameUrl") ?: "",
                 joinedAt          = doc.millis("joinedAt"),
+                inCall            = doc.getBoolean("inCall") ?: false,
             )
         }
     }

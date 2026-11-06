@@ -33,6 +33,8 @@ import javax.inject.Inject
 enum class PKState { IDLE, WAITING, INVITED, ACTIVE }
 
 data class GoLiveUiState(
+    /** Back from a call while live: paused and off air until the host chooses (Owner, 6 Nov). */
+    val returnFromCallPrompt: Boolean = false,
     // Pre-live
     val title: String = "",
     val category: String = "general",
@@ -536,6 +538,8 @@ class GoLiveViewModel @Inject constructor(
         val prev = _state.value.faceDetected
         _state.update { it.copy(faceDetected = detected) }
 
+        // Paused (or waiting to come back from a call) is not "left the camera": no countdown.
+        if (_state.value.isPaused || _state.value.returnFromCallPrompt) { faceCountdownJob?.cancel(); return }
         if (!detected && prev) {
             // Face just disappeared — start countdown
             startFaceCountdown()
@@ -659,6 +663,33 @@ class GoLiveViewModel @Inject constructor(
     }
 
     // ── B12: pause, camera, pinned message ───────────────────────────────────
+
+    /*
+     * 6 Nov 2026 — PRIVACY AFTER A CALL. Taking a call leaves this live's channel (one engine). When the host comes
+     * back the live is PAUSED and stays off air — no camera, no mic, viewers see "back soon" — until the host answers
+     * "Return to your live?". A private call must never turn into a public broadcast on its own.
+     */
+    fun onScreenResumed() {
+        val s = _state.value
+        if (!s.isLive || s.roomId.isBlank() || s.returnFromCallPrompt) return
+        if (pkChannelJob?.isActive == true || AgoraManager.currentChannel.isNotEmpty()) return
+        AgoraManager.muteLocalVideo(true)
+        AgoraManager.muteLocalAudio(true)
+        _state.update { it.copy(isPaused = true, returnFromCallPrompt = true) }
+        viewModelScope.launch { try { repo.setPaused(s.roomId, true) } catch (_: Exception) {} }
+    }
+
+    fun returnToLiveAfterCall() {
+        val roomId = _state.value.roomId
+        if (roomId.isBlank()) return
+        _state.update { it.copy(returnFromCallPrompt = false) }
+        viewModelScope.launch {
+            val grant = agoraTokenRepo.fetchGrant(roomId)
+            AgoraManager.joinAsBroadcaster(roomId, grant?.token, grant?.uid ?: 0)
+            _state.update { it.copy(cameraEpoch = it.cameraEpoch + 1) }
+            if (_state.value.isPaused) togglePause()
+        }
+    }
 
     /** Pause (camera and mic off, viewers see "back soon") or resume (back as they were). */
     fun togglePause() {

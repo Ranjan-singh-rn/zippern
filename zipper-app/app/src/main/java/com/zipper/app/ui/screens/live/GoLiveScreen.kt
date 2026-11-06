@@ -118,6 +118,7 @@ fun GoLiveScreen(
             if (event == Lifecycle.Event.ON_RESUME || event == Lifecycle.Event.ON_PAUSE) {
                 isInPip = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity?.isInPictureInPictureMode == true
             }
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.onScreenResumed()
             if (event == Lifecycle.Event.ON_STOP && isInPip && state.isLive) {
                 // Read the figures before ending: endLive tears the session down.
                 val summary = viewModel.sessionSummary(); viewModel.endLive(); onLiveEnded(summary)
@@ -335,6 +336,15 @@ fun GoLiveScreen(
     }
 
     // ── Dialogs & sheets ───────────────────────────────────────────────────
+    if (state.returnFromCallPrompt) {
+        AlertDialog(
+            onDismissRequest = { }, containerColor = c.bgElevated,
+            title = { Text("Your call has ended", style = ZipperTheme.type.headingS, color = c.textPrimary) },
+            text = { Text("Your live is paused — viewers can't see or hear you. Go back on air?", style = ZipperTheme.type.bodyM, color = c.textSecondary) },
+            confirmButton = { TextButton({ viewModel.returnToLiveAfterCall() }) { Text("Return to live") } },
+            dismissButton = { TextButton({ val summary = viewModel.sessionSummary(); viewModel.endLive(); onLiveEnded(summary) }) { Text("End live", color = c.statusDanger) } },
+        )
+    }
     if (showEnd) {
         AlertDialog(
             onDismissRequest = { showEnd = false }, containerColor = c.bgElevated,

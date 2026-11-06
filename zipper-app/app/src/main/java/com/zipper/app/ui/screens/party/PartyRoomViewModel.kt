@@ -52,6 +52,8 @@ enum class PartyGate {
 }
 
 data class PartyRoomUiState(
+    /** Back from a call: nothing is published and nobody sees us until the person chooses (Owner, 6 Nov). */
+    val returnFromCallPrompt: Boolean = false,
     val room: PartyRoom? = null,
     /** Occupied seats only. An absent index is an empty seat. */
     val seats: List<PartySeat> = emptyList(),
@@ -146,13 +148,15 @@ data class PartyRoomUiState(
     val memberList: List<PartyMember>
         get() {
             val levels = listeners.associate { it.uid to it.level }
+            val calling = listeners.filter { it.inCall }.map { it.uid }.toSet()
             val seated = seats.map {
-                PartyMember(it.uid, it.name, it.photoUrl, seatIndex = it.index, level = levels[it.uid] ?: 0)
+                PartyMember(it.uid, it.name, it.photoUrl, seatIndex = it.index, level = levels[it.uid] ?: 0,
+                    inCall = it.inCall || it.uid in calling)
             }
             val seatedUids = seated.map { it.uid }.toSet()
             val rest = listeners
                 .filter { it.uid !in seatedUids }
-                .map { PartyMember(it.uid, it.name, it.photoUrl, seatIndex = 0, level = it.level) }
+                .map { PartyMember(it.uid, it.name, it.photoUrl, seatIndex = 0, level = it.level, inCall = it.inCall) }
             return seated + rest
         }
 
@@ -207,6 +211,8 @@ data class PartyMember(
     val seatIndex: Int,
     /** B7: shown on the member's profile card. */
     val level: Int = 0,
+    /** Owner, 6 Nov 2026: on a call — dot yellow instead of green. */
+    val inCall: Boolean = false,
 )
 
 @HiltViewModel
@@ -813,6 +819,23 @@ class PartyRoomViewModel @Inject constructor(
         if (user != null) currentUser = user
         val name = user?.name?.ifBlank { null } ?: "Someone"
         try { repo.sendJoinMessage(roomId, name) } catch (_: Exception) {}
+    }
+
+    /*
+     * 6 Nov 2026 — PRIVACY AFTER A CALL. A call takes the one Agora engine away from this room. When the person comes
+     * back here they are NOT put back on air: no channel, no camera, no mic, until they answer "Return to the party?".
+     * Their seat stays theirs; the server keeps showing them as in a call while the call lasts.
+     */
+    fun onScreenResumed() {
+        if (hasLeft || !joinStarted || _state.value.returnFromCallPrompt) return
+        if (AgoraManager.isInChannel(channelName)) return
+        _state.update { it.copy(returnFromCallPrompt = true, isConnected = false) }
+    }
+
+    fun returnAfterCall(context: android.content.Context) {
+        _state.update { it.copy(returnFromCallPrompt = false) }
+        joinStarted = false
+        connectAgora(context)
     }
 
     private fun connectAgora(context: android.content.Context) {

@@ -684,7 +684,15 @@ internal fun PartyMembersSheet(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(Space.md),
                 ) {
-                    Avatar(m.photoUrl, size = AvatarSize.MD, initial = m.name, decorUid = m.uid)
+                    Box {
+                        Avatar(m.photoUrl, size = AvatarSize.MD, initial = m.name, decorUid = m.uid)
+                        // Online dot: green = here, yellow = on a call (Owner, 6 Nov 2026).
+                        Box(
+                            Modifier.align(Alignment.BottomEnd).size(12.dp)
+                                .background(c.bgElevated, androidx.compose.foundation.shape.CircleShape).padding(2.dp)
+                                .background(if (m.inCall) Color(0xFFFFC107) else c.statusSuccess, androidx.compose.foundation.shape.CircleShape),
+                        )
+                    }
                     Column(Modifier.weight(1f)) {
                         Text(
                             if (m.uid == state.myUid) "${m.name.ifBlank { "You" }} (you)" else m.name.ifBlank { "Guest" },
@@ -692,7 +700,7 @@ internal fun PartyMembersSheet(
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            if (m.seatIndex > 0) "on seat ${m.seatIndex}" else "listening",
+                            (if (m.seatIndex > 0) "on seat ${m.seatIndex}" else "listening") + if (m.inCall) " · in a call" else "",
                             style = ZipperTheme.type.caption, color = c.textSecondary, maxLines = 1,
                         )
                     }
