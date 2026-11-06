@@ -2190,11 +2190,24 @@ async def approve_recharge(
         raise _fail(exc) from exc
 
 
+async def _recharge_seller_id(recharge_id: str, user: dict) -> str:
+    """Owner rule (6 Nov 2026): only the Coin Seller who was paid — never staff through this door (staff approve on
+    /recharges with the Owner signature as before)."""
+    if R.is_internal(user["role"]):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Staff decide recharges on /recharges, not through the seller's own approval.")
+    try:
+        return str((await recharges_svc.get_recharge(recharge_id)).get("seller_id") or "")
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
 @router.post("/recharges/{recharge_id}/seller-approve")
 async def seller_approve_recharge(recharge_id: str, body: Reason, user: dict = Depends(require_write_or_partner)):
     """Owner rule (6 Nov 2026): the seller who was paid approves; refused while they owe borrowed coins."""
+    seller_id = _own_id_or_403(user, await _recharge_seller_id(recharge_id, user), kind="seller")
     try:
-        return await recharges_svc.seller_decide_recharge(recharge_id, True, body.reason, user, set(partner_ids_of(user)))
+        return await recharges_svc.seller_decide_recharge(recharge_id, True, body.reason, user, {seller_id})
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
 
@@ -2202,8 +2215,9 @@ async def seller_approve_recharge(recharge_id: str, body: Reason, user: dict = D
 @router.post("/recharges/{recharge_id}/seller-reject")
 async def seller_reject_recharge(recharge_id: str, body: Reason, user: dict = Depends(require_write_or_partner)):
     """The seller says the payment never arrived. Nothing moves; the buyer is told."""
+    seller_id = _own_id_or_403(user, await _recharge_seller_id(recharge_id, user), kind="seller")
     try:
-        return await recharges_svc.seller_decide_recharge(recharge_id, False, body.reason, user, set(partner_ids_of(user)))
+        return await recharges_svc.seller_decide_recharge(recharge_id, False, body.reason, user, {seller_id})
     except PartnerOpsError as exc:
         raise _fail(exc) from exc
 

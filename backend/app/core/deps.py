@@ -247,6 +247,10 @@ PARTNER_REACHABLE: frozenset[tuple[str, str]] = frozenset(
         # unsold coins handed back. Scoped by `own_partner_id_or_403(…, kind="seller")`; a request that moves
         # nothing until one Owner approves it.
         ("POST", "/api/partner-ops/sellers/{seller_id}/repayment-requests"),
+        # Owner, 6 Nov 2026: the paid Coin Seller approves / rejects their own recharge (ownership checked in
+        # recharges.seller_decide_recharge against the session's partner ids; refused while borrowed coins are owed).
+        ("POST", "/api/partner-ops/recharges/{recharge_id}/seller-approve"),
+        ("POST", "/api/partner-ops/recharges/{recharge_id}/seller-reject"),
         # 4.3.8 — "Seller sells diamonds to users and files a record of each
         # sale." Filing leaves the sale at `pending`; approval is owner-only and
         # debits the seller's inventory first (4.3.9).

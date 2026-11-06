@@ -1054,9 +1054,10 @@ reachable = [row for row in table if row[2] == "scoped"]
 # Thirty-five since O7 (Owner, 5 Nov 2026): a coin seller pays back borrowed coins
 # (`POST …/sellers/{seller_id}/repayment-requests`) — a payment with its reference, or unsold coins handed back —
 # scoped to their own seller record, a request that moves nothing until one Owner approves it.
-check("exactly thirty-five routes are partner-reachable", len(reachable), 35)
+# Thirty-seven since the Owner decision of 6 Nov 2026: the paid seller approves / rejects their own recharge.
+check("exactly thirty-seven routes are partner-reachable", len(reachable), 37)
 check(
-    "and they are the thirty-five named in PARTNER_REACHABLE",
+    "and they are the thirty-seven named in PARTNER_REACHABLE",
     {(row[0], row[1]) for row in reachable},
     set(deps.PARTNER_REACHABLE),
 )
@@ -1269,13 +1270,19 @@ partner_writes = sorted(
 # a trade filed as its buyer, a dispute raised as its seller, and self-use where Zipper allows it. Each names the
 # caller's own seller record and is scoped to it (asserted above); none decides, signs or executes.
 # O7 (5 Nov 2026): ten — a repayment request for borrowed coins, scoped the same way, deciding nothing.
+# Owner decision (6 Nov 2026): twelve — the paid Coin Seller approves or rejects a recharge filed against THEIR OWN
+# stock (seller-approve / seller-reject). It is the one decision a partner makes, deliberately and only on their own
+# inventory: ownership is checked against the session's partner ids, the movement is the same ledger path as a staff
+# approval, and it is refused while the seller owes borrowed coins (then Zipper staff decide, as before).
 check(
-    "the only ten writes a partner may make",
+    "the only twelve writes a partner may make",
     partner_writes,
     [
         ("POST", "/api/partner-ops/agencies/{agency_id}/sub-agencies/reapply"),
         ("POST", "/api/partner-ops/me/verification/check"),
         ("POST", "/api/partner-ops/me/verification/conflict"),
+        ("POST", "/api/partner-ops/recharges/{recharge_id}/seller-approve"),
+        ("POST", "/api/partner-ops/recharges/{recharge_id}/seller-reject"),
         ("POST", "/api/partner-ops/sales"),
         ("POST", "/api/partner-ops/seller-trades"),
         ("POST", "/api/partner-ops/seller-trades/{trade_id}/dispute"),
