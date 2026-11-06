@@ -95,7 +95,11 @@ fun ProfileScreen(
     Box(Modifier.fillMaxSize().background(c.bgBase)) {
     Column(Modifier.fillMaxSize().verticalScroll(profileScroll)) {
         // ── Hero ──────────────────────────────────────────────────────────
-        Box(Modifier.fillMaxWidth().height(262.dp)) {
+        // Owner, 6 Nov 2026: the profile card this person wears is drawn behind their profile header.
+        val wornCard = com.zipper.app.ui.components.rememberDecorBrush(
+            "profile_card", com.zipper.app.ui.components.rememberUserDecor(user.uid.ifBlank { null })?.cardId,
+        )
+        Box(Modifier.fillMaxWidth().height(262.dp).then(if (wornCard != null) Modifier.background(wornCard) else Modifier)) {
             Box(Modifier.fillMaxWidth().height(210.dp).background(placeholderBrush(user.uid))) {
                 val cover = user.coverPhotoUrl.ifBlank { user.photoUrl }
                 if (cover.isNotBlank()) {

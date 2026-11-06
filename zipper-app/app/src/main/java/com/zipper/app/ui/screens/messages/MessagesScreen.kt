@@ -231,7 +231,7 @@ private fun ConversationsTab(
                         if (ticked) Icon(Icons.Default.CheckCircle, "Selected", tint = c.brandPrimary, modifier = Modifier.size(22.dp))
                     }
                 }
-                Avatar(convo.otherUserPhotoUrl, size = AvatarSize.MD, initial = convo.otherUserName)
+                Avatar(convo.otherUserPhotoUrl, size = AvatarSize.MD, initial = convo.otherUserName, decorUid = convo.otherUserUid)
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(convo.otherUserName.ifBlank { "User" }, style = ZipperTheme.type.labelL, color = c.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(
