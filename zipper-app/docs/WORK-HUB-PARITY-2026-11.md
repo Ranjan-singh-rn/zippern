@@ -98,8 +98,8 @@ holds an agency record, `seller` a seller record, `agency+seller` both,
 | `marketing_admin` | 61 | 29 | 7 | 11 | 2 |
 | `marketing_member` | 39 | 12 | 7 | 11 | 2 |
 | `agency` | 10 | 3 | 0 | 1 | 0 |
-| `seller` | 10 | 10 | 1 | 2 | 0 |
-| `agency+seller` | 16 | 10 | 1 | 3 | 0 |
+| `seller` | 10 | 12 | 1 | 2 | 0 |
+| `agency+seller` | 16 | 12 | 1 | 3 | 0 |
 | `pending partner` | 3 | 3 | 0 | 0 | 0 |
 <!-- role-counts:end -->
 
