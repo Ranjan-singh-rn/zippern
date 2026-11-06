@@ -267,8 +267,31 @@ fun FaceVerificationScreen(
                         }
                     }
 
-                    // All checks passed — save & proceed
-                    viewModel.submitHostCapture(uri)
+                    // All checks passed — save & proceed.
+                    // 7 Nov 2026 ("host face verification not working"): the camera saves a full-resolution photo,
+                    // 4–8 MB on most current phones, and storage.rules accepts at most 4 MB at
+                    // hostVerification/{uid}/capture.jpg — so the upload was refused and verification never started.
+                    // The photo is scaled to 1280 px on its long side and saved at JPEG 85 (a few hundred KB) first.
+                    val upload = runCatching {
+                        val raw = bitmap ?: return@runCatching uri
+                        // Keep the photo upright: re-encoding drops the EXIF rotation the camera wrote.
+                        val deg = when (android.media.ExifInterface(photoFile.absolutePath).getAttributeInt(
+                            android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL)) {
+                            android.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                            android.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                            android.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                            else -> 0f
+                        }
+                        val b = if (deg == 0f) raw else android.graphics.Bitmap.createBitmap(
+                            raw, 0, 0, raw.width, raw.height, android.graphics.Matrix().apply { postRotate(deg) }, true)
+                        val scale = 1280f / maxOf(b.width, b.height)
+                        val small = if (scale < 1f) android.graphics.Bitmap.createScaledBitmap(
+                            b, (b.width * scale).toInt(), (b.height * scale).toInt(), true) else b
+                        val out = File(context.cacheDir, "fv_upload_${System.currentTimeMillis()}.jpg")
+                        out.outputStream().use { small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it) }
+                        Uri.fromFile(out)
+                    }.getOrDefault(uri)
+                    viewModel.submitHostCapture(upload)
                 }
 
                 override fun onError(exc: ImageCaptureException) {
