@@ -115,8 +115,8 @@ android {
         // session cut-off (A-9). Publish with `minSupportedVersionCode: 20` —
         // 19 still runs the ten-second tick loop against a server that bills
         // whole minutes and shows a price that no longer matches.
-        versionCode = 22
-        versionName = "1.2.8"
+        versionCode = 23
+        versionName = "1.2.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
 

@@ -73,9 +73,9 @@ class Apk20WiringTest {
     }
 
     @Test fun `build 21 ships a non-debuggable prod type on the debug key and reads its channel by name`() {
-        // 6 Nov 2026: APK 22 / 1.2.8 — same as 21 plus screenshots allowed in the prod test build.
-        assertTrue(gradle.contains("versionCode = 22"))
-        assertTrue(gradle.contains("versionName = \"1.2.8\""))
+        // 7 Nov 2026: APK 23 / 1.2.9 — 22 plus calls, In Call overlay, decorations, seller approval, notices, face upload fix.
+        assertTrue(gradle.contains("versionCode = 23"))
+        assertTrue(gradle.contains("versionName = \"1.2.9\""))
         val prod = gradle.substring(gradle.indexOf("create(\"prod\")"))
         assertTrue(prod.contains("initWith(getByName(\"release\"))"))
         assertTrue(prod.contains("isDebuggable = false"))

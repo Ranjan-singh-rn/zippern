@@ -201,10 +201,10 @@ rcs = (REL / "rel_common.sh").read_text(encoding="utf-8")
 ok("rel_common.sh: rollback bases refs/heads/prod-live-20261030 = 4e21b7f… and LIVE_FN_COMMIT = cf64145…, f1af30a… named NOT production",
    'PROD_FN_REF="refs/heads/prod-live-20261030"' in rcs and 'PROD_FN_COMMIT="%s"' % REAL_PROD in rcs
    and 'NOT_PROD_FN_COMMIT="%s"' % REAL_NOTPROD in rcs and 'LIVE_FN_COMMIT="%s"' % REAL_LIVE in rcs)
-ok("rel_common.sh describes 4 Nov production: serving and template zipper-api-00057-xiq, CRM bf4066501e5f593a, APK 22 / 1.2.8 / min 22",
+ok("rel_common.sh describes 4 Nov production: serving and template zipper-api-00057-xiq, CRM bf4066501e5f593a, APK 23 / 1.2.9 / min 23",
    'EXPECT_SERVING="zipper-api-00057-xiq"' in rcs and 'EXPECT_TEMPLATE="zipper-api-00057-xiq"' in rcs
-   and 'OLD_CRM_VERSION="bf4066501e5f593a"' in rcs and "APK_VERSION_CODE=22" in rcs and 'APK_VERSION_NAME="1.2.8"' in rcs
-   and "APK_MIN_SUPPORTED=22" in rcs)
+   and 'OLD_CRM_VERSION="bf4066501e5f593a"' in rcs and "APK_VERSION_CODE=23" in rcs and 'APK_VERSION_NAME="1.2.9"' in rcs
+   and "APK_MIN_SUPPORTED=23" in rcs)
 # The fleet's signing certificate: pinned once (rel_common.sh); 60 and LOCAL-VERIFY 6b read the APK Signing Block.
 ok("rel_common.sh pins the fleet's signing certificate FLEET_CERT_SHA256 = %s… (the key that signed APK 19)" % REAL_FLEET[:16],
    'FLEET_CERT_SHA256="%s"' % REAL_FLEET in rcs)
@@ -930,7 +930,7 @@ w(REPO / "firebase.json", json.dumps({"firestore": {"rules": "firestore.rules"},
                                       "hosting": [{"target": "production", "public": "zipper-crm/out"}]}, indent=1) + "\n")
 w(REPO / ".firebaserc", '{"projects":{"default":"zipper-83816"}}\n')
 w(REPO / "deploy-crm.command", DEPLOY_CRM, 0o755)
-w(REPO / "zipper-app" / "app" / "build.gradle.kts", 'android {\n    defaultConfig {\n        versionCode = 22\n        versionName = "1.2.8"\n    }\n    buildTypes { create("prod") { } }\n}\n')
+w(REPO / "zipper-app" / "app" / "build.gradle.kts", 'android {\n    defaultConfig {\n        versionCode = 23\n        versionName = "1.2.9"\n    }\n    buildTypes { create("prod") { } }\n}\n')
 HF = REPO / "hotfix" / "rules-20261101"
 w(HF / "firestore.rules", HOTFIX_FS)
 w(HF / "storage.rules", HOTFIX_ST)
@@ -1375,17 +1375,17 @@ run(C41, "RELEASE\n")
 
 # ── 21 / 60 / 61 / 29 2b ──
 rc, o = run(C21, "DEPLOY2B\n")
-ok("21 refuses before APK 22 is published with minSupportedVersionCode 22", rc == 3 and "firebase deploy" not in calls(), o[-300:])
+ok("21 refuses before APK 23 is published with minSupportedVersionCode 23", rc == 3 and "firebase deploy" not in calls(), o[-300:])
 APKD = REPO / "zipper-app" / "app" / "build" / "outputs" / "apk" / "prod"
 
 
-def apks(code="22", dbg="no", signer="debug", certs=("fleet",), apksigner="ok"):
+def apks(code="23", dbg="no", signer="debug", certs=("fleet",), apksigner="ok"):
     """Both prod APKs. `certs`: the test certificates in the signing block (None: no block); `signer`: what publish_apk.py
     makes of apksigner's text (none = it cannot read it); `apksigner`: ok | fail (the stub's exit 0 | 1)."""
     for abi in ("arm64-v8a", "armeabi-v7a"):
         p = APKD / ("app-%s-prod.apk" % abi)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(signed_zip("FAKEAPK package=com.zipper.app versionCode=%s versionName=1.2.8 debuggable=%s signer=%s abi=%s apksigner=%s\n"
+        p.write_bytes(signed_zip("FAKEAPK package=com.zipper.app versionCode=%s versionName=1.2.9 debuggable=%s signer=%s abi=%s apksigner=%s\n"
                                  % (code, dbg, signer, abi, apksigner), None if certs is None else [CERTS[c] for c in certs]))
 
 
@@ -1420,9 +1420,9 @@ ok("60 does not need publish_apk.py to read apksigner's text ('unrecognised cert
 apks(dbg="yes")
 rc, o = run(C60, "PUBLISH\n")
 ok("60 refuses a debuggable APK", rc == 3 and "--apply" not in calls(), o[-300:])
-apks(code="21")
+apks(code="22")
 rc, o = run(C60, "PUBLISH\n")
-ok("60 refuses an APK whose versionCode is not 22 (APK 21)", rc == 3 and "--apply" not in calls(), o[-300:])
+ok("60 refuses an APK whose versionCode is not 23 (APK 22)", rc == 3 and "--apply" not in calls(), o[-300:])
 apks()
 before_doc = st()["android"]
 rc, o = run(C60, "NO\n")
@@ -1430,9 +1430,9 @@ ok("60 refuses without PUBLISH (exit 4) after a clean dry run", rc == 4 and "--a
 rc, o = run(C60, "PUBLISH\n")
 ev60 = newest("60-publish-apk-")
 d = st()["android"]["debug"]
-ok("60 publishes APK 22 with minSupportedVersionCode 22 to the debug channel: PASS", rc == 0 and "RESULT: PASS" in o and d["versionCode"] == 22
-   and d["minSupportedVersionCode"] == 22 and d["versionName"] == "1.2.8" and st()["android"]["release"] == before_doc["release"], o[-900:])
-ok("60 ran publish_apk.py --apply on the staged prod APKs (app-<abi>-debug.apk copies)", re.search(r"-m scripts\.publish_apk --channel debug --apk-dir \S+/apk --min-supported 22 --notes .* --apply", calls()))
+ok("60 publishes APK 23 with minSupportedVersionCode 23 to the debug channel: PASS", rc == 0 and "RESULT: PASS" in o and d["versionCode"] == 23
+   and d["minSupportedVersionCode"] == 23 and d["versionName"] == "1.2.9" and st()["android"]["release"] == before_doc["release"], o[-900:])
+ok("60 ran publish_apk.py --apply on the staged prod APKs (app-<abi>-debug.apk copies)", re.search(r"-m scripts\.publish_apk --channel debug --apk-dir \S+/apk --min-supported 23 --notes .* --apply", calls()))
 s60 = (ev60 / "SUMMARY.txt").read_text() if ev60 else ""
 ok("60 SUMMARY records each APK's certificate (CN, SHA-256 = FLEET_CERT_SHA256); apksigner's raw output and apk_cert.py's line are kept",
    s60.count("SIGNER schemes=v2 certificates=1 sha256=%s CN=Android Debug" % FLEET_SHA) == 2 and s60.count("SIGNER-CHECK ok") == 2
@@ -1441,7 +1441,7 @@ ok("60 SUMMARY records each APK's certificate (CN, SHA-256 = FLEET_CERT_SHA256);
 sv = ev60 / "android-update-before.json"
 ok("60 saved the previous androidUpdate document (mode 600) for 61", sv.exists() and json.loads(sv.read_text()) == before_doc and (sv.stat().st_mode & 0o777) == 0o600)
 rc, o = run(C60, "PUBLISH\n")
-ok("60 re-run refuses: version 22 already published", rc == 3 and "--apply" not in calls(), o[-300:])
+ok("60 re-run refuses: version 23 already published", rc == 3 and "--apply" not in calls(), o[-300:])
 EXPORTS.write_text(GOOD_EXPORTS + "EXPORT brandNewFunction asia-south1\n")
 rc, o = run(C21, "DEPLOY2B\n")
 ok("21 refuses an exported function that is in no list (UNCLASSIFIED), nothing deployed",
