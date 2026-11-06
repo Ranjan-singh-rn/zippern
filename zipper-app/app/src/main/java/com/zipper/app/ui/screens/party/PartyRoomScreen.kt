@@ -422,10 +422,17 @@ fun PartyRoomScreen(
     // needs in the snapshot it is handed — see [PartyEntranceOverlay].
     var knownListeners by remember { mutableStateOf<Set<String>?>(null) }
     var entrance by remember { mutableStateOf<PartyListener?>(null) }
+    var myEntranceShown by remember { mutableStateOf(false) }
     LaunchedEffect(state.listeners) {
         val ids = state.listeners.map { it.uid }.toSet()
         val before = knownListeners
         knownListeners = ids
+        // Owner, 7 Nov 2026 ("entrance not showing"): the person who bought the entrance never saw it — their own row
+        // is usually already in the first snapshot (ignored as "the room as we found it") and every later arrival
+        // excluded `myUid`. Show my own arrival once, the first time my row is in the room, like every other app.
+        if (!myEntranceShown && entrance == null) {
+            state.listeners.firstOrNull { it.uid == state.myUid }?.let { me -> myEntranceShown = true; entrance = me }
+        }
         // The first snapshot is the room as we found it, not forty arrivals.
         if (before == null) return@LaunchedEffect
         // The slot is full: this arrival gets no animation at all rather than a
