@@ -354,6 +354,15 @@ class WorkModulesTest {
         assertFalse(pendingMods.any { it.startsWith("agency.") || it.startsWith("seller.") })
     }
 
+    @Test fun `the paid seller approves or rejects their own recharge, staff do not get the seller buttons`() {
+        val sellerWrites = offeredWrites(seller).toSet()
+        assertTrue("recharges/recharge.sellerApprove" in sellerWrites)
+        assertTrue("recharges/recharge.sellerReject" in sellerWrites)
+        assertFalse("recharges/recharge.approve" in sellerWrites)
+        val ownerWrites = offeredWrites(owner).toSet()
+        assertFalse("recharges/recharge.sellerApprove" in ownerWrites)
+    }
+
     @Test fun `owner-only decisions are offered to the owner only`() {
         val ownerOnly = listOf("roleAppeals/roleAppeal.decide", "transfers/transfer.decide", "frozenMoney/freeze.decide",
             "recharges/recharge.approve", "sales/sale.approve", "cards.board/card.sign", "approvals/approval.approve")

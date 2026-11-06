@@ -593,6 +593,39 @@ async def approve_recharge(recharge_id: str, reason: str, actor: dict) -> dict[s
     return out
 
 
+BORROWED_NEEDS_ZIPPER = (
+    "You have borrowed coins from Zipper that are not repaid yet ({owed} coins). Until they are repaid, "
+    "Zipper verifies your sales: this request stays pending for Zipper staff. Repay from Work → Seller "
+    "statement to approve your own sales again."
+)
+
+
+async def seller_decide_recharge(recharge_id: str, approve: bool, reason: str, actor: dict,
+                                 own_seller_ids: set[str]) -> dict[str, Any]:
+    """Owner rule (6 Nov 2026): the Coin Seller who received the buyer's payment approves the sale themself,
+    and the sale is filed automatically — the same ledger path as a staff approval (`approve_recharge`: CAS,
+    idempotency keys, seller coins → buyer diamonds, audit, both notified, Owners told).
+
+    The one exception the Owner set: a seller who still owes Zipper BORROWED coins (credit outstanding > 0)
+    cannot approve — they may be selling stock they have not paid for, so Zipper staff verify those sales on
+    /recharges as before. Rejecting is always the seller's own call (nothing moves).
+
+    `own_seller_ids` comes from the caller's session (`partner_ids_of`), never from the request."""
+    recharge = await _recharge(recharge_id)
+    seller_id = str(recharge.get("seller_id") or "")
+    if not seller_id or seller_id not in own_seller_ids:
+        raise PartnerOpsError("This recharge request is not one of yours. Nothing was changed.")
+    if not approve:
+        return await reject_recharge(recharge_id, reason or "Payment not received by the seller", actor)
+    from app.services.seller_business import borrowing_headroom  # local: avoids an import cycle
+
+    partner = await get_db()[C.PARTNERS].find_one({"_id": seller_id}) or {}
+    _limit, owed, _headroom = borrowing_headroom(partner)
+    if owed > 0:
+        raise PartnerOpsError(BORROWED_NEEDS_ZIPPER.format(owed=owed))
+    return await approve_recharge(recharge_id, reason or "Seller confirmed the payment was received", actor)
+
+
 async def reject_recharge(recharge_id: str, reason: str, actor: dict) -> dict[str, Any]:
     reason = _require_reason(reason)
     recharge = await _recharge(recharge_id)

@@ -337,6 +337,40 @@ finally:
     fs.collection("notifications").clear_failures()
 
 # ══════════════════════════════════════════════════════════════════════════════
+print("8. The paid seller approves their own sale (Owner rule, 6 Nov 2026)")
+
+SELLER = {"uid": "u-seller", "name": "Coins R Us", "role": "seller", "team": None}
+r10 = file(reference="UTR-010", diamonds=20, amount_minor=2000); R10 = r10["id"]
+m = refuses("another seller cannot approve it", rc.seller_decide_recharge(R10, True, "", SELLER, {"OTHER"}))
+ok("…told it is not theirs", "not one of yours" in m)
+eq("…still pending", rec(R10)["status"], "pending")
+before_d, before_c = diamonds("u-buyer"), bal(HolderType.SELLER, "SELL", Currency.COINS)
+run(rc.seller_decide_recharge(R10, True, "", SELLER, {"SELL"}))
+eq("seller approval credits the buyer through the ledger", diamonds("u-buyer"), before_d + 20)
+eq("…and debits the seller's coins", bal(HolderType.SELLER, "SELL", Currency.COINS), before_c - 20)
+eq("…status approved, filed as a sale", rec(R10)["status"], "approved")
+ok("…audited with the seller as the actor", rec(R10)["approved_by"]["uid"] == "u-seller")
+refuses("approving it again moves nothing", rc.seller_decide_recharge(R10, True, "", SELLER, {"SELL"}))
+eq("…buyer unchanged", diamonds("u-buyer"), before_d + 20)
+
+# Borrowed coins not repaid: Zipper verifies instead.
+sell = next(p for p in DB[C.PARTNERS].docs if p["_id"] == "SELL")
+sell["credit"] = {"limit": 5000, "outstanding": 400}
+r11 = file(reference="UTR-011", diamonds=10, amount_minor=1000); R11 = r11["id"]
+m = refuses("a seller who owes borrowed coins cannot self-approve", rc.seller_decide_recharge(R11, True, "", SELLER, {"SELL"}))
+ok("…told why (400 borrowed coins)", "400" in m and "borrowed" in m)
+eq("…request stays pending for Zipper staff", rec(R11)["status"], "pending")
+run(rc.approve_recharge(R11, "Zipper verified the payment.", OWNER))
+eq("…and staff can still approve it", rec(R11)["status"], "approved")
+sell["credit"] = {"limit": 5000, "outstanding": 0}
+
+r12 = file(reference="UTR-012", diamonds=10, amount_minor=1000); R12 = r12["id"]
+before_d = diamonds("u-buyer")
+run(rc.seller_decide_recharge(R12, False, "Money never arrived", SELLER, {"SELL"}))
+eq("a seller can reject (nothing moves)", rec(R12)["status"], "rejected")
+eq("…buyer unchanged", diamonds("u-buyer"), before_d)
+
+# ══════════════════════════════════════════════════════════════════════════════
 if failures:
     print(f"\n{len(failures)} of {checks} checks FAILED\n")
     for f in failures:

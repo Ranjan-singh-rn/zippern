@@ -423,7 +423,7 @@ fun SellerDashboardScreen(
                                     RowNotice(
                                         when {
                                             req.transferErrorReason.isNotBlank() -> req.transferErrorReason
-                                            else -> "Awaiting verification by Zipper. Your coins move and the buyer is credited once the payment is confirmed."
+                                            else -> "Payment received? Approve it in Work → Recharges. (If you still owe borrowed coins, Zipper verifies it instead.)"
                                         },
                                         c.statusWarning,
                                     )

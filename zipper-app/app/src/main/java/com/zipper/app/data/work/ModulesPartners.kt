@@ -101,6 +101,15 @@ internal val partnersModules: List<WorkModule> = listOf(
         actions = listOf(
             WorkAction("recharge.proof", "Open payment proof", kind = ActionKind.OpenUrl, gate = { true }, urlPath = "proof_url",
                 showFor = { i, _ -> stat(i, "proof_url").startsWith("https://") }),
+            // Owner rule (6 Nov 2026): the seller who was paid approves their own sale; it is filed through the
+            // ledger at once. Refused by the server while the seller owes borrowed coins — then Zipper verifies.
+            WorkAction("recharge.sellerApprove", "Payment received — approve", "/api/partner-ops/recharges/{item:id}/seller-approve",
+                gate = { c -> c.isSellerPartner }, showFor = statusIn("pending"),
+                fixed = mapOf("reason" to "Seller confirmed the payment was received"),
+                confirm = "Did this payment reach your account? Your coins go to the buyer as diamonds now, and the sale is recorded."),
+            WorkAction("recharge.sellerReject", "Not received — reject", "/api/partner-ops/recharges/{item:id}/seller-reject", danger = true,
+                gate = { c -> c.isSellerPartner }, showFor = statusIn("pending"),
+                inputs = listOf(reason()), confirm = "Reject this request? Nothing moves and the buyer is told."),
             WorkAction("recharge.approve", "Approve & credit", "/api/partner-ops/recharges/{item:id}/approve", danger = true,
                 gate = { c -> c.isOwner && c.has(Perm.COIN_OPERATIONS) }, showFor = statusIn("pending", "approving"),
                 inputs = listOf(reason()),

@@ -2190,6 +2190,24 @@ async def approve_recharge(
         raise _fail(exc) from exc
 
 
+@router.post("/recharges/{recharge_id}/seller-approve")
+async def seller_approve_recharge(recharge_id: str, body: Reason, user: dict = Depends(require_write_or_partner)):
+    """Owner rule (6 Nov 2026): the seller who was paid approves; refused while they owe borrowed coins."""
+    try:
+        return await recharges_svc.seller_decide_recharge(recharge_id, True, body.reason, user, set(partner_ids_of(user)))
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
+@router.post("/recharges/{recharge_id}/seller-reject")
+async def seller_reject_recharge(recharge_id: str, body: Reason, user: dict = Depends(require_write_or_partner)):
+    """The seller says the payment never arrived. Nothing moves; the buyer is told."""
+    try:
+        return await recharges_svc.seller_decide_recharge(recharge_id, False, body.reason, user, set(partner_ids_of(user)))
+    except PartnerOpsError as exc:
+        raise _fail(exc) from exc
+
+
 @router.post("/recharges/{recharge_id}/reject", dependencies=[_COIN_OPS])
 async def reject_recharge(
     recharge_id: str, body: Reason, user: dict = Depends(require_write)
